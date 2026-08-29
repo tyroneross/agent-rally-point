@@ -3424,6 +3424,22 @@ impl RoomStore {
         }
     }
 
+    /// Relinquish this process's direct-owner guard before handing storage to
+    /// rallyd. Routed callers already use a daemon and therefore have nothing
+    /// local to release. Call only after the direct store has finished its last
+    /// operation; subsequent access must reopen through [`RoomStore::open`].
+    pub(crate) fn release_direct_ownership_for_daemon_handover(&self) -> Result<()> {
+        match self {
+            RoomStore::Direct(direct) => {
+                let rally_dir = direct.facts_db_path.parent().ok_or_else(|| {
+                    RallyError::Message("facts db path has no parent".to_string())
+                })?;
+                release_direct_owner_for_ack_poll(rally_dir)
+            }
+            RoomStore::Routed(_) => Ok(()),
+        }
+    }
+
     // ----- dispatch: ROUTED methods -------------------------------------------
     // Each `Routed` arm calls the real wire client (`store_client.rs`); a
     // transport failure there (R6) surfaces as a retryable

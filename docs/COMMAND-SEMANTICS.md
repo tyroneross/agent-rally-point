@@ -36,6 +36,8 @@ Definitions:
 | `rally check liveness` | optional | yes | no | conditional | Advisory mode may scan all conflicted squads or filter one exact `--tool`. `--enforce` requires both `--tool <exact-target>` and `--actor <release-author>` and can release only that selected target's takeover-eligible claims. |
 | `rally session ensure` | yes | yes | no | no | Mints or reuses one parent-exported lease, records exact-session presence, and reports identity, visibility, blocking, atomic-claim, lifecycle-close, and delivery guarantees independently as `enforced`, `advisory`, or `unmanaged`. Adapter flags are attestations, not capability discovery. |
 | `rally session close` | yes | yes | no | no | Requires `--session-id` or parent `RALLY_SESSION_ID`; never guesses from the short-lived CLI process. Appends one `session.closed` transition and releases only claims whose tool and authoring session both exactly match. |
+| `rally session current` | no | yes | no | yes | Returns at most 128 unclosed registered leases, exact freshness counts, and omission counts. Stale/unknown leases remain explicit; this view never closes them or changes claim authority. |
+| `rally session history` | no | yes | no | yes | Returns the newest explicit active/closed lease transitions with a caller-bounded limit of 1–100. Canonical history remains in `.rally/log/**`. |
 | `rally say <kind>` | yes | yes | no | no | Appends durable coordination facts: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson, standby, wake, backlog-item, mission. |
 
 ### Referenced handoff targeting

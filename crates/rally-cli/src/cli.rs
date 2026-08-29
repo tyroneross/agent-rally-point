@@ -21,7 +21,7 @@ pub(crate) enum CliCommand {
     Run(RunArgs),
     Sessions(SessionsArgs),
     Inject(InjectArgs),
-    /// Host-neutral parent lease lifecycle (`session ensure|close`).
+    /// Host-neutral parent lease lifecycle and current/history views.
     SessionLifecycle(SessionLifecycleArgs),
     Session(SessionActionArgs),
     Locate(LocateArgs),
@@ -514,6 +514,8 @@ pub(crate) struct SessionLifecycleArgs {
 pub(crate) enum SessionLifecycleSubcommand {
     Ensure(SessionEnsureArgs),
     Close(SessionCloseArgs),
+    Current(SessionCurrentArgs),
+    History(SessionHistoryArgs),
 }
 
 #[derive(Clone, Debug)]
@@ -531,6 +533,17 @@ pub(crate) struct SessionEnsureArgs {
 pub(crate) struct SessionCloseArgs {
     pub(crate) tool: String,
     pub(crate) session_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SessionCurrentArgs {
+    pub(crate) tool: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SessionHistoryArgs {
+    pub(crate) tool: Option<String>,
+    pub(crate) limit: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -2061,8 +2074,25 @@ fn session_lifecycle_parser() -> impl Parser<SessionLifecycleArgs> {
         .descr("Close the exact parent lease and release only claims authored by that tool/session pair.")
         .command("close");
 
+    let current_tool = optional_string_arg("tool", "TOOL");
+    let current = construct!(current_tool)
+        .map(|tool| SessionLifecycleSubcommand::Current(SessionCurrentArgs { tool }))
+        .to_options()
+        .descr("Read the bounded current lease projection, including explicit freshness and omission counts.")
+        .command("current");
+
+    let history_tool = optional_string_arg("tool", "TOOL");
+    let history_limit = bounded_i64_arg("limit", "N", 20, 1, 100);
+    let history = construct!(history_tool, history_limit)
+        .map(|(tool, limit)| {
+            SessionLifecycleSubcommand::History(SessionHistoryArgs { tool, limit })
+        })
+        .to_options()
+        .descr("Read recent explicit lease transitions without expanding the current view.")
+        .command("history");
+
     let json = json_flag();
-    let subcommand = construct!([ensure, close]);
+    let subcommand = construct!([ensure, close, current, history]);
     construct!(json, subcommand).map(|(json, subcommand)| SessionLifecycleArgs { json, subcommand })
 }
 

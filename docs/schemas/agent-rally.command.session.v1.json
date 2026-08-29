@@ -17,7 +17,7 @@
           "oneOf": [
             {
               "type": "object",
-              "required": ["action", "lease", "environment", "shell_export"],
+              "required": ["action", "lease", "environment", "shell_export", "daemon"],
               "properties": {
                 "action": { "const": "ensure" },
                 "lease": {
@@ -50,7 +50,8 @@
                   "required": ["RALLY_SESSION_ID", "RALLY_AGENT_ID", "RALLY_TOOL_ID"],
                   "additionalProperties": { "type": "string" }
                 },
-                "shell_export": { "type": "string" }
+                "shell_export": { "type": "string" },
+                "daemon": { "$ref": "#/$defs/daemon_status" }
               }
             },
             {
@@ -66,6 +67,42 @@
                 },
                 "close_fact": { "type": "object" }
               }
+            },
+            {
+              "type": "object",
+              "required": ["action", "sessions", "total", "emitted", "omitted", "fresh", "stale", "unknown", "window_secs", "history_command"],
+              "properties": {
+                "action": { "const": "current" },
+                "sessions": {
+                  "type": "array",
+                  "maxItems": 128,
+                  "items": { "$ref": "#/$defs/current_session" }
+                },
+                "total": { "type": "integer", "minimum": 0 },
+                "emitted": { "type": "integer", "minimum": 0, "maximum": 128 },
+                "omitted": { "type": "integer", "minimum": 0 },
+                "fresh": { "type": "integer", "minimum": 0 },
+                "stale": { "type": "integer", "minimum": 0 },
+                "unknown": { "type": "integer", "minimum": 0 },
+                "window_secs": { "type": "integer", "minimum": 1 },
+                "history_command": { "type": "string" }
+              }
+            },
+            {
+              "type": "object",
+              "required": ["action", "transitions", "total", "emitted", "omitted", "limit"],
+              "properties": {
+                "action": { "const": "history" },
+                "transitions": {
+                  "type": "array",
+                  "maxItems": 100,
+                  "items": { "$ref": "#/$defs/session_transition" }
+                },
+                "total": { "type": "integer", "minimum": 0 },
+                "emitted": { "type": "integer", "minimum": 0, "maximum": 100 },
+                "omitted": { "type": "integer", "minimum": 0 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
+              }
             }
           ]
         }
@@ -76,6 +113,55 @@
     "capability": {
       "type": "string",
       "enum": ["enforced", "advisory", "unmanaged"]
+    },
+    "daemon_status": {
+      "type": "object",
+      "required": ["activation", "live"],
+      "properties": {
+        "activation": {
+          "type": "string",
+          "enum": ["not_needed", "disabled", "already_running", "started", "failed"]
+        },
+        "live": { "type": "boolean" },
+        "pid": { "type": "integer", "minimum": 1 },
+        "socket": { "type": "string" },
+        "detail": { "type": "string" }
+      }
+    },
+    "current_session": {
+      "type": "object",
+      "required": ["tool", "session_id", "adapter", "capabilities", "started_at", "last_seen_at", "last_seen_seq", "freshness"],
+      "properties": {
+        "tool": { "type": "string" },
+        "session_id": { "type": "string" },
+        "adapter": { "type": "string" },
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/capability" }
+        },
+        "started_at": { "type": "string" },
+        "last_seen_at": { "type": "string" },
+        "last_seen_seq": { "type": "integer", "minimum": 0 },
+        "age_secs": { "type": "integer", "minimum": 0 },
+        "freshness": { "type": "string", "enum": ["fresh", "stale", "unknown"] }
+      }
+    },
+    "session_transition": {
+      "type": "object",
+      "required": ["state", "event_id", "seq", "at", "tool", "session_id"],
+      "properties": {
+        "state": { "type": "string", "enum": ["active", "closed"] },
+        "event_id": { "type": "string" },
+        "seq": { "type": "integer", "minimum": 0 },
+        "at": { "type": "string" },
+        "tool": { "type": "string" },
+        "session_id": { "type": "string" },
+        "adapter": { "type": "string" },
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/capability" }
+        }
+      }
     }
   }
 }

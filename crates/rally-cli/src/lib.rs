@@ -48,6 +48,8 @@ const SCHEMA_ADOPT: &str = "agent-rally.command.adopt.v1";
 pub(crate) const FACT_SCHEMA: &str = "agent-rally.fact.v1";
 const SESSION_IDENTITY_RETRIES: usize = 4096;
 const SESSION_RESERVATION_LOCK_FILENAME: &str = "session-reservation.lock";
+const SESSION_CURRENT_WINDOW_SECS: i64 = 15 * 60;
+const MAX_CURRENT_SESSION_ROWS: usize = 128;
 
 #[cfg(unix)]
 mod session_reservation_lock {
@@ -786,6 +788,14 @@ fn first_two_positionals_are_daemon_start(args: &[String]) -> bool {
     matches!(first_positionals(args), (Some("daemon"), Some("start")))
 }
 
+/// `session ensure` may synchronously activate rallyd when the second fresh
+/// parent lease enters. Give that one startup path the same cold-reconcile
+/// budget as an explicit `daemon start`; current/history/close stay bounded by
+/// the ordinary hook-safe deadline.
+fn first_two_positionals_are_session_ensure(args: &[String]) -> bool {
+    matches!(first_positionals(args), (Some("session"), Some("ensure")))
+}
+
 /// Extract the `--timeout-seconds VALUE` (or `=VALUE`) ACK budget from an
 /// inject invocation, if present and parseable.
 fn inject_timeout_seconds(args: &[String]) -> Option<u64> {
@@ -853,7 +863,9 @@ fn resolve_watchdog_timeout(args: &[String]) -> Duration {
     // router's 30s corridor (R3). `daemon serve` never reaches here at all —
     // it is intercepted before this function is even called (see
     // `run_with_watchdog`'s D1 bypass).
-    if first_two_positionals_are_daemon_start(args) {
+    if first_two_positionals_are_daemon_start(args)
+        || first_two_positionals_are_session_ensure(args)
+    {
         return Duration::from_millis(DAEMON_START_WATCHDOG_TIMEOUT_MS);
     }
 
@@ -9187,6 +9199,7 @@ enum SessionLifecyclePayload {
         lease: session_identity::SessionLease,
         environment: BTreeMap<String, String>,
         shell_export: String,
+        daemon: SessionDaemonStatus,
     },
     Close {
         tool: String,
@@ -9194,6 +9207,247 @@ enum SessionLifecyclePayload {
         released_claim_ids: Vec<String>,
         close_fact: Box<Fact>,
     },
+    Current {
+        sessions: Vec<CurrentSessionLease>,
+        total: usize,
+        emitted: usize,
+        omitted: usize,
+        fresh: usize,
+        stale: usize,
+        unknown: usize,
+        window_secs: i64,
+        history_command: String,
+    },
+    History {
+        transitions: Vec<SessionTransition>,
+        total: usize,
+        emitted: usize,
+        omitted: usize,
+        limit: usize,
+    },
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+struct SessionDaemonStatus {
+    activation: String,
+    live: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    socket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+struct CurrentSessionLease {
+    tool: String,
+    session_id: String,
+    adapter: String,
+    capabilities: BTreeMap<String, String>,
+    started_at: String,
+    last_seen_at: String,
+    last_seen_seq: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    age_secs: Option<i64>,
+    freshness: String,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+struct SessionTransition {
+    state: String,
+    event_id: String,
+    seq: i64,
+    at: String,
+    tool: String,
+    session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adapter: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    capabilities: BTreeMap<String, String>,
+}
+
+fn evidence_value<'a>(fact: &'a Fact, prefix: &str) -> Option<&'a str> {
+    fact.evidence
+        .iter()
+        .find_map(|item| item.strip_prefix(prefix))
+}
+
+fn session_capability_markers(fact: &Fact) -> BTreeMap<String, String> {
+    [
+        "identity",
+        "visibility",
+        "blocking",
+        "atomic_claims",
+        "lifecycle_close",
+        "delivery",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        evidence_value(fact, &format!("capability:{name}="))
+            .map(|value| (name.to_string(), value.to_string()))
+    })
+    .collect()
+}
+
+fn explicit_session_transition(fact: &Fact) -> Option<SessionTransition> {
+    let tool = fact.tool.clone()?;
+    let session_id = fact.from_session_id.clone()?;
+    let state = if fact.kind == FactKind::SessionClosed
+        && evidence_value(fact, "protocol:session_state=") == Some("closed")
+    {
+        "closed"
+    } else if fact.kind == FactKind::Presence
+        && evidence_value(fact, "protocol:session_state=") == Some("active")
+        && fact
+            .evidence
+            .iter()
+            .any(|item| item == "protocol:session_capabilities=v1")
+    {
+        "active"
+    } else {
+        return None;
+    };
+    Some(SessionTransition {
+        state: state.to_string(),
+        event_id: fact.event_id.clone(),
+        seq: fact.seq,
+        at: fact.created_at.clone(),
+        tool,
+        session_id,
+        adapter: evidence_value(fact, "protocol:session_adapter=").map(str::to_string),
+        capabilities: session_capability_markers(fact),
+    })
+}
+
+fn session_control_projection(
+    mut facts: Vec<Fact>,
+    tool_filter: Option<&str>,
+) -> (Vec<CurrentSessionLease>, Vec<SessionTransition>) {
+    facts.sort_by_key(|fact| fact.seq);
+    let mut active = BTreeMap::<(String, String), CurrentSessionLease>::new();
+    let mut transitions = Vec::new();
+    for fact in &facts {
+        let key = fact
+            .tool
+            .as_ref()
+            .zip(fact.from_session_id.as_ref())
+            .map(|(tool, session)| (tool.clone(), session.clone()));
+        if let Some(key) = &key
+            && let Some(record) = active.get_mut(key)
+        {
+            record.last_seen_at = fact.created_at.clone();
+            record.last_seen_seq = fact.seq;
+        }
+        let Some(transition) = explicit_session_transition(fact) else {
+            continue;
+        };
+        if tool_filter.is_some_and(|tool| tool != transition.tool) {
+            continue;
+        }
+        let transition_key = (transition.tool.clone(), transition.session_id.clone());
+        if transition.state == "closed" {
+            active.remove(&transition_key);
+        } else {
+            active
+                .entry(transition_key)
+                .and_modify(|session| {
+                    session.adapter = transition
+                        .adapter
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    session.capabilities = transition.capabilities.clone();
+                    session.last_seen_at = transition.at.clone();
+                    session.last_seen_seq = transition.seq;
+                })
+                .or_insert_with(|| CurrentSessionLease {
+                    tool: transition.tool.clone(),
+                    session_id: transition.session_id.clone(),
+                    adapter: transition
+                        .adapter
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    capabilities: transition.capabilities.clone(),
+                    started_at: transition.at.clone(),
+                    last_seen_at: transition.at.clone(),
+                    last_seen_seq: transition.seq,
+                    age_secs: None,
+                    freshness: "unknown".to_string(),
+                });
+        }
+        transitions.push(transition);
+    }
+
+    let now = Utc::now();
+    let mut current = active.into_values().collect::<Vec<_>>();
+    for session in &mut current {
+        session.age_secs = chrono::DateTime::parse_from_rfc3339(&session.last_seen_at)
+            .ok()
+            .map(|seen| (now.timestamp() - seen.timestamp()).max(0));
+        session.freshness = match session.age_secs {
+            Some(age) if age <= SESSION_CURRENT_WINDOW_SECS => "fresh",
+            Some(_) => "stale",
+            None => "unknown",
+        }
+        .to_string();
+    }
+    current.sort_by_key(|session| std::cmp::Reverse(session.last_seen_seq));
+    transitions.sort_by_key(|transition| std::cmp::Reverse(transition.seq));
+    (current, transitions)
+}
+
+fn daemon_status_without_activation(
+    activation: &str,
+    detail: Option<String>,
+) -> SessionDaemonStatus {
+    SessionDaemonStatus {
+        activation: activation.to_string(),
+        live: false,
+        pid: None,
+        socket: None,
+        detail,
+    }
+}
+
+fn maybe_activate_session_daemon(fresh_sessions: usize) -> SessionDaemonStatus {
+    if fresh_sessions < 2 {
+        return daemon_status_without_activation(
+            "not_needed",
+            Some("fewer than two fresh session leases".to_string()),
+        );
+    }
+    if env::var("RALLY_DAEMON_AUTOSTART").as_deref() == Ok("0") {
+        return daemon_status_without_activation(
+            "disabled",
+            Some("RALLY_DAEMON_AUTOSTART=0".to_string()),
+        );
+    }
+    match command_daemon_start(
+        true,
+        cli::DaemonStartArgs {
+            idle_exit_secs: None,
+        },
+    ) {
+        Ok(output) => {
+            let daemon = &output.body["data"]["daemon"];
+            let already_running = daemon["note"] == "already running";
+            SessionDaemonStatus {
+                activation: if already_running {
+                    "already_running"
+                } else {
+                    "started"
+                }
+                .to_string(),
+                live: daemon["live"].as_bool().unwrap_or(false),
+                pid: daemon["pid"]
+                    .as_u64()
+                    .and_then(|pid| u32::try_from(pid).ok()),
+                socket: daemon["socket"].as_str().map(str::to_string),
+                detail: daemon["note"].as_str().map(str::to_string),
+            }
+        }
+        Err(error) => daemon_status_without_activation("failed", Some(error.to_string())),
+    }
 }
 
 fn infer_session_adapter(tool: &str) -> String {
@@ -9220,6 +9474,12 @@ fn command_session_lifecycle(args: SessionLifecycleArgs) -> Result<Output> {
             command_session_ensure(args.json, ensure)
         }
         cli::SessionLifecycleSubcommand::Close(close) => command_session_close(args.json, close),
+        cli::SessionLifecycleSubcommand::Current(current) => {
+            command_session_current(args.json, current)
+        }
+        cli::SessionLifecycleSubcommand::History(history) => {
+            command_session_history(args.json, history)
+        }
     }
 }
 
@@ -9246,6 +9506,17 @@ fn command_session_ensure(json: bool, args: SessionEnsureArgs) -> Result<Output>
     evidence.push(format!("protocol:session_adapter={adapter}"));
 
     let room = RoomStore::open()?;
+    if room.facts()?.iter().any(|fact| {
+        fact.kind == FactKind::SessionClosed
+            && fact.tool.as_deref() == Some(args.tool.as_str())
+            && fact.from_session_id.as_deref() == Some(identity.from_session_id())
+    }) {
+        return Err(RallyError::Usage(format!(
+            "session lease {} is already closed for {}; start a new parent lease instead of reusing it",
+            identity.from_session_id(),
+            args.tool
+        )));
+    }
     with_watchdog_command_commit(|| {
         ensure_presence_tiered_for_session_with_evidence(
             &room,
@@ -9255,6 +9526,15 @@ fn command_session_ensure(json: bool, args: SessionEnsureArgs) -> Result<Output>
             &evidence,
         )
     })?;
+    let facts = room.facts()?;
+    let (current_sessions, _) = session_control_projection(facts, None);
+    let fresh_sessions = current_sessions
+        .iter()
+        .filter(|session| session.freshness == "fresh")
+        .count();
+    room.release_direct_ownership_for_daemon_handover()?;
+    drop(room);
+    let daemon = maybe_activate_session_daemon(fresh_sessions);
 
     let lease = session_identity::SessionLease {
         raw_session_id: raw_session_id.clone(),
@@ -9270,12 +9550,7 @@ fn command_session_ensure(json: bool, args: SessionEnsureArgs) -> Result<Output>
         ("RALLY_AGENT_ID".to_string(), raw_session_id.clone()),
         ("RALLY_TOOL_ID".to_string(), args.tool.clone()),
     ]);
-    let shell_export = format!(
-        "export RALLY_SESSION_ID={} RALLY_AGENT_ID={} RALLY_TOOL_ID={}",
-        shell_quote(&raw_session_id),
-        shell_quote(&raw_session_id),
-        shell_quote(&args.tool),
-    );
+    let shell_export = session_shell_export(&raw_session_id, &args.tool);
     let body = envelope(
         "session",
         SCHEMA_SESSION,
@@ -9284,14 +9559,85 @@ fn command_session_ensure(json: bool, args: SessionEnsureArgs) -> Result<Output>
                 lease: lease.clone(),
                 environment,
                 shell_export,
+                daemon: daemon.clone(),
             },
         },
     )?;
     let text = format!(
-        "session ensure tool={} session_id={} reused={}",
-        lease.tool, lease.session_id, lease.reused
+        "session ensure tool={} session_id={} reused={} daemon={}",
+        lease.tool, lease.session_id, lease.reused, daemon.activation
     );
     Ok(Output::new(json, text, body))
+}
+
+fn command_session_current(json: bool, args: cli::SessionCurrentArgs) -> Result<Output> {
+    let room = RoomStore::open()?;
+    let (mut sessions, _) = session_control_projection(room.facts()?, args.tool.as_deref());
+    let total = sessions.len();
+    let fresh = sessions
+        .iter()
+        .filter(|session| session.freshness == "fresh")
+        .count();
+    let stale = sessions
+        .iter()
+        .filter(|session| session.freshness == "stale")
+        .count();
+    let unknown = total.saturating_sub(fresh + stale);
+    sessions.truncate(MAX_CURRENT_SESSION_ROWS);
+    let emitted = sessions.len();
+    let omitted = total.saturating_sub(emitted);
+    let body = envelope(
+        "session",
+        SCHEMA_SESSION,
+        SessionLifecycleData {
+            session: SessionLifecyclePayload::Current {
+                sessions,
+                total,
+                emitted,
+                omitted,
+                fresh,
+                stale,
+                unknown,
+                window_secs: SESSION_CURRENT_WINDOW_SECS,
+                history_command: "rally session history --limit 20 --json".to_string(),
+            },
+        },
+    )?;
+    Ok(Output::new(
+        json,
+        format!(
+            "session current total={total} fresh={fresh} stale={stale} unknown={unknown} omitted={omitted}"
+        ),
+        body,
+    ))
+}
+
+fn command_session_history(json: bool, args: cli::SessionHistoryArgs) -> Result<Output> {
+    let limit = usize::try_from(args.limit).unwrap_or(20);
+    let room = RoomStore::open()?;
+    let (_, mut transitions) = session_control_projection(room.facts()?, args.tool.as_deref());
+    let total = transitions.len();
+    transitions.truncate(limit);
+    let emitted = transitions.len();
+    let omitted = total.saturating_sub(emitted);
+    let body = envelope(
+        "session",
+        SCHEMA_SESSION,
+        SessionLifecycleData {
+            session: SessionLifecyclePayload::History {
+                transitions,
+                total,
+                emitted,
+                omitted,
+                limit,
+            },
+        },
+    )?;
+    Ok(Output::new(
+        json,
+        format!("session history total={total} emitted={emitted} omitted={omitted}"),
+        body,
+    ))
 }
 
 fn command_session_close(json: bool, args: SessionCloseArgs) -> Result<Output> {
@@ -9329,7 +9675,7 @@ fn command_session_close(json: bool, args: SessionCloseArgs) -> Result<Output> {
         .collect::<Vec<_>>();
     scope.sort();
     scope.dedup();
-    let operation_material = format!("{}:{}", session_id, released_claim_ids.join(","));
+    let operation_material = format!("{}:{session_id}", args.tool);
     let event_id = stable_operation_id("session-close", &operation_material);
     let existing = room
         .facts()?
@@ -10858,6 +11204,15 @@ pub(crate) fn shell_quote(value: &str) -> String {
         .into_owned()
 }
 
+fn session_shell_export(raw_session_id: &str, tool: &str) -> String {
+    format!(
+        "export RALLY_SESSION_ID={} RALLY_AGENT_ID={} RALLY_TOOL_ID={}",
+        shell_quote(raw_session_id),
+        shell_quote(raw_session_id),
+        shell_quote(tool),
+    )
+}
+
 /// Render the stable-id recovery command as one shell-safe argv sequence.
 ///
 /// Event ids are opaque schema strings, so callers must quote them rather than
@@ -10915,6 +11270,18 @@ mod tests {
             "`rally --help` omits registered commands: {missing:?}. Add a usage line to \
              help_text() for each — a command users cannot discover is a command they \
              will not use."
+        );
+    }
+
+    #[test]
+    fn session_ensure_watchdog_covers_daemon_handover() {
+        assert_eq!(
+            resolve_watchdog_timeout(&argv(&["session", "ensure", "--tool", "codex:01"])),
+            Duration::from_millis(DAEMON_START_WATCHDOG_TIMEOUT_MS)
+        );
+        assert_eq!(
+            resolve_watchdog_timeout(&argv(&["session", "current", "--json"])),
+            Duration::from_millis(DEFAULT_WATCHDOG_TIMEOUT_MS)
         );
     }
 
@@ -12411,6 +12778,22 @@ mod tests {
         let quoted = shell_quote("bad\0arg");
         assert!(quoted.contains('?'));
         assert!(!quoted.contains('\0'));
+    }
+
+    #[test]
+    fn session_shell_export_preserves_hostile_values_as_single_assignments() {
+        let session_id = "lease 'quoted' $(touch should-not-run); $HOME";
+        let tool = "generic shell:01; echo should-not-run";
+        let export = session_shell_export(session_id, tool);
+        assert_eq!(
+            shlex::split(&export).unwrap(),
+            vec![
+                "export".to_string(),
+                format!("RALLY_SESSION_ID={session_id}"),
+                format!("RALLY_AGENT_ID={session_id}"),
+                format!("RALLY_TOOL_ID={tool}"),
+            ]
+        );
     }
 
     #[test]
@@ -18548,6 +18931,8 @@ fn help_text() -> String {
         "    mint or reuse one parent-exported lease and report each adapter guarantee as enforced, advisory, or unmanaged",
         "  rally session close --tool <tool> [--session-id <id>] [--json]",
         "    close one exact tool/session lease and release only claims authored by that lease",
+        "  rally session current [--tool <tool>] [--json]  # bounded current leases with freshness and omission counts",
+        "  rally session history [--tool <tool>] [--limit <1..100>] [--json]  # explicit lease transitions",
         "  rally inject <session|name|tool> (--text <text>|--handoff <event-id>) [--timeout-seconds <n>] [--json]",
         "    --handoff waits for target-authored Rally ACK by default; without that evidence, branch on reached_target, queued, and fallback_plan",
         "  rally attach <session|name|tool> [--dry-run] [--json]",

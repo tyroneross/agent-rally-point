@@ -580,15 +580,35 @@ mod tests {
     }
 
     #[test]
-    fn capability_handshake_never_claims_codex_write_blocking() {
-        let codex = SessionCapabilities::for_adapter("codex", true, true, true, false);
-        assert_eq!(codex.blocking, CapabilityLevel::Advisory);
-        assert_eq!(codex.atomic_claims, CapabilityLevel::Enforced);
-        assert_eq!(codex.lifecycle_close, CapabilityLevel::Enforced);
+    fn capability_handshake_matches_each_supported_host_contract() {
+        let cases = [
+            ("claude", CapabilityLevel::Enforced),
+            ("claude_code", CapabilityLevel::Enforced),
+            ("cursor", CapabilityLevel::Enforced),
+            ("gemini", CapabilityLevel::Enforced),
+            ("gemini-cli", CapabilityLevel::Enforced),
+            ("codex", CapabilityLevel::Advisory),
+            ("generic-shell", CapabilityLevel::Advisory),
+        ];
+        for (adapter, expected_blocking) in cases {
+            let capabilities = SessionCapabilities::for_adapter(adapter, true, true, true, true);
+            assert_eq!(
+                capabilities.blocking, expected_blocking,
+                "incorrect blocking guarantee for {adapter}"
+            );
+            assert_eq!(capabilities.atomic_claims, CapabilityLevel::Enforced);
+            assert_eq!(capabilities.lifecycle_close, CapabilityLevel::Enforced);
+            assert_eq!(capabilities.delivery, CapabilityLevel::Enforced);
+        }
 
-        let claude = SessionCapabilities::for_adapter("claude_code", true, true, true, true);
-        assert_eq!(claude.blocking, CapabilityLevel::Enforced);
-        assert_eq!(claude.delivery, CapabilityLevel::Enforced);
+        let unmanaged =
+            SessionCapabilities::for_adapter("generic-shell", true, false, false, false);
+        assert_eq!(unmanaged.identity, CapabilityLevel::Enforced);
+        assert_eq!(unmanaged.visibility, CapabilityLevel::Enforced);
+        assert_eq!(unmanaged.blocking, CapabilityLevel::Unmanaged);
+        assert_eq!(unmanaged.atomic_claims, CapabilityLevel::Unmanaged);
+        assert_eq!(unmanaged.lifecycle_close, CapabilityLevel::Advisory);
+        assert_eq!(unmanaged.delivery, CapabilityLevel::Advisory);
     }
 
     #[test]

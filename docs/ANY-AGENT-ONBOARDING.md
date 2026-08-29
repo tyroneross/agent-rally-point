@@ -27,6 +27,21 @@ An adapter adds `--native-hook`, `--strict`, `--lifecycle-close`, or
 each guarantee as `enforced`, `advisory`, or `unmanaged`. In particular, Codex
 write blocking remains `advisory` because its current hook output cannot deny a
 tool call; visibility and atomic claim acquisition remain separate guarantees.
+When a second fresh lease appears, `session ensure` starts the per-repo
+single-writer daemon idempotently and reports the result under `daemon`.
+Set `RALLY_DAEMON_AUTOSTART=0` in the parent only when the host deliberately
+owns daemon lifecycle itself.
+
+Any agent can inspect the bounded live control plane without expanding room
+history:
+
+```bash
+rally session current --json
+rally session history --limit 20 --json
+```
+
+`current` caps rows at 128 and reports `total`, `emitted`, and `omitted` plus
+fresh/stale/unknown counts. `history` is an explicit, separately bounded view.
 
 Every agent then does these steps before editing:
 

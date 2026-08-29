@@ -180,6 +180,7 @@ impl Workspace {
             .env("HOME", &self.home)
             .env_remove("GITHUB_ACTIONS")
             .env_remove("GITHUB_RUN_ID")
+            .env("RALLY_DAEMON_AUTOSTART", "0")
             .env("RALLY_SESSION_ID", session_id);
         if self.global_index {
             cmd.env("RALLY_GLOBAL_INDEX", "1");
@@ -209,6 +210,7 @@ impl Workspace {
             .env("HOME", &self.home)
             .env_remove("GITHUB_ACTIONS")
             .env_remove("GITHUB_RUN_ID")
+            .env("RALLY_DAEMON_AUTOSTART", "0")
             .env("RALLY_SESSION_ID", session_id);
         let output = cmd.args(args).output().unwrap();
         let value = serde_json::from_slice(&output.stdout).unwrap();
@@ -217,7 +219,9 @@ impl Workspace {
 
     fn output(&self, args: &[&str]) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_rally"));
-        cmd.current_dir(&self.cwd).env("HOME", &self.home);
+        cmd.current_dir(&self.cwd)
+            .env("HOME", &self.home)
+            .env("RALLY_DAEMON_AUTOSTART", "0");
         if self.global_index {
             cmd.env("RALLY_GLOBAL_INDEX", "1");
         }
@@ -235,7 +239,8 @@ impl Workspace {
             .env_remove("RALLY_AGENT_ID")
             .env_remove("RALLY_TOOL_ID")
             .env_remove("GITHUB_ACTIONS")
-            .env_remove("GITHUB_RUN_ID");
+            .env_remove("GITHUB_RUN_ID")
+            .env("RALLY_DAEMON_AUTOSTART", "0");
         if self.suppress_worktree {
             cmd.env("RALLY_NO_WORKTREE", "1");
         }
@@ -4603,6 +4608,14 @@ fn session_ensure_mints_or_reuses_one_parent_lease_with_truthful_capabilities() 
         "--strict",
         "--native-hook",
     ]);
+    let started_before_refresh = workspace.json(&[
+        "session",
+        "current",
+        "--tool",
+        "claude_code:shared",
+        "--json",
+    ])["data"]["session"]["sessions"][0]["started_at"]
+        .clone();
     let second = workspace.json(&[
         "session",
         "ensure",
@@ -4621,10 +4634,35 @@ fn session_ensure_mints_or_reuses_one_parent_lease_with_truthful_capabilities() 
         first["data"]["session"]["lease"]["session_id"],
         second["data"]["session"]["lease"]["session_id"]
     );
+    let refreshed = workspace.json(&[
+        "session",
+        "current",
+        "--tool",
+        "claude_code:shared",
+        "--json",
+    ]);
+    assert_eq!(
+        refreshed["data"]["session"]["sessions"][0]["started_at"], started_before_refresh,
+        "refreshing a lease must preserve its original start time"
+    );
     assert_eq!(
         first["data"]["session"]["lease"]["capabilities"]["blocking"],
         "enforced"
     );
+
+    let current = workspace.json(&["session", "current", "--json"]);
+    assert_matches_schema("agent-rally.command.session.v1.json", &current);
+    assert_eq!(current["data"]["session"]["action"], "current");
+    assert_eq!(current["data"]["session"]["total"], 2);
+    assert_eq!(current["data"]["session"]["fresh"], 2);
+    assert_eq!(current["data"]["session"]["omitted"], 0);
+
+    let history = workspace.json(&["session", "history", "--limit", "1", "--json"]);
+    assert_matches_schema("agent-rally.command.session.v1.json", &history);
+    assert_eq!(history["data"]["session"]["action"], "history");
+    assert_eq!(history["data"]["session"]["total"], 2);
+    assert_eq!(history["data"]["session"]["emitted"], 1);
+    assert_eq!(history["data"]["session"]["omitted"], 1);
 
     workspace.cleanup();
 }
@@ -4632,6 +4670,24 @@ fn session_ensure_mints_or_reuses_one_parent_lease_with_truthful_capabilities() 
 #[test]
 fn session_close_releases_only_the_exact_same_tool_session_claims() {
     let workspace = Workspace::new("session-close-exact-owner");
+    workspace.json(&[
+        "session",
+        "ensure",
+        "--json",
+        "--tool",
+        "codex:shared",
+        "--session-id",
+        "parent-a",
+    ]);
+    workspace.json(&[
+        "session",
+        "ensure",
+        "--json",
+        "--tool",
+        "codex:shared",
+        "--session-id",
+        "parent-b",
+    ]);
     let owner = workspace.json_with_session(
         "parent-a",
         &[
@@ -4690,6 +4746,117 @@ fn session_close_releases_only_the_exact_same_tool_session_claims() {
         active[0]["from_session_id"],
         sibling["data"]["say"]["fact"]["from_session_id"]
     );
+    let current = workspace.json(&["session", "current", "--json"]);
+    assert_eq!(current["data"]["session"]["total"], 1);
+    assert_eq!(
+        current["data"]["session"]["sessions"][0]["session_id"],
+        sibling["data"]["say"]["fact"]["from_session_id"]
+    );
+    let history = workspace.json(&["session", "history", "--tool", "codex:shared", "--json"]);
+    assert_eq!(history["data"]["session"]["total"], 3);
+    assert_eq!(
+        history["data"]["session"]["transitions"][0]["state"],
+        "closed"
+    );
+
+    let close_again = workspace.json_with_session(
+        "parent-a",
+        &["session", "close", "--json", "--tool", "codex:shared"],
+    );
+    assert_eq!(
+        close_again["data"]["session"]["close_fact"]["event_id"],
+        close["data"]["session"]["close_fact"]["event_id"]
+    );
+    let history_after_retry =
+        workspace.json(&["session", "history", "--tool", "codex:shared", "--json"]);
+    assert_eq!(history_after_retry["data"]["session"]["total"], 3);
+
+    let reuse = workspace.output(&[
+        "session",
+        "ensure",
+        "--json",
+        "--tool",
+        "codex:shared",
+        "--session-id",
+        "parent-a",
+    ]);
+    assert_eq!(reuse.status.code(), Some(2));
+    let reuse_error: Value = serde_json::from_slice(&reuse.stderr).unwrap();
+    assert!(
+        reuse_error["error"]
+            .as_str()
+            .unwrap()
+            .contains("already closed")
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
+fn second_fresh_session_activates_rallyd_and_current_view_has_direct_daemon_parity() {
+    let workspace = Workspace::new("session-daemon-autostart");
+    let ensure = |session_id: &str, tool: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_rally"))
+            .current_dir(&workspace.cwd)
+            .env("HOME", &workspace.home)
+            .env("RALLY_NO_WORKTREE", "1")
+            .env("RALLY_DAEMON_AUTOSTART", "1")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID")
+            .args([
+                "session",
+                "ensure",
+                "--json",
+                "--tool",
+                tool,
+                "--session-id",
+                session_id,
+            ])
+            .output()
+            .expect("run session ensure");
+        assert!(
+            output.status.success(),
+            "session ensure failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+
+    let first = ensure("parent-a", "codex:a");
+    assert_eq!(
+        first["data"]["session"]["daemon"]["activation"],
+        "not_needed"
+    );
+    let direct = workspace.json(&["session", "current", "--json"]);
+    assert_eq!(direct["data"]["session"]["total"], 1);
+
+    let second = ensure("parent-b", "claude_code:b");
+    assert_eq!(second["data"]["session"]["daemon"]["live"], true);
+    assert!(matches!(
+        second["data"]["session"]["daemon"]["activation"].as_str(),
+        Some("started" | "already_running")
+    ));
+    let routed = workspace.json(&["session", "current", "--json"]);
+    assert_eq!(routed["data"]["session"]["total"], 2);
+    assert_eq!(routed["data"]["session"]["omitted"], 0);
+
+    let stopped = workspace.json(&["daemon", "stop", "--json"]);
+    assert_eq!(stopped["data"]["daemon"]["live"], false);
+    let direct_again = workspace.json(&["session", "current", "--json"]);
+    assert_eq!(direct_again["data"]["session"]["total"], 2);
+    let routed_ids = routed["data"]["session"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["session_id"].as_str().unwrap().to_string())
+        .collect::<BTreeSet<_>>();
+    let direct_ids = direct_again["data"]["session"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["session_id"].as_str().unwrap().to_string())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(routed_ids, direct_ids);
 
     workspace.cleanup();
 }

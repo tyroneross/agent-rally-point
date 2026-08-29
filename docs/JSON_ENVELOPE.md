@@ -78,8 +78,10 @@ print(d['data'][d['command']])
 | `version` | `version: { version, build_id }` | — |
 | `whoami` | `whoami: { tool?, repo_root, repo_id, room_id, worktree, build_id, cwd }` | `repo_id` is stable repo identity; `room_id` is the active engagement label |
 | `sessions` | `sessions: { sessions: [...] }` | — |
-| `session` ensure | `session: { action: "ensure", lease: { raw_session_id, session_id, endpoint_id, tool, adapter, reused, capabilities }, environment, shell_export }` | — |
+| `session` ensure | `session: { action: "ensure", lease: { raw_session_id, session_id, endpoint_id, tool, adapter, reused, capabilities }, environment, shell_export, daemon }` | — |
 | `session` close | `session: { action: "close", tool, session_id, released_claim_ids, close_fact }` | — |
+| `session` current | `session: { action: "current", sessions, total, emitted, omitted, fresh, stale, unknown, window_secs, history_command }` | — |
+| `session` history | `session: { action: "history", transitions, total, emitted, omitted, limit }` | — |
 | `run` | `run: { mode, session, commands }` | — |
 | `inject` | `inject: { mode, session, target_kind, handoff, require_ack, ack, verified_received, ack_state, fallback_plan, wake_intent, commands, sender_tool, content_fact, delivered, delivery_state, directive_seq, directive_to, delivery_path, daemon_receipt_state?, daemon_delivery_error?, delivery_reason, delivery_detail, reached_target, queued, target_injectability? }` | — |
 | `attach` | `attach: { mode, action, session, output?, commands }` | — |
@@ -136,7 +138,7 @@ An ACK timeout is also **`ok: true` / exit 0**: optional target evidence did not
 - `say` output: `data.say.fact` holds the written `Fact`. `data.room` and `data.verified` are shared contextual payloads.
 - `enter` output: `data.enter` holds the enter result (tool, cursor, entry, attention, warnings, mission). `data.room` is the room summary sibling.
 - Session actions (`attach`, `capture`, `stop`) share the schema `agent-rally.command.session-action.v1` but each nests under its own action name.
-- Session lease lifecycle (`session ensure`, `session close`) uses `agent-rally.command.session.v1`. Capability fields are independent three-level guarantees: `enforced`, `advisory`, or `unmanaged`; do not infer host write blocking from identity or visibility.
+- Session lease lifecycle and views (`session ensure|close|current|history`) use `agent-rally.command.session.v1`. Capability fields are independent three-level guarantees: `enforced`, `advisory`, or `unmanaged`; do not infer host write blocking from identity or visibility. Current/history rows are separately bounded and always carry exact omission counts.
 - `hook` output: `hook capabilities --json` is a standard envelope with `data.hook` holding the
   contract version, supported phases, effect registry, target ceiling, and the host-specific
   coordination contract. **`hook <phase>` is

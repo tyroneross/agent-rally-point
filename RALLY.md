@@ -400,9 +400,11 @@ writes over a Unix socket (`.rally/rallyd.sock`) instead of opening the SQLite
 cache directly. This removes the multi-process contention that made many
 concurrent CLIs flaky under load — the cache is opened once, by one writer.
 
-It is **opt-in and fail-open.** With no daemon running, every command behaves
-exactly as before (each process opens the cache directly). Start it when a repo
-has many concurrent agents; skip it otherwise.
+It is **demand-activated and fail-open.** With no daemon running, every command
+behaves exactly as before (each process opens the cache directly). A second
+fresh registered lease starts it idempotently through `rally session ensure`;
+set `RALLY_DAEMON_AUTOSTART=0` when a host deliberately owns daemon lifecycle.
+The explicit commands remain available for operators and diagnostics.
 
 ```bash
 rally daemon start    # spawn the daemon (detached; returns once it is serving)
