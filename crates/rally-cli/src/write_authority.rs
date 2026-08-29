@@ -110,8 +110,20 @@ pub(crate) const LEAD_FORCE_MARKER: &str = "lead-seizure-acknowledged";
 /// admission cost and no new spelling to remember.
 pub(crate) fn needs_authority_check(fact: &Fact) -> bool {
     claim_authority::closes_active_claim(&fact.kind)
+        || fact.kind == FactKind::SessionClosed
         || claim_authority::is_lead_decision(fact)
         || crate::retraction::target_of(fact).is_some()
+}
+
+pub(crate) fn needs_session_lifecycle_check(fact: &Fact) -> bool {
+    fact.kind == FactKind::SessionClosed
+        || fact.kind == FactKind::Claim
+        || fact.kind == FactKind::ClaimRenewed
+        || (fact.kind == FactKind::Presence
+            && fact
+                .evidence
+                .iter()
+                .any(|item| item == "protocol:session_state=active"))
 }
 
 /// Assert `fact` may be written, given the room as it stands immediately before
@@ -134,11 +146,93 @@ pub(crate) fn assert_write_authorized(
     coord: &CoordinationConfig,
 ) -> Result<()> {
     assert_field_bounds(fact)?;
+    assert_session_lifecycle_authorized(fact, facts_before)?;
     assert_claim_close_authorized(fact, snapshot, coord)?;
     assert_release_sweep_authorized(fact, snapshot, coord)?;
     assert_retraction_authorized(fact, snapshot, coord)?;
     assert_lead_retraction_authorized(fact, facts_before, snapshot, coord)?;
     assert_lead_transfer_authorized(fact, facts_before, snapshot, coord)?;
+    Ok(())
+}
+
+fn assert_session_lifecycle_authorized(fact: &Fact, facts_before: &[Fact]) -> Result<()> {
+    if !needs_session_lifecycle_check(fact) {
+        return Ok(());
+    }
+    let Some(tool) = fact.tool.as_deref() else {
+        return Ok(());
+    };
+    let Some(session_id) = fact.from_session_id.as_deref() else {
+        return Ok(());
+    };
+    let exact = |candidate: &&Fact| {
+        candidate.tool.as_deref() == Some(tool)
+            && candidate.from_session_id.as_deref() == Some(session_id)
+    };
+    if fact.kind != FactKind::SessionClosed
+        && facts_before
+            .iter()
+            .filter(exact)
+            .any(|candidate| candidate.kind == FactKind::SessionClosed)
+    {
+        return Err(RallyError::Usage(format!(
+            "session lease {session_id} is closed for {tool}; start a new parent lease"
+        )));
+    }
+
+    let latest_close_hash = facts_before
+        .iter()
+        .filter(exact)
+        .filter(|candidate| {
+            candidate.kind == FactKind::Presence
+                && candidate
+                    .evidence
+                    .iter()
+                    .any(|item| item == "protocol:session_state=active")
+        })
+        .filter_map(|candidate| {
+            candidate.evidence.iter().find_map(|item| {
+                item.strip_prefix(crate::session_identity::SESSION_CLOSE_TOKEN_HASH_PREFIX)
+            })
+        })
+        .next_back();
+
+    if fact.kind == FactKind::SessionClosed {
+        let expected = latest_close_hash.ok_or_else(|| {
+            RallyError::Usage(format!(
+                "session close refused: {tool} {session_id} has no active close-token lease"
+            ))
+        })?;
+        let supplied = fact
+            .evidence
+            .iter()
+            .find_map(|item| {
+                item.strip_prefix(crate::session_identity::SESSION_CLOSE_TOKEN_REVEAL_PREFIX)
+            })
+            .ok_or_else(|| {
+                RallyError::Usage(
+                    "session close refused: missing one-time close-token proof".to_string(),
+                )
+            })?;
+        if crate::session_identity::session_close_token_hash(supplied) != expected {
+            return Err(RallyError::Usage(
+                "session close refused: close-token proof does not match the active lease"
+                    .to_string(),
+            ));
+        }
+    } else if fact.kind == FactKind::Presence {
+        let proposed = fact.evidence.iter().find_map(|item| {
+            item.strip_prefix(crate::session_identity::SESSION_CLOSE_TOKEN_HASH_PREFIX)
+        });
+        if let Some(expected) = latest_close_hash
+            && proposed != Some(expected)
+        {
+            return Err(RallyError::Usage(
+                "session ensure refused: an existing lease cannot rotate its close token"
+                    .to_string(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -795,6 +889,91 @@ mod tests {
 
     fn authorized(fact: &Fact, snapshot: &RoomSnapshot) {
         authorized_with(fact, &[], snapshot)
+    }
+
+    fn active_session_presence(tool: &str, session: &str, token: &str) -> Fact {
+        Fact {
+            event_id: "session-active".to_string(),
+            seq: 1,
+            kind: FactKind::Presence,
+            tool: Some(tool.to_string()),
+            from_session_id: Some(session.to_string()),
+            subject: "session active".to_string(),
+            evidence: vec![
+                "protocol:session_state=active".to_string(),
+                crate::session_identity::session_close_token_hash_marker(token),
+            ],
+            created_at: iso_ago(0),
+            ..Fact::default()
+        }
+    }
+
+    fn session_close(tool: &str, session: &str, token: &str) -> Fact {
+        Fact {
+            event_id: "session-close".to_string(),
+            seq: 2,
+            kind: FactKind::SessionClosed,
+            tool: Some(tool.to_string()),
+            from_session_id: Some(session.to_string()),
+            subject: "session closed".to_string(),
+            evidence: vec![
+                "protocol:session_state=closed".to_string(),
+                format!(
+                    "{}{}",
+                    crate::session_identity::SESSION_CLOSE_TOKEN_REVEAL_PREFIX,
+                    token
+                ),
+            ],
+            created_at: iso_ago(0),
+            ..Fact::default()
+        }
+    }
+
+    #[test]
+    fn session_close_requires_the_registered_one_time_token() {
+        let presence = active_session_presence("codex:victim", "sess:victim", "secret");
+        let wrong = session_close("codex:victim", "sess:victim", "wrong");
+        let err = refusal_with(
+            &wrong,
+            std::slice::from_ref(&presence),
+            &RoomSnapshot::default(),
+        );
+        assert!(err.contains("does not match"), "{err}");
+
+        let correct = session_close("codex:victim", "sess:victim", "secret");
+        authorized_with(
+            &correct,
+            std::slice::from_ref(&presence),
+            &RoomSnapshot::default(),
+        );
+    }
+
+    #[test]
+    fn closed_session_cannot_claim_or_rotate_its_close_token() {
+        let presence = active_session_presence("codex:victim", "sess:victim", "secret");
+        let closed = session_close("codex:victim", "sess:victim", "secret");
+        let facts = vec![presence.clone(), closed];
+        let claim = Fact {
+            event_id: "later-claim".to_string(),
+            seq: 3,
+            kind: FactKind::Claim,
+            tool: presence.tool.clone(),
+            from_session_id: presence.from_session_id.clone(),
+            subject: "must fail".to_string(),
+            scope: vec!["file:src/a.rs".to_string()],
+            ..Fact::default()
+        };
+        assert!(refusal_with(&claim, &facts, &RoomSnapshot::default()).contains("is closed"));
+
+        let rotated = active_session_presence("codex:victim", "sess:victim", "rotated");
+        assert!(
+            refusal_with(
+                &rotated,
+                std::slice::from_ref(&presence),
+                &RoomSnapshot::default()
+            )
+            .contains("cannot rotate")
+        );
     }
 
     /// R1, THE defect. A retraction drops its target from every projection, so

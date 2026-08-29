@@ -61,7 +61,7 @@ use serde_json::Value;
 /// Wire protocol version. Bumped only on a breaking envelope change. The ping
 /// reply carries this; a client seeing an incompatible version fails
 /// immediately with typed `IncompatibleWire` and never falls back to direct.
-pub const WIRE_VERSION: u32 = 5;
+pub const WIRE_VERSION: u32 = 6;
 
 /// Hard cap on a single request/response line. A longer line is a framing
 /// error (or an abuse) and maps to the transport-error class (R7): the daemon
@@ -140,6 +140,9 @@ pub enum StoreOp {
     },
     /// `RoomStore::facts()` → `Vec<Fact>`.
     Facts,
+    /// Repository-wide claim lifecycle facts across every engagement. Used by
+    /// exact-session close so its effect and reported released claims agree.
+    RepoWideClaimLifecycleFacts,
     /// `RoomStore::rebuild_claim_index()` → `()`.
     RebuildClaimIndex,
     /// `RoomStore::renew_claim_lease(claim_id, lease_expires_at, caller, expected)` →
@@ -174,6 +177,13 @@ pub enum StoreOp {
     /// `RoomStore::snapshot()` (== `snapshot_with_archived(false)`) and
     /// `RoomStore::snapshot_with_archived(include_archived)` → `RoomSnapshot`.
     SnapshotWithArchived { include_archived: bool },
+    /// Target-scoped obligation projection. Counts remain exact while rows are
+    /// caller-bounded, so one peer cannot make every daemon snapshot fail.
+    SnapshotForObligationTarget {
+        tool: String,
+        row_limit: usize,
+        include_archived: bool,
+    },
     /// Engagement-selected snapshot. `StoreRequest::engagement` is required;
     /// run/path narrowing happens before projection, while a path separately
     /// joins repository-wide live collision claims.
@@ -215,8 +225,10 @@ impl StoreOp {
             | Self::RenewClaimLease { .. }
             | Self::MaybeAppendReadCheckpoint { .. } => true,
             Self::Facts
+            | Self::RepoWideClaimLifecycleFacts
             | Self::SessionFactsWithContextVersion
             | Self::SnapshotWithArchived { .. }
+            | Self::SnapshotForObligationTarget { .. }
             | Self::SnapshotScoped { .. }
             | Self::SnapshotWithReadersArchived { .. }
             | Self::LastCheckpointSeq { .. }
@@ -421,8 +433,8 @@ mod tests {
     }
 
     #[test]
-    fn o26_wire_v5_round_trips_all_query_controls() {
-        assert_eq!(WIRE_VERSION, 5);
+    fn o26_wire_v6_round_trips_all_query_controls() {
+        assert_eq!(WIRE_VERSION, 6);
         let req = StoreRequest::new(
             Some("engagement-alpha".to_string()),
             StoreOp::SnapshotScoped {

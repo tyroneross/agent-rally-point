@@ -19,7 +19,7 @@
         },
         "inbox": {
           "type": "object",
-          "required": ["count", "handoffs", "artifacts", "oldest_age_secs", "items"],
+          "required": ["count", "handoffs", "artifacts", "oldest_age_secs", "stale_window_secs", "items"],
           "properties": {
             "count": {
               "type": "integer",
@@ -30,6 +30,10 @@
             "oldest_age_secs": {
               "type": "integer",
               "description": "Age of the oldest open obligation; 0 when the inbox is empty."
+            },
+            "stale_window_secs": {
+              "type": "integer",
+              "description": "Effective coordination stale_wait_secs used for each item's advisory stale flag."
             },
             "items": {
               "type": "array",

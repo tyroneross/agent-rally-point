@@ -47,7 +47,7 @@
                 },
                 "environment": {
                   "type": "object",
-                  "required": ["RALLY_SESSION_ID", "RALLY_AGENT_ID", "RALLY_TOOL_ID"],
+                  "required": ["RALLY_SESSION_ID", "RALLY_AGENT_ID", "RALLY_TOOL_ID", "RALLY_SESSION_CLOSE_TOKEN"],
                   "additionalProperties": { "type": "string" }
                 },
                 "shell_export": { "type": "string" },

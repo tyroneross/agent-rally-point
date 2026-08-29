@@ -6,12 +6,14 @@ use crate::backlog::BacklogItem;
 use crate::store::{Fact, FactKind, RoomSnapshot, Squad};
 use crate::{FACT_SCHEMA, normalize_path, path_matches_scope, shell_quote};
 
-/// Default window after which an unanswered handoff stops counting as an active
-/// obligation in the `next` projection. Overridable via
+/// Default window after which an unanswered handoff is de-prioritized out of
+/// `next`'s waiting/ranking projection. It remains an open inbox obligation.
+/// Overridable via
 /// `coordination.stale_wait_secs` (config) or `RALLY_STALE_WAIT_SECS` (env) —
 /// resolved by the caller and threaded in, so this module stays pure and the
 /// window can flex per repo instead of being pinned at one day for everyone.
 pub(crate) const DEFAULT_STALE_WAIT_SECS: i64 = 24 * 60 * 60;
+pub(crate) const MAX_ENTER_ROWS: usize = 128;
 
 /// What `build_next` does with an INBOUND targeted handoff older than the stale
 /// window.
@@ -52,7 +54,6 @@ pub(crate) struct EntryData {
     verify: Vec<EntryItem>,
     respond_to: Vec<EntryItem>,
     ignore: Vec<EntryItem>,
-    attention: Vec<AttentionItem>,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -252,7 +253,6 @@ pub(crate) fn build_entry(
     tool: &str,
     role: Option<&str>,
     paths: &[String],
-    attention: &[AttentionItem],
 ) -> EntryData {
     let respond_to = snapshot
         .open_handoffs
@@ -262,6 +262,7 @@ pub(crate) fn build_entry(
                 .as_deref()
                 .is_none_or(|target| target == tool || target == "all")
         })
+        .take(MAX_ENTER_ROWS)
         .map(|f| entry_item("respond_to_handoff", f))
         .collect::<Vec<_>>();
     let mut do_items = respond_to.clone();
@@ -272,6 +273,7 @@ pub(crate) fn build_entry(
             .filter(|f| f.tool.as_deref() == Some(tool))
             .map(|f| entry_item("continue_or_release_claim", f)),
     );
+    do_items.truncate(MAX_ENTER_ROWS);
     do_items.extend(
         snapshot
             .active_blockers
@@ -291,6 +293,9 @@ pub(crate) fn build_entry(
                 }))
         {
             do_not.push(entry_item("avoid_claimed_scope", claim));
+            if do_not.len() == MAX_ENTER_ROWS {
+                break;
+            }
         }
     }
     let know = snapshot
@@ -314,7 +319,6 @@ pub(crate) fn build_entry(
         verify,
         respond_to,
         ignore: Vec::new(),
-        attention: attention.to_vec(),
     }
 }
 
@@ -488,7 +492,12 @@ pub(crate) fn build_next(
         alternatives,
         suggested_backlog_items,
         peer_targets: peer_targets(snapshot, tool, PEER_TARGETS_LIMIT),
-        inbox: crate::obligations::build_inbox(snapshot, tool, NEXT_INBOX_ITEMS_LIMIT),
+        inbox: crate::obligations::build_inbox(
+            snapshot,
+            tool,
+            NEXT_INBOX_ITEMS_LIMIT,
+            stale_wait_secs,
+        ),
     }
 }
 
@@ -1043,6 +1052,16 @@ pub(crate) fn build_attention(
     items
 }
 
+pub(crate) fn bound_enter_attention(
+    mut items: Vec<AttentionItem>,
+) -> (Vec<AttentionItem>, usize, usize, usize) {
+    let total = items.len();
+    items.truncate(MAX_ENTER_ROWS);
+    let emitted = items.len();
+    let omitted = total.saturating_sub(emitted);
+    (items, total, emitted, omitted)
+}
+
 fn entry_item(reason: &'static str, fact: &Fact) -> EntryItem {
     EntryItem {
         reason,
@@ -1306,6 +1325,33 @@ mod tests {
         let items = build_attention(&snapshot, "codex", 0, &[]);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].reason, "handoff_assigned");
+    }
+
+    #[test]
+    fn enter_attention_and_entry_lists_are_bounded_without_a_duplicate_copy() {
+        let mut snapshot = RoomSnapshot::default();
+        for index in 0..(MAX_ENTER_ROWS + 12) {
+            let mut owed = handoff(&format!("owed-{index}"), "codex", "2999-01-01T00:00:00Z");
+            owed.seq = index as i64 + 1;
+            snapshot.open_handoffs.push(owed.clone());
+            snapshot.open_obligations.push(owed);
+        }
+
+        let (attention, total, emitted, omitted) =
+            bound_enter_attention(build_attention(&snapshot, "codex", 0, &[]));
+        assert_eq!(total, MAX_ENTER_ROWS + 12);
+        assert_eq!(emitted, MAX_ENTER_ROWS);
+        assert_eq!(omitted, 12);
+
+        let entry = build_entry(&snapshot, "codex", None, &[]);
+        let value = serde_json::to_value(entry).unwrap();
+        assert!(value.get("attention").is_none(), "attention must ship once");
+        assert_eq!(
+            value["respond_to"].as_array().unwrap().len(),
+            MAX_ENTER_ROWS
+        );
+        assert_eq!(value["do"].as_array().unwrap().len(), MAX_ENTER_ROWS);
+        assert_eq!(attention.len(), MAX_ENTER_ROWS);
     }
 
     /// `next.inbox` rides along on the same snapshot read the ranking used.

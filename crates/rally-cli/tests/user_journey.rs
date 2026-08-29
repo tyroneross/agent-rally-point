@@ -198,6 +198,33 @@ impl Workspace {
         serde_json::from_slice(&output.stdout).unwrap()
     }
 
+    fn json_with_session_close_token(
+        &self,
+        session_id: &str,
+        close_token: &str,
+        args: &[&str],
+    ) -> Value {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rally"));
+        cmd.current_dir(&self.cwd)
+            .env("HOME", &self.home)
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID")
+            .env("RALLY_DAEMON_AUTOSTART", "0")
+            .env("RALLY_SESSION_ID", session_id)
+            .env("RALLY_SESSION_CLOSE_TOKEN", close_token);
+        if self.suppress_worktree {
+            cmd.env("RALLY_NO_WORKTREE", "1");
+        }
+        let output = cmd.args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "stderr: {}\nstdout: {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
     fn json_with_status(&self, args: &[&str]) -> (Value, Output) {
         let output = self.output(args);
         let value = serde_json::from_slice(&output.stdout).unwrap();
@@ -213,7 +240,12 @@ impl Workspace {
             .env("RALLY_DAEMON_AUTOSTART", "0")
             .env("RALLY_SESSION_ID", session_id);
         let output = cmd.args(args).output().unwrap();
-        let value = serde_json::from_slice(&output.stdout).unwrap();
+        let body = if output.stdout.is_empty() {
+            &output.stderr
+        } else {
+            &output.stdout
+        };
+        let value = serde_json::from_slice(body).unwrap();
         (value, output)
     }
 
@@ -4594,6 +4626,11 @@ fn session_ensure_mints_or_reuses_one_parent_lease_with_truthful_capabilities() 
         minted["data"]["session"]["environment"]["RALLY_SESSION_ID"],
         lease["raw_session_id"]
     );
+    assert!(
+        minted["data"]["session"]["environment"]["RALLY_SESSION_CLOSE_TOKEN"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty())
+    );
 
     let first = workspace.json(&[
         "session",
@@ -4616,19 +4653,26 @@ fn session_ensure_mints_or_reuses_one_parent_lease_with_truthful_capabilities() 
         "--json",
     ])["data"]["session"]["sessions"][0]["started_at"]
         .clone();
-    let second = workspace.json(&[
-        "session",
-        "ensure",
-        "--json",
-        "--tool",
-        "claude_code:shared",
-        "--session-id",
+    let first_close_token = first["data"]["session"]["environment"]["RALLY_SESSION_CLOSE_TOKEN"]
+        .as_str()
+        .unwrap();
+    let second = workspace.json_with_session_close_token(
         "parent-lease",
-        "--adapter",
-        "claude_code",
-        "--strict",
-        "--native-hook",
-    ]);
+        first_close_token,
+        &[
+            "session",
+            "ensure",
+            "--json",
+            "--tool",
+            "claude_code:shared",
+            "--session-id",
+            "parent-lease",
+            "--adapter",
+            "claude_code",
+            "--strict",
+            "--native-hook",
+        ],
+    );
     assert_eq!(first["data"]["session"]["lease"]["reused"], true);
     assert_eq!(
         first["data"]["session"]["lease"]["session_id"],
@@ -4670,7 +4714,7 @@ fn session_ensure_mints_or_reuses_one_parent_lease_with_truthful_capabilities() 
 #[test]
 fn session_close_releases_only_the_exact_same_tool_session_claims() {
     let workspace = Workspace::new("session-close-exact-owner");
-    workspace.json(&[
+    let parent_a = workspace.json(&[
         "session",
         "ensure",
         "--json",
@@ -4679,7 +4723,7 @@ fn session_close_releases_only_the_exact_same_tool_session_claims() {
         "--session-id",
         "parent-a",
     ]);
-    workspace.json(&[
+    let parent_b = workspace.json(&[
         "session",
         "ensure",
         "--json",
@@ -4688,6 +4732,12 @@ fn session_close_releases_only_the_exact_same_tool_session_claims() {
         "--session-id",
         "parent-b",
     ]);
+    let parent_a_token = parent_a["data"]["session"]["environment"]["RALLY_SESSION_CLOSE_TOKEN"]
+        .as_str()
+        .unwrap();
+    let _parent_b_token = parent_b["data"]["session"]["environment"]["RALLY_SESSION_CLOSE_TOKEN"]
+        .as_str()
+        .unwrap();
     let owner = workspace.json_with_session(
         "parent-a",
         &[
@@ -4716,18 +4766,70 @@ fn session_close_releases_only_the_exact_same_tool_session_claims() {
             "src/b.rs",
         ],
     );
+    let cross_engagement_output = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .current_dir(&workspace.cwd)
+        .env("HOME", &workspace.home)
+        .env("RALLY_NO_WORKTREE", "1")
+        .env("RALLY_ENGAGEMENT", "session-close-other-engagement")
+        .env("RALLY_SESSION_ID", "parent-a")
+        .args([
+            "say",
+            "claim",
+            "--json",
+            "--tool",
+            "codex:shared",
+            "--subject",
+            "session A owns a cross-engagement path",
+            "--path",
+            "src/cross-engagement.rs",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        cross_engagement_output.status.success(),
+        "cross-engagement claim failed: {}",
+        String::from_utf8_lossy(&cross_engagement_output.stderr)
+    );
+    let cross_engagement: Value = serde_json::from_slice(&cross_engagement_output.stdout).unwrap();
     let owner_id = owner["data"]["say"]["fact"]["event_id"].as_str().unwrap();
     let sibling_id = sibling["data"]["say"]["fact"]["event_id"].as_str().unwrap();
+    let cross_engagement_id = cross_engagement["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .unwrap();
 
-    let close = workspace.json_with_session(
+    let (unauthorized_close, unauthorized_output) = workspace.json_with_status_and_session(
         "parent-a",
+        &["session", "close", "--json", "--tool", "codex:shared"],
+    );
+    assert!(!unauthorized_output.status.success());
+    assert!(
+        unauthorized_close["error"]
+            .as_str()
+            .unwrap()
+            .contains("RALLY_SESSION_CLOSE_TOKEN")
+    );
+    let still_owned = workspace.json(&["room", "--json"]);
+    assert!(
+        still_owned["data"]["room"]["active_claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|claim| claim["event_id"] == owner_id),
+        "an unauthenticated close must not release the victim claim"
+    );
+
+    let close = workspace.json_with_session_close_token(
+        "parent-a",
+        parent_a_token,
         &["session", "close", "--json", "--tool", "codex:shared"],
     );
     assert_matches_schema("agent-rally.command.session.v1.json", &close);
     assert_eq!(close["data"]["session"]["action"], "close");
+    let mut expected_released = vec![owner_id, cross_engagement_id];
+    expected_released.sort();
     assert_eq!(
         close["data"]["session"]["released_claim_ids"],
-        json!([owner_id])
+        json!(expected_released)
     );
     assert_eq!(
         close["data"]["session"]["close_fact"]["kind"],
@@ -4759,8 +4861,9 @@ fn session_close_releases_only_the_exact_same_tool_session_claims() {
         "closed"
     );
 
-    let close_again = workspace.json_with_session(
+    let close_again = workspace.json_with_session_close_token(
         "parent-a",
+        parent_a_token,
         &["session", "close", "--json", "--tool", "codex:shared"],
     );
     assert_eq!(
@@ -4787,6 +4890,33 @@ fn session_close_releases_only_the_exact_same_tool_session_claims() {
             .as_str()
             .unwrap()
             .contains("already closed")
+    );
+
+    let post_close = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .current_dir(&workspace.cwd)
+        .env("HOME", &workspace.home)
+        .env("RALLY_NO_WORKTREE", "1")
+        .env("RALLY_SESSION_ID", "parent-a")
+        .args([
+            "say",
+            "claim",
+            "--json",
+            "--tool",
+            "codex:shared",
+            "--subject",
+            "closed lease must not claim",
+            "--path",
+            "src/after-close.rs",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(post_close.status.code(), Some(2));
+    let post_close_error: Value = serde_json::from_slice(&post_close.stderr).unwrap();
+    assert!(
+        post_close_error["error"]
+            .as_str()
+            .unwrap()
+            .contains("is closed")
     );
 
     workspace.cleanup();
@@ -6002,6 +6132,67 @@ fn rally_inbox_is_read_only() {
         .unwrap();
     assert_eq!(before, after, "rally inbox must append no fact");
 
+    workspace.cleanup();
+}
+
+#[test]
+fn receiver_can_resolve_an_obligation_after_reaper_expires_the_handoff() {
+    let workspace = Workspace::new("rally-inbox-reaper-resolve");
+    let handoff = workspace.json(&[
+        "say",
+        "handoff",
+        "--json",
+        "--tool",
+        "claude_code:01",
+        "--target",
+        "codex",
+        "--subject",
+        "survive liveness cleanup",
+    ]);
+    let handoff_id = handoff["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    backdate_all_facts(&workspace.cwd, 31 * 24 * 60 * 60);
+    workspace.json(&["doctor", "--reap-stale", "--apply", "--json"]);
+
+    let room = workspace.json(&["room", "--json"]);
+    assert!(
+        room["data"]["room"]["open_handoffs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|fact| fact["event_id"] != handoff_id),
+        "reaper must close the liveness handoff"
+    );
+    assert_eq!(inbox_ids(&workspace, "codex"), vec![handoff_id.clone()]);
+
+    let wrong = workspace.output(&[
+        "say",
+        "resolve",
+        "--json",
+        "--tool",
+        "claude_code:01",
+        "--subject",
+        "sender cannot answer for receiver",
+        "--ref",
+        &handoff_id,
+    ]);
+    assert!(!wrong.status.success());
+    assert_eq!(inbox_ids(&workspace, "codex"), vec![handoff_id.clone()]);
+
+    workspace.json(&[
+        "say",
+        "resolve",
+        "--json",
+        "--tool",
+        "codex",
+        "--subject",
+        "receiver resolved expired handoff",
+        "--ref",
+        &handoff_id,
+    ]);
+    assert!(inbox_ids(&workspace, "codex").is_empty());
     workspace.cleanup();
 }
 

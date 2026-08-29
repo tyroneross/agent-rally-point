@@ -26,7 +26,7 @@ Definitions:
 | Command | Ledger write | Cache write | Runtime write | Audit-safe | Notes |
 |---|---:|---:|---:|---:|---|
 | `rally whoami` | no | yes | no | yes | Self-locates repo, host runtime, lead, mission, and build id; may open/rebuild the room cache. |
-| `rally enter` | yes | yes | no | no | Records presence, lead context, build-id drift, duplicate tool risks, and read cursor advancement. |
+| `rally enter` | yes | yes | no | no | Records presence, lead context, build-id drift, duplicate tool risks, and read cursor advancement. Attention is capped at 128 rows and reports total/emitted/omitted counts. |
 | `rally ack` | yes | yes | no | no | Records that the tool ingested current rules, guardrails, lead, and mission. |
 | `rally next` | yes | yes | no | no | Projects actionable work and records wake/read state for the calling tool. |
 | `rally next --audit` | no | no | no | no | Projects the same actionable work without presence, wake, or read-checkpoint facts; derived caches may still rebuild. |
@@ -35,8 +35,8 @@ Definitions:
 | `rally check before-complete` | no | yes | no | yes | Reports only claims owned by the exact `--tool` plus current session; a sibling session sharing the tool label is not the owner. Manual CLI workflows must export one stable `RALLY_SESSION_ID` before claiming. The check rejects an invocation whose only identity is its short-lived Rally process, so an unpinned lifecycle cannot silently pass with a stranded claim. |
 | `rally check liveness` | optional | yes | no | conditional | Advisory mode may scan all conflicted squads or filter one exact `--tool`. `--enforce` requires both `--tool <exact-target>` and `--actor <release-author>` and can release only that selected target's takeover-eligible claims. |
 | `rally session ensure` | yes | yes | no | no | Mints or reuses one parent-exported lease, records exact-session presence, and reports identity, visibility, blocking, atomic-claim, lifecycle-close, and delivery guarantees independently as `enforced`, `advisory`, or `unmanaged`. Adapter flags are attestations, not capability discovery. |
-| `rally session close` | yes | yes | no | no | Requires `--session-id` or parent `RALLY_SESSION_ID`; never guesses from the short-lived CLI process. Appends one `session.closed` transition and releases only claims whose tool and authoring session both exactly match. |
-| `rally session current` | no | yes | no | yes | Returns at most 128 unclosed registered leases, exact freshness counts, and omission counts. Stale/unknown leases remain explicit; this view never closes them or changes claim authority. |
+| `rally session close` | yes | yes | no | no | Requires `--session-id` or parent `RALLY_SESSION_ID` plus the parent-exported one-time `RALLY_SESSION_CLOSE_TOKEN`; never guesses authority from the short-lived CLI process. Appends one `session.closed` transition and releases only claims whose tool and authoring session both exactly match, across engagements. |
+| `rally session current` | no | yes | no | yes | Returns at most 128 unclosed registered leases, exact freshness counts, omission counts, and the effective adaptive `window_secs`. Stale/unknown leases remain explicit; this view never closes them or changes claim authority. |
 | `rally session history` | no | yes | no | yes | Returns the newest explicit active/closed lease transitions with a caller-bounded limit of 1–100. Canonical history remains in `.rally/log/**`. |
 | `rally say <kind>` | yes | yes | no | no | Appends durable coordination facts: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson, standby, wake, backlog-item, mission. |
 

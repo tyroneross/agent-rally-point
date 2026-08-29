@@ -2178,6 +2178,30 @@ rm -f "$canary_file" 2>/dev/null
 if [ "$symlink_rc" = "0" ]; then ok "$T"; else bad "$T" "a symlinked .hook-seen path must never be read or written"; fi
 
 # ----------------------------------------------------------------------
+# Test 11j2: a symlinked `.hook-seen` directory is refused
+# ----------------------------------------------------------------------
+T="hook-seen parent symlink: outside directory is never written"
+parent_repo="$tmpdir/hook-seen-parent-repo"
+parent_canary_dir="$tmpdir/hook-seen-parent-canary"
+mkdir -p "$parent_repo/.git" "$parent_repo/.rally" "$parent_canary_dir"
+printf 'PARENT-CANARY\n' > "$parent_canary_dir/canary.txt"
+ln -s "$parent_canary_dir" "$parent_repo/.rally/.hook-seen"
+(
+  cd "$parent_repo"
+  p1=$(RALLY_BIN="$symlink_bin" RALLY_SESSION_ID="parent-symlink-$$" "$HOOK" idle claude_code </dev/null 2>/dev/null)
+  rc1=$?
+  p2=$(RALLY_BIN="$symlink_bin" RALLY_SESSION_ID="parent-symlink-$$" "$HOOK" idle claude_code </dev/null 2>/dev/null)
+  rc2=$?
+  [ "$rc1" = "0" ] && [ "$rc2" = "0" ] || exit 1
+  printf '%s' "$p1" | grep -q "additionalContext" || exit 1
+  printf '%s' "$p2" | grep -q "additionalContext" || exit 1
+  [ "$(cat "$parent_canary_dir/canary.txt")" = "PARENT-CANARY" ] || exit 1
+  [ "$(find "$parent_canary_dir" -type f | wc -l | tr -d ' ')" = "1" ] || exit 1
+)
+parent_symlink_rc=$?
+if [ "$parent_symlink_rc" = "0" ]; then ok "$T"; else bad "$T" "a symlinked .hook-seen directory must never receive marker writes"; fi
+
+# ----------------------------------------------------------------------
 # Test 11k: a displaced notification survives as a peer COUNT, never prose
 # ----------------------------------------------------------------------
 # One open obligation upgrades `notification` to `inbox`, and inbox renders

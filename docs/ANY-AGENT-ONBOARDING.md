@@ -41,7 +41,9 @@ rally session history --limit 20 --json
 ```
 
 `current` caps rows at 128 and reports `total`, `emitted`, and `omitted` plus
-fresh/stale/unknown counts. `history` is an explicit, separately bounded view.
+fresh/stale/unknown counts. Its `window_secs` is derived from the effective
+coordination cadence, miss multiplier, and grace settings. `history` is an
+explicit, separately bounded view.
 
 Every agent then does these steps before editing:
 
@@ -84,8 +86,17 @@ rally session close --tool <stable-tool-id> --json
 ```
 
 `session close` releases only claims whose authoring `tool` and
-`from_session_id` both match the closing lease. Never bind it to a per-turn
-`Stop` callback: one conversation turn ending is not the agent session ending.
+`from_session_id` both match the closing lease, across every engagement. It
+also requires the one-time `RALLY_SESSION_CLOSE_TOKEN` exported by `session
+ensure`; Rally stores only its hash while the lease is active. Never bind close
+to a per-turn `Stop` callback: one conversation turn ending is not the agent
+session ending. The token prevents a sibling process that only knows the lease
+id from closing it; it does not protect against a same-UID process that can read
+the parent environment or write `.rally/` directly.
+
+`enter`, `next`, and `inbox` retrieve obligations with a bounded target-scoped
+read. Totals remain exact even when rows are omitted, and `stale_wait_secs`
+only annotates/de-prioritizes old work; it never closes receiver-owned work.
 
 Use `rally say blocker`, `rally say handoff`, `rally say decision`, and
 `rally say resolve` for durable coordination. Do not rely on chat scrollback as

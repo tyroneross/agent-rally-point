@@ -416,8 +416,10 @@ fn mutation_query(op: &StoreOp) -> Option<MutationQuery> {
             })
         }
         StoreOp::Facts
+        | StoreOp::RepoWideClaimLifecycleFacts
         | StoreOp::SessionFactsWithContextVersion
         | StoreOp::SnapshotWithArchived { .. }
+        | StoreOp::SnapshotForObligationTarget { .. }
         | StoreOp::SnapshotScoped { .. }
         | StoreOp::SnapshotWithReadersArchived { .. }
         | StoreOp::LastCheckpointSeq { .. }
@@ -616,6 +618,13 @@ impl RoutedRoomStore {
         }
     }
 
+    pub(crate) fn repo_wide_claim_lifecycle_facts(&self) -> Result<Vec<Fact>> {
+        match self.dispatch(StoreOp::RepoWideClaimLifecycleFacts)? {
+            StoreOk::Facts { facts } => facts.into_iter().map(from_value).collect(),
+            _ => Err(unexpected_reply("repo_wide_claim_lifecycle_facts")),
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn rebuild_claim_index(&self) -> Result<()> {
         match self.dispatch(StoreOp::RebuildClaimIndex)? {
@@ -676,6 +685,21 @@ impl RoutedRoomStore {
         match self.dispatch(StoreOp::SnapshotWithArchived { include_archived })? {
             StoreOk::Snapshot { snapshot, .. } => snapshot_from_value(snapshot),
             _ => Err(unexpected_reply("snapshot_with_archived")),
+        }
+    }
+
+    pub(crate) fn snapshot_for_obligation_target(
+        &self,
+        tool: &str,
+        row_limit: usize,
+    ) -> Result<RoomSnapshot> {
+        match self.dispatch(StoreOp::SnapshotForObligationTarget {
+            tool: tool.to_string(),
+            row_limit,
+            include_archived: false,
+        })? {
+            StoreOk::Snapshot { snapshot, .. } => snapshot_from_value(snapshot),
+            _ => Err(unexpected_reply("snapshot_for_obligation_target")),
         }
     }
 
@@ -970,8 +994,8 @@ mod tests {
     }
 
     #[test]
-    fn probe_rejects_a_v4_daemon_after_append_outcome_cutover() {
-        assert_eq!(WIRE_VERSION, 5, "this control grades the v4 to v5 cutover");
+    fn probe_rejects_a_v5_daemon_after_targeted_read_cutover() {
+        assert_eq!(WIRE_VERSION, 6, "this control grades the v5 to v6 cutover");
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -992,21 +1016,21 @@ mod tests {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             let request: StoreRequest = serde_json::from_str(line.trim()).unwrap();
-            assert_eq!(request.wire_version, 5);
+            assert_eq!(request.wire_version, 6);
             let response = StoreResponse::Ok(StoreOk::Pong {
                 repo_root: "/expected/repo".to_string(),
                 pid: 42,
-                wire_version: 4,
+                wire_version: 5,
             });
             let mut writer = &stream;
             writeln!(writer, "{}", serde_json::to_string(&response).unwrap()).unwrap();
         });
 
         let error = probe_identity(&rally_dir, "/expected/repo")
-            .expect_err("a v4 daemon must fail a v5 client immediately");
+            .expect_err("a v5 daemon must fail a v6 client immediately");
         assert!(matches!(error, RallyError::IncompatibleWire { .. }));
-        assert!(error.to_string().contains("client speaks 5"));
-        assert!(error.to_string().contains("daemon speaks 4"));
+        assert!(error.to_string().contains("client speaks 6"));
+        assert!(error.to_string().contains("daemon speaks 5"));
         server.join().unwrap();
         std::fs::remove_file(&socket).ok();
         std::fs::remove_dir_all(&rally_dir).ok();

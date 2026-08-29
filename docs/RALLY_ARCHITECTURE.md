@@ -359,10 +359,11 @@ Output should group facts as:
 - `know`
 - `verify`
 - `respond_to`
-- `attention`
 - `ignore`
 
-`attention` is the since-last-enter refresh bucket. It is for newly relevant
+`attention` is a separate sibling, emitted once with total/emitted/omitted
+counts; every enter list is capped at 128 rows. It is the since-last-enter
+refresh bucket for newly relevant
 facts and conflicts that deserve immediate model awareness, not a replacement
 for the durable `do`, `do_not`, `know`, `verify`, and `respond_to` buckets.
 

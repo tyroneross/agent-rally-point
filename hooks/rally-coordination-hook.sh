@@ -279,18 +279,33 @@ _rally_resolve_bin() {
 # unchanged and the stale verdict would survive. `stat -f '%z:%Fm'` (BSD) and
 # `stat -c '%s:%.9Y'` (GNU) both carry nanoseconds; if neither is available
 # the id is empty, which re-probes every fire -- slower, never wrong.
+_rally_safe_seen_dir() { # $1=root; prints the physical safe directory
+  local root="$1" rally_dir="$1/.rally" seen_dir="$1/.rally/.hook-seen"
+  [ -L "$rally_dir" ] && return 1
+  [ -e "$rally_dir" ] && [ ! -d "$rally_dir" ] && return 1
+  mkdir -p "$rally_dir" 2>/dev/null || return 1
+  [ -L "$seen_dir" ] && return 1
+  [ -e "$seen_dir" ] && [ ! -d "$seen_dir" ] && return 1
+  mkdir -p "$seen_dir" 2>/dev/null || return 1
+  local physical_root physical_seen
+  physical_root="$(cd -P "$root" 2>/dev/null && pwd)" || return 1
+  physical_seen="$(cd -P "$seen_dir" 2>/dev/null && pwd)" || return 1
+  [ "$physical_seen" = "$physical_root/.rally/.hook-seen" ] || return 1
+  printf '%s' "$seen_dir"
+}
+
 _rally_native_capable() {  # $1=root $2=absolute resolved binary path
   local root="$1" bin="$2" marker_dir marker safe_bin verdict out tmp
   local bin_id cached_verdict cached_id
   safe_bin="${bin//[^A-Za-z0-9._-]/_}"
-  marker_dir="$root/.rally/.hook-seen"
-  marker="$marker_dir/native-probe.$safe_bin.seen"
+  marker_dir="$(_rally_safe_seen_dir "$root" 2>/dev/null || true)"
+  marker="${marker_dir:+$marker_dir/native-probe.$safe_bin.seen}"
   # GNU stat accepts `-f` too, but there it selects mutable filesystem status
   # instead of BSD's format string. Try GNU's file format first (BSD rejects
   # `-c`), then BSD, and fall back to an empty id so we re-probe rather than
   # cache against the wrong object.
   bin_id="$(stat -c '%s:%.9Y' "$bin" 2>/dev/null || stat -f '%z:%Fm' "$bin" 2>/dev/null || true)"
-  if [ -f "$marker" ] && [ -n "$bin_id" ]; then
+  if [ -n "$marker" ] && [ -f "$marker" ] && [ -n "$bin_id" ]; then
     cached_verdict=""
     cached_id=""
     { read -r cached_verdict; read -r cached_id; } < "$marker" 2>/dev/null || true
@@ -317,7 +332,7 @@ _rally_native_capable() {  # $1=root $2=absolute resolved binary path
   # in front of classification, every fire including a pure read paid a probe
   # spawn PLUS the whole Node path. Only the CACHE is lost: no marker lands,
   # so the next fire re-probes.
-  if mkdir -p "$marker_dir" 2>/dev/null &&
+  if [ -n "$marker_dir" ] &&
      tmp="$(mktemp "$marker.XXXXXX" 2>/dev/null)"; then
     if printf '%s\n%s\n' "$verdict" "$bin_id" > "$tmp" 2>/dev/null; then
       mv -f "$tmp" "$marker" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
@@ -578,9 +593,9 @@ _rally_advise_native_skip() {
   safe_name="$(printf '%s' "${raw_name:-unknown}" | tr -c 'A-Za-z0-9_.:-' '_' | cut -c1-80)"
   safe_reason="$(printf '%s' "$raw_reason" | tr -c 'A-Za-z0-9 ._:-' '_' | cut -c1-120)"
   safe_session="$(printf '%s' "${raw_session:-${RALLY_SESSION_ID:-anon}}" | tr -c 'A-Za-z0-9_.:-' '_' | cut -c1-80)"
-  marker_dir="$root/.rally/.hook-seen"
+  marker_dir="$(_rally_safe_seen_dir "$root" 2>/dev/null || true)"
+  [ -n "$marker_dir" ] || return 0
   marker="$marker_dir/$safe_session.native-$kind-$safe_name.seen"
-  mkdir -p "$marker_dir" 2>/dev/null || return 0
   # noclobber creates the marker atomically. Plugin + project registrations can
   # race; exactly one wins and owns the single diagnostic.
   ( set -C; : > "$marker" ) 2>/dev/null || return 0
@@ -597,9 +612,9 @@ _rally_advise_node_missing() {
   local marker_dir marker safe_session message
   [ -n "$root" ] || return 0
   safe_session="$(printf '%s' "${raw_session:-anon}" | tr -c 'A-Za-z0-9_.:-' '_')"
-  marker_dir="$root/.rally/.hook-seen"
+  marker_dir="$(_rally_safe_seen_dir "$root" 2>/dev/null || true)"
+  [ -n "$marker_dir" ] || return 0
   marker="$marker_dir/$safe_session.node-missing.seen"
-  mkdir -p "$marker_dir" 2>/dev/null || return 0
   ( set -C; : > "$marker" ) 2>/dev/null || return 0
   if [ "$mode" = "before-write" ]; then
     message="rally-hook: node is not on PATH — before-write input cannot be classified safely, so this tool call skipped every Rally status/check/claim operation and is proceeding uncoordinated. Install node to restore scoped deconfliction."
@@ -1175,9 +1190,9 @@ _rally_advise_mutation_abort() {
   [ -n "$root" ] || return 0
   safe_reason="$(printf '%s' "$raw_reason" | tr -c 'A-Za-z0-9 ._:-' '_' | cut -c1-120)"
   safe_session="$(printf '%s' "${raw_session:-anon}" | tr -c 'A-Za-z0-9_.:-' '_' | cut -c1-80)"
-  marker_dir="$root/.rally/.hook-seen"
+  marker_dir="$(_rally_safe_seen_dir "$root" 2>/dev/null || true)"
+  [ -n "$marker_dir" ] || return 0
   marker="$marker_dir/$safe_session.mutation-abort.seen"
-  mkdir -p "$marker_dir" 2>/dev/null || return 0
   ( set -C; : > "$marker" ) 2>/dev/null || return 0
   printf 'rally-hook: mutation coordination aborted (%s); no automatic claim was created and the edit is proceeding unclaimed.\n' "$safe_reason" >&2
 }
@@ -1258,12 +1273,16 @@ _rally_advise_claim_failed() {
   # Classify by the leading words of the CLI's message so distinct failures
   # (claim conflict vs breadth refusal vs binary missing) each report once.
   rcf_class="$(printf '%s' "$rcf_err" | tr -d '\n' | cut -c1-40 | tr -c 'A-Za-z0-9_.:-' '_')"
-  rcf_marker_dir="$rcf_root/.rally/.hook-seen"
+  rcf_marker_dir="$(_rally_safe_seen_dir "$rcf_root" 2>/dev/null || true)"
+  [ -n "$rcf_marker_dir" ] || {
+    printf 'rally-hook: auto-claim FAILED for %s — this edit is proceeding UNCLAIMED, so peers will not see it as yours. rally said: %s\n' \
+      "$rcf_path" "$(printf '%s' "$rcf_err" | tr '\n' ' ' | cut -c1-400)" >&2
+    return 0
+  }
   rcf_marker="$rcf_marker_dir/$rcf_session.claim-failed.$rcf_class.seen"
   [ -f "$rcf_marker" ] && return 0
   printf 'rally-hook: auto-claim FAILED for %s — this edit is proceeding UNCLAIMED, so peers will not see it as yours. rally said: %s\n' \
     "$rcf_path" "$(printf '%s' "$rcf_err" | tr '\n' ' ' | cut -c1-400)" >&2
-  mkdir -p "$rcf_marker_dir" 2>/dev/null || true
   printf '1' > "$rcf_marker" 2>/dev/null || true
   return 0
 }
@@ -2925,7 +2944,8 @@ if (phase === "idle" || phase === "after-write") {
   try {
     const root = process.env.RALLY_HOOK_ROOT || process.cwd();
     const sess = (process.env.RALLY_HOOK_SESSION || "anon").replace(/[^A-Za-z0-9_.:-]/g, "_");
-    const dir = root + "/.rally/.hook-seen";
+    const rallyDir = root + "/.rally";
+    const dir = rallyDir + "/.hook-seen";
     const file = dir + "/" + sess + "." + phase + ".seen";
     const key = event + "|" + severity + "|" + rawMessage;
     let h = 5381; for (let i = 0; i < key.length; i++) { h = ((h * 33) ^ key.charCodeAt(i)) >>> 0; }
@@ -2958,10 +2978,25 @@ if (phase === "idle" || phase === "after-write") {
     // ONE lstat so a TOCTOU window between "check" and "read" cannot reopen
     // either gap on its own.
     const SEEN_MAX_BYTES = 4096;
+    let parentsSafe = false;
+    try {
+      const rallyStat = fs.lstatSync(rallyDir);
+      if (!rallyStat.isSymbolicLink() && rallyStat.isDirectory()) {
+        let dirStat = null;
+        try { dirStat = fs.lstatSync(dir); } catch (_) { dirStat = null; }
+        if (!dirStat) {
+          fs.mkdirSync(dir);
+          dirStat = fs.lstatSync(dir);
+        }
+        parentsSafe = !dirStat.isSymbolicLink() && dirStat.isDirectory();
+      }
+    } catch (_) { parentsSafe = false; }
     let seenStat = null;
-    try { seenStat = fs.lstatSync(file); } catch (_) { seenStat = null; }
+    if (parentsSafe) {
+      try { seenStat = fs.lstatSync(file); } catch (_) { seenStat = null; }
+    }
     const seenIsSymlink = Boolean(seenStat && seenStat.isSymbolicLink());
-    if (!seenIsSymlink) {
+    if (parentsSafe && !seenIsSymlink) {
       let prevSig = "", prevTs = 0, prevCount = 0;
       if (seenStat && seenStat.size <= SEEN_MAX_BYTES) {
         try {
@@ -2999,7 +3034,6 @@ if (phase === "idle" || phase === "after-write") {
         // crash or a concurrent fire mid-write can leave a stray temp file,
         // never a torn or truncated seen file.
         try {
-          fs.mkdirSync(dir, { recursive: true });
           const tmp = file + "." + process.pid + "." + nowSecs + ".tmp";
           fs.writeFileSync(tmp, payload);
           fs.renameSync(tmp, file);

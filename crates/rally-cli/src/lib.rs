@@ -48,7 +48,6 @@ const SCHEMA_ADOPT: &str = "agent-rally.command.adopt.v1";
 pub(crate) const FACT_SCHEMA: &str = "agent-rally.fact.v1";
 const SESSION_IDENTITY_RETRIES: usize = 4096;
 const SESSION_RESERVATION_LOCK_FILENAME: &str = "session-reservation.lock";
-const SESSION_CURRENT_WINDOW_SECS: i64 = 15 * 60;
 const MAX_CURRENT_SESSION_ROWS: usize = 128;
 
 #[cfg(unix)]
@@ -173,8 +172,8 @@ use cli::*;
 use dag::{DagOutput, WakeDueEntry, build_dag, project_wake_due, resolve_wake_after};
 use error::{RallyError, Result};
 use next::{
-    AttentionItem, EntryData, NextResult, StaleTargetedPolicy, build_attention, build_entry,
-    build_next,
+    AttentionItem, EntryData, NextResult, StaleTargetedPolicy, bound_enter_attention,
+    build_attention, build_entry, build_next,
 };
 use obligations::{InboxResult, build_inbox};
 use output::{CliError, Output, RenderedOutput};
@@ -1648,7 +1647,7 @@ fn command_self_exit_check(args: cli::SelfExitCheckArgs) -> Result<Output> {
 
     let room = RoomStore::open()?;
     ensure_presence(&room, &tool)?;
-    let snapshot = room.snapshot()?;
+    let snapshot = room.snapshot_for_obligation_target(&tool, 128)?;
 
     // work_resolved: no active claim is owned by this tool.
     let owned_active = snapshot
@@ -2953,10 +2952,11 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     // `ensure_presence_tiered`. Re-snapshot here so the room summary + squads
     // reflect the just-written presence/lead facts AND any warning-block risk
     // facts.
-    let snapshot = room.snapshot()?;
+    let snapshot = room.snapshot_for_obligation_target(&tool, 128)?;
 
-    let attention = build_attention(&snapshot, &tool, cursor_before, &paths);
-    let entry = build_entry(&snapshot, &tool, role.as_deref(), &paths, &attention);
+    let (attention, attention_total, attention_emitted, attention_omitted) =
+        bound_enter_attention(build_attention(&snapshot, &tool, cursor_before, &paths));
+    let entry = build_entry(&snapshot, &tool, role.as_deref(), &paths);
     // Set cursor to the post-presence max_seq so subsequent enters do NOT see
     // this tool's own just-written presence/lead facts as "new peer content".
     // Using snapshot.max_seq (re-snapshotted after ensure_presence) rather than
@@ -2993,7 +2993,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
         },
     };
     let room_summary = RoomSummary::from(&snapshot);
-    let attention_count = attention.len();
+    let attention_count = attention_total;
     let enter_payload = EnterPayload {
         tool: tool.clone(),
         session_id,
@@ -3005,6 +3005,9 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
         },
         entry,
         attention,
+        attention_total,
+        attention_emitted,
+        attention_omitted,
         warnings,
         mission,
     };
@@ -4299,7 +4302,7 @@ fn command_next(args: NextArgs) -> Result<Output> {
     if !audit {
         ensure_presence(&room, &tool)?;
     }
-    let snapshot = room.snapshot()?;
+    let snapshot = room.snapshot_for_obligation_target(&tool, 128)?;
     // #7: always read the backlog store and surface ready items in next output.
     let backlog_items = list_backlog_items(&room).unwrap_or_default();
     let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
@@ -4407,8 +4410,14 @@ struct InboxData {
 /// mangled `subject` where the ledger holds the real one would be its own defect.
 fn command_inbox(args: cli::InboxArgs) -> Result<Output> {
     let room = RoomStore::open()?;
-    let snapshot = room.snapshot()?;
-    let inbox = build_inbox(&snapshot, &args.tool, args.limit.max(0) as usize);
+    let snapshot = room.snapshot_for_obligation_target(&args.tool, args.limit.max(1) as usize)?;
+    let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
+    let inbox = build_inbox(
+        &snapshot,
+        &args.tool,
+        args.limit.max(0) as usize,
+        coord.stale_wait_secs,
+    );
 
     let text = if inbox.count == 0 {
         format!("inbox {} — nothing owed", args.tool)
@@ -9323,6 +9332,7 @@ fn explicit_session_transition(fact: &Fact) -> Option<SessionTransition> {
 fn session_control_projection(
     mut facts: Vec<Fact>,
     tool_filter: Option<&str>,
+    freshness_window_secs: i64,
 ) -> (Vec<CurrentSessionLease>, Vec<SessionTransition>) {
     facts.sort_by_key(|fact| fact.seq);
     let mut active = BTreeMap::<(String, String), CurrentSessionLease>::new();
@@ -9385,7 +9395,7 @@ fn session_control_projection(
             .ok()
             .map(|seen| (now.timestamp() - seen.timestamp()).max(0));
         session.freshness = match session.age_secs {
-            Some(age) if age <= SESSION_CURRENT_WINDOW_SECS => "fresh",
+            Some(age) if age <= freshness_window_secs => "fresh",
             Some(_) => "stale",
             None => "unknown",
         }
@@ -9394,6 +9404,15 @@ fn session_control_projection(
     current.sort_by_key(|session| std::cmp::Reverse(session.last_seen_seq));
     transitions.sort_by_key(|transition| std::cmp::Reverse(transition.seq));
     (current, transitions)
+}
+
+fn session_current_window_secs(coord: &crate::hooks_config::CoordinationConfig) -> i64 {
+    crate::liveness::adaptive_window_secs(
+        coord.default_cadence_secs,
+        coord.default_cadence_secs,
+        coord.miss_multiplier,
+        coord.grace_secs,
+    )
 }
 
 fn daemon_status_without_activation(
@@ -9501,12 +9520,9 @@ fn command_session_ensure(json: bool, args: SessionEnsureArgs) -> Result<Output>
     );
     let identity =
         session_identity::ProtocolSessionIdentity::from_managed_lease(&raw_session_id, &args.tool);
-    let mut evidence = capabilities.evidence_markers();
-    evidence.push("protocol:session_state=active".to_string());
-    evidence.push(format!("protocol:session_adapter={adapter}"));
-
     let room = RoomStore::open()?;
-    if room.facts()?.iter().any(|fact| {
+    let facts = room.facts()?;
+    if facts.iter().any(|fact| {
         fact.kind == FactKind::SessionClosed
             && fact.tool.as_deref() == Some(args.tool.as_str())
             && fact.from_session_id.as_deref() == Some(identity.from_session_id())
@@ -9517,6 +9533,46 @@ fn command_session_ensure(json: bool, args: SessionEnsureArgs) -> Result<Output>
             args.tool
         )));
     }
+    let supplied_close_token = env::var(session_identity::SESSION_CLOSE_TOKEN_ENV)
+        .ok()
+        .filter(|token| !token.trim().is_empty());
+    let existing_close_hash = facts
+        .iter()
+        .filter(|fact| {
+            fact.kind == FactKind::Presence
+                && fact.tool.as_deref() == Some(args.tool.as_str())
+                && fact.from_session_id.as_deref() == Some(identity.from_session_id())
+                && evidence_value(fact, "protocol:session_state=") == Some("active")
+        })
+        .filter_map(|fact| evidence_value(fact, session_identity::SESSION_CLOSE_TOKEN_HASH_PREFIX))
+        .next_back();
+    let close_token = match (existing_close_hash, supplied_close_token) {
+        (Some(expected), Some(token))
+            if session_identity::session_close_token_hash(&token) == expected =>
+        {
+            token
+        }
+        (Some(_), Some(_)) => {
+            return Err(RallyError::Usage(
+                "session ensure refused: RALLY_SESSION_CLOSE_TOKEN does not authorize this existing parent lease"
+                    .to_string(),
+            ));
+        }
+        (Some(_), None) => {
+            return Err(RallyError::Usage(
+                "session ensure refused: this parent lease already exists; reuse its exported RALLY_SESSION_CLOSE_TOKEN"
+                    .to_string(),
+            ));
+        }
+        (None, Some(token)) => token,
+        (None, None) => uuid::Uuid::new_v4().to_string(),
+    };
+    let mut evidence = capabilities.evidence_markers();
+    evidence.push("protocol:session_state=active".to_string());
+    evidence.push(format!("protocol:session_adapter={adapter}"));
+    evidence.push(session_identity::session_close_token_hash_marker(
+        &close_token,
+    ));
     with_watchdog_command_commit(|| {
         ensure_presence_tiered_for_session_with_evidence(
             &room,
@@ -9527,7 +9583,9 @@ fn command_session_ensure(json: bool, args: SessionEnsureArgs) -> Result<Output>
         )
     })?;
     let facts = room.facts()?;
-    let (current_sessions, _) = session_control_projection(facts, None);
+    let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
+    let freshness_window_secs = session_current_window_secs(&coord);
+    let (current_sessions, _) = session_control_projection(facts, None, freshness_window_secs);
     let fresh_sessions = current_sessions
         .iter()
         .filter(|session| session.freshness == "fresh")
@@ -9549,8 +9607,12 @@ fn command_session_ensure(json: bool, args: SessionEnsureArgs) -> Result<Output>
         ("RALLY_SESSION_ID".to_string(), raw_session_id.clone()),
         ("RALLY_AGENT_ID".to_string(), raw_session_id.clone()),
         ("RALLY_TOOL_ID".to_string(), args.tool.clone()),
+        (
+            session_identity::SESSION_CLOSE_TOKEN_ENV.to_string(),
+            close_token.clone(),
+        ),
     ]);
-    let shell_export = session_shell_export(&raw_session_id, &args.tool);
+    let shell_export = session_shell_export(&raw_session_id, &args.tool, &close_token);
     let body = envelope(
         "session",
         SCHEMA_SESSION,
@@ -9572,7 +9634,10 @@ fn command_session_ensure(json: bool, args: SessionEnsureArgs) -> Result<Output>
 
 fn command_session_current(json: bool, args: cli::SessionCurrentArgs) -> Result<Output> {
     let room = RoomStore::open()?;
-    let (mut sessions, _) = session_control_projection(room.facts()?, args.tool.as_deref());
+    let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
+    let freshness_window_secs = session_current_window_secs(&coord);
+    let (mut sessions, _) =
+        session_control_projection(room.facts()?, args.tool.as_deref(), freshness_window_secs);
     let total = sessions.len();
     let fresh = sessions
         .iter()
@@ -9598,7 +9663,7 @@ fn command_session_current(json: bool, args: cli::SessionCurrentArgs) -> Result<
                 fresh,
                 stale,
                 unknown,
-                window_secs: SESSION_CURRENT_WINDOW_SECS,
+                window_secs: freshness_window_secs,
                 history_command: "rally session history --limit 20 --json".to_string(),
             },
         },
@@ -9615,7 +9680,12 @@ fn command_session_current(json: bool, args: cli::SessionCurrentArgs) -> Result<
 fn command_session_history(json: bool, args: cli::SessionHistoryArgs) -> Result<Output> {
     let limit = usize::try_from(args.limit).unwrap_or(20);
     let room = RoomStore::open()?;
-    let (_, mut transitions) = session_control_projection(room.facts()?, args.tool.as_deref());
+    let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
+    let (_, mut transitions) = session_control_projection(
+        room.facts()?,
+        args.tool.as_deref(),
+        session_current_window_secs(&coord),
+    );
     let total = transitions.len();
     transitions.truncate(limit);
     let emitted = transitions.len();
@@ -9651,22 +9721,54 @@ fn command_session_close(json: bool, args: SessionCloseArgs) -> Result<Output> {
             )
         })?;
     let raw_session_id = checked_raw_session_id(raw_session_id)?;
+    let close_token = env::var(session_identity::SESSION_CLOSE_TOKEN_ENV)
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| {
+            RallyError::Usage(format!(
+                "session close requires the parent-exported {}; refusing an unauthenticated close",
+                session_identity::SESSION_CLOSE_TOKEN_ENV
+            ))
+        })?;
     let identity =
         session_identity::ProtocolSessionIdentity::from_managed_lease(&raw_session_id, &args.tool);
     let session_id = identity.from_session_id().to_string();
     let room = RoomStore::open()?;
-    let snapshot = room.snapshot()?;
-    let claims = snapshot
-        .active_claims
+    let engagement_facts = room.facts()?;
+    let expected_close_hash = engagement_facts
         .iter()
-        .filter(|claim| {
-            claim.tool.as_deref() == Some(args.tool.as_str())
-                && claim.from_session_id.as_deref() == Some(session_id.as_str())
+        .filter(|fact| {
+            fact.kind == FactKind::Presence
+                && fact.tool.as_deref() == Some(args.tool.as_str())
+                && fact.from_session_id.as_deref() == Some(session_id.as_str())
+                && evidence_value(fact, "protocol:session_state=") == Some("active")
+        })
+        .filter_map(|fact| evidence_value(fact, session_identity::SESSION_CLOSE_TOKEN_HASH_PREFIX))
+        .next_back()
+        .ok_or_else(|| {
+            RallyError::Usage(format!(
+                "session close refused: no managed parent lease exists for {} / {}",
+                args.tool, session_id
+            ))
+        })?;
+    if session_identity::session_close_token_hash(&close_token) != expected_close_hash {
+        return Err(RallyError::Usage(
+            "session close refused: RALLY_SESSION_CLOSE_TOKEN does not authorize this parent lease"
+                .to_string(),
+        ));
+    }
+    let lifecycle_facts = room.repo_wide_claim_lifecycle_facts()?;
+    let claims = lifecycle_facts
+        .iter()
+        .filter(|fact| {
+            crate::claim_authority::is_active_claim_fact(fact, &lifecycle_facts)
+                && fact.tool.as_deref() == Some(args.tool.as_str())
+                && fact.from_session_id.as_deref() == Some(session_id.as_str())
         })
         .collect::<Vec<_>>();
     let mut released_claim_ids = claims
         .iter()
-        .map(|claim| claim.event_id.clone())
+        .map(|fact| fact.event_id.clone())
         .collect::<Vec<_>>();
     released_claim_ids.sort();
     let mut scope = claims
@@ -9677,8 +9779,7 @@ fn command_session_close(json: bool, args: SessionCloseArgs) -> Result<Output> {
     scope.dedup();
     let operation_material = format!("{}:{session_id}", args.tool);
     let event_id = stable_operation_id("session-close", &operation_material);
-    let existing = room
-        .facts()?
+    let existing = engagement_facts
         .into_iter()
         .find(|fact| fact.event_id == event_id);
     let close_fact = if let Some(existing) = existing {
@@ -9704,6 +9805,11 @@ fn command_session_close(json: bool, args: SessionCloseArgs) -> Result<Output> {
             evidence: vec![
                 "protocol:session_state=closed".to_string(),
                 format!("protocol:released_claims={}", released_claim_ids.len()),
+                format!(
+                    "{}{}",
+                    session_identity::SESSION_CLOSE_TOKEN_REVEAL_PREFIX,
+                    close_token
+                ),
             ],
             target: None,
             ref_id: None,
@@ -9714,9 +9820,11 @@ fn command_session_close(json: bool, args: SessionCloseArgs) -> Result<Output> {
         };
         with_watchdog_command_commit(|| room.append_fact_verified(&fact))?.into_fact_reporting()
     };
-    let still_owned = room.snapshot()?.active_claims.into_iter().any(|claim| {
-        claim.tool.as_deref() == Some(args.tool.as_str())
-            && claim.from_session_id.as_deref() == Some(session_id.as_str())
+    let facts_after_close = room.repo_wide_claim_lifecycle_facts()?;
+    let still_owned = facts_after_close.iter().any(|fact| {
+        crate::claim_authority::is_active_claim_fact(fact, &facts_after_close)
+            && fact.tool.as_deref() == Some(args.tool.as_str())
+            && fact.from_session_id.as_deref() == Some(session_id.as_str())
     });
     if still_owned {
         return Err(RallyError::Message(format!(
@@ -11204,12 +11312,14 @@ pub(crate) fn shell_quote(value: &str) -> String {
         .into_owned()
 }
 
-fn session_shell_export(raw_session_id: &str, tool: &str) -> String {
+fn session_shell_export(raw_session_id: &str, tool: &str, close_token: &str) -> String {
     format!(
-        "export RALLY_SESSION_ID={} RALLY_AGENT_ID={} RALLY_TOOL_ID={}",
+        "export RALLY_SESSION_ID={} RALLY_AGENT_ID={} RALLY_TOOL_ID={} {}={}",
         shell_quote(raw_session_id),
         shell_quote(raw_session_id),
         shell_quote(tool),
+        session_identity::SESSION_CLOSE_TOKEN_ENV,
+        shell_quote(close_token),
     )
 }
 
@@ -11283,6 +11393,15 @@ mod tests {
             resolve_watchdog_timeout(&argv(&["session", "current", "--json"])),
             Duration::from_millis(DEFAULT_WATCHDOG_TIMEOUT_MS)
         );
+    }
+
+    #[test]
+    fn session_freshness_window_uses_effective_coordination_config() {
+        let mut coord = crate::hooks_config::CoordinationConfig::default();
+        coord.default_cadence_secs = 17;
+        coord.miss_multiplier = 4;
+        coord.grace_secs = 9;
+        assert_eq!(session_current_window_secs(&coord), 77);
     }
 
     #[test]
@@ -12784,7 +12903,8 @@ mod tests {
     fn session_shell_export_preserves_hostile_values_as_single_assignments() {
         let session_id = "lease 'quoted' $(touch should-not-run); $HOME";
         let tool = "generic shell:01; echo should-not-run";
-        let export = session_shell_export(session_id, tool);
+        let close_token = "close 'quoted' $(touch should-not-run); $HOME";
+        let export = session_shell_export(session_id, tool, close_token);
         assert_eq!(
             shlex::split(&export).unwrap(),
             vec![
@@ -12792,6 +12912,7 @@ mod tests {
                 format!("RALLY_SESSION_ID={session_id}"),
                 format!("RALLY_AGENT_ID={session_id}"),
                 format!("RALLY_TOOL_ID={tool}"),
+                format!("RALLY_SESSION_CLOSE_TOKEN={close_token}"),
             ]
         );
     }
@@ -17186,6 +17307,9 @@ struct EnterPayload {
     cursor: CursorData,
     entry: EntryData,
     attention: Vec<AttentionItem>,
+    attention_total: usize,
+    attention_emitted: usize,
+    attention_omitted: usize,
     /// Non-blocking advisories (omitted from JSON when empty).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<EnterWarning>,

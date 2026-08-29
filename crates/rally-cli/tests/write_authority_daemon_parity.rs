@@ -264,17 +264,63 @@ impl Room {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_rally"))
+        self.run_as_session(&self.session_id, None, args)
+    }
+
+    fn run_as_session(&self, session_id: &str, close_token: Option<&str>, args: &[&str]) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rally"));
+        command
             .current_dir(&self.cwd)
             .env("HOME", &self.home)
             .env("RALLY_HOOKS", "off")
-            .env("RALLY_SESSION_ID", &self.session_id)
-            // Take the product's 3s wall-clock budget out of the observation
-            // window. See `WATCHDOG_BUDGET_MS`.
-            .env("RALLY_HOOK_TIMEOUT_MS", WATCHDOG_BUDGET_MS)
-            .args(args)
-            .output()
-            .unwrap()
+            .env("RALLY_DAEMON_AUTOSTART", "0")
+            .env("RALLY_SESSION_ID", session_id)
+            .env("RALLY_HOOK_TIMEOUT_MS", WATCHDOG_BUDGET_MS);
+        if let Some(token) = close_token {
+            command.env("RALLY_SESSION_CLOSE_TOKEN", token);
+        } else {
+            command.env_remove("RALLY_SESSION_CLOSE_TOKEN");
+        }
+        command.args(args).output().unwrap()
+    }
+
+    fn json_as_session(&self, session_id: &str, close_token: Option<&str>, args: &[&str]) -> Value {
+        let out = self.run_as_session(session_id, close_token, args);
+        let body = if out.stdout.is_empty() {
+            &out.stderr
+        } else {
+            &out.stdout
+        };
+        let value: Value = serde_json::from_slice(body).unwrap();
+        if let Some(reason) = timing_defect(&value) {
+            setup_defect(args, &reason, &value);
+        }
+        value
+    }
+
+    fn ensure_parent_session(&self, tool: &str, session_id: &str) -> String {
+        let value = self.json_as_session(
+            session_id,
+            None,
+            &[
+                "session",
+                "ensure",
+                "--tool",
+                tool,
+                "--session-id",
+                session_id,
+                "--json",
+            ],
+        );
+        assert_eq!(value["ok"], true, "session ensure failed: {value:#}");
+        value["data"]["session"]["environment"]["RALLY_SESSION_CLOSE_TOKEN"]
+            .as_str()
+            .expect("close token")
+            .to_string()
+    }
+
+    fn ok_as_session(&self, session_id: &str, close_token: Option<&str>, args: &[&str]) -> bool {
+        self.json_as_session(session_id, close_token, args)["ok"] == Value::Bool(true)
     }
 
     /// Run `args` and return the envelope, having first screened it for
@@ -545,6 +591,68 @@ fn claim_close_authorization_is_identical_in_direct_and_routed_mode() {
         verdicts.push(("claim_survives", room.active_claim_count() == 1));
         verdicts
     });
+}
+
+#[test]
+fn exact_session_close_authority_and_terminality_match_direct_and_routed_mode() {
+    let verdict = assert_parity("exact-session-close", |room| {
+        let tool = "codex:victim";
+        let session = "victim-parent";
+        let token = room.ensure_parent_session(tool, session);
+        let claim_created = room.ok_as_session(
+            session,
+            None,
+            &[
+                "say",
+                "claim",
+                "--tool",
+                tool,
+                "--path",
+                "src/session-owned.rs",
+                "--subject",
+                "victim owns it",
+                "--json",
+            ],
+        );
+        let wrong_token_close = room.ok_as_session(
+            session,
+            Some("wrong-token"),
+            &["session", "close", "--tool", tool, "--json"],
+        );
+        let survives_wrong_token = room.active_claim_count() == 1;
+        let valid_close = room.ok_as_session(
+            session,
+            Some(&token),
+            &["session", "close", "--tool", tool, "--json"],
+        );
+        let closed_claim_count = room.active_claim_count();
+        let post_close_claim = room.ok_as_session(
+            session,
+            None,
+            &[
+                "say",
+                "claim",
+                "--tool",
+                tool,
+                "--path",
+                "src/after-close.rs",
+                "--subject",
+                "must not resurrect",
+                "--json",
+            ],
+        );
+        (
+            claim_created,
+            wrong_token_close,
+            survives_wrong_token,
+            valid_close,
+            closed_claim_count,
+            post_close_claim,
+            room.active_claim_count(),
+        )
+    })
+    .expect("parity scenario should run");
+    assert_eq!(verdict, (true, false, true, true, 0, false, 0));
 }
 
 /// The reaper's expired-lease authority, on both store modes.

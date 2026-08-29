@@ -40,6 +40,22 @@
 //! allowances until their remaining call sites migrate.
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+pub(crate) const SESSION_CLOSE_TOKEN_ENV: &str = "RALLY_SESSION_CLOSE_TOKEN";
+pub(crate) const SESSION_CLOSE_TOKEN_HASH_PREFIX: &str = "protocol:session_close_token_sha256=";
+pub(crate) const SESSION_CLOSE_TOKEN_REVEAL_PREFIX: &str = "protocol:session_close_token=";
+
+pub(crate) fn session_close_token_hash(token: &str) -> String {
+    format!("{:x}", Sha256::digest(token.as_bytes()))
+}
+
+pub(crate) fn session_close_token_hash_marker(token: &str) -> String {
+    format!(
+        "{SESSION_CLOSE_TOKEN_HASH_PREFIX}{}",
+        session_close_token_hash(token)
+    )
+}
 
 /// Identity-string charset: lowercase alphanumerics plus the structural
 /// separators this module emits (`:` segment, `#` lease, `.` `-` `_` literal).

@@ -28,7 +28,7 @@
 //! `open_obligations` and `author_last_seen` joined the list after these tests
 //! were written and ride the same side channel. Neither has a routed-behaviour
 //! test HERE: `open_obligations` is covered by
-//! `store::obligation_projection_tests::open_obligations_ride_the_wire_and_fail_loud_past_the_bound`
+//! `store::obligation_projection_tests::open_obligations_use_bounded_target_transport_with_exact_counts`
 //! and by `tests/user_journey.rs`, and `author_last_seen` by the destructive-
 //! reclaim tests. Named so the count and the coverage do not silently diverge
 //! again.

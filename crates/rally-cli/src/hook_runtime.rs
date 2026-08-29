@@ -1481,12 +1481,12 @@ pub(crate) fn capabilities() -> Value {
             "identity": "parent_lease_or_host_session",
             "visibility": "ledger_enforced",
             "atomic_claims": "native_before_write_transaction",
-            "lifecycle_close": "adapter_attested",
-            "delivery": "receipt_attested",
+            "lifecycle_close": "conditional_on_adapter_attestation",
+            "delivery": "conditional_on_receipt_attestation",
             "blocking_by_host": {
-                "claude_code": "strict_native_hook",
-                "cursor": "strict_native_hook",
-                "gemini": "strict_native_hook",
+                "claude_code": "conditional_on_strict_native_hook",
+                "cursor": "conditional_on_strict_native_hook",
+                "gemini": "conditional_on_strict_native_hook",
                 "codex": "advisory"
             }
         },
@@ -2609,7 +2609,7 @@ mod tests {
         );
         assert_eq!(
             capabilities["coordination_contract"]["blocking_by_host"]["claude_code"],
-            "strict_native_hook"
+            "conditional_on_strict_native_hook"
         );
     }
 

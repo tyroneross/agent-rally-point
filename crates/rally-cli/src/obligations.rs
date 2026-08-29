@@ -22,6 +22,7 @@
 use schemars::JsonSchema;
 use serde::Serialize;
 
+#[cfg(test)]
 use crate::next::DEFAULT_STALE_WAIT_SECS;
 use crate::shell_quote;
 use crate::store::{Fact, FactKind, RoomSnapshot};
@@ -58,6 +59,7 @@ pub(crate) struct InboxResult {
     pub(crate) artifacts: usize,
     /// Age of the OLDEST open obligation, or `0` when the inbox is empty.
     pub(crate) oldest_age_secs: i64,
+    pub(crate) stale_window_secs: i64,
     pub(crate) items: Vec<InboxItem>,
 }
 
@@ -68,7 +70,12 @@ pub(crate) struct InboxResult {
 /// oldest-first by `seq` in `store::project_open_obligations`; the order is
 /// re-established here anyway so this function does not silently depend on a
 /// caller's sort.
-pub(crate) fn build_inbox(snapshot: &RoomSnapshot, tool: &str, limit: usize) -> InboxResult {
+pub(crate) fn build_inbox(
+    snapshot: &RoomSnapshot,
+    tool: &str,
+    limit: usize,
+    stale_wait_secs: i64,
+) -> InboxResult {
     let mut mine = snapshot
         .open_obligations
         .iter()
@@ -76,14 +83,26 @@ pub(crate) fn build_inbox(snapshot: &RoomSnapshot, tool: &str, limit: usize) -> 
         .collect::<Vec<_>>();
     mine.sort_by_key(|fact| fact.seq);
 
-    let handoffs = mine
-        .iter()
-        .filter(|fact| fact.kind == FactKind::Handoff)
-        .count();
-    let artifacts = mine
-        .iter()
-        .filter(|fact| fact.kind == FactKind::Artifact)
-        .count();
+    let target_scoped = snapshot.open_obligations_target.as_deref() == Some(tool);
+    let count = if target_scoped {
+        snapshot.open_obligations_total
+    } else {
+        mine.len()
+    };
+    let handoffs = if target_scoped {
+        snapshot.open_obligations_handoffs
+    } else {
+        mine.iter()
+            .filter(|fact| fact.kind == FactKind::Handoff)
+            .count()
+    };
+    let artifacts = if target_scoped {
+        snapshot.open_obligations_artifacts
+    } else {
+        mine.iter()
+            .filter(|fact| fact.kind == FactKind::Artifact)
+            .count()
+    };
     let oldest_age_secs = mine
         .iter()
         .map(|fact| fact_age_secs(fact))
@@ -101,17 +120,18 @@ pub(crate) fn build_inbox(snapshot: &RoomSnapshot, tool: &str, limit: usize) -> 
                 subject: fact.subject.clone(),
                 from: fact.tool.clone().unwrap_or_default(),
                 age_secs,
-                stale: age_secs > DEFAULT_STALE_WAIT_SECS,
+                stale: age_secs > stale_wait_secs,
                 ack_command: ack_command(tool, &fact.event_id),
             }
         })
         .collect::<Vec<_>>();
 
     InboxResult {
-        count: mine.len(),
+        count,
         handoffs,
         artifacts,
         oldest_age_secs,
+        stale_window_secs: stale_wait_secs,
         items,
     }
 }
@@ -286,7 +306,7 @@ mod tests {
             ..RoomSnapshot::default()
         };
 
-        let inbox = build_inbox(&snapshot, "codex", 5);
+        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS);
         assert_eq!(inbox.count, 1);
         assert_eq!(inbox.handoffs, 1);
         assert_eq!(inbox.artifacts, 0);
@@ -315,7 +335,7 @@ mod tests {
             ..RoomSnapshot::default()
         };
 
-        let inbox = build_inbox(&snapshot, "codex", 2);
+        let inbox = build_inbox(&snapshot, "codex", 2, DEFAULT_STALE_WAIT_SECS);
         assert_eq!(inbox.count, 7, "count covers every obligation");
         assert_eq!(inbox.items.len(), 2, "items are capped");
         assert_eq!(
@@ -343,7 +363,7 @@ mod tests {
             ..RoomSnapshot::default()
         };
 
-        let inbox = build_inbox(&snapshot, "codex", 5);
+        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS);
         assert_eq!(inbox.count, 1);
         assert_eq!(inbox.artifacts, 1);
         assert_eq!(inbox.items[0].age_secs, 0);
@@ -364,10 +384,31 @@ mod tests {
             ..RoomSnapshot::default()
         };
 
-        let inbox = build_inbox(&snapshot, "codex", 5);
+        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS);
         assert_eq!(inbox.count, 1);
         assert!(inbox.items[0].stale, "a very old item is annotated stale");
         assert_eq!(inbox.oldest_age_secs, inbox.items[0].age_secs);
+    }
+
+    #[test]
+    fn stale_annotation_uses_the_effective_configured_window() {
+        let created_at = (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+        let snapshot = RoomSnapshot {
+            open_obligations: vec![obligation(
+                "configured-window",
+                FactKind::Handoff,
+                "codex",
+                &created_at,
+            )],
+            ..RoomSnapshot::default()
+        };
+
+        let short = build_inbox(&snapshot, "codex", 5, 60);
+        let long = build_inbox(&snapshot, "codex", 5, 600);
+        assert_eq!(short.stale_window_secs, 60);
+        assert_eq!(long.stale_window_secs, 600);
+        assert!(short.items[0].stale);
+        assert!(!long.items[0].stale);
     }
 
     #[test]

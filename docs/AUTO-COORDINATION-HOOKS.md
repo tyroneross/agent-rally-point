@@ -119,6 +119,13 @@ and release jobs.
 
 ## What the hook does
 
+`rally hook capabilities --json` distinguishes implemented surfaces from
+runtime guarantees. Lifecycle close and live delivery are conditional on
+adapter/receipt attestation. Claude, Cursor, and Gemini blocking is conditional
+on an installed strict native hook; Codex remains advisory. Capability labels
+must not be read as proof that a particular host session installed or invoked
+the corresponding adapter.
+
 | Event | Action |
 |------|--------|
 | `SessionStart` | Resolves `rally hooks status`, calls `rally enter` when hooks are enabled, posts `state=idle` with a next check-in, and surfaces a short context line from `rally room` / `rally next` / `rally status read` (active peers, claimed paths, suggested next, agent status). Even in a quiet room, the default prompt tells the user Rally is active and shows the session/repo off commands. |

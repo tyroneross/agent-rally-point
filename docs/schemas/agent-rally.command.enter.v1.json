@@ -15,7 +15,7 @@
       "properties": {
         "enter": {
           "type": "object",
-          "required": ["tool", "cursor", "entry", "attention"],
+          "required": ["tool", "cursor", "entry", "attention", "attention_total", "attention_emitted", "attention_omitted"],
           "properties": {
             "tool": { "type": "string" },
             "session_id": { "type": "string" },
@@ -25,7 +25,10 @@
               "type": "object",
               "required": ["do", "do_not", "know", "verify", "respond_to", "ignore"]
             },
-            "attention": { "type": "array" }
+            "attention": { "type": "array", "maxItems": 128 },
+            "attention_total": { "type": "integer", "minimum": 0 },
+            "attention_emitted": { "type": "integer", "minimum": 0, "maximum": 128 },
+            "attention_omitted": { "type": "integer", "minimum": 0 }
           }
         },
         "room": { "type": "object" }

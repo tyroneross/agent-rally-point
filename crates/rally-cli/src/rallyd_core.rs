@@ -954,6 +954,14 @@ mod imp {
                     facts: to_wire_values(&facts)?,
                 }
             }
+            StoreOp::RepoWideClaimLifecycleFacts => {
+                let facts = store
+                    .repo_wide_claim_lifecycle_facts()
+                    .map_err(rally_to_wire)?;
+                StoreOk::Facts {
+                    facts: to_wire_values(&facts)?,
+                }
+            }
             StoreOp::RebuildClaimIndex => {
                 store.rebuild_claim_index().map_err(rally_to_wire)?;
                 StoreOk::RebuildClaimIndex
@@ -997,13 +1005,28 @@ mod imp {
                 let capture = store
                     .snapshot_cache_capture(include_archived)
                     .map_err(rally_to_wire)?;
+                let snapshot = capture.snapshot.without_obligation_transport();
                 StoreOk::Snapshot {
-                    snapshot: snapshot_to_wire(&capture.snapshot)?,
+                    snapshot: snapshot_to_wire(&snapshot)?,
                     fingerprint: capture
                         .fingerprint
                         .as_ref()
                         .map(to_wire_value)
                         .transpose()?,
+                }
+            }
+            StoreOp::SnapshotForObligationTarget {
+                tool,
+                row_limit,
+                include_archived,
+            } => {
+                let snapshot = store
+                    .snapshot_with_archived(include_archived)
+                    .map_err(rally_to_wire)?
+                    .for_obligation_target(&tool, row_limit);
+                StoreOk::Snapshot {
+                    snapshot: snapshot_to_wire(&snapshot)?,
+                    fingerprint: None,
                 }
             }
             StoreOp::SnapshotScoped {
@@ -1026,7 +1049,8 @@ mod imp {
                         include_archived,
                         include_presence_only,
                     )
-                    .map_err(rally_to_wire)?;
+                    .map_err(rally_to_wire)?
+                    .without_obligation_transport();
                 StoreOk::Snapshot {
                     snapshot: snapshot_to_wire(&snap)?,
                     fingerprint: None,
@@ -1035,7 +1059,8 @@ mod imp {
             StoreOp::SnapshotWithReadersArchived { include_archived } => {
                 let snap = store
                     .snapshot_with_readers_archived(include_archived)
-                    .map_err(rally_to_wire)?;
+                    .map_err(rally_to_wire)?
+                    .without_obligation_transport();
                 StoreOk::SnapshotWithReaders {
                     snapshot: snapshot_to_wire(&snap)?,
                 }
@@ -1464,12 +1489,12 @@ mod imp {
         }
 
         #[test]
-        fn daemon_rejects_v4_requests_after_append_outcome_cutover() {
-            assert_eq!(WIRE_VERSION, 5, "this control grades the v4 to v5 cutover");
-            let repo_root = unique_repo_root("reject-v4");
+        fn daemon_rejects_v5_requests_after_targeted_read_cutover() {
+            assert_eq!(WIRE_VERSION, 6, "this control grades the v5 to v6 cutover");
+            let repo_root = unique_repo_root("reject-v5");
             let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
             let request = StoreRequest {
-                wire_version: 4,
+                wire_version: 5,
                 engagement: None,
                 deadline_unix_ms: None,
                 mutation_budget_ms: None,
@@ -1478,10 +1503,10 @@ mod imp {
             match dispatch_one(&mut store, "/expected/repo", request) {
                 StoreResponse::Err(error) => {
                     assert_eq!(error.kind, StoreErrorKind::IncompatibleWire);
-                    assert!(error.message.contains("daemon speaks 5"));
-                    assert!(error.message.contains("client sent 4"));
+                    assert!(error.message.contains("daemon speaks 6"));
+                    assert!(error.message.contains("client sent 5"));
                 }
-                other => panic!("v4 request was not rejected: {other:?}"),
+                other => panic!("v5 request was not rejected: {other:?}"),
             }
             std::fs::remove_dir_all(repo_root).ok();
         }
@@ -1544,6 +1569,54 @@ mod imp {
                     );
                 }
                 other => panic!("unexpected routed snapshot capture: {other:?}"),
+            }
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn routed_repo_wide_claim_lifecycle_query_crosses_engagements() {
+            let repo_root = unique_repo_root("repo-wide-claim-lifecycle");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            for (engagement, event_id, path) in [
+                ("engagement-alpha", "claim-alpha", "src/alpha.rs"),
+                ("engagement-beta", "claim-beta", "src/beta.rs"),
+            ] {
+                store.set_engagement_scope(Some(engagement.to_string()));
+                store
+                    .append_fact(&crate::store::Fact {
+                        schema: crate::FACT_SCHEMA.to_string(),
+                        event_id: event_id.to_string(),
+                        thread_id: format!("thread-{event_id}"),
+                        kind: crate::store::FactKind::Claim,
+                        tool: Some("codex:session-owner".to_string()),
+                        subject: format!("own {path}"),
+                        scope: vec![format!("file:{path}")],
+                        created_at: crate::now_string(),
+                        ..crate::store::Fact::default()
+                    })
+                    .unwrap();
+            }
+
+            let response = dispatch_one(
+                &mut store,
+                canonical_repo_root(&repo_root).as_str(),
+                StoreRequest::new(
+                    Some("engagement-gamma".to_string()),
+                    StoreOp::RepoWideClaimLifecycleFacts,
+                ),
+            );
+            match response {
+                StoreResponse::Ok(StoreOk::Facts { facts }) => {
+                    let ids = facts
+                        .iter()
+                        .filter_map(|fact| fact["event_id"].as_str())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    assert_eq!(
+                        ids,
+                        std::collections::BTreeSet::from(["claim-alpha", "claim-beta"])
+                    );
+                }
+                other => panic!("unexpected repository-wide lifecycle reply: {other:?}"),
             }
             std::fs::remove_dir_all(repo_root).ok();
         }

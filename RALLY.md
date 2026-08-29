@@ -386,7 +386,7 @@ Every threshold is config, resolved default → user → repo → env, under
 | `relevance.stale_author_factor` | `0.5` | Multiplier for an author past its adaptive heartbeat window. Clamped to `(0, 1]`. |
 | `relevance.addressed_boost` | `1.0` | Boost when an item is addressed to you. |
 | `relevance.path_overlap_boost` | `1.0` | Boost at full overlap with your declared paths. |
-| `stale_wait_secs` | `86400` | When an unanswered handoff stops counting as an active obligation. |
+| `stale_wait_secs` | `86400` | Advisory stale window for inbox rows and `next` ranking. It never erases or closes an unanswered obligation. |
 | `rotate_threshold_days` | `30` | Age at which a log segment is eligible for `rally rotate`. |
 
 Each has a `RALLY_`-prefixed env override (`RALLY_ROOM_BUDGET_FRACTION`,
@@ -420,6 +420,11 @@ rebuilds from the ledger. A client never writes the cache directly while the
 daemon holds it, and the daemon never starts while a direct writer is mid-write —
 a kernel file lock (`.rally/rallyd.owner.lock`) enforces the handover, so there
 is never more than one writer.
+
+Obligation-heavy rooms use a target-scoped wire read for `enter`, `next`, and
+`inbox`: the daemon returns oldest rows within a fixed row/byte ceiling plus
+exact target totals and omission counts. A repository-wide backlog therefore
+cannot make every snapshot reader fail, and bounded output never looks empty.
 
 ## Install
 

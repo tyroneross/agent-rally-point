@@ -62,7 +62,7 @@ print(d['data'][d['command']])
 | Command | `data[command]` fields | Siblings in `data` |
 |---------|------------------------|-------------------|
 | `init` | `init: { repo_root, manifest, pointers, docs, ledger_dir, room_cmd }` | — |
-| `enter` | `enter: { tool, session_id, room_id, cursor, entry, attention, warnings?, mission? }` | `room` |
+| `enter` | `enter: { tool, session_id, room_id, cursor, entry, attention, attention_total, attention_emitted, attention_omitted, warnings?, mission? }` | `room` |
 | `say` | `say: { fact }` | `room`, `verified`, `warnings?` |
 | `room` | `room: RoomSnapshot` | `query`, `readers?`, `mission?` |
 | `next` | `next: NextResult` | `tool`, `role`, `paths`, `wake_intent?`, `room` |
@@ -136,9 +136,9 @@ An ACK timeout is also **`ok: true` / exit 0**: optional target evidence did not
 - `room` output: `data.room` is the full `RoomSnapshot`. The command name and the sibling key share the same name `room` — `data["room"]` is unambiguous because `command` field says `"room"`.
 - `next` output: `data.next` is the `NextResult`. Other fields (`tool`, `role`, `paths`, `wake_intent`, `room`) are siblings in `data`.
 - `say` output: `data.say.fact` holds the written `Fact`. `data.room` and `data.verified` are shared contextual payloads.
-- `enter` output: `data.enter` holds the enter result (tool, cursor, entry, attention, warnings, mission). `data.room` is the room summary sibling.
+- `enter` output: `data.enter` holds the enter result (tool, cursor, entry, bounded attention, total/emitted/omitted counts, warnings, mission). `data.room` is the room summary sibling.
 - Session actions (`attach`, `capture`, `stop`) share the schema `agent-rally.command.session-action.v1` but each nests under its own action name.
-- Session lease lifecycle and views (`session ensure|close|current|history`) use `agent-rally.command.session.v1`. Capability fields are independent three-level guarantees: `enforced`, `advisory`, or `unmanaged`; do not infer host write blocking from identity or visibility. Current/history rows are separately bounded and always carry exact omission counts.
+- Session lease lifecycle and views (`session ensure|close|current|history`) use `agent-rally.command.session.v1`. `ensure.environment` exports the one-time `RALLY_SESSION_CLOSE_TOKEN` required by `close`. Capability fields are independent three-level guarantees: `enforced`, `advisory`, or `unmanaged`; do not infer host write blocking from identity or visibility. Current/history rows are separately bounded and always carry exact omission counts; `current.window_secs` is the effective adaptive freshness window.
 - `hook` output: `hook capabilities --json` is a standard envelope with `data.hook` holding the
   contract version, supported phases, effect registry, target ceiling, and the host-specific
   coordination contract. **`hook <phase>` is

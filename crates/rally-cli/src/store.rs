@@ -669,7 +669,9 @@ impl FactKind {
             "risk" => Some(Self::Risk),
             "lesson" => Some(Self::Lesson),
             "session" => Some(Self::Session),
-            "session.closed" | "session_closed" => Some(Self::SessionClosed),
+            // `session.closed` is intentionally internal-only. It enters
+            // through `rally session close`, which supplies the private
+            // one-time close proof checked at the durable write boundary.
             "wake" => Some(Self::Wake),
             "presence" => Some(Self::Presence),
             "read" => Some(Self::Read),
@@ -751,9 +753,9 @@ mod fact_kind_say_surface_tests {
     #[test]
     fn every_wire_spelling_parses_back_to_its_variant() {
         for kind in FactKind::ALL {
-            // Renewals enter through `RoomStore::renew_claim_lease`, never
-            // through a caller-typed kind, so parse intentionally rejects it.
-            if matches!(kind, FactKind::ClaimRenewed) {
+            // Renewals and lifecycle closes enter only through their guarded
+            // commands, never through a caller-typed `rally say` kind.
+            if matches!(kind, FactKind::ClaimRenewed | FactKind::SessionClosed) {
                 continue;
             }
             let wire = serde_json::to_value(kind)
@@ -823,6 +825,8 @@ mod fact_kind_say_surface_tests {
             !FactKind::SessionClosed.advertised_in_say(),
             "session.closed is authored only by the exact-session close command"
         );
+        assert!(FactKind::parse("session.closed").is_none());
+        assert!(FactKind::parse("session_closed").is_none());
         assert!(
             !FactKind::Unknown.advertised_in_say(),
             "unknown is the serde fallback, not a kind a caller should author"
@@ -1576,6 +1580,17 @@ pub(crate) struct RoomSnapshot {
     /// NOT ride the side channel.
     #[serde(skip)]
     pub(crate) open_obligations: Vec<Fact>,
+    /// Exact target-scoped obligation counts for a bounded daemon reply.
+    #[serde(skip)]
+    pub(crate) open_obligations_target: Option<String>,
+    #[serde(skip)]
+    pub(crate) open_obligations_total: usize,
+    #[serde(skip)]
+    pub(crate) open_obligations_handoffs: usize,
+    #[serde(skip)]
+    pub(crate) open_obligations_artifacts: usize,
+    #[serde(skip)]
+    pub(crate) open_obligations_omitted: usize,
     pub(crate) current_decisions: Vec<Fact>,
     pub(crate) current_risks: Vec<Fact>,
     /// System-generated health/telemetry facts (`external-intake`,
@@ -1717,6 +1732,16 @@ pub(crate) struct SnapshotInternals {
     #[serde(default)]
     pub(crate) open_obligations: Vec<Fact>,
     #[serde(default)]
+    pub(crate) open_obligations_target: Option<String>,
+    #[serde(default)]
+    pub(crate) open_obligations_total: usize,
+    #[serde(default)]
+    pub(crate) open_obligations_handoffs: usize,
+    #[serde(default)]
+    pub(crate) open_obligations_artifacts: usize,
+    #[serde(default)]
+    pub(crate) open_obligations_omitted: usize,
+    #[serde(default)]
     pub(crate) stale_authors: BTreeSet<String>,
     #[serde(default)]
     pub(crate) author_last_seen: BTreeMap<String, String>,
@@ -1735,6 +1760,7 @@ pub(crate) const MAX_WIRE_PENDING_WAKES: usize = 1_024;
 /// id; truncating here would silently empty an inbox that exists precisely so
 /// nothing can silently empty it. Crossing the bound is a structured error.
 pub(crate) const MAX_WIRE_OPEN_OBLIGATIONS: usize = 1_024;
+pub(crate) const MAX_TARGET_OBLIGATION_BYTES: usize = 256 * 1_024;
 pub(crate) const MAX_WIRE_STALE_AUTHORS: usize = 4_096;
 pub(crate) const MAX_WIRE_SNAPSHOT_INTERNALS_BYTES: usize = 512 * 1_024;
 
@@ -1796,6 +1822,11 @@ impl RoomSnapshot {
             last_activity_ts: self.last_activity_ts.clone(),
             pending_wakes: self.pending_wakes.clone(),
             open_obligations: self.open_obligations.clone(),
+            open_obligations_target: self.open_obligations_target.clone(),
+            open_obligations_total: self.open_obligations_total,
+            open_obligations_handoffs: self.open_obligations_handoffs,
+            open_obligations_artifacts: self.open_obligations_artifacts,
+            open_obligations_omitted: self.open_obligations_omitted,
             stale_authors: self.stale_authors.clone(),
             author_last_seen: self.author_last_seen.clone(),
         }
@@ -1807,6 +1838,11 @@ impl RoomSnapshot {
         self.last_activity_ts = internals.last_activity_ts;
         self.pending_wakes = internals.pending_wakes;
         self.open_obligations = internals.open_obligations;
+        self.open_obligations_target = internals.open_obligations_target;
+        self.open_obligations_total = internals.open_obligations_total;
+        self.open_obligations_handoffs = internals.open_obligations_handoffs;
+        self.open_obligations_artifacts = internals.open_obligations_artifacts;
+        self.open_obligations_omitted = internals.open_obligations_omitted;
         self.stale_authors = internals.stale_authors;
         self.author_last_seen = internals.author_last_seen;
     }
@@ -1881,6 +1917,55 @@ pub(crate) fn snapshot_from_wire_value(
 }
 
 impl RoomSnapshot {
+    pub(crate) fn without_obligation_transport(mut self) -> Self {
+        self.open_obligations.clear();
+        self.open_obligations_target = None;
+        self.open_obligations_total = 0;
+        self.open_obligations_handoffs = 0;
+        self.open_obligations_artifacts = 0;
+        self.open_obligations_omitted = 0;
+        self
+    }
+
+    pub(crate) fn for_obligation_target(mut self, tool: &str, row_limit: usize) -> Self {
+        let mut mine = self
+            .open_obligations
+            .into_iter()
+            .filter(|fact| fact.target.as_deref() == Some(tool))
+            .collect::<Vec<_>>();
+        mine.sort_by_key(|fact| fact.seq);
+        let total = mine.len();
+        let handoffs = mine
+            .iter()
+            .filter(|fact| fact.kind == FactKind::Handoff)
+            .count();
+        let artifacts = mine
+            .iter()
+            .filter(|fact| fact.kind == FactKind::Artifact)
+            .count();
+        let mut emitted = Vec::new();
+        let mut emitted_bytes = 0usize;
+        for fact in mine
+            .into_iter()
+            .take(row_limit.min(MAX_WIRE_OPEN_OBLIGATIONS))
+        {
+            let fact_bytes =
+                serde_json::to_vec(&fact).map_or(MAX_TARGET_OBLIGATION_BYTES, |v| v.len());
+            if emitted_bytes.saturating_add(fact_bytes) > MAX_TARGET_OBLIGATION_BYTES {
+                break;
+            }
+            emitted_bytes = emitted_bytes.saturating_add(fact_bytes);
+            emitted.push(fact);
+        }
+        self.open_obligations_omitted = total.saturating_sub(emitted.len());
+        self.open_obligations = emitted;
+        self.open_obligations_target = Some(tool.to_string());
+        self.open_obligations_total = total;
+        self.open_obligations_handoffs = handoffs;
+        self.open_obligations_artifacts = artifacts;
+        self
+    }
+
     /// ADVISORY tier — tools whose latest presence is liveness-idle (squad
     /// `status == "idle"`, i.e. `last_seen_ts` older than the 15-minute
     /// `IDLE_THRESHOLD_SECS`). This is the standard TTL-primary signal reused
@@ -2051,6 +2136,11 @@ impl RoomSnapshot {
             // over it would let a query argument decide an obligation is gone —
             // one more reader-side erasure of the kind this bucket removes.
             open_obligations: self.open_obligations,
+            open_obligations_target: self.open_obligations_target,
+            open_obligations_total: self.open_obligations_total,
+            open_obligations_handoffs: self.open_obligations_handoffs,
+            open_obligations_artifacts: self.open_obligations_artifacts,
+            open_obligations_omitted: self.open_obligations_omitted,
             current_decisions: filter_facts(self.current_decisions, query),
             current_risks: filter_facts(self.current_risks, query),
             recent_artifacts: filter_facts(self.recent_artifacts, query),
@@ -3496,6 +3586,13 @@ impl RoomStore {
         }
     }
 
+    pub(crate) fn repo_wide_claim_lifecycle_facts(&self) -> Result<Vec<Fact>> {
+        match self {
+            RoomStore::Direct(d) => d.repo_wide_claim_lifecycle_facts(),
+            RoomStore::Routed(r) => r.repo_wide_claim_lifecycle_facts(),
+        }
+    }
+
     /// Consume the command's general-purpose store before a bounded ACK wait.
     /// Routed mode keeps using the daemon. Direct mode closes its store facade,
     /// releases process ownership, and thereafter folds canonical JSONL only.
@@ -3583,6 +3680,17 @@ impl RoomStore {
         match self {
             RoomStore::Direct(d) => d.snapshot(),
             RoomStore::Routed(r) => r.snapshot(),
+        }
+    }
+
+    pub(crate) fn snapshot_for_obligation_target(
+        &self,
+        tool: &str,
+        row_limit: usize,
+    ) -> Result<RoomSnapshot> {
+        match self {
+            RoomStore::Direct(d) => Ok(d.snapshot()?.for_obligation_target(tool, row_limit)),
+            RoomStore::Routed(r) => r.snapshot_for_obligation_target(tool, row_limit),
         }
     }
 
@@ -4431,6 +4539,10 @@ impl DirectRoomStore {
                         .open_handoffs
                         .iter()
                         .find(|candidate| candidate.event_id == ref_id);
+                    let open_obligation = snapshot
+                        .open_obligations
+                        .iter()
+                        .find(|candidate| candidate.event_id == ref_id);
                     let is_live = snapshot
                         .active_blockers
                         .iter()
@@ -4440,6 +4552,7 @@ impl DirectRoomStore {
                             .iter()
                             .any(|candidate| candidate.event_id == ref_id)
                         || open_handoff.is_some()
+                        || open_obligation.is_some()
                         || snapshot
                             .current_risks
                             .iter()
@@ -4454,13 +4567,14 @@ impl DirectRoomStore {
                             .any(|candidate| candidate.event_id == ref_id);
                     if !is_live {
                         return Err(RallyError::Usage(format!(
-                            "resolve failed: ref {ref_id} is not a live blocker, claim, handoff, risk, or unconsumed artifact (already resolved, never existed, or invalid); nothing to resolve"
+                            "resolve failed: ref {ref_id} is not a live blocker, claim, handoff, obligation, risk, or unconsumed artifact (already resolved, never existed, or invalid); nothing to resolve"
                         )));
                     }
-                    if let Some(handoff) = open_handoff
-                        && !handoff_closer_matches_target(handoff, &fact)
+                    let targeted = open_handoff.or(open_obligation);
+                    if let Some(targeted) = targeted
+                        && !handoff_closer_matches_target(targeted, &fact)
                     {
-                        let target = handoff.target.as_deref().unwrap_or("<untargeted>");
+                        let target = targeted.target.as_deref().unwrap_or("<untargeted>");
                         let tool = fact.tool.as_deref().unwrap_or("<unknown>");
                         return Err(RallyError::Usage(format!(
                             "resolve failed: ref {ref_id} is targeted to {target}; tool {tool} cannot resolve it"
@@ -4498,7 +4612,9 @@ impl DirectRoomStore {
                         .to_string(),
                 ));
         }
-        if crate::write_authority::needs_authority_check(&fact) {
+        let needs_authority = crate::write_authority::needs_authority_check(&fact);
+        let needs_session_lifecycle = crate::write_authority::needs_session_lifecycle_check(&fact);
+        if needs_authority || needs_session_lifecycle {
             let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
             let coord =
                 crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
@@ -5210,7 +5326,7 @@ impl DirectRoomStore {
         self.snapshot_cache_capture_at(include_archived, projection_unix_sec)
     }
 
-    fn repo_wide_claim_lifecycle_facts(&self) -> Result<Vec<Fact>> {
+    pub(crate) fn repo_wide_claim_lifecycle_facts(&self) -> Result<Vec<Fact>> {
         // facts.db is derived from the canonical segment set. Validate that
         // relationship before asking it a safety-bearing collision question.
         // Cold/direct mode may rebuild the cache; a warm daemon pool must fail
@@ -6112,8 +6228,8 @@ fn claim_lifecycle_relevant_to_path(facts: &[Fact], path: &str) -> Vec<Fact> {
                         .iter()
                         .any(|scope| claim_scopes.contains(scope.as_str())))
                 || (fact.kind == FactKind::SessionClosed
-                    && fact.scope.iter().any(|scope| {
-                        claim_scopes.contains(scope.as_str()) || path_matches_scope(scope, path)
+                    && relevant_claims.iter().any(|claim| {
+                        claim_authority::later_session_close_matches_claim(fact, claim)
                     }))
         })
         .cloned()
@@ -7343,6 +7459,11 @@ fn snapshot_from_facts_with_policy_at(
         open_handoffs,
         pending_wakes,
         open_obligations,
+        open_obligations_target: None,
+        open_obligations_total: 0,
+        open_obligations_handoffs: 0,
+        open_obligations_artifacts: 0,
+        open_obligations_omitted: 0,
         current_decisions,
         current_risks,
         system_health,
@@ -11681,6 +11802,39 @@ mod ledger_tests {
             "path-scoped collision context must still stop a conflicting writer: {findings:?}"
         );
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn path_scoped_lifecycle_selects_exact_session_close_without_scope_match() {
+        let mut claim = make_fact(
+            "claim-a",
+            FactKind::Claim,
+            "file:src/a.rs",
+            "owned in engagement A",
+        );
+        claim.seq = 1;
+        claim.tool = Some("codex:shared".to_string());
+        claim.from_session_id = Some("sess:parent-a".to_string());
+        let mut close = make_fact(
+            "close-a",
+            FactKind::SessionClosed,
+            "file:unrelated.rs",
+            "closed in engagement B",
+        );
+        close.seq = 2;
+        close.tool = claim.tool.clone();
+        close.from_session_id = claim.from_session_id.clone();
+
+        let lifecycle = claim_lifecycle_relevant_to_path(&[claim.clone(), close], "src/a.rs");
+        assert_eq!(
+            lifecycle.len(),
+            2,
+            "exact session identity must select the close"
+        );
+        assert!(
+            claim_authority::active_claim_records(&lifecycle).is_empty(),
+            "the cross-engagement close must remove the path-relevant claim"
+        );
     }
 
     #[test]
@@ -19823,11 +19977,10 @@ mod obligation_projection_tests {
         assert_eq!(ids(&snapshot.open_obligations), vec!["older", "newer"]);
     }
 
-    /// The bucket rides the daemon side-channel and is bounded FAIL-LOUD, never
-    /// truncated: silently dropping rows is the failure the inbox exists to
-    /// prevent.
+    /// A raw room-wide bucket stays fail-loud, while the daemon-facing target
+    /// projection returns bounded oldest rows plus exact omission counts.
     #[test]
-    fn open_obligations_ride_the_wire_and_fail_loud_past_the_bound() {
+    fn open_obligations_use_bounded_target_transport_with_exact_counts() {
         let owed = aged_handoff("owed", 1, "codex", THIRTY_DAYS_SECS);
         let snapshot = RoomSnapshot {
             open_obligations: vec![owed],
@@ -19851,5 +20004,24 @@ mod obligation_projection_tests {
         };
         let error = snapshot_to_wire_value(&flooded).unwrap_err().to_string();
         assert!(error.contains("open-obligation bound"), "{error}");
+
+        let targeted = flooded.for_obligation_target("codex", 32);
+        let wire = snapshot_to_wire_value(&targeted).unwrap();
+        let restored = snapshot_from_wire_value(wire).unwrap();
+        assert_eq!(restored.open_obligations_target.as_deref(), Some("codex"));
+        assert_eq!(
+            restored.open_obligations_total,
+            MAX_WIRE_OPEN_OBLIGATIONS + 1
+        );
+        assert_eq!(
+            restored.open_obligations_handoffs,
+            MAX_WIRE_OPEN_OBLIGATIONS + 1
+        );
+        assert_eq!(restored.open_obligations_artifacts, 0);
+        assert_eq!(restored.open_obligations.len(), 32);
+        assert_eq!(
+            restored.open_obligations_omitted,
+            MAX_WIRE_OPEN_OBLIGATIONS + 1 - 32
+        );
     }
 }
