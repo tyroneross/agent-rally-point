@@ -2954,8 +2954,11 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     // facts.
     let snapshot = room.snapshot_for_obligation_target(&tool, 128)?;
 
-    let (attention, attention_total, attention_emitted, attention_omitted) =
-        bound_enter_attention(build_attention(&snapshot, &tool, cursor_before, &paths));
+    let (attention, attention_total, attention_emitted, attention_omitted) = bound_enter_attention(
+        &snapshot,
+        &tool,
+        build_attention(&snapshot, &tool, cursor_before, &paths),
+    );
     let entry = build_entry(&snapshot, &tool, role.as_deref(), &paths);
     // Set cursor to the post-presence max_seq so subsequent enters do NOT see
     // this tool's own just-written presence/lead facts as "new peer content".
@@ -9710,6 +9713,30 @@ fn command_session_history(json: bool, args: cli::SessionHistoryArgs) -> Result<
     ))
 }
 
+fn released_claim_ids_for_close(
+    lifecycle_facts: &[Fact],
+    close_seq: i64,
+    tool: &str,
+    session_id: &str,
+) -> Vec<String> {
+    let facts_before_close = lifecycle_facts
+        .iter()
+        .filter(|fact| fact.seq < close_seq)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut released = facts_before_close
+        .iter()
+        .filter(|fact| {
+            crate::claim_authority::is_active_claim_fact(fact, &facts_before_close)
+                && fact.tool.as_deref() == Some(tool)
+                && fact.from_session_id.as_deref() == Some(session_id)
+        })
+        .map(|fact| fact.event_id.clone())
+        .collect::<Vec<_>>();
+    released.sort();
+    released
+}
+
 fn command_session_close(json: bool, args: SessionCloseArgs) -> Result<Output> {
     let raw_session_id = args
         .session_id
@@ -9757,26 +9784,6 @@ fn command_session_close(json: bool, args: SessionCloseArgs) -> Result<Output> {
                 .to_string(),
         ));
     }
-    let lifecycle_facts = room.repo_wide_claim_lifecycle_facts()?;
-    let claims = lifecycle_facts
-        .iter()
-        .filter(|fact| {
-            crate::claim_authority::is_active_claim_fact(fact, &lifecycle_facts)
-                && fact.tool.as_deref() == Some(args.tool.as_str())
-                && fact.from_session_id.as_deref() == Some(session_id.as_str())
-        })
-        .collect::<Vec<_>>();
-    let mut released_claim_ids = claims
-        .iter()
-        .map(|fact| fact.event_id.clone())
-        .collect::<Vec<_>>();
-    released_claim_ids.sort();
-    let mut scope = claims
-        .iter()
-        .flat_map(|claim| claim.scope.iter().cloned())
-        .collect::<Vec<_>>();
-    scope.sort();
-    scope.dedup();
     let operation_material = format!("{}:{session_id}", args.tool);
     let event_id = stable_operation_id("session-close", &operation_material);
     let existing = engagement_facts
@@ -9794,17 +9801,13 @@ fn command_session_close(json: bool, args: SessionCloseArgs) -> Result<Output> {
             kind: FactKind::SessionClosed,
             tool: Some(args.tool.clone()),
             role: None,
-            subject: format!(
-                "session closed: {} (released {} exact-session claim(s))",
-                session_id,
-                released_claim_ids.len()
-            ),
-            scope,
+            subject: format!("session closed: {session_id}"),
+            scope: Vec::new(),
             created_at: now_string(),
             summary: None,
             evidence: vec![
                 "protocol:session_state=closed".to_string(),
-                format!("protocol:released_claims={}", released_claim_ids.len()),
+                "protocol:release_effect=all_exact_session_claims_before_close".to_string(),
                 format!(
                     "{}{}",
                     session_identity::SESSION_CLOSE_TOKEN_REVEAL_PREFIX,
@@ -9821,6 +9824,8 @@ fn command_session_close(json: bool, args: SessionCloseArgs) -> Result<Output> {
         with_watchdog_command_commit(|| room.append_fact_verified(&fact))?.into_fact_reporting()
     };
     let facts_after_close = room.repo_wide_claim_lifecycle_facts()?;
+    let released_claim_ids =
+        released_claim_ids_for_close(&facts_after_close, close_fact.seq, &args.tool, &session_id);
     let still_owned = facts_after_close.iter().any(|fact| {
         crate::claim_authority::is_active_claim_fact(fact, &facts_after_close)
             && fact.tool.as_deref() == Some(args.tool.as_str())
@@ -11404,6 +11409,40 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(session_current_window_secs(&coord), 77);
+    }
+
+    #[test]
+    fn session_close_reports_claims_active_at_its_committed_sequence() {
+        let claim = |event_id: &str, seq: i64, path: &str| Fact {
+            event_id: event_id.to_string(),
+            seq,
+            kind: FactKind::Claim,
+            tool: Some("codex:owner".to_string()),
+            from_session_id: Some("sess:owner".to_string()),
+            scope: vec![format!("file:{path}")],
+            subject: format!("own {path}"),
+            created_at: now_string(),
+            ..Fact::default()
+        };
+        let released_earlier = claim("claim-released", 1, "src/old.rs");
+        let release = Fact {
+            event_id: "release-old".to_string(),
+            seq: 2,
+            kind: FactKind::Release,
+            tool: Some("codex:owner".to_string()),
+            from_session_id: Some("sess:owner".to_string()),
+            ref_id: Some("claim-released".to_string()),
+            subject: "released earlier".to_string(),
+            created_at: now_string(),
+            ..Fact::default()
+        };
+        let raced_before_commit = claim("claim-raced", 3, "src/raced.rs");
+        let lifecycle = vec![released_earlier, release, raced_before_commit];
+
+        assert_eq!(
+            released_claim_ids_for_close(&lifecycle, 4, "codex:owner", "sess:owner"),
+            vec!["claim-raced"]
+        );
     }
 
     #[test]

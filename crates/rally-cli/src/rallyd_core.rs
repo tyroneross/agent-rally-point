@@ -1622,6 +1622,168 @@ mod imp {
         }
 
         #[test]
+        fn raw_routed_writes_cannot_extend_a_closed_session_history() {
+            let repo_root = unique_repo_root("closed-session-raw-wire");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let token = "close-token";
+            let presence = crate::store::Fact {
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "session-presence".to_string(),
+                thread_id: "session-thread".to_string(),
+                kind: crate::store::FactKind::Presence,
+                tool: Some("codex:closed".to_string()),
+                from_session_id: Some("sess:closed".to_string()),
+                subject: "session active".to_string(),
+                evidence: vec![
+                    "protocol:session_state=active".to_string(),
+                    crate::session_identity::session_close_token_hash_marker(token),
+                ],
+                created_at: crate::now_string(),
+                ..crate::store::Fact::default()
+            };
+            store.append_fact(&presence).unwrap();
+            let close = crate::store::Fact {
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "session-close".to_string(),
+                thread_id: "session-thread".to_string(),
+                kind: crate::store::FactKind::SessionClosed,
+                tool: presence.tool.clone(),
+                from_session_id: presence.from_session_id.clone(),
+                subject: "session closed".to_string(),
+                evidence: vec![
+                    "protocol:session_state=closed".to_string(),
+                    format!(
+                        "{}{}",
+                        crate::session_identity::SESSION_CLOSE_TOKEN_REVEAL_PREFIX,
+                        token
+                    ),
+                ],
+                created_at: crate::now_string(),
+                ..crate::store::Fact::default()
+            };
+            store.append_fact_verified(&close).unwrap();
+
+            for mut forged in [
+                crate::store::Fact {
+                    event_id: "duplicate-session-close".to_string(),
+                    ..close.clone()
+                },
+                crate::store::Fact {
+                    event_id: "post-close-artifact".to_string(),
+                    kind: crate::store::FactKind::Artifact,
+                    subject: "must not append".to_string(),
+                    evidence: Vec::new(),
+                    ..close.clone()
+                },
+            ] {
+                forged.seq = 0;
+                let response = dispatch_one(
+                    &mut store,
+                    canonical_repo_root(&repo_root).as_str(),
+                    StoreRequest::new(
+                        None,
+                        StoreOp::AppendFactVerified {
+                            fact: serde_json::to_value(forged).unwrap(),
+                        },
+                    ),
+                );
+                assert!(
+                    matches!(response, StoreResponse::Err(ref error) if error.kind == StoreErrorKind::Usage && error.message.contains("is closed")),
+                    "closed-session raw write was not refused: {response:?}"
+                );
+            }
+
+            assert_eq!(
+                store
+                    .facts()
+                    .unwrap()
+                    .iter()
+                    .filter(|fact| fact.kind == crate::store::FactKind::SessionClosed)
+                    .count(),
+                1
+            );
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn routed_snapshots_survive_more_than_one_thousand_distinct_obligations() {
+            let repo_root = unique_repo_root("obligation-flood-wire");
+            let engagement = "engagement-flood";
+            let log_dir = repo_root.join(".rally").join(crate::store::LOG_DIRNAME);
+            std::fs::create_dir_all(&log_dir).unwrap();
+            let mut segment =
+                std::fs::File::create(log_dir.join(format!("{engagement}.jsonl"))).unwrap();
+            for seq in 1..=1025i64 {
+                let fact = crate::store::Fact {
+                    schema: crate::FACT_SCHEMA.to_string(),
+                    event_id: format!("obligation-{seq}"),
+                    seq,
+                    thread_id: format!("thread-{seq}"),
+                    kind: crate::store::FactKind::Handoff,
+                    tool: Some("claude_code:sender".to_string()),
+                    subject: format!("obligation {seq}"),
+                    target: Some("codex:receiver".to_string()),
+                    created_at: crate::now_string(),
+                    ..crate::store::Fact::default()
+                };
+                writeln!(
+                    segment,
+                    "{}",
+                    serde_json::json!({
+                        "seq": seq,
+                        "occurred_at": fact.created_at,
+                        "event_type": "handoff",
+                        "payload": fact,
+                        "engagement": engagement
+                    })
+                )
+                .unwrap();
+            }
+            segment.sync_all().unwrap();
+
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let normal = dispatch_one(
+                &mut store,
+                canonical_repo_root(&repo_root).as_str(),
+                StoreRequest::new(
+                    Some(engagement.to_string()),
+                    StoreOp::SnapshotWithArchived {
+                        include_archived: false,
+                    },
+                ),
+            );
+            assert!(
+                matches!(normal, StoreResponse::Ok(StoreOk::Snapshot { .. })),
+                "ordinary routed snapshot failed under obligation flood: {normal:?}"
+            );
+
+            let targeted = dispatch_one(
+                &mut store,
+                canonical_repo_root(&repo_root).as_str(),
+                StoreRequest::new(
+                    Some(engagement.to_string()),
+                    StoreOp::SnapshotForObligationTarget {
+                        tool: "codex:receiver".to_string(),
+                        row_limit: 32,
+                        include_archived: false,
+                    },
+                ),
+            );
+            match targeted {
+                StoreResponse::Ok(StoreOk::Snapshot { snapshot, .. }) => {
+                    let restored = crate::store::snapshot_from_wire_value(snapshot).unwrap();
+                    assert_eq!(restored.open_obligations_total, 1025);
+                    assert_eq!(restored.open_obligations.len(), 32);
+                    assert_eq!(restored.open_obligations_omitted, 993);
+                }
+                other => {
+                    panic!("targeted routed snapshot failed under obligation flood: {other:?}")
+                }
+            }
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
         fn o26_fresh_daemon_repairs_canonical_ahead_db_before_warm_install() {
             let repo_root = unique_repo_root("o26-fresh-daemon-repair");
             let rally_dir = repo_root.join(".rally");

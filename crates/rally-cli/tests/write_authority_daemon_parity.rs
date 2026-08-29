@@ -641,6 +641,19 @@ fn exact_session_close_authority_and_terminality_match_direct_and_routed_mode() 
                 "--json",
             ],
         );
+        let post_close_artifact = room.ok_as_session(
+            session,
+            None,
+            &[
+                "say",
+                "artifact",
+                "--tool",
+                tool,
+                "--subject",
+                "closed lease must not author",
+                "--json",
+            ],
+        );
         (
             claim_created,
             wrong_token_close,
@@ -648,11 +661,12 @@ fn exact_session_close_authority_and_terminality_match_direct_and_routed_mode() 
             valid_close,
             closed_claim_count,
             post_close_claim,
+            post_close_artifact,
             room.active_claim_count(),
         )
     })
     .expect("parity scenario should run");
-    assert_eq!(verdict, (true, false, true, true, 0, false, 0));
+    assert_eq!(verdict, (true, false, true, true, 0, false, false, 0));
 }
 
 /// The reaper's expired-lease authority, on both store modes.

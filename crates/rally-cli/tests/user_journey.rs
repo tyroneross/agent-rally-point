@@ -4919,6 +4919,32 @@ fn session_close_releases_only_the_exact_same_tool_session_claims() {
             .contains("is closed")
     );
 
+    let post_close_artifact = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .current_dir(&workspace.cwd)
+        .env("HOME", &workspace.home)
+        .env("RALLY_NO_WORKTREE", "1")
+        .env("RALLY_SESSION_ID", "parent-a")
+        .args([
+            "say",
+            "artifact",
+            "--json",
+            "--tool",
+            "codex:shared",
+            "--subject",
+            "closed lease must not author any fact",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(post_close_artifact.status.code(), Some(2));
+    let post_close_artifact_error: Value =
+        serde_json::from_slice(&post_close_artifact.stderr).unwrap();
+    assert!(
+        post_close_artifact_error["error"]
+            .as_str()
+            .unwrap()
+            .contains("is closed")
+    );
+
     workspace.cleanup();
 }
 

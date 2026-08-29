@@ -117,13 +117,11 @@ pub(crate) fn needs_authority_check(fact: &Fact) -> bool {
 
 pub(crate) fn needs_session_lifecycle_check(fact: &Fact) -> bool {
     fact.kind == FactKind::SessionClosed
-        || fact.kind == FactKind::Claim
-        || fact.kind == FactKind::ClaimRenewed
-        || (fact.kind == FactKind::Presence
+        || (fact.tool.as_deref().is_some_and(|tool| !tool.is_empty())
             && fact
-                .evidence
-                .iter()
-                .any(|item| item == "protocol:session_state=active"))
+                .from_session_id
+                .as_deref()
+                .is_some_and(|session| !session.is_empty()))
 }
 
 /// Assert `fact` may be written, given the room as it stands immediately before
@@ -169,12 +167,11 @@ fn assert_session_lifecycle_authorized(fact: &Fact, facts_before: &[Fact]) -> Re
         candidate.tool.as_deref() == Some(tool)
             && candidate.from_session_id.as_deref() == Some(session_id)
     };
-    if fact.kind != FactKind::SessionClosed
-        && facts_before
-            .iter()
-            .filter(exact)
-            .any(|candidate| candidate.kind == FactKind::SessionClosed)
-    {
+    let already_closed = facts_before
+        .iter()
+        .filter(exact)
+        .any(|candidate| candidate.kind == FactKind::SessionClosed);
+    if already_closed {
         return Err(RallyError::Usage(format!(
             "session lease {session_id} is closed for {tool}; start a new parent lease"
         )));
@@ -949,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_session_cannot_claim_or_rotate_its_close_token() {
+    fn closed_session_cannot_author_any_later_fact_or_rotate_its_close_token() {
         let presence = active_session_presence("codex:victim", "sess:victim", "secret");
         let closed = session_close("codex:victim", "sess:victim", "secret");
         let facts = vec![presence.clone(), closed];
@@ -964,6 +961,24 @@ mod tests {
             ..Fact::default()
         };
         assert!(refusal_with(&claim, &facts, &RoomSnapshot::default()).contains("is closed"));
+
+        let artifact = Fact {
+            event_id: "later-artifact".to_string(),
+            seq: 3,
+            kind: FactKind::Artifact,
+            tool: presence.tool.clone(),
+            from_session_id: presence.from_session_id.clone(),
+            subject: "must also fail".to_string(),
+            ..Fact::default()
+        };
+        assert!(refusal_with(&artifact, &facts, &RoomSnapshot::default()).contains("is closed"));
+
+        let mut duplicate_close = session_close("codex:victim", "sess:victim", "secret");
+        duplicate_close.event_id = "forged-duplicate-close".to_string();
+        duplicate_close.seq = 3;
+        assert!(
+            refusal_with(&duplicate_close, &facts, &RoomSnapshot::default()).contains("is closed")
+        );
 
         let rotated = active_session_presence("codex:victim", "sess:victim", "rotated");
         assert!(

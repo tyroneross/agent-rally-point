@@ -281,6 +281,7 @@ pub(crate) fn build_entry(
             .filter(|f| f.tool.as_deref() == Some(tool))
             .map(|f| entry_item("resolve_owned_blocker", f)),
     );
+    do_items.truncate(MAX_ENTER_ROWS);
     let mut do_not = Vec::new();
     for claim in &snapshot.active_claims {
         if claim.tool.as_deref() != Some(tool)
@@ -1053,9 +1054,41 @@ pub(crate) fn build_attention(
 }
 
 pub(crate) fn bound_enter_attention(
+    snapshot: &RoomSnapshot,
+    tool: &str,
     mut items: Vec<AttentionItem>,
 ) -> (Vec<AttentionItem>, usize, usize, usize) {
-    let total = items.len();
+    let visible_obligation_ids = snapshot
+        .open_obligations
+        .iter()
+        .map(|fact| fact.event_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let built_obligations = items
+        .iter()
+        .filter(|item| {
+            visible_obligation_ids.contains(item.event_id.as_str())
+                || snapshot.open_handoffs.iter().any(|fact| {
+                    fact.event_id == item.event_id && fact.target.as_deref() == Some(tool)
+                })
+                || snapshot.unconsumed_artifacts.iter().any(|fact| {
+                    fact.event_id == item.event_id
+                        && fact.target.as_deref() == Some(tool)
+                        && crate::store::fact_requires_ack(fact)
+                })
+        })
+        .count();
+    let exact_obligations = if snapshot.open_obligations_target.as_deref() == Some(tool) {
+        snapshot.open_obligations_total.max(built_obligations)
+    } else {
+        snapshot
+            .open_obligations
+            .iter()
+            .filter(|fact| fact.target.as_deref() == Some(tool))
+            .count()
+            .max(built_obligations)
+    };
+    let non_obligation_items = items.len().saturating_sub(built_obligations);
+    let total = non_obligation_items.saturating_add(exact_obligations);
     items.truncate(MAX_ENTER_ROWS);
     let emitted = items.len();
     let omitted = total.saturating_sub(emitted);
@@ -1337,8 +1370,11 @@ mod tests {
             snapshot.open_obligations.push(owed);
         }
 
-        let (attention, total, emitted, omitted) =
-            bound_enter_attention(build_attention(&snapshot, "codex", 0, &[]));
+        let (attention, total, emitted, omitted) = bound_enter_attention(
+            &snapshot,
+            "codex",
+            build_attention(&snapshot, "codex", 0, &[]),
+        );
         assert_eq!(total, MAX_ENTER_ROWS + 12);
         assert_eq!(emitted, MAX_ENTER_ROWS);
         assert_eq!(omitted, 12);
@@ -1352,6 +1388,39 @@ mod tests {
         );
         assert_eq!(value["do"].as_array().unwrap().len(), MAX_ENTER_ROWS);
         assert_eq!(attention.len(), MAX_ENTER_ROWS);
+    }
+
+    #[test]
+    fn enter_attention_counts_target_transport_omissions_exactly() {
+        let mut snapshot = RoomSnapshot {
+            open_obligations_target: Some("codex".to_string()),
+            open_obligations_total: MAX_ENTER_ROWS + 12,
+            open_obligations_handoffs: 0,
+            open_obligations_artifacts: MAX_ENTER_ROWS + 12,
+            open_obligations_omitted: 12,
+            ..RoomSnapshot::default()
+        };
+        for index in 0..MAX_ENTER_ROWS {
+            let mut artifact = handoff(
+                &format!("artifact-{index}"),
+                "codex",
+                "2999-01-01T00:00:00Z",
+            );
+            artifact.kind = FactKind::Artifact;
+            artifact.evidence.push("requires_ack:true".to_string());
+            artifact.seq = index as i64 + 1;
+            snapshot.open_obligations.push(artifact);
+        }
+
+        let (attention, total, emitted, omitted) = bound_enter_attention(
+            &snapshot,
+            "codex",
+            build_attention(&snapshot, "codex", i64::MAX, &[]),
+        );
+        assert_eq!(attention.len(), MAX_ENTER_ROWS);
+        assert_eq!(total, MAX_ENTER_ROWS + 12);
+        assert_eq!(emitted, MAX_ENTER_ROWS);
+        assert_eq!(omitted, 12);
     }
 
     /// `next.inbox` rides along on the same snapshot read the ranking used.

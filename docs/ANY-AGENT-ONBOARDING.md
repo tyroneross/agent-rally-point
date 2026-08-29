@@ -88,7 +88,9 @@ rally session close --tool <stable-tool-id> --json
 `session close` releases only claims whose authoring `tool` and
 `from_session_id` both match the closing lease, across every engagement. It
 also requires the one-time `RALLY_SESSION_CLOSE_TOKEN` exported by `session
-ensure`; Rally stores only its hash while the lease is active. Never bind close
+ensure`; Rally stores only its hash while the lease is active. After close,
+Rally rejects every later fact carrying that exact tool/session identity; a
+new parent lease is required for more work. Never bind close
 to a per-turn `Stop` callback: one conversation turn ending is not the agent
 session ending. The token prevents a sibling process that only knows the lease
 id from closing it; it does not protect against a same-UID process that can read
