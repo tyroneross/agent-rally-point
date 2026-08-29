@@ -18,6 +18,42 @@ replay unchanged**. Event-kind validation — not the type — decides which ids
 mandatory. New durable writes SHOULD populate the envelope; the stricter
 `from_session_id` requirement is gated (see [Compat mode](#compat-mode)).
 
+## Mixed-version rooms: unknown event kinds
+
+A room may run several rally versions at once, so the two sides of a version gap
+each carry an obligation.
+
+**Readers skip what they cannot name.** A canonical row whose kind this build
+does not know is SKIPPED with a warning on stderr, never graded corruption and
+never a write-blocker. The row stays on disk byte-for-byte for the binaries that
+can read it, and it reaches no work surface — `FactKind::Unknown` appears in no
+claim, handoff, blocker, or `next` bucket. The row's `tool` still reaches the
+agent roster, because the roster reads envelope metadata every
+`agent-rally.fact.v1` row carries rather than interpreting the kind; that peer is
+the binary an operator has to upgrade.
+
+Tolerance stops exactly there. Structural damage stays fail-loud: unparseable
+JSON, a non-positive or broken seq, an unsupported `schema`, an empty
+`event_id`, and any envelope/payload kind disagreement other than the
+forward-compatible case — including an unknown `event_type` whose payload `kind`
+does not match it, which no binary would ever write.
+
+**Writers do not outrun the room.** Each kind carries a schema-floor generation,
+and the room records the floor every participating binary is known to handle in
+`.rally/schema-floor.json` (`agent-rally.schema-floor.v1`). A room with no
+recorded floor, or with an unreadable one, reads as generation 1. Appending a
+kind above the room's floor is refused at the write boundary with two ways
+forward: dual-write the meaning onto a kind at or below the floor, carrying the
+new semantics in a `protocol:` evidence marker older readers ignore; or upgrade
+every binary in the room and then raise the floor with
+`rally doctor --schema-floor --apply`. A room floor ABOVE the running binary
+never blocks the kinds that binary does know — one upgraded peer must not lock
+everyone else out.
+
+Reader tolerance alone is not sufficient, which is why both halves exist: it only
+protects binaries built after it shipped, and the binaries already installed
+elsewhere are exactly the ones a new kind breaks.
+
 ## Envelope fields
 
 | Field | Meaning |

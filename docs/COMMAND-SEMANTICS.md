@@ -109,7 +109,7 @@ therefore receive distinct operation identities.
 | `rally mission` | no | yes | no | yes | GET is read-oriented; `--set`, `--may`, and `--must-check` append mission facts. |
 | `rally backlog list` | no | yes | no | yes | Listing is read-oriented; `add` and `done` append facts. |
 | `rally check-ci` | no | yes | no | yes | Read-only CI health gate; strict mode changes exit code, not ledger state. |
-| `rally doctor` | no | yes | no | yes | Dry inspection by default; `--apply` rewrites the discovery index and is not audit-safe. `--binary-skew` is read-only and never exits non-zero on skew. |
+| `rally doctor` | no | yes | no | yes | Dry inspection by default; `--apply` rewrites the discovery index and is not audit-safe. `--binary-skew` is read-only and never exits non-zero on skew. `--schema-floor` reports the room's recorded event-kind generation; with `--apply` it raises that floor to the running binary's generation, so run it only once every binary participating in the room reads that generation. |
 | `rally enter` | yes | yes | no | no | Stale-state reaping is off by default — an audit found it closed a live agent's claim and widened RC-044. Opt in via `coordination.auto_reap_interval_secs` (config) or `RALLY_AUTO_REAP_INTERVAL_SECS` (env); supported cleanup is `rally doctor --reap-stale --apply`. |
 | `rally retrospective` | no | yes | no | yes | Writes the requested retrospective output file, not ledger facts. |
 | `rally rotate` | yes | yes | no | no | Moves old segments into archive unless `--dry-run` is used. |

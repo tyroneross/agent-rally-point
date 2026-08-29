@@ -3,7 +3,7 @@
 
 //! `rally doctor` — diagnostics and remediation for path hygiene, room registry, and stale state.
 //!
-//! Nine independent modes:
+//! Ten independent modes:
 //!   (no mode)          ledger-health — the default; see below
 //!   --ledger-health    read the JSONL ledger as raw text and report its health
 //!   --repair-ledger    renumber rows to unique increasing seqs (dry-run; write with --apply)
@@ -13,6 +13,7 @@
 //!   --sweep-corrupt    move facts.db.corrupt.* snapshots to the archive (dry-run; move with --apply)
 //!   --compact-log      render a diagnostic log with presence/heartbeat runs collapsed into counts
 //!   --binary-skew      compare the RUNNING binary's build stamp against this repo's HEAD
+//!   --schema-floor     report the room's recorded event-kind floor (raise it with --apply)
 //!   --migrate-db-only  inspect or explicitly migrate a current-format DB-only room offline
 //!
 //! # Two rules this module exists under
@@ -2751,6 +2752,97 @@ pub(crate) fn run_sweep_corrupt(
         apply,
         now_ns,
     ))
+}
+
+// =============================================================================
+// schema-floor logic
+// =============================================================================
+
+/// What `rally doctor --schema-floor` reports.
+///
+/// `room_generation` is what the room records; `binary_generation` is what the
+/// RUNNING binary can read. The gap between them is the whole point: a binary
+/// ahead of the room may not write its newest kinds until every other binary in
+/// the room has caught up and an operator raises the floor.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct SchemaFloorReport {
+    pub(crate) room_generation: u32,
+    pub(crate) binary_generation: u32,
+    /// True when `--apply` actually moved the recorded floor.
+    pub(crate) raised: bool,
+    pub(crate) path: String,
+    pub(crate) note: String,
+}
+
+/// `rally doctor --schema-floor`: report the room's recorded event-kind floor,
+/// and with `--apply`, raise it to this binary's generation.
+///
+/// Raising is an operator decision, never automatic. The floor asserts a fact
+/// about OTHER machines — that every binary participating in this room can read
+/// generation-N kinds — and no single process can observe that. A binary that
+/// raised the floor on its own would be asserting its own newness as room-wide
+/// consensus, which is the mixed-version failure with extra steps.
+pub(crate) fn run_schema_floor(apply: bool) -> Result<SchemaFloorReport> {
+    // Same reasoning as `run_sweep_corrupt`: compute `.rally` directly rather
+    // than opening a store, so this stays usable on a room whose store will not
+    // open.
+    let dir = repo_root()?.join(".rally");
+    let room_generation = crate::store::read_schema_floor(&dir);
+    let binary_generation = crate::store::KIND_GENERATION_CURRENT;
+    let path = dir
+        .join(crate::store::SCHEMA_FLOOR_FILENAME)
+        .display()
+        .to_string();
+
+    if !apply {
+        let note = if room_generation >= binary_generation {
+            format!(
+                "room floor {room_generation} already covers this binary (generation \
+                 {binary_generation}); nothing to raise"
+            )
+        } else {
+            format!(
+                "this binary reads generation {binary_generation}, the room records \
+                 {room_generation}. Re-run with --apply ONLY after every binary participating in \
+                 this room reads generation {binary_generation} — check each with `rally doctor \
+                 --schema-floor`."
+            )
+        };
+        return Ok(SchemaFloorReport {
+            room_generation,
+            binary_generation,
+            raised: false,
+            path,
+            note,
+        });
+    }
+
+    if room_generation >= binary_generation {
+        return Ok(SchemaFloorReport {
+            room_generation,
+            binary_generation,
+            raised: false,
+            path,
+            note: format!("room floor is already {room_generation}; --apply made no change"),
+        });
+    }
+
+    crate::store::write_schema_floor(
+        &dir,
+        binary_generation,
+        &format!("rally {} ({})", env!("CARGO_PKG_VERSION"), crate::BUILD_ID),
+    )?;
+    Ok(SchemaFloorReport {
+        room_generation: binary_generation,
+        binary_generation,
+        raised: true,
+        path,
+        note: format!(
+            "raised the room floor from {room_generation} to {binary_generation}. Any binary in \
+             this room still below generation {binary_generation} will now skip-with-warning the \
+             newer kinds it cannot read."
+        ),
+    })
 }
 
 // =============================================================================

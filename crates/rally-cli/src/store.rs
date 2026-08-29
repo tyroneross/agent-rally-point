@@ -647,6 +647,50 @@ impl FactKind {
         Self::say_kinds().join(", ")
     }
 
+    /// The schema-floor generation at which this kind became writable.
+    ///
+    /// The other half of the mixed-version fix. [`validate_canonical_line`]
+    /// stops an OLD reader from grading a NEW kind as corruption; this stops a
+    /// NEW writer from putting that kind in a room whose readers cannot yet
+    /// handle it. Reader tolerance only protects readers built after the fix —
+    /// binaries already installed elsewhere still wedge, so the writer side has
+    /// to hold too.
+    ///
+    /// Every kind shipped as of generation 1 is generation 1: those are what
+    /// every deployed reader already handles. A new kind takes the next
+    /// generation, and rooms opt into it explicitly via
+    /// `rally doctor --schema-floor --apply` once every participating binary is
+    /// upgraded.
+    ///
+    /// Deliberately exhaustive with no `_` arm, for the same reason
+    /// [`FactKind::advertised_in_say`] is: a new variant must not compile until
+    /// someone decides which generation it belongs to. A `_ => 1` default would
+    /// silently reintroduce exactly the defect this gate exists to prevent.
+    pub(crate) const fn since_generation(&self) -> u32 {
+        match self {
+            Self::Claim
+            | Self::ClaimRenewed
+            | Self::ClaimExpired
+            | Self::Release
+            | Self::Blocker
+            | Self::Resolve
+            | Self::Decision
+            | Self::Artifact
+            | Self::Handoff
+            | Self::Risk
+            | Self::Lesson
+            | Self::Session
+            | Self::Wake
+            | Self::Presence
+            | Self::Read
+            | Self::BacklogItem
+            | Self::Receipt
+            | Self::Standby
+            | Self::Mission
+            | Self::Unknown => 1,
+        }
+    }
+
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "claim" => Some(Self::Claim),
@@ -709,6 +753,178 @@ impl FactKind {
 impl PartialEq<&str> for FactKind {
     fn eq(&self, other: &&str) -> bool {
         self.as_str() == *other
+    }
+}
+
+#[cfg(test)]
+mod schema_floor_tests {
+    use super::{
+        FactKind, KIND_GENERATION_CURRENT, SCHEMA_FLOOR_DEFAULT, SCHEMA_FLOOR_FILENAME,
+        assert_kind_within_schema_floor, read_schema_floor, write_schema_floor,
+    };
+    use crate::store::Fact;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    fn temp_room(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after the Unix epoch")
+            .as_nanos();
+        let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "rally-schema-floor-{name}-{}-{nanos}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn fact_of(kind: FactKind) -> Fact {
+        Fact {
+            kind,
+            ..Fact::default()
+        }
+    }
+
+    /// Every kind shipped today must be generation 1. A kind quietly declared at
+    /// a higher generation would be refused in every existing room, because
+    /// [`SCHEMA_FLOOR_DEFAULT`] is what a room with no recorded floor reports.
+    #[test]
+    fn every_shipped_kind_is_writable_at_the_default_floor() {
+        for kind in FactKind::ALL {
+            assert!(
+                kind.since_generation() <= SCHEMA_FLOOR_DEFAULT,
+                "kind {:?} is generation {} but rooms default to {SCHEMA_FLOOR_DEFAULT}, so it \
+                 would be refused everywhere until an operator raised the floor",
+                kind.as_str(),
+                kind.since_generation()
+            );
+        }
+    }
+
+    /// This binary must be able to write every kind it declares. A
+    /// `KIND_GENERATION_CURRENT` left behind a newly-added kind would refuse that
+    /// kind in a room this binary itself had just raised.
+    #[test]
+    fn this_binary_covers_every_kind_it_declares() {
+        for kind in FactKind::ALL {
+            assert!(
+                kind.since_generation() <= KIND_GENERATION_CURRENT,
+                "kind {:?} is generation {} but KIND_GENERATION_CURRENT is \
+                 {KIND_GENERATION_CURRENT} — raise the constant in the same commit that adds \
+                 the kind",
+                kind.as_str(),
+                kind.since_generation()
+            );
+        }
+    }
+
+    #[test]
+    fn a_room_with_no_recorded_floor_reads_as_generation_one() {
+        let dir = temp_room("absent");
+        assert_eq!(read_schema_floor(&dir), 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every degraded read resolves DOWNWARD. Falling back to this binary's own
+    /// generation would let a damaged sidecar hand the newest binary permission
+    /// to write past every older reader in the room.
+    #[test]
+    fn damaged_or_foreign_floor_files_read_as_generation_one() {
+        for (label, body) in [
+            ("malformed", "{ not json"),
+            ("empty", ""),
+            (
+                "wrong-schema",
+                r#"{"schema":"something.else.v1","kind_generation":99,
+                    "recorded_at":"2026-08-29T03:40:00Z","recorded_by":"x"}"#,
+            ),
+        ] {
+            let dir = temp_room(label);
+            fs::write(dir.join(SCHEMA_FLOOR_FILENAME), body).unwrap();
+            assert_eq!(
+                read_schema_floor(&dir),
+                1,
+                "a {label} floor file must degrade to the lowest floor"
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn a_recorded_floor_round_trips() {
+        let dir = temp_room("roundtrip");
+        write_schema_floor(&dir, 7, "test").unwrap();
+        assert_eq!(read_schema_floor(&dir), 7);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Lowering cannot make an older reader safe — the higher-generation rows are
+    /// already on disk — so a downward move would only hide that they are there.
+    #[test]
+    fn a_recorded_floor_never_moves_down() {
+        let dir = temp_room("monotonic");
+        write_schema_floor(&dir, 7, "test").unwrap();
+        let error = write_schema_floor(&dir, 3, "test").expect_err("lowering must be refused");
+        assert!(
+            error.to_string().contains("refusing to lower"),
+            "unexpected refusal message: {error}"
+        );
+        assert_eq!(read_schema_floor(&dir), 7, "the refused write still landed");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The gate is inert today (every kind is generation 1, every room floors at
+    /// 1), so an inert-path test would prove nothing. Recording a floor BELOW
+    /// generation 1 exercises the exact comparison and the exact refusal a
+    /// future generation-2 kind will hit.
+    #[test]
+    fn a_kind_above_the_room_floor_is_refused_with_both_remedies() {
+        let dir = temp_room("refusal");
+        fs::write(
+            dir.join(SCHEMA_FLOOR_FILENAME),
+            r#"{"schema":"agent-rally.schema-floor.v1","kind_generation":0,
+                "recorded_at":"2026-08-29T03:40:00Z","recorded_by":"test"}"#,
+        )
+        .unwrap();
+
+        let error = assert_kind_within_schema_floor(&dir, &fact_of(FactKind::Decision))
+            .expect_err("a kind above the room floor must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("decision") && message.contains("generation"),
+            "refusal does not name the kind and generation: {message}"
+        );
+        // Both escape hatches must be named, or the operator is told only that
+        // they are stuck. Dual-writing is the one that does not require touching
+        // every other machine first.
+        assert!(
+            message.contains("dual-write"),
+            "refusal does not offer the dual-write path: {message}"
+        );
+        assert!(
+            message.contains("rally doctor --schema-floor --apply"),
+            "refusal does not name the raise command: {message}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_kind_at_or_below_the_room_floor_is_allowed() {
+        let dir = temp_room("allowed");
+        assert!(assert_kind_within_schema_floor(&dir, &fact_of(FactKind::Decision)).is_ok());
+        write_schema_floor(&dir, 42, "test").unwrap();
+        assert!(
+            assert_kind_within_schema_floor(&dir, &fact_of(FactKind::Decision)).is_ok(),
+            "a room floor ABOVE this binary must not block the kinds it does know — \
+             one upgraded peer must not lock every other binary out of the room"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 }
 
@@ -2853,7 +3069,85 @@ enum ActiveTailRepair {
     TruncateTo(u64),
 }
 
+/// Kinds already warned about in this process, so a 10k-line segment carrying
+/// one unknown kind emits one warning rather than 10k. Keyed by the on-disk
+/// spelling, so two different future kinds each still get their own line.
+static UNKNOWN_FUTURE_KIND_WARNINGS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+
+/// Classify a kind this build does not recognise.
+///
+/// Returns `Some(kind)` only when the row is VERSION SKEW rather than data
+/// damage — a newer binary wrote a kind that did not exist when this reader was
+/// compiled, and the row is otherwise internally consistent. Three conditions,
+/// all required:
+///
+/// 1. `fact.kind` fell through to [`FactKind::Unknown`], serde's
+///    `#[serde(other)]` arm. A kind this reader DOES know that disagrees with
+///    the envelope is a real inconsistency, and stays corruption.
+/// 2. [`FactKind::parse`] also does not recognise the envelope spelling. `parse`
+///    is a hand-written table independent of serde's; requiring both to miss
+///    means neither surface knows this kind, which is what "newer than me"
+///    actually means.
+/// 3. The payload literally carries the same `kind` string as the envelope
+///    `event_type`. This is the check that keeps genuine damage loud: a row
+///    whose `kind` is absent, non-string, or disagrees with its envelope is not
+///    a future kind, it is a broken row.
+fn unknown_future_kind<'a>(entry: &'a LedgerLine, fact: &Fact) -> Option<&'a str> {
+    if fact.kind != FactKind::Unknown || FactKind::parse(&entry.event_type).is_some() {
+        return None;
+    }
+    let payload_kind = entry.payload.get("kind").and_then(Value::as_str)?;
+    (payload_kind == entry.event_type).then_some(payload_kind)
+}
+
+/// Log a future kind once per process. Deliberately a log and not a fact: this
+/// fires from every read path, and appending a fact on read would turn
+/// `rally room` into a mutation of the ledger it is reporting on.
+fn warn_unknown_future_kind(path: &Path, line_number: usize, kind: &str) {
+    let Ok(mut seen) = UNKNOWN_FUTURE_KIND_WARNINGS
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+    else {
+        // A poisoned warning set must never take down a read. Losing a warning
+        // costs an operator one hint; panicking here costs them the room.
+        return;
+    };
+    if !seen.insert(kind.to_string()) {
+        return;
+    }
+    eprintln!(
+        "rally: warning: {} line {} carries event kind {:?}, which this rally build does not \
+         know (written by a newer binary). Skipping it; every other row is unaffected. Upgrade \
+         this binary to read it.",
+        path.display(),
+        line_number,
+        kind
+    );
+}
+
+/// Validate one canonical row.
+///
+/// The kind check is the only tolerant one, and it is tolerant in exactly one
+/// direction. RC: a room running mixed rally versions wedged completely — a
+/// single `session.closed` row from a newer binary made `FactKind` fall to
+/// `Unknown`, whose `as_str()` is `"unknown"`, so `"session.closed" != "unknown"`
+/// graded the row corrupt. Because `inspect_active_segment_tail` validates every
+/// completed line before any append, that one row blocked every subsequent WRITE
+/// by every older binary in the room. Nothing was damaged: the segment was 100%
+/// valid JSON with no seq breaks. Version skew was being graded as data damage.
+///
+/// Everything else here stays fail-loud, because everything else IS data damage:
+/// unparseable JSON (the caller's `serde_json` step), a non-positive seq, an
+/// unsupported `schema`, an empty `event_id`, and any kind mismatch that is not
+/// the narrow forward-compatible case [`unknown_future_kind`] describes.
 fn validate_canonical_line(entry: &LedgerLine) -> Result<Fact> {
+    validate_canonical_line_at(entry, Path::new("<segment>"), 0)
+}
+
+/// [`validate_canonical_line`] with the location a forward-compat warning should
+/// name. Callers that know the file and line pass them; the rest get a generic
+/// placeholder rather than a wrong-but-specific location.
+fn validate_canonical_line_at(entry: &LedgerLine, path: &Path, line_number: usize) -> Result<Fact> {
     if entry.seq <= 0 {
         return Err(RallyError::Message(format!(
             "canonical segment row has non-positive seq {}",
@@ -2873,11 +3167,14 @@ fn validate_canonical_line(entry: &LedgerLine) -> Result<Fact> {
         ));
     }
     if entry.event_type != fact.kind.as_str() {
-        return Err(RallyError::Message(format!(
-            "canonical segment event_type {:?} does not match payload kind {:?}",
-            entry.event_type,
-            fact.kind.as_str()
-        )));
+        let Some(kind) = unknown_future_kind(entry, &fact) else {
+            return Err(RallyError::Message(format!(
+                "canonical segment event_type {:?} does not match payload kind {:?}",
+                entry.event_type,
+                fact.kind.as_str()
+            )));
+        };
+        warn_unknown_future_kind(path, line_number, kind);
     }
     Ok(fact)
 }
@@ -2917,7 +3214,7 @@ fn inspect_active_segment_tail(path: &Path) -> Result<ActiveTailRepair> {
                 error
             ))
         })?;
-        validate_canonical_line(&entry).map_err(|error| {
+        validate_canonical_line_at(&entry, path, index + 1).map_err(|error| {
             RallyError::Message(format!(
                 "completed canonical segment corruption in {} at line {}: {}",
                 path.display(),
@@ -2933,15 +3230,16 @@ fn inspect_active_segment_tail(path: &Path) -> Result<ActiveTailRepair> {
     }
     match serde_json::from_slice::<LedgerLine>(tail) {
         Ok(entry) => {
-            validate_canonical_line(&entry).map_err(|error| {
+            let line_number = bytes[..completed_end]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count()
+                + 1;
+            validate_canonical_line_at(&entry, path, line_number).map_err(|error| {
                 RallyError::Message(format!(
                     "unterminated canonical segment corruption in {} at line {}: {}",
                     path.display(),
-                    bytes[..completed_end]
-                        .iter()
-                        .filter(|byte| **byte == b'\n')
-                        .count()
-                        + 1,
+                    line_number,
                     error
                 ))
             })?;
@@ -4423,6 +4721,12 @@ impl DirectRoomStore {
         } else {
             crate::write_authority::assert_field_bounds(&fact)?;
         }
+        // Sits here, beside the authority checks, for the reason the block
+        // comment above gives: this is the one gate every durable write passes,
+        // in BOTH store modes. Gating at the commands instead would leave the
+        // daemon path — and any future write surface — ungated, which is the
+        // exact shape of the three defects that put this block here.
+        assert_kind_within_schema_floor(rally_dir_for_segment(&active_segment)?, &fact)?;
         if fact.kind == FactKind::Claim {
             let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
             // RC-037: gate room-wide breadth BEFORE conflict detection. A
@@ -8586,7 +8890,7 @@ fn read_segment_entries_matching_with_policy(
 
         match serde_json::from_slice::<LedgerLine>(&bytes) {
             Ok(entry) => {
-                validate_canonical_line(&entry).map_err(|error| {
+                validate_canonical_line_at(&entry, path, line_number).map_err(|error| {
                     RallyError::Message(format!(
                         "completed canonical segment corruption in {} at line {}: {}",
                         path.display(),
@@ -9421,6 +9725,127 @@ pub(crate) fn prune_corrupt_quarantine(dir: &Path, base: &str) -> Result<PruneSt
 /// two can never disagree about what counts as "one group".
 pub(crate) fn count_corrupt_quarantine_groups(dir: &Path, base: &str) -> usize {
     scan_corrupt_quarantine_groups(dir, base).len()
+}
+
+// ---------------------------------------------------------------------------
+// Room schema floor (writer discipline for mixed-version rooms)
+// ---------------------------------------------------------------------------
+
+/// The highest kind generation THIS binary can read (see
+/// [`FactKind::since_generation`]). Raise it in the same commit that adds a kind
+/// at a new generation, never on its own.
+pub(crate) const KIND_GENERATION_CURRENT: u32 = 1;
+
+/// Filename of the room's recorded schema floor.
+///
+/// A SIBLING of `.rally/log/`, never a file inside it — for the same reason
+/// [`CORRUPTION_COUNTER_FILENAME`] is: `rally watch` polls the segment index
+/// under `log/` for its `max_seq`, so a write in that directory self-triggers
+/// every watcher in the room.
+pub(crate) const SCHEMA_FLOOR_FILENAME: &str = "schema-floor.json";
+
+/// The generation assumed for a room that has never recorded a floor.
+///
+/// 1, deliberately: every room that predates this file was written by binaries
+/// that only ever emit generation-1 kinds, so treating "absent" as 1 makes an
+/// existing room behave exactly as it did before the gate existed. Defaulting to
+/// [`KIND_GENERATION_CURRENT`] instead would let the newest binary in the room
+/// declare its own floor and write straight past every older reader — the
+/// failure this gate exists to stop.
+pub(crate) const SCHEMA_FLOOR_DEFAULT: u32 = 1;
+
+/// The room's recorded reader floor: the newest kind generation every binary
+/// participating in this room is known to handle.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct SchemaFloor {
+    pub(crate) schema: String,
+    pub(crate) kind_generation: u32,
+    pub(crate) recorded_at: String,
+    pub(crate) recorded_by: String,
+}
+
+pub(crate) const SCHEMA_FLOOR_SCHEMA: &str = "agent-rally.schema-floor.v1";
+
+/// Read the recorded floor, treating a missing, unreadable, malformed, or
+/// wrong-schema file as [`SCHEMA_FLOOR_DEFAULT`].
+///
+/// Tolerant on purpose and safe in the tolerant direction: every failure mode
+/// resolves to the LOWEST floor, which refuses more writes rather than fewer. A
+/// hard error here would take down every write in a room over a damaged
+/// telemetry-sized sidecar.
+pub(crate) fn read_schema_floor(rally_dir: &Path) -> u32 {
+    fs::read_to_string(rally_dir.join(SCHEMA_FLOOR_FILENAME))
+        .ok()
+        .and_then(|text| serde_json::from_str::<SchemaFloor>(&text).ok())
+        .filter(|floor| floor.schema == SCHEMA_FLOOR_SCHEMA)
+        .map_or(SCHEMA_FLOOR_DEFAULT, |floor| floor.kind_generation)
+}
+
+/// Record a new floor for the room. Atomic (temp file + rename), matching the
+/// convention `record_corruption_event` uses.
+///
+/// Monotonic: refuses to LOWER a recorded floor. Lowering cannot make an old
+/// reader safe — the rows written at the higher generation are already on disk —
+/// so a downward move would only hide that they are there.
+pub(crate) fn write_schema_floor(
+    rally_dir: &Path,
+    generation: u32,
+    recorded_by: &str,
+) -> Result<()> {
+    let current = read_schema_floor(rally_dir);
+    if generation < current {
+        return Err(RallyError::Usage(format!(
+            "room schema floor is already {current}; refusing to lower it to {generation}. Rows \
+             written at generation {current} are already on disk, so lowering the floor would \
+             hide them rather than make an older reader able to read them."
+        )));
+    }
+    let floor = SchemaFloor {
+        schema: SCHEMA_FLOOR_SCHEMA.to_string(),
+        kind_generation: generation,
+        recorded_at: now_string(),
+        recorded_by: recorded_by.to_string(),
+    };
+    let content = serde_json::to_string_pretty(&floor)
+        .map(|text| format!("{text}\n"))
+        .map_err(RallyError::json("render schema floor"))?;
+    let path = rally_dir.join(SCHEMA_FLOOR_FILENAME);
+    let temp_path = rally_dir.join(format!("{SCHEMA_FLOOR_FILENAME}.tmp-{}", short_id()));
+    fs::write(&temp_path, content)
+        .map_err(RallyError::io(format!("write {}", temp_path.display())))?;
+    if let Err(error) = fs::rename(&temp_path, &path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(RallyError::io(format!("persist {}", path.display()))(error));
+    }
+    Ok(())
+}
+
+/// Refuse to append a kind newer than the room's recorded floor.
+///
+/// This is the control that would have stopped the incident at its source: the
+/// newer binary that introduced `session.closed` into a room of older readers
+/// would have been refused here, instead of wedging every writer in the room.
+///
+/// The alternative an author may choose instead of raising the floor is to
+/// DUAL-WRITE: emit a kind that already sits at or below the floor and carry the
+/// new meaning in a `protocol:` evidence marker, which older readers ignore and
+/// newer ones interpret. `session.closed` already had that representation
+/// available — it carries `protocol:session_state=closed` — so writing it as a
+/// `session` fact would have been readable by every binary in the room.
+fn assert_kind_within_schema_floor(rally_dir: &Path, fact: &Fact) -> Result<()> {
+    let required = fact.kind.since_generation();
+    let floor = read_schema_floor(rally_dir);
+    if required <= floor {
+        return Ok(());
+    }
+    Err(RallyError::Usage(format!(
+        "event kind {:?} needs schema-floor generation {required}, but this room records \
+         generation {floor}. Older binaries in this room cannot read generation-{required} rows. \
+         Either dual-write the meaning onto a kind at or below generation {floor} (a `protocol:` \
+         evidence marker older readers ignore), or upgrade every binary participating in this \
+         room and then raise the floor with `rally doctor --schema-floor --apply`.",
+        fact.kind.as_str()
+    )))
 }
 
 /// Filename of the persisted corruption-recurrence counter.
