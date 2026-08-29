@@ -1,16 +1,16 @@
 // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Direct-vs-routed behaviour parity for the four `#[serde(skip)]` snapshot
+//! Direct-vs-routed behaviour parity for the six `#[serde(skip)]` snapshot
 //! projections (design audit D1 and D6).
 //!
 //! # What was wrong
 //!
 //! `RoomSnapshot::{content_max_seq, last_activity_ts, pending_wakes,
-//! stale_authors}` are `#[serde(skip)]` so they stay out of the public room
-//! JSON. The daemon serialized the snapshot with the same impl, so routing also
-//! dropped them — and three behaviours changed depending on whether `rallyd`
-//! happened to be running:
+//! open_obligations, stale_authors, author_last_seen}` are `#[serde(skip)]` so
+//! they stay out of the public room JSON. The daemon serialized the snapshot
+//! with the same impl, so routing also dropped them — and three behaviours
+//! changed depending on whether `rallyd` happened to be running:
 //!
 //! 1. **Ranking.** `apply_budget` demotes items whose author is in
 //!    `stale_authors`. Empty over the wire means nothing is ever demoted, so the
@@ -24,6 +24,14 @@
 //!    so a routed caller appends a DUPLICATE wake intent on every poll.
 //! 4. **Global status age.** `status_global` reads `last_activity_ts` from the
 //!    snapshot. Empty over the wire makes an active room look timestamp-less.
+//!
+//! `open_obligations` and `author_last_seen` joined the list after these tests
+//! were written and ride the same side channel. Neither has a routed-behaviour
+//! test HERE: `open_obligations` is covered by
+//! `store::obligation_projection_tests::open_obligations_ride_the_wire_and_fail_loud_past_the_bound`
+//! and by `tests/user_journey.rs`, and `author_last_seen` by the destructive-
+//! reclaim tests. Named so the count and the coverage do not silently diverge
+//! again.
 //!
 //! # Why these tests are shaped this way
 //!

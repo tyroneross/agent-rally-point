@@ -6408,7 +6408,14 @@ pub(crate) fn fact_requires_ack(fact: &Fact) -> bool {
 ///
 /// `external-intake` is excluded for the same reason `open_handoffs` excludes it
 /// (B18): those facts are not repo-local coordination work.
-fn fact_is_addressed_obligation(fact: &Fact) -> bool {
+///
+/// `pub(crate)` so that `retract_in_room`'s authorship arm decides "is this an
+/// addressed obligation?" by CALLING this predicate rather than restating it.
+/// ARP-R-02 is the register entry for what restating a predicate costs: the
+/// projection's set of closing kinds and the gate's set of authorized kinds
+/// drifted apart, and the gap was a bypass. A write-side guard keyed off the
+/// same function the read side projects from cannot drift.
+pub(crate) fn fact_is_addressed_obligation(fact: &Fact) -> bool {
     let Some(target) = fact.target.as_deref() else {
         return false;
     };
@@ -6423,6 +6430,36 @@ fn fact_is_addressed_obligation(fact: &Fact) -> bool {
         FactKind::Artifact => fact_requires_ack(fact),
         _ => false,
     }
+}
+
+/// Candidate closers keyed by the id they reference, built in ONE pass.
+///
+/// `obligation_is_acked` used to scan the whole slice per obligation, making the
+/// projection O(obligations x facts) — and the projection runs on EVERY snapshot,
+/// which is every hook fire. This repo's performance agreement already records
+/// that hook cost scales with ledger size (O39), so quadratic growth here is a
+/// regression vector a peer can drive on purpose simply by addressing more
+/// obligations to one id. The index makes it linear.
+///
+/// Deliberately NOT a cap. A bounded index would answer the cost problem by
+/// silently dropping closers, and a dropped closer means an obligation the
+/// receiver already answered stays in its inbox — the mirror of the false-empty
+/// defect this bucket exists to remove, and just as dishonest.
+fn closers_by_ref(facts: &[Fact]) -> BTreeMap<&str, Vec<&Fact>> {
+    let mut by_ref: BTreeMap<&str, Vec<&Fact>> = BTreeMap::new();
+    for fact in facts {
+        if !matches!(
+            fact.kind,
+            FactKind::Resolve | FactKind::Receipt | FactKind::Artifact
+        ) {
+            continue;
+        }
+        let Some(ref_id) = fact.ref_id.as_deref() else {
+            continue;
+        };
+        by_ref.entry(ref_id).or_default().push(fact);
+    }
+    by_ref
 }
 
 /// Is `closer` an ack of `obligation` AUTHORED BY THE RECEIVER?
@@ -6469,7 +6506,13 @@ fn receiver_ack_closes_obligation(obligation: &Fact, closer: &Fact) -> bool {
     //
     // When the obligation DOES carry a strict `to_session_id`, keep
     // `strict_handoff_target_session`'s guarantee that a same-tool sibling
-    // session cannot manufacture completion.
+    // session cannot manufacture completion. The write boundary validates new
+    // referenced handoffs against the referenced fact or one exact active
+    // managed session, so an arbitrary sender cannot plant an unsatisfiable
+    // binding through the supported CLI. Historical malformed rows stay strict:
+    // weakening them here would let a same-tool sibling answer for another
+    // session. The sender can withdraw its own request through the separately
+    // authorized retraction path.
     if let Some(expected_session) = strict_handoff_target_session(obligation)
         && closer.from_session_id.as_deref() != Some(expected_session)
     {
@@ -6478,10 +6521,14 @@ fn receiver_ack_closes_obligation(obligation: &Fact, closer: &Fact) -> bool {
     true
 }
 
-fn obligation_is_acked(obligation: &Fact, facts: &[Fact]) -> bool {
-    facts
-        .iter()
-        .any(|closer| receiver_ack_closes_obligation(obligation, closer))
+fn obligation_is_acked(obligation: &Fact, closers: &BTreeMap<&str, Vec<&Fact>>) -> bool {
+    closers
+        .get(obligation.event_id.as_str())
+        .is_some_and(|candidates| {
+            candidates
+                .iter()
+                .any(|closer| receiver_ack_closes_obligation(obligation, closer))
+        })
 }
 
 /// Open addressed obligations, oldest first.
@@ -6495,11 +6542,27 @@ fn obligation_is_acked(obligation: &Fact, facts: &[Fact]) -> bool {
 /// * **No reaper arm** — see `receiver_ack_closes_obligation`.
 /// * **No count cap.** `MAX_WIRE_OPEN_OBLIGATIONS` fails loud on the daemon wire
 ///   and `rally inbox --limit` bounds the render; neither silently drops a row.
+///
+/// # The ONE removal that is not an ack, and where it is gated
+///
+/// `snapshot_from_facts_with_policy_at` drops retracted facts from the slice
+/// BEFORE this function ever sees them, so `rally retract <obligation-id>` takes
+/// an item out of every inbox without any ack from anyone. That is not a hole in
+/// the rule above — it is a fifth erasure path arriving through a different door,
+/// and the guard for it lives at the WRITE boundary rather than here, in
+/// `retract_in_room` (`lib.rs`), which refuses to withdraw an addressed
+/// obligation unless the caller is its author or its addressee. Read-side
+/// filtering could not have done the job: the retraction is already committed by
+/// the time any projection runs, and re-surfacing a withdrawn fact would break
+/// retraction's own contract that a withdrawn fact leaves every bucket.
 fn project_open_obligations(facts: &[Fact]) -> Vec<Fact> {
+    // One pass each, then a lookup per obligation. See `closers_by_ref` for why
+    // the previous per-obligation scan was a cost regression a peer could drive.
+    let closers = closers_by_ref(facts);
     let mut open = facts
         .iter()
         .filter(|fact| fact_is_addressed_obligation(fact))
-        .filter(|fact| !obligation_is_acked(fact, facts))
+        .filter(|fact| !obligation_is_acked(fact, &closers))
         .cloned()
         .collect::<Vec<_>>();
     open.sort_by_key(|fact| fact.seq);
@@ -6842,11 +6905,42 @@ fn snapshot_from_facts_with_policy_at(
     // the inbox without the hook paying an extra process spawn per fire (the
     // repo's performance agreement counts spawns as an attributed cost).
     let open_obligations = project_open_obligations(facts);
+    // Tools that have AUTHORED at least one fact here — the room's evidence that
+    // an agent by that name has actually been present.
+    //
+    // `fact.tool` and never `fact.target`, for the same reason
+    // `attested_sessions_by_author` gives: `target` is picked by the sender, so a
+    // set built from it would be attested by the very write it is meant to grade.
+    let tools_present_in_room = facts
+        .iter()
+        .filter_map(|fact| fact.tool.as_deref())
+        .collect::<BTreeSet<_>>();
     // Artifact ids the decay filter below must NOT archive. See the exemption
     // site for why this is a correctness rule and not a presentation one.
+    //
+    // Narrowed to obligations whose TARGET has spoken in this room. Nothing
+    // checks that a `--target` names an agent that exists, so
+    // `rally say artifact --target claude_code:ghost-99 --evidence requires_ack`
+    // is addressed to nobody, can never be acked by anybody, and — without this
+    // narrowing — pins itself out of the archive floor forever. That is an
+    // unbounded write-path lever, since `unconsumed_artifacts` is a write-path
+    // authority.
+    //
+    // The trade, stated rather than assumed: a `requires_ack` artifact addressed
+    // to an agent that has not yet spoken in the room decays exactly as it did
+    // before this feature. That is the right direction. Nothing is lost — the
+    // item still appears in `open_obligations` and still lists in `rally inbox`
+    // for that id — and the ONLY thing withdrawn is an exemption from an
+    // age heuristic, granted on behalf of a receiver the room has never seen. The
+    // moment that agent enters and writes anything, the exemption applies again.
     let unacked_obligation_ids = open_obligations
         .iter()
         .filter(|fact| fact.kind == FactKind::Artifact)
+        .filter(|fact| {
+            fact.target
+                .as_deref()
+                .is_some_and(|target| tools_present_in_room.contains(target))
+        })
         .map(|fact| fact.event_id.as_str())
         .collect::<BTreeSet<_>>();
     let pending_wakes = facts
@@ -10145,7 +10239,12 @@ impl DirectRoomStore {
 // longer TTL could cross a liveness decision boundary.
 
 const SNAPSHOT_CACHE_FILENAME: &str = "snapshot.cache.json";
-const SNAPSHOT_CACHE_GENERATION: u32 = 2;
+/// Bumped 2 -> 3 when [`SnapshotCacheEnvelope`] started carrying
+/// [`SnapshotInternals`]. A generation-2 file on disk deserializes cleanly into
+/// the new envelope (the field is `#[serde(default)]`) and would hand back a
+/// snapshot whose internals are EMPTY — the precise silent-empty answer the
+/// carrier exists to prevent. The bump makes those files miss instead.
+const SNAPSHOT_CACHE_GENERATION: u32 = 3;
 
 /// Snapshot and freshness proof captured while one room mutation lock is held.
 /// This pair is the only value accepted by the cache writer.
@@ -10164,6 +10263,25 @@ struct SnapshotCacheEnvelope {
     fingerprint: SnapshotCacheFingerprint,
     /// Projected `RoomSnapshot` for the fingerprinted ledger state.
     snapshot: RoomSnapshot,
+    /// The six `#[serde(skip)]` projections, which plain serde writes ABSENT and
+    /// reloads EMPTY.
+    ///
+    /// The cache had the same defect the daemon wire had before
+    /// [`SnapshotInternals`] existed, for the same reason: `#[serde(skip)]` was
+    /// answering "keep this out of the public room JSON" and, as nobody's
+    /// decision, also answering "drop this on every serialization boundary". The
+    /// wire got a side channel; this envelope did not.
+    ///
+    /// It was latent, not live: `try_load_cached_snapshot_for`'s only caller is
+    /// `command_check`, and `check.rs` reads none of the six. But that function's
+    /// own doc comment invites `status` / `next` / `room` to join, and `next`
+    /// embeds `open_obligations` as `next.inbox` — so the first caller to accept
+    /// that invitation would report an EMPTY inbox from a fresh cache, which is
+    /// exactly the false-empty this feature exists to remove. Carrying the
+    /// internals costs one field and removes the trap rather than posting a
+    /// warning sign next to it.
+    #[serde(default)]
+    internals: SnapshotInternals,
     /// ISO-8601 stamp for observability (not part of the freshness check).
     cached_at: String,
 }
@@ -10278,7 +10396,9 @@ fn try_load_cached_snapshot_at(rally_dir: &Path, projection_unix_sec: i64) -> Op
     let coord = crate::hooks_config::resolve_coordination(repo_root).ok()?;
     let now = snapshot_cache_fingerprint_at(rally_dir, projection_unix_sec, false, &coord).ok()?;
     if envelope.fingerprint == now {
-        Some(envelope.snapshot)
+        let mut snapshot = envelope.snapshot;
+        snapshot.restore_internals(envelope.internals);
+        Some(snapshot)
     } else {
         None
     }
@@ -10294,6 +10414,7 @@ pub(crate) fn write_snapshot_cache(rally_dir: &Path, capture: &SnapshotCacheCapt
     };
     let envelope = SnapshotCacheEnvelope {
         fingerprint,
+        internals: capture.snapshot.internals(),
         snapshot: capture.snapshot.clone(),
         cached_at: now_string(),
     };
@@ -10321,6 +10442,12 @@ pub(crate) fn write_snapshot_cache(rally_dir: &Path, capture: &SnapshotCacheCapt
 /// snapshot when one is available. Convenience wrapper used by hot read-only
 /// paths (the before-write gate today; status / next / room are candidates
 /// for a follow-up extension).
+///
+/// That invitation is now safe to accept: the returned snapshot carries its
+/// [`SnapshotInternals`] restored, so a cached `next` reports the same
+/// `content_max_seq`, `stale_authors` and `open_obligations` a freshly-projected
+/// one would. Before that, taking it up would have given `next` a silently empty
+/// inbox and a read position stuck at 0.
 pub(crate) fn try_load_cached_snapshot_for(repo_root: &Path) -> Option<RoomSnapshot> {
     try_load_cached_snapshot(&repo_root.join(".rally"))
 }
@@ -17288,6 +17415,51 @@ mod ledger_tests {
     }
 
     #[test]
+    fn snapshot_cache_preserves_private_obligation_internals() {
+        // The cache fingerprint includes the effective coordination policy,
+        // which is partly sourced from process-global environment variables.
+        // Serialize capture and lookup with tests that temporarily mutate that
+        // environment so this round-trip exercises internals, not a policy race.
+        let _env_lock = crate::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = unique_root("snapshot-cache-obligation-internals");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let mut handoff = make_fact(
+            "cached-open-obligation",
+            FactKind::Handoff,
+            "review",
+            "cache must preserve the private inbox projection",
+        );
+        handoff.target = Some("codex".to_string());
+        store.append_fact(&handoff).unwrap();
+
+        let capture = store.snapshot_cache_capture(false).unwrap();
+        assert_eq!(
+            capture
+                .snapshot
+                .open_obligations
+                .iter()
+                .map(|fact| fact.event_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cached-open-obligation"]
+        );
+        let rally_dir = root.join(".rally");
+        write_snapshot_cache(&rally_dir, &capture);
+        let cached = try_load_cached_snapshot(&rally_dir).expect("fresh cache");
+        assert_eq!(
+            cached
+                .open_obligations
+                .iter()
+                .map(|fact| fact.event_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cached-open-obligation"],
+            "serde-skipped internals must round-trip through the cache side channel"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn o26_snapshot_cache_expires_across_no_write_liveness_transition() {
         let root = unique_root("o26-snapshot-cache-liveness-time");
         let rally_dir = root.join(".rally");
@@ -19495,10 +19667,11 @@ mod obligation_projection_tests {
             "strict-handoff",
         );
         sibling.from_session_id = Some("session-codex-b".to_string());
+        sibling.evidence = vec!["ack_session_mismatch".to_string()];
         assert_eq!(
             ids(&project(&[handoff.clone(), sibling]).open_obligations),
             vec!["strict-handoff"],
-            "a sibling session must not answer for the bound receiver"
+            "a sibling session must not answer for the bound receiver, even with a self-declared mismatch marker"
         );
 
         let mut bound = closer("bound-ack", 2, FactKind::Receipt, "codex", "strict-handoff");
@@ -19539,14 +19712,21 @@ mod obligation_projection_tests {
     /// archives exactly as before.
     #[test]
     fn decay_exempts_an_unacked_targeted_obligation_but_nothing_else() {
+        let target_present = fact("codex-present", 0, FactKind::Presence, "codex");
         let owed = aged_requires_ack_artifact("owed-artifact", 1, "codex", THIRTY_DAYS_SECS);
         let acked = aged_requires_ack_artifact("acked-artifact", 2, "codex", THIRTY_DAYS_SECS);
         let ack = closer("ack", 3, FactKind::Receipt, "codex", "acked-artifact");
         let mut untargeted =
             aged_requires_ack_artifact("untargeted-artifact", 4, "codex", THIRTY_DAYS_SECS);
         untargeted.target = None;
+        let ghost = aged_requires_ack_artifact(
+            "ghost-artifact",
+            5,
+            "codex:never-present",
+            THIRTY_DAYS_SECS,
+        );
 
-        let snapshot = project(&[owed, acked, ack, untargeted]);
+        let snapshot = project(&[target_present, owed, acked, ack, untargeted, ghost]);
 
         assert!(
             snapshot
@@ -19567,6 +19747,17 @@ mod obligation_projection_tests {
         assert!(
             !archived.contains(&"owed-artifact"),
             "the open obligation must not be archived: {archived:?}"
+        );
+        assert!(
+            archived.contains(&"ghost-artifact"),
+            "an obligation addressed to a tool never seen in the room must not pin the write-path archive floor: {archived:?}"
+        );
+        assert!(
+            snapshot
+                .open_obligations
+                .iter()
+                .any(|fact| fact.event_id == "ghost-artifact"),
+            "archiving from the write-path bucket must not erase the obligation from its dedicated inbox projection"
         );
     }
 
