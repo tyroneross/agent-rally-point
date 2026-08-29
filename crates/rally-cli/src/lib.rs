@@ -9315,9 +9315,7 @@ fn session_capability_markers(fact: &Fact) -> BTreeMap<String, String> {
 fn explicit_session_transition(fact: &Fact) -> Option<SessionTransition> {
     let tool = fact.tool.clone()?;
     let session_id = fact.from_session_id.clone()?;
-    let state = if fact.kind == FactKind::SessionClosed
-        && evidence_value(fact, "protocol:session_state=") == Some("closed")
-    {
+    let state = if crate::store::is_session_close_fact(fact) {
         "closed"
     } else if fact.kind == FactKind::Presence
         && evidence_value(fact, "protocol:session_state=") == Some("active")
@@ -9536,7 +9534,7 @@ fn command_session_ensure(json: bool, args: SessionEnsureArgs) -> Result<Output>
     let room = RoomStore::open()?;
     let facts = room.facts()?;
     if facts.iter().any(|fact| {
-        fact.kind == FactKind::SessionClosed
+        crate::store::is_session_close_fact(fact)
             && fact.tool.as_deref() == Some(args.tool.as_str())
             && fact.from_session_id.as_deref() == Some(identity.from_session_id())
     }) {
@@ -9808,7 +9806,11 @@ fn command_session_close(json: bool, args: SessionCloseArgs) -> Result<Output> {
             event_id,
             seq: 0,
             thread_id: stable_operation_id("session-close-thread", &session_id),
-            kind: FactKind::SessionClosed,
+            // Compatibility dual-write: old binaries already understand the
+            // `session` kind and ignore protocol markers they do not know.
+            // Keep `SessionClosed` only for reading rows written before the
+            // schema-floor gate landed.
+            kind: FactKind::Session,
             tool: Some(args.tool.clone()),
             role: None,
             subject: format!("session closed: {session_id}"),

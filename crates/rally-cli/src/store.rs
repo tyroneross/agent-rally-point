@@ -694,6 +694,11 @@ impl FactKind {
             | Self::Standby
             | Self::Mission
             | Self::Unknown => 1,
+            // Kept as a read-only compatibility variant for rows already
+            // written by the short-lived v2 lifecycle implementation. New
+            // closes use the generation-1 `session` kind with the
+            // `protocol:session_state=closed` marker instead.
+            Self::SessionClosed => 2,
         }
     }
 
@@ -801,12 +806,15 @@ mod schema_floor_tests {
         }
     }
 
-    /// Every kind shipped today must be generation 1. A kind quietly declared at
-    /// a higher generation would be refused in every existing room, because
-    /// [`SCHEMA_FLOOR_DEFAULT`] is what a room with no recorded floor reports.
+    /// Every kind this build may author in a generation-1 room must remain
+    /// writable there. `session.closed` is a read-only compatibility variant;
+    /// new closes use `session` plus a protocol marker.
     #[test]
-    fn every_shipped_kind_is_writable_at_the_default_floor() {
-        for kind in FactKind::ALL {
+    fn every_generation_one_kind_is_writable_at_the_default_floor() {
+        for kind in FactKind::ALL
+            .iter()
+            .filter(|kind| kind.as_str() != "session.closed")
+        {
             assert!(
                 kind.since_generation() <= SCHEMA_FLOOR_DEFAULT,
                 "kind {:?} is generation {} but rooms default to {SCHEMA_FLOOR_DEFAULT}, so it \
@@ -815,6 +823,7 @@ mod schema_floor_tests {
                 kind.since_generation()
             );
         }
+        assert!(FactKind::SessionClosed.since_generation() > SCHEMA_FLOOR_DEFAULT);
     }
 
     /// This binary must be able to write every kind it declares. A
@@ -886,6 +895,46 @@ mod schema_floor_tests {
             "unexpected refusal message: {error}"
         );
         assert_eq!(read_schema_floor(&dir), 7, "the refused write still landed");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_floor_raise_cannot_commit_a_lower_generation_last() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = temp_room("concurrent-monotonic");
+        let held = super::acquire_room_mutation_lock(&dir).unwrap();
+        let writer_dir = dir.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = write_schema_floor(&writer_dir, 2, "generation-2")
+                .map_err(|error| error.to_string());
+            done_tx.send(result).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "the competing writer bypassed the held room mutation lock"
+        );
+        super::write_schema_floor_under_lock(&dir, 3, "generation-3").unwrap();
+        drop(held);
+
+        let error = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .expect_err("the delayed generation-2 writer must observe and refuse generation 3");
+        assert!(
+            error.contains("refusing to lower"),
+            "unexpected error: {error}"
+        );
+        writer.join().unwrap();
+        assert_eq!(read_schema_floor(&dir), 3);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1039,7 +1088,7 @@ mod fact_kind_say_surface_tests {
         );
         assert!(
             !FactKind::SessionClosed.advertised_in_say(),
-            "session.closed is authored only by the exact-session close command"
+            "session.closed is read-only compatibility; new closes use session plus a marker"
         );
         assert!(FactKind::parse("session.closed").is_none());
         assert!(FactKind::parse("session_closed").is_none());
@@ -3311,6 +3360,20 @@ fn validate_canonical_line_at(entry: &LedgerLine, path: &Path, line_number: usiz
             "canonical segment row has an empty event_id".to_string(),
         ));
     }
+    // `#[serde(other)]` collapses every unknown payload spelling to
+    // `FactKind::Unknown`. When the envelope itself says the known literal
+    // `unknown`, comparing only against `fact.kind.as_str()` would therefore
+    // accept a payload that actually says some different future kind.
+    if fact.kind == FactKind::Unknown && entry.event_type == FactKind::Unknown.as_str() {
+        let payload_kind = entry.payload.get("kind").and_then(Value::as_str);
+        if payload_kind != Some(entry.event_type.as_str()) {
+            return Err(RallyError::Message(format!(
+                "canonical segment event_type {:?} does not match payload kind {:?}",
+                entry.event_type,
+                payload_kind.unwrap_or("<missing-or-non-string>")
+            )));
+        }
+    }
     if entry.event_type != fact.kind.as_str() {
         let Some(kind) = unknown_future_kind(entry, &fact) else {
             return Err(RallyError::Message(format!(
@@ -4897,16 +4960,19 @@ impl DirectRoomStore {
         // accepting the action. Field bounds always apply; the claim-close and
         // lead-transfer arms self-select on kind, so ordinary writes pay one
         // `matches!` and nothing else.
-        if fact.kind == FactKind::SessionClosed
+        if is_session_close_attempt(&fact)
             && (fact.tool.as_deref().is_none_or(str::is_empty)
                 || fact.from_session_id.as_deref().is_none_or(str::is_empty)
                 || !fact
                     .evidence
                     .iter()
-                    .any(|item| item == "protocol:session_state=closed"))
+                    .any(|item| item == "protocol:session_state=closed")
+                || !fact.evidence.iter().any(|item| {
+                    item.starts_with(crate::session_identity::SESSION_CLOSE_TOKEN_REVEAL_PREFIX)
+                }))
         {
             return Err(RallyError::Usage(
-                    "session.closed requires an exact tool, from_session_id, and protocol:session_state=closed evidence"
+                    "session close requires an exact tool, from_session_id, protocol:session_state=closed, and a one-time close-token proof"
                         .to_string(),
                 ));
         }
@@ -6386,13 +6452,14 @@ fn facts_from_store(store: &SqliteStore) -> Result<Vec<Fact>> {
         .collect()
 }
 
-const CLAIM_LIFECYCLE_EVENT_TYPES: [&str; 7] = [
+const CLAIM_LIFECYCLE_EVENT_TYPES: [&str; 8] = [
     "claim",
     "claim.renewed",
     "claim.expired",
     "release",
     "resolve",
     "receipt",
+    "session",
     "session.closed",
 ];
 
@@ -6531,7 +6598,7 @@ fn claim_lifecycle_relevant_to_path(facts: &[Fact], path: &str) -> Vec<Fact> {
                         .scope
                         .iter()
                         .any(|scope| claim_scopes.contains(scope.as_str())))
-                || (fact.kind == FactKind::SessionClosed
+                || (is_session_close_fact(fact)
                     && relevant_claims.iter().any(|claim| {
                         claim_authority::later_session_close_matches_claim(fact, claim)
                     }))
@@ -10245,7 +10312,7 @@ pub(crate) fn count_corrupt_quarantine_groups(dir: &Path, base: &str) -> usize {
 /// The highest kind generation THIS binary can read (see
 /// [`FactKind::since_generation`]). Raise it in the same commit that adds a kind
 /// at a new generation, never on its own.
-pub(crate) const KIND_GENERATION_CURRENT: u32 = 1;
+pub(crate) const KIND_GENERATION_CURRENT: u32 = 2;
 
 /// Filename of the room's recorded schema floor.
 ///
@@ -10264,6 +10331,30 @@ pub(crate) const SCHEMA_FLOOR_FILENAME: &str = "schema-floor.json";
 /// declare its own floor and write straight past every older reader — the
 /// failure this gate exists to stop.
 pub(crate) const SCHEMA_FLOOR_DEFAULT: u32 = 1;
+
+/// Select any spelling that attempts the privileged session-close act. The
+/// dedicated kind counts as an attempt even when malformed so it cannot evade
+/// close-token checks by omitting its protocol marker.
+pub(crate) fn is_session_close_attempt(fact: &Fact) -> bool {
+    fact.kind == FactKind::SessionClosed
+        || (fact.kind == FactKind::Session
+            && fact
+                .evidence
+                .iter()
+                .any(|item| item == "protocol:session_state=closed"))
+}
+
+/// A session close is encoded on the generation-1 `session` kind so binaries
+/// predating lifecycle close can skip its protocol markers without treating the
+/// row as corruption. The dedicated `session.closed` kind remains readable for
+/// compatibility with rows written before the schema-floor gate landed.
+pub(crate) fn is_session_close_fact(fact: &Fact) -> bool {
+    is_session_close_attempt(fact)
+        && fact
+            .evidence
+            .iter()
+            .any(|item| item == "protocol:session_state=closed")
+}
 
 /// The room's recorded reader floor: the newest kind generation every binary
 /// participating in this room is known to handle.
@@ -10299,6 +10390,19 @@ pub(crate) fn read_schema_floor(rally_dir: &Path) -> u32 {
 /// reader safe — the rows written at the higher generation are already on disk —
 /// so a downward move would only hide that they are there.
 pub(crate) fn write_schema_floor(
+    rally_dir: &Path,
+    generation: u32,
+    recorded_by: &str,
+) -> Result<()> {
+    let _guard = acquire_room_mutation_lock(rally_dir)?;
+    write_schema_floor_under_lock(rally_dir, generation, recorded_by)
+}
+
+/// Read-check-write half of [`write_schema_floor`]. The caller holds the room
+/// mutation lock, making the monotonicity check and atomic rename one serialized
+/// state transition rather than two independently safe operations with a race
+/// between them.
+fn write_schema_floor_under_lock(
     rally_dir: &Path,
     generation: u32,
     recorded_by: &str,
@@ -12242,13 +12346,16 @@ mod ledger_tests {
         claim.from_session_id = Some("sess:parent-a".to_string());
         let mut close = make_fact(
             "close-a",
-            FactKind::SessionClosed,
+            FactKind::Session,
             "file:unrelated.rs",
             "closed in engagement B",
         );
         close.seq = 2;
         close.tool = claim.tool.clone();
         close.from_session_id = claim.from_session_id.clone();
+        close
+            .evidence
+            .push("protocol:session_state=closed".to_string());
 
         let lifecycle = claim_lifecycle_relevant_to_path(&[claim.clone(), close], "src/a.rs");
         assert_eq!(

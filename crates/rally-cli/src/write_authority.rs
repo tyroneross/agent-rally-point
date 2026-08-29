@@ -110,13 +110,13 @@ pub(crate) const LEAD_FORCE_MARKER: &str = "lead-seizure-acknowledged";
 /// admission cost and no new spelling to remember.
 pub(crate) fn needs_authority_check(fact: &Fact) -> bool {
     claim_authority::closes_active_claim(&fact.kind)
-        || fact.kind == FactKind::SessionClosed
+        || crate::store::is_session_close_attempt(fact)
         || claim_authority::is_lead_decision(fact)
         || crate::retraction::target_of(fact).is_some()
 }
 
 pub(crate) fn needs_session_lifecycle_check(fact: &Fact) -> bool {
-    fact.kind == FactKind::SessionClosed
+    crate::store::is_session_close_attempt(fact)
         || (fact.tool.as_deref().is_some_and(|tool| !tool.is_empty())
             && fact
                 .from_session_id
@@ -170,7 +170,7 @@ fn assert_session_lifecycle_authorized(fact: &Fact, facts_before: &[Fact]) -> Re
     let already_closed = facts_before
         .iter()
         .filter(exact)
-        .any(|candidate| candidate.kind == FactKind::SessionClosed);
+        .any(crate::store::is_session_close_fact);
     if already_closed {
         return Err(RallyError::Usage(format!(
             "session lease {session_id} is closed for {tool}; start a new parent lease"
@@ -194,7 +194,7 @@ fn assert_session_lifecycle_authorized(fact: &Fact, facts_before: &[Fact]) -> Re
         })
         .next_back();
 
-    if fact.kind == FactKind::SessionClosed {
+    if crate::store::is_session_close_attempt(fact) {
         let expected = latest_close_hash.ok_or_else(|| {
             RallyError::Usage(format!(
                 "session close refused: {tool} {session_id} has no active close-token lease"
@@ -909,7 +909,7 @@ mod tests {
         Fact {
             event_id: "session-close".to_string(),
             seq: 2,
-            kind: FactKind::SessionClosed,
+            kind: FactKind::Session,
             tool: Some(tool.to_string()),
             from_session_id: Some(session.to_string()),
             subject: "session closed".to_string(),

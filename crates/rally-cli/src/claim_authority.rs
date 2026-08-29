@@ -93,7 +93,7 @@ fn claim_closed_by_later_fact(claim: &Fact, facts: &[Fact]) -> bool {
 /// tool/session pair. Scope is deliberately irrelevant to authority and effect:
 /// it is carried only so path-scoped projections can select the transition.
 pub(crate) fn later_session_close_matches_claim(fact: &Fact, claim: &Fact) -> bool {
-    fact.kind == FactKind::SessionClosed
+    crate::store::is_session_close_fact(fact)
         && fact.tool.as_deref().is_some()
         && fact.from_session_id.as_deref().is_some()
         && fact.tool == claim.tool

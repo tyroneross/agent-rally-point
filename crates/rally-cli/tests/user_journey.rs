@@ -4831,10 +4831,7 @@ fn session_close_releases_only_the_exact_same_tool_session_claims() {
         close["data"]["session"]["released_claim_ids"],
         json!(expected_released)
     );
-    assert_eq!(
-        close["data"]["session"]["close_fact"]["kind"],
-        "session.closed"
-    );
+    assert_eq!(close["data"]["session"]["close_fact"]["kind"], "session");
     assert_matches_schema(
         "agent-rally.fact.v1.json",
         &close["data"]["session"]["close_fact"],

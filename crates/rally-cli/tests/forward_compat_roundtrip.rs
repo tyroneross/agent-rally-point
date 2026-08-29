@@ -459,6 +459,53 @@ fn unknown_kind_disagreeing_with_its_payload_still_fails_loud() {
     );
 }
 
+/// `#[serde(other)]` maps a future payload kind to `Unknown`. The literal
+/// envelope kind `unknown` must not make that disagreement disappear after
+/// deserialization.
+#[test]
+fn literal_unknown_envelope_cannot_hide_a_future_payload_kind() {
+    let room = Room::new("unknown-envelope");
+    room.seed("first fact");
+    let seq = room.max_seq() + 1;
+    let line = json!({
+        "seq": seq,
+        "occurred_at": "2026-08-29T03:40:00Z",
+        "event_type": "unknown",
+        "payload": {
+            "created_at": "2026-08-29T03:40:00Z",
+            "event_id": "future-row-unknown-envelope-evt",
+            "evidence": [],
+            "kind": FUTURE_KIND,
+            "ref": Value::Null,
+            "role": Value::Null,
+            "schema": "agent-rally.fact.v1",
+            "scope": [],
+            "seq": seq,
+            "severity": Value::Null,
+            "status": Value::Null,
+            "subject": "unknown envelope disagrees with future payload kind",
+            "summary": Value::Null,
+            "target": Value::Null,
+            "thread_id": "fwdcompat-unknown-envelope-thread",
+            "tool": "codex:fwdcompat-test",
+            "uri": Value::Null,
+        },
+        "engagement": "seed",
+    });
+    room.append_raw(&serde_json::to_string(&line).unwrap());
+
+    let output = room.run(&["room", "--json"]);
+    assert!(
+        !output.status.success(),
+        "a literal unknown envelope hid a different payload kind: {}",
+        stdout(&output)
+    );
+    assert!(
+        format!("{}{}", stdout(&output), stderr(&output)).contains("does not match payload kind"),
+        "mismatch did not report the literal kind disagreement"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Writer discipline: the other half of the mixed-version fix
 // ---------------------------------------------------------------------------

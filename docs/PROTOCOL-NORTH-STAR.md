@@ -211,7 +211,7 @@ reliability, deconfliction, auditability, and performance.
 | Event | Author | Durable? | Purpose |
 |---|---|---:|---|
 | `session.registered` | Brainstem | Yes | Proves a session joined with identity, endpoint, cwd, tool, and capabilities. |
-| `session.closed` | Brainstem | Yes | Clean closeout; retires a session lease. |
+| `session` + `protocol:session_state=closed` (`session.closed` read-compatible) | Brainstem | Yes | Clean closeout; retires a session lease without breaking older readers. |
 | `session.revoked` | Brainstem or operator | Yes | Security or control event. |
 | `presence.heartbeat` | Brainstem | No | Mutable TTL update only. |
 | `capability.updated` | Brainstem | No by default | Mutable session capability registry update; durable only if policy-relevant. |

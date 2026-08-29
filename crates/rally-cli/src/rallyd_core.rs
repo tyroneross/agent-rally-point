@@ -1646,7 +1646,7 @@ mod imp {
                 schema: crate::FACT_SCHEMA.to_string(),
                 event_id: "session-close".to_string(),
                 thread_id: "session-thread".to_string(),
-                kind: crate::store::FactKind::SessionClosed,
+                kind: crate::store::FactKind::Session,
                 tool: presence.tool.clone(),
                 from_session_id: presence.from_session_id.clone(),
                 subject: "session closed".to_string(),
@@ -1698,7 +1698,7 @@ mod imp {
                     .facts()
                     .unwrap()
                     .iter()
-                    .filter(|fact| fact.kind == crate::store::FactKind::SessionClosed)
+                    .filter(|fact| crate::store::is_session_close_fact(fact))
                     .count(),
                 1
             );
