@@ -200,7 +200,15 @@ fn inject_timeout_marks_committed_only_after_directive_is_durable() {
             "durable directive",
             "--json",
             "--timeout-ms",
-            "300",
+            // The window between process start and `mark_watchdog_command_commit`
+            // (bootstrap, engagement resolution, ledger append) must complete
+            // before this fires, or the watchdog observes an unarmed commit
+            // signal and reports uncommitted instead of committed. 300ms only
+            // has margin on an idle machine; 2000ms matches the proven-stable
+            // window the sibling `committed_mutation_timeout_...` test already
+            // uses against the same 5000ms post-commit block, while staying
+            // well under it so the watchdog still fires mid-block as intended.
+            "2000",
         ])
         .env("RALLY_TEST_BLOCK_AFTER_COMMIT_MS", "5000")
         .output()

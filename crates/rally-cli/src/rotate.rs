@@ -179,6 +179,16 @@ fn pause_rotation_before_source_link_if_armed(source: &Path) {
         .unwrap_or_else(|error| error.into_inner())
         .remove(source);
     if let Some(pause) = pause {
+        // Deterministically mark this thread's mutation deadline as already
+        // elapsed before handing control back to the test. `MUTATION_DEADLINE`
+        // is thread-local, so the test driver (a different thread) cannot set
+        // it directly; this is the one point that runs on the rotate thread
+        // itself between "batch admitted" and the caller's resume signal.
+        // Using the sentinel here (instead of the caller picking a short
+        // wall-clock budget and hoping enough real time passes while paused)
+        // removes the only place o26's "deadline elapsed mid-batch" scenario
+        // used to race real filesystem I/O.
+        crate::store::expire_mutation_deadline_for_test();
         pause.reached.send(()).unwrap();
         pause
             .resume
@@ -1202,19 +1212,43 @@ mod tests {
         let (second_link_reached, resume_second_link) =
             pause_rotation_before_source_link_once(&beta_source);
         let rotate_root = root.clone();
+        // The budget only needs to survive real setup work that precedes the
+        // pause point — archive_dir creation/fsync plus segment alpha's own
+        // durable install (link + 2 fsyncs) — none of which this test is
+        // trying to race. A tight 50ms budget made that setup race real disk
+        // I/O under CPU contention (parallel cargo test/build): if alpha's
+        // fsyncs ran long, the deadline elapsed before reaching the pause at
+        // all, the pause signal never fired, and the recv below hung until
+        // its own timeout. 5s gives that setup comfortable headroom; the
+        // "deadline already elapsed" state this test actually exercises is
+        // now injected deterministically at the pause point below instead of
+        // raced via wall clock, so this budget is no longer load-sensitive.
         let rotate_handle = std::thread::spawn(move || {
-            with_mutation_deadline(std::time::Duration::from_millis(50), || {
+            with_mutation_deadline(std::time::Duration::from_secs(5), || {
                 run_rotate(rotate_root, Some(90), false)
             })
         });
+        // Ceiling only bounds "did the rotate thread ever get scheduled and
+        // reach the pause point" — the actual synchronization is the channel
+        // send/recv itself, not a wall-clock guess at completion time. 2s was
+        // tight under CPU contention: the rotate thread must be scheduled,
+        // then durably install segment alpha before it even reaches the
+        // pause for beta's source link, and that work can be starved past 2s
+        // on a loaded machine. 30s gives it room without changing what is
+        // being waited on.
         second_link_reached
-            .recv_timeout(std::time::Duration::from_secs(2))
+            .recv_timeout(std::time::Duration::from_secs(30))
             .unwrap();
         assert!(
             !alpha_source.exists() && archive_dir.join("alpha.jsonl").exists(),
             "the first source must already be durably installed and unlinked"
         );
-        std::thread::sleep(std::time::Duration::from_millis(80));
+        // The mutation deadline was already expired deterministically (on the
+        // rotate thread, inside the pause hook) before it signaled
+        // `second_link_reached` above — see
+        // `pause_rotation_before_source_link_if_armed`. No sleep is needed
+        // here to "probably" outlast the old 50ms budget; the expired state
+        // is guaranteed by the time this line runs.
         resume_second_link.send(()).unwrap();
 
         let outcome = rotate_handle
