@@ -4759,6 +4759,7 @@ fn command_doctor(args: DoctorArgs) -> Result<Output> {
         args.binary_skew,
         args.ledger_health,
         args.repair_ledger,
+        args.schema_floor,
     ];
     if args.migrate_db_only && existing_modes.into_iter().any(|enabled| enabled) {
         return Err(RallyError::Usage(
@@ -4926,6 +4927,15 @@ fn command_doctor(args: DoctorArgs) -> Result<Output> {
     if args.repair_ledger {
         let data = doctor::run_repair_ledger(args.apply)?;
         let text = render_repair_ledger_text(&data);
+        let body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
+        return Ok(Output::new(args.json, text, body));
+    }
+    if args.schema_floor {
+        let data = doctor::run_schema_floor(args.apply)?;
+        let text = format!(
+            "doctor schema-floor: room={} binary={} raised={} — {}",
+            data.room_generation, data.binary_generation, data.raised, data.note
+        );
         let body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: data })?;
         return Ok(Output::new(args.json, text, body));
     }

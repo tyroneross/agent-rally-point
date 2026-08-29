@@ -373,6 +373,9 @@ pub(crate) struct DoctorArgs {
     /// Compare the RUNNING binary's build stamp against this checkout's HEAD.
     /// Read-only; reports skew, never blocks.
     pub(crate) binary_skew: bool,
+    /// Report the room's recorded event-kind schema floor (read-only); raise it
+    /// to this binary's generation with --apply.
+    pub(crate) schema_floor: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1777,6 +1780,9 @@ fn doctor_parser() -> impl Parser<DoctorArgs> {
     let binary_skew = long("binary-skew")
         .help("Compare the running binary's build stamp against this checkout's HEAD (read-only)")
         .switch();
+    let schema_floor = long("schema-floor")
+        .help("Report the room's recorded event-kind schema floor; raise it to this binary's generation with --apply (do that only once every binary in the room is upgraded)")
+        .switch();
     construct!(DoctorArgs {
         json,
         migrate_db_only,
@@ -1792,7 +1798,8 @@ fn doctor_parser() -> impl Parser<DoctorArgs> {
         max_age_days,
         compact_log,
         log_file,
-        binary_skew
+        binary_skew,
+        schema_floor
     })
 }
 
