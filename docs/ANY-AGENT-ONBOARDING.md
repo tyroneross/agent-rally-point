@@ -11,7 +11,24 @@ Rally-aware runtime.
 
 ## Contract
 
-Every agent must do these steps before editing:
+Every host must establish one lease in the long-lived parent process before it
+starts short-lived Rally commands. Reuse an existing `RALLY_SESSION_ID`; mint a
+new one only for a genuinely new agent session:
+
+```bash
+eval "$(rally session ensure \
+  --tool <stable-tool-id> \
+  --adapter <host-family> \
+  --json | jq -r '.data.session.shell_export')"
+```
+
+An adapter adds `--native-hook`, `--strict`, `--lifecycle-close`, or
+`--live-delivery` only after it has wired that behavior. The response reports
+each guarantee as `enforced`, `advisory`, or `unmanaged`. In particular, Codex
+write blocking remains `advisory` because its current hook output cannot deny a
+tool call; visibility and atomic claim acquisition remain separate guarantees.
+
+Every agent then does these steps before editing:
 
 ```bash
 rally whoami --tool <stable-tool-id> --json
@@ -44,6 +61,16 @@ rally say artifact --tool <stable-tool-id> \
 rally say release --tool <stable-tool-id> --ref <claim-id> --subject "done" --json
 rally next --tool <stable-tool-id> --json
 ```
+
+At real process/session exit, an integrated adapter must run:
+
+```bash
+rally session close --tool <stable-tool-id> --json
+```
+
+`session close` releases only claims whose authoring `tool` and
+`from_session_id` both match the closing lease. Never bind it to a per-turn
+`Stop` callback: one conversation turn ending is not the agent session ending.
 
 Use `rally say blocker`, `rally say handoff`, `rally say decision`, and
 `rally say resolve` for durable coordination. Do not rely on chat scrollback as
@@ -141,9 +168,11 @@ A manual session is any CLI or editor agent that can run commands but is not
 listed by `rally sessions --json`. Examples: Cursor agent, Qwen CLI, Gemma CLI,
 Aider, an IDE plugin, or a model running in another terminal.
 
-Manual sessions still fully participate in Rally:
+Manual sessions still participate in Rally. Establish their lease in the
+parent shell, then enter the room:
 
 ```bash
+eval "$(rally session ensure --tool qwen:reviewer --adapter qwen --json | jq -r '.data.session.shell_export')"
 rally whoami --tool qwen:reviewer --json
 rally enter --tool qwen:reviewer --json
 rally ack --tool qwen:reviewer
@@ -192,6 +221,7 @@ Use this when starting a generic agent that does not automatically read
 You are joining this repo as a Rally participant.
 
 Before editing, run:
+  eval "$(rally session ensure --tool <your-stable-tool-id> --adapter <host-family> --json | jq -r '.data.session.shell_export')"
   rally whoami --tool <your-stable-tool-id> --json
   rally enter --tool <your-stable-tool-id> --json
   rally ack --tool <your-stable-tool-id>
@@ -206,8 +236,8 @@ Before writing a file, run:
   rally say claim --tool <your-stable-tool-id> --subject "<work lane>" --path <path> --json
 
 After work, verify it, post an artifact with evidence, release your claim, and
-run rally next again. If blocked, post rally say blocker with the concrete
-blocking condition.
+run rally next again. On real agent-session exit, run rally session close. If
+blocked, post rally say blocker with the concrete blocking condition.
 ```
 
 ## Easy Terminal Runtime Contract

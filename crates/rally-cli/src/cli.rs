@@ -21,6 +21,8 @@ pub(crate) enum CliCommand {
     Run(RunArgs),
     Sessions(SessionsArgs),
     Inject(InjectArgs),
+    /// Host-neutral parent lease lifecycle (`session ensure|close`).
+    SessionLifecycle(SessionLifecycleArgs),
     Session(SessionActionArgs),
     Locate(LocateArgs),
     Recent(RecentArgs),
@@ -503,6 +505,35 @@ pub(crate) struct SessionActionArgs {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct SessionLifecycleArgs {
+    pub(crate) json: bool,
+    pub(crate) subcommand: SessionLifecycleSubcommand,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum SessionLifecycleSubcommand {
+    Ensure(SessionEnsureArgs),
+    Close(SessionCloseArgs),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SessionEnsureArgs {
+    pub(crate) tool: String,
+    pub(crate) session_id: Option<String>,
+    pub(crate) adapter: Option<String>,
+    pub(crate) strict: bool,
+    pub(crate) native_hook: bool,
+    pub(crate) lifecycle_close: bool,
+    pub(crate) live_delivery: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SessionCloseArgs {
+    pub(crate) tool: String,
+    pub(crate) session_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct StatusArgs {
     pub(crate) json: bool,
     pub(crate) subcommand: StatusSubcommand,
@@ -885,6 +916,7 @@ pub(crate) const COMMANDS: &[&str] = &[
     "run",
     "sessions",
     "inject",
+    "session",
     "attach",
     "capture",
     "stop",
@@ -1069,6 +1101,11 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .to_options()
         .command("inject")
         .map(CliCommand::Inject);
+    let session_lifecycle = session_lifecycle_parser()
+        .to_options()
+        .descr("Mint/reuse one parent-exported session lease or close that exact session and all claims it owns in one transition.")
+        .command("session")
+        .map(CliCommand::SessionLifecycle);
     let attach = session_action_parser(SessionAction::Attach)
         .to_options()
         .command("attach")
@@ -1261,6 +1298,7 @@ fn cli_parser() -> OptionParser<CliCommand> {
         run,
         sessions,
         inject,
+        session_lifecycle,
         attach,
         capture,
         stop,
@@ -1963,6 +2001,69 @@ fn inject_parser() -> impl Parser<InjectArgs> {
             }
         },
     )
+}
+
+fn session_lifecycle_parser() -> impl Parser<SessionLifecycleArgs> {
+    let ensure_tool = string_arg("tool", "TOOL");
+    let ensure_session_id = optional_string_arg("session-id", "SESSION_ID");
+    let adapter = optional_string_arg("adapter", "HOST");
+    let strict = long("strict")
+        .help("Report blocking as enforced only when the active host contract can deny.")
+        .switch();
+    let native_hook = long("native-hook")
+        .help("Attest that the host invokes Rally's native before-write transaction.")
+        .switch();
+    let lifecycle_close = long("lifecycle-close")
+        .help("Attest that the host invokes `rally session close` on real session exit.")
+        .switch();
+    let live_delivery = long("live-delivery")
+        .help("Attest that this session has a receipt-capable live delivery path.")
+        .switch();
+    let ensure = construct!(
+        ensure_tool,
+        ensure_session_id,
+        adapter,
+        strict,
+        native_hook,
+        lifecycle_close,
+        live_delivery
+    )
+    .map(
+        |(
+            tool,
+            session_id,
+            adapter,
+            strict,
+            native_hook,
+            lifecycle_close,
+            live_delivery,
+        )| SessionLifecycleSubcommand::Ensure(SessionEnsureArgs {
+            tool,
+            session_id,
+            adapter,
+            strict,
+            native_hook,
+            lifecycle_close,
+            live_delivery,
+        }),
+    )
+    .to_options()
+    .descr("Mint a fresh lease unless --session-id/RALLY_SESSION_ID already supplies the parent lease; append exact-session presence and capability evidence.")
+    .command("ensure");
+
+    let close_tool = string_arg("tool", "TOOL");
+    let close_session_id = optional_string_arg("session-id", "SESSION_ID");
+    let close = construct!(close_tool, close_session_id)
+        .map(|(tool, session_id)| {
+            SessionLifecycleSubcommand::Close(SessionCloseArgs { tool, session_id })
+        })
+        .to_options()
+        .descr("Close the exact parent lease and release only claims authored by that tool/session pair.")
+        .command("close");
+
+    let json = json_flag();
+    let subcommand = construct!([ensure, close]);
+    construct!(json, subcommand).map(|(json, subcommand)| SessionLifecycleArgs { json, subcommand })
 }
 
 fn session_action_parser(action: SessionAction) -> impl Parser<SessionActionArgs> {

@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-rally:command:session:v1",
+  "title": "Rally Session Lease Command",
+  "type": "object",
+  "required": ["ok", "product", "command", "schema", "data"],
+  "properties": {
+    "ok": { "const": true },
+    "product": { "const": "rally" },
+    "command": { "const": "session" },
+    "schema": { "const": "agent-rally.command.session.v1" },
+    "data": {
+      "type": "object",
+      "required": ["session"],
+      "properties": {
+        "session": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["action", "lease", "environment", "shell_export"],
+              "properties": {
+                "action": { "const": "ensure" },
+                "lease": {
+                  "type": "object",
+                  "required": ["raw_session_id", "session_id", "endpoint_id", "tool", "adapter", "reused", "capabilities"],
+                  "properties": {
+                    "raw_session_id": { "type": "string" },
+                    "session_id": { "type": "string" },
+                    "endpoint_id": { "type": "string" },
+                    "tool": { "type": "string" },
+                    "adapter": { "type": "string" },
+                    "reused": { "type": "boolean" },
+                    "capabilities": {
+                      "type": "object",
+                      "required": ["identity", "visibility", "blocking", "atomic_claims", "lifecycle_close", "delivery"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "identity": { "$ref": "#/$defs/capability" },
+                        "visibility": { "$ref": "#/$defs/capability" },
+                        "blocking": { "$ref": "#/$defs/capability" },
+                        "atomic_claims": { "$ref": "#/$defs/capability" },
+                        "lifecycle_close": { "$ref": "#/$defs/capability" },
+                        "delivery": { "$ref": "#/$defs/capability" }
+                      }
+                    }
+                  }
+                },
+                "environment": {
+                  "type": "object",
+                  "required": ["RALLY_SESSION_ID", "RALLY_AGENT_ID", "RALLY_TOOL_ID"],
+                  "additionalProperties": { "type": "string" }
+                },
+                "shell_export": { "type": "string" }
+              }
+            },
+            {
+              "type": "object",
+              "required": ["action", "tool", "session_id", "released_claim_ids", "close_fact"],
+              "properties": {
+                "action": { "const": "close" },
+                "tool": { "type": "string" },
+                "session_id": { "type": "string" },
+                "released_claim_ids": {
+                  "type": "array",
+                  "items": { "type": "string" }
+                },
+                "close_fact": { "type": "object" }
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "capability": {
+      "type": "string",
+      "enum": ["enforced", "advisory", "unmanaged"]
+    }
+  }
+}

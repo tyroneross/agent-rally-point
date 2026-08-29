@@ -227,6 +227,21 @@ impl Workspace {
         cmd.args(args).output().unwrap()
     }
 
+    fn output_without_session(&self, args: &[&str]) -> Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rally"));
+        cmd.current_dir(&self.cwd)
+            .env("HOME", &self.home)
+            .env_remove("RALLY_SESSION_ID")
+            .env_remove("RALLY_AGENT_ID")
+            .env_remove("RALLY_TOOL_ID")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID");
+        if self.suppress_worktree {
+            cmd.env("RALLY_NO_WORKTREE", "1");
+        }
+        cmd.args(args).output().unwrap()
+    }
+
     fn cleanup(self) {
         fs::remove_dir_all(self.cwd).ok();
         fs::remove_dir_all(self.home).ok();
@@ -435,6 +450,7 @@ fn published_fact_schema_covers_runtime_fact_kinds() {
         "risk",
         "lesson",
         "session",
+        "session.closed",
         "wake",
         "presence",
         "read",
@@ -4532,6 +4548,164 @@ fn same_tool_sibling_session_cannot_claim_owned_path() {
     assert!(
         warning.contains("claim conflict"),
         "failure must identify the existing claim: {body:#}"
+    );
+    workspace.cleanup();
+}
+
+#[test]
+fn session_ensure_mints_or_reuses_one_parent_lease_with_truthful_capabilities() {
+    let workspace = Workspace::new("session-ensure-lease");
+
+    let minted_output = workspace.output_without_session(&[
+        "session",
+        "ensure",
+        "--json",
+        "--tool",
+        "codex:shared",
+        "--adapter",
+        "codex",
+        "--strict",
+        "--native-hook",
+        "--lifecycle-close",
+        "--live-delivery",
+    ]);
+    assert!(
+        minted_output.status.success(),
+        "session ensure failed: {}",
+        String::from_utf8_lossy(&minted_output.stderr)
+    );
+    let minted: Value = serde_json::from_slice(&minted_output.stdout).unwrap();
+    assert_matches_schema("agent-rally.command.session.v1.json", &minted);
+    let lease = &minted["data"]["session"]["lease"];
+    assert_eq!(minted["data"]["session"]["action"], "ensure");
+    assert_eq!(lease["reused"], false);
+    assert_eq!(lease["capabilities"]["identity"], "enforced");
+    assert_eq!(lease["capabilities"]["visibility"], "enforced");
+    assert_eq!(lease["capabilities"]["blocking"], "advisory");
+    assert_eq!(lease["capabilities"]["atomic_claims"], "enforced");
+    assert_eq!(lease["capabilities"]["lifecycle_close"], "enforced");
+    assert_eq!(lease["capabilities"]["delivery"], "enforced");
+    assert_eq!(
+        minted["data"]["session"]["environment"]["RALLY_SESSION_ID"],
+        lease["raw_session_id"]
+    );
+
+    let first = workspace.json(&[
+        "session",
+        "ensure",
+        "--json",
+        "--tool",
+        "claude_code:shared",
+        "--session-id",
+        "parent-lease",
+        "--adapter",
+        "claude_code",
+        "--strict",
+        "--native-hook",
+    ]);
+    let second = workspace.json(&[
+        "session",
+        "ensure",
+        "--json",
+        "--tool",
+        "claude_code:shared",
+        "--session-id",
+        "parent-lease",
+        "--adapter",
+        "claude_code",
+        "--strict",
+        "--native-hook",
+    ]);
+    assert_eq!(first["data"]["session"]["lease"]["reused"], true);
+    assert_eq!(
+        first["data"]["session"]["lease"]["session_id"],
+        second["data"]["session"]["lease"]["session_id"]
+    );
+    assert_eq!(
+        first["data"]["session"]["lease"]["capabilities"]["blocking"],
+        "enforced"
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
+fn session_close_releases_only_the_exact_same_tool_session_claims() {
+    let workspace = Workspace::new("session-close-exact-owner");
+    let owner = workspace.json_with_session(
+        "parent-a",
+        &[
+            "say",
+            "claim",
+            "--json",
+            "--tool",
+            "codex:shared",
+            "--subject",
+            "session A owns A",
+            "--path",
+            "src/a.rs",
+        ],
+    );
+    let sibling = workspace.json_with_session(
+        "parent-b",
+        &[
+            "say",
+            "claim",
+            "--json",
+            "--tool",
+            "codex:shared",
+            "--subject",
+            "session B owns B",
+            "--path",
+            "src/b.rs",
+        ],
+    );
+    let owner_id = owner["data"]["say"]["fact"]["event_id"].as_str().unwrap();
+    let sibling_id = sibling["data"]["say"]["fact"]["event_id"].as_str().unwrap();
+
+    let close = workspace.json_with_session(
+        "parent-a",
+        &["session", "close", "--json", "--tool", "codex:shared"],
+    );
+    assert_matches_schema("agent-rally.command.session.v1.json", &close);
+    assert_eq!(close["data"]["session"]["action"], "close");
+    assert_eq!(
+        close["data"]["session"]["released_claim_ids"],
+        json!([owner_id])
+    );
+    assert_eq!(
+        close["data"]["session"]["close_fact"]["kind"],
+        "session.closed"
+    );
+    assert_matches_schema(
+        "agent-rally.fact.v1.json",
+        &close["data"]["session"]["close_fact"],
+    );
+
+    let room = workspace.json(&["room", "--json"]);
+    let active = room["data"]["room"]["active_claims"].as_array().unwrap();
+    assert_eq!(active.len(), 1, "only the sibling claim should survive");
+    assert_eq!(active[0]["event_id"], sibling_id);
+    assert_eq!(
+        active[0]["from_session_id"],
+        sibling["data"]["say"]["fact"]["from_session_id"]
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
+fn session_close_without_a_parent_lease_refuses_to_guess() {
+    let workspace = Workspace::new("session-close-no-lease");
+    let output =
+        workspace.output_without_session(&["session", "close", "--json", "--tool", "codex:shared"]);
+    assert_eq!(output.status.code(), Some(2));
+    let body: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("refusing to guess")
     );
     workspace.cleanup();
 }

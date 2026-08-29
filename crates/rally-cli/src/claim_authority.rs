@@ -84,8 +84,20 @@ fn claim_closed_by_later_fact(claim: &Fact, facts: &[Fact]) -> bool {
     facts.iter().any(|fact| {
         fact.seq > claim.seq
             && (later_fact_refs_claim(fact, claim.event_id.as_str())
-                || later_release_overlaps_claim_scope(fact, claim))
+                || later_release_overlaps_claim_scope(fact, claim)
+                || later_session_close_matches_claim(fact, claim))
     })
+}
+
+/// An exact-session lifecycle close removes only claims authored by that same
+/// tool/session pair. Scope is deliberately irrelevant to authority and effect:
+/// it is carried only so path-scoped projections can select the transition.
+pub(crate) fn later_session_close_matches_claim(fact: &Fact, claim: &Fact) -> bool {
+    fact.kind == FactKind::SessionClosed
+        && fact.tool.as_deref().is_some()
+        && fact.from_session_id.as_deref().is_some()
+        && fact.tool == claim.tool
+        && fact.from_session_id == claim.from_session_id
 }
 
 /// The fact kinds that CLOSE an active claim.

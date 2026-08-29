@@ -34,6 +34,7 @@
         "risk",
         "lesson",
         "session",
+        "session.closed",
         "wake",
         "presence",
         "claim.expired",

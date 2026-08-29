@@ -34,13 +34,10 @@
 //! [`ProtocolSessionIdentity::is_legacy`] so callers can distinguish a real
 //! live lease from a back-filled one.
 //!
-//! ## Staged delivery
-//! `#![allow(dead_code)]`: this is the Phase-1 module of a staged build. Its
-//! public surface is consumed by `whoami`/`say` in the later `integration-wiring`
-//! task; until then the items are unused by the crate proper (they are exercised
-//! by this module's own tests). The allow is removed when integration lands.
-#![allow(dead_code)]
-
+//! ## Staged compatibility
+//! Live lease creation is wired into the CLI. A few legacy comparison helpers
+//! remain test-backed for replay compatibility and carry narrow dead-code
+//! allowances until their remaining call sites migrate.
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -126,6 +123,110 @@ pub(crate) enum EndpointSource {
     HostOnly,
     /// Back-filled for a legacy event that carried only `tool`.
     Legacy,
+}
+
+/// The guarantee an active adapter can truthfully make for one coordination
+/// capability. These levels describe observed/wired behavior, not product
+/// aspiration: an installed command that the host never invokes is advisory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CapabilityLevel {
+    Enforced,
+    Advisory,
+    Unmanaged,
+}
+
+/// Host-neutral capability handshake carried by a session lease.
+///
+/// Every field is explicit so a caller never infers write blocking from mere
+/// visibility, or live delivery from a successful ledger enqueue.
+#[derive(Clone, Debug, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
+pub(crate) struct SessionCapabilities {
+    pub identity: CapabilityLevel,
+    pub visibility: CapabilityLevel,
+    pub blocking: CapabilityLevel,
+    pub atomic_claims: CapabilityLevel,
+    pub lifecycle_close: CapabilityLevel,
+    pub delivery: CapabilityLevel,
+}
+
+impl SessionCapabilities {
+    /// Resolve the active contract for one adapter invocation.
+    ///
+    /// Claude Code, Cursor, and Gemini have host-native deny responses. Codex
+    /// deliberately does not: its current hook contract rejects those fields,
+    /// so strict mode remains advisory there. The other switches are supplied
+    /// by the adapter only after it has actually wired the corresponding path.
+    pub(crate) fn for_adapter(
+        adapter: &str,
+        strict: bool,
+        native_hook: bool,
+        lifecycle_close: bool,
+        live_delivery: bool,
+    ) -> Self {
+        let adapter = adapter.trim().to_ascii_lowercase();
+        let host_can_block = matches!(
+            adapter.as_str(),
+            "claude" | "claude_code" | "cursor" | "gemini" | "gemini-cli"
+        );
+        let blocking = if native_hook && strict && host_can_block {
+            CapabilityLevel::Enforced
+        } else if native_hook {
+            CapabilityLevel::Advisory
+        } else {
+            CapabilityLevel::Unmanaged
+        };
+        Self {
+            identity: CapabilityLevel::Enforced,
+            visibility: CapabilityLevel::Enforced,
+            blocking,
+            atomic_claims: if native_hook {
+                CapabilityLevel::Enforced
+            } else {
+                CapabilityLevel::Unmanaged
+            },
+            lifecycle_close: if lifecycle_close {
+                CapabilityLevel::Enforced
+            } else {
+                CapabilityLevel::Advisory
+            },
+            delivery: if live_delivery {
+                CapabilityLevel::Enforced
+            } else {
+                CapabilityLevel::Advisory
+            },
+        }
+    }
+
+    pub(crate) fn evidence_markers(&self) -> Vec<String> {
+        let level = |value: CapabilityLevel| match value {
+            CapabilityLevel::Enforced => "enforced",
+            CapabilityLevel::Advisory => "advisory",
+            CapabilityLevel::Unmanaged => "unmanaged",
+        };
+        vec![
+            "protocol:session_capabilities=v1".to_string(),
+            format!("capability:identity={}", level(self.identity)),
+            format!("capability:visibility={}", level(self.visibility)),
+            format!("capability:blocking={}", level(self.blocking)),
+            format!("capability:atomic_claims={}", level(self.atomic_claims)),
+            format!("capability:lifecycle_close={}", level(self.lifecycle_close)),
+            format!("capability:delivery={}", level(self.delivery)),
+        ]
+    }
+}
+
+/// Lease returned by `rally session ensure`. `raw_session_id` is the value a
+/// parent exports; `session_id` is the normalized durable ledger identity.
+#[derive(Clone, Debug, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
+pub(crate) struct SessionLease {
+    pub raw_session_id: String,
+    pub session_id: String,
+    pub endpoint_id: String,
+    pub tool: String,
+    pub adapter: String,
+    pub reused: bool,
+    pub capabilities: SessionCapabilities,
 }
 
 /// Derive a stable, structured `endpoint_id` from runtime signals.
@@ -273,6 +374,7 @@ impl ProtocolSessionIdentity {
     /// Synthesize a stable identity for a legacy event carrying only `tool`
     /// (e.g. `"codex:01"` or `"claude_code"`). Namespaced `legacy:` so it never
     /// collides with a live lease, and flagged [`is_legacy`](Self::is_legacy).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_legacy_tool(tool: &str) -> Self {
         let raw = tool.trim();
         let (tool_type, actor) = match raw.split_once(':') {
@@ -298,7 +400,20 @@ impl ProtocolSessionIdentity {
         }
     }
 
+    /// Build the normalized identity used by a parent-exported managed lease.
+    pub(crate) fn from_managed_lease(raw_session_id: &str, tool: &str) -> Self {
+        let endpoint = derive_endpoint(&EndpointInputs {
+            managed_session_id: Some(raw_session_id.to_string()),
+            ..Default::default()
+        });
+        let (tool_type, actor) = tool
+            .split_once(':')
+            .map_or((tool, None), |(kind, actor)| (kind, Some(actor)));
+        Self::mint(&endpoint, tool_type, "live", actor, None)
+    }
+
     /// True when this identity was back-filled from a legacy `tool`-only event.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_legacy(&self) -> bool {
         self.legacy
     }
@@ -313,12 +428,14 @@ impl ProtocolSessionIdentity {
 
     /// Two identities are the **same live runtime** iff their session leases match.
     /// Same endpoint + different lease = same place, different session (a restart).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn same_runtime(&self, other: &Self) -> bool {
         self.session_id == other.session_id
     }
 
     /// Two identities share an **endpoint lineage** (same physical place across
     /// restarts) even when they are distinct sessions.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn same_endpoint(&self, other: &Self) -> bool {
         self.endpoint_id == other.endpoint_id
     }
@@ -460,6 +577,28 @@ mod tests {
         );
         assert!(before.same_endpoint(&after));
         assert!(!before.same_runtime(&after));
+    }
+
+    #[test]
+    fn capability_handshake_never_claims_codex_write_blocking() {
+        let codex = SessionCapabilities::for_adapter("codex", true, true, true, false);
+        assert_eq!(codex.blocking, CapabilityLevel::Advisory);
+        assert_eq!(codex.atomic_claims, CapabilityLevel::Enforced);
+        assert_eq!(codex.lifecycle_close, CapabilityLevel::Enforced);
+
+        let claude = SessionCapabilities::for_adapter("claude_code", true, true, true, true);
+        assert_eq!(claude.blocking, CapabilityLevel::Enforced);
+        assert_eq!(claude.delivery, CapabilityLevel::Enforced);
+    }
+
+    #[test]
+    fn managed_lease_is_stable_for_children_and_changes_on_restart() {
+        let first = ProtocolSessionIdentity::from_managed_lease("lease-a", "codex:01");
+        let child = ProtocolSessionIdentity::from_managed_lease("lease-a", "codex:01");
+        let restarted = ProtocolSessionIdentity::from_managed_lease("lease-b", "codex:01");
+        assert_eq!(first.session_id, child.session_id);
+        assert_ne!(first.session_id, restarted.session_id);
+        assert_ne!(first.endpoint_id, restarted.endpoint_id);
     }
 
     #[test]

@@ -34,6 +34,8 @@ Definitions:
 | `rally check before-write` | no | yes | no | yes | Evaluates claim/decision/risk state; hooks may pair it with a separate claim write. |
 | `rally check before-complete` | no | yes | no | yes | Reports only claims owned by the exact `--tool` plus current session; a sibling session sharing the tool label is not the owner. Manual CLI workflows must export one stable `RALLY_SESSION_ID` before claiming. The check rejects an invocation whose only identity is its short-lived Rally process, so an unpinned lifecycle cannot silently pass with a stranded claim. |
 | `rally check liveness` | optional | yes | no | conditional | Advisory mode may scan all conflicted squads or filter one exact `--tool`. `--enforce` requires both `--tool <exact-target>` and `--actor <release-author>` and can release only that selected target's takeover-eligible claims. |
+| `rally session ensure` | yes | yes | no | no | Mints or reuses one parent-exported lease, records exact-session presence, and reports identity, visibility, blocking, atomic-claim, lifecycle-close, and delivery guarantees independently as `enforced`, `advisory`, or `unmanaged`. Adapter flags are attestations, not capability discovery. |
+| `rally session close` | yes | yes | no | no | Requires `--session-id` or parent `RALLY_SESSION_ID`; never guesses from the short-lived CLI process. Appends one `session.closed` transition and releases only claims whose tool and authoring session both exactly match. |
 | `rally say <kind>` | yes | yes | no | no | Appends durable coordination facts: claim, release, blocker, resolve, decision, artifact, handoff, risk, lesson, standby, wake, backlog-item, mission. |
 
 ### Referenced handoff targeting

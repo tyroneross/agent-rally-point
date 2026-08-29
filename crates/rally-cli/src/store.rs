@@ -508,6 +508,11 @@ pub(crate) enum FactKind {
     Risk,
     Lesson,
     Session,
+    /// Exact-session lifecycle close. One internal transition closes every
+    /// active claim whose tool and `from_session_id` match this fact. It is not
+    /// a public `say` kind; callers use `rally session close`.
+    #[serde(rename = "session.closed")]
+    SessionClosed,
     Wake,
     /// Agent presence heartbeat — emitted once per `rally enter` call.
     Presence,
@@ -582,6 +587,7 @@ impl FactKind {
         Self::Risk,
         Self::Lesson,
         Self::Session,
+        Self::SessionClosed,
         Self::Wake,
         Self::Presence,
         Self::Read,
@@ -622,7 +628,7 @@ impl FactKind {
             // Renewals enter through `RoomStore::renew_claim_lease`, which
             // verifies the live target and owner under the write lock. `parse`
             // rejects it, so advertising it would hand callers a kind that fails.
-            Self::ClaimRenewed => false,
+            Self::ClaimRenewed | Self::SessionClosed => false,
             // The `#[serde(other)]` fallback for facts written by a newer
             // producer. `parse` accepts it for round-tripping, but it is not a
             // kind anyone should author — listing it in a discovery surface
@@ -663,6 +669,7 @@ impl FactKind {
             "risk" => Some(Self::Risk),
             "lesson" => Some(Self::Lesson),
             "session" => Some(Self::Session),
+            "session.closed" | "session_closed" => Some(Self::SessionClosed),
             "wake" => Some(Self::Wake),
             "presence" => Some(Self::Presence),
             "read" => Some(Self::Read),
@@ -694,6 +701,7 @@ impl FactKind {
             Self::Risk => "risk",
             Self::Lesson => "lesson",
             Self::Session => "session",
+            Self::SessionClosed => "session.closed",
             Self::Wake => "wake",
             Self::Presence => "presence",
             Self::Read => "read",
@@ -743,8 +751,8 @@ mod fact_kind_say_surface_tests {
     #[test]
     fn every_wire_spelling_parses_back_to_its_variant() {
         for kind in FactKind::ALL {
-            // `claim.renewed` is unparseable on purpose: renewals enter through
-            // `RoomStore::renew_claim_lease`, never through a caller-typed kind.
+            // Renewals enter through `RoomStore::renew_claim_lease`, never
+            // through a caller-typed kind, so parse intentionally rejects it.
             if matches!(kind, FactKind::ClaimRenewed) {
                 continue;
             }
@@ -786,6 +794,7 @@ mod fact_kind_say_surface_tests {
             "risk",
             "lesson",
             "session",
+            "session.closed",
             "wake",
             "presence",
             "read",
@@ -809,6 +818,10 @@ mod fact_kind_say_surface_tests {
         assert!(
             !FactKind::ClaimRenewed.advertised_in_say(),
             "claim.renewed is not parseable — advertising it hands callers a failing kind"
+        );
+        assert!(
+            !FactKind::SessionClosed.advertised_in_say(),
+            "session.closed is authored only by the exact-session close command"
         );
         assert!(
             !FactKind::Unknown.advertised_in_say(),
@@ -4456,6 +4469,19 @@ impl DirectRoomStore {
         // accepting the action. Field bounds always apply; the claim-close and
         // lead-transfer arms self-select on kind, so ordinary writes pay one
         // `matches!` and nothing else.
+        if fact.kind == FactKind::SessionClosed
+            && (fact.tool.as_deref().is_none_or(str::is_empty)
+                || fact.from_session_id.as_deref().is_none_or(str::is_empty)
+                || !fact
+                    .evidence
+                    .iter()
+                    .any(|item| item == "protocol:session_state=closed"))
+        {
+            return Err(RallyError::Usage(
+                    "session.closed requires an exact tool, from_session_id, and protocol:session_state=closed evidence"
+                        .to_string(),
+                ));
+        }
         if crate::write_authority::needs_authority_check(&fact) {
             let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
             let coord =
@@ -5882,7 +5908,11 @@ fn scoped_contributor_tools(facts: &[Fact]) -> BTreeSet<String> {
         .filter(|fact| {
             !matches!(
                 fact.kind,
-                FactKind::Presence | FactKind::Session | FactKind::Read | FactKind::ClaimRenewed
+                FactKind::Presence
+                    | FactKind::Session
+                    | FactKind::SessionClosed
+                    | FactKind::Read
+                    | FactKind::ClaimRenewed
             )
         })
         .filter(|fact| !is_system_authored(fact))
@@ -5920,13 +5950,14 @@ fn facts_from_store(store: &SqliteStore) -> Result<Vec<Fact>> {
         .collect()
 }
 
-const CLAIM_LIFECYCLE_EVENT_TYPES: [&str; 6] = [
+const CLAIM_LIFECYCLE_EVENT_TYPES: [&str; 7] = [
     "claim",
     "claim.renewed",
     "claim.expired",
     "release",
     "resolve",
     "receipt",
+    "session.closed",
 ];
 
 fn is_claim_lifecycle_event_type(event_type: &str) -> bool {
@@ -6029,7 +6060,8 @@ fn force_rebuild_db_from_canonical_segments(
 /// Reduce the typed repository-wide lifecycle query to the facts that can
 /// change the collision answer for one requested path. The origin claims name
 /// the relevant ids/scopes; renewals and id-based closers reference those ids,
-/// while an atomic Release may close by exact scope without a ref.
+/// while an atomic Release may close by exact scope without a ref and a
+/// session close carries the exact owned scopes for path selection.
 fn claim_lifecycle_relevant_to_path(facts: &[Fact], path: &str) -> Vec<Fact> {
     let relevant_claims = facts
         .iter()
@@ -6063,6 +6095,10 @@ fn claim_lifecycle_relevant_to_path(facts: &[Fact], path: &str) -> Vec<Fact> {
                         .scope
                         .iter()
                         .any(|scope| claim_scopes.contains(scope.as_str())))
+                || (fact.kind == FactKind::SessionClosed
+                    && fact.scope.iter().any(|scope| {
+                        claim_scopes.contains(scope.as_str()) || path_matches_scope(scope, path)
+                    }))
         })
         .cloned()
         .collect()
@@ -11180,6 +11216,7 @@ mod ledger_tests {
             | FactKind::Risk
             | FactKind::Lesson
             | FactKind::Session
+            | FactKind::SessionClosed
             | FactKind::Wake
             | FactKind::Presence
             | FactKind::Read

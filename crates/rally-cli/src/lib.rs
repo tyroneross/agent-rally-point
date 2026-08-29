@@ -42,6 +42,7 @@ const SCHEMA_HOOK: &str = "agent-rally.command.hook.v1";
 const SCHEMA_RUN: &str = "agent-rally.command.run.v1";
 const SCHEMA_SESSIONS: &str = "agent-rally.command.sessions.v1";
 const SCHEMA_INJECT: &str = "agent-rally.command.inject.v1";
+const SCHEMA_SESSION: &str = "agent-rally.command.session.v1";
 const SCHEMA_SESSION_ACTION: &str = "agent-rally.command.session-action.v1";
 const SCHEMA_ADOPT: &str = "agent-rally.command.adopt.v1";
 pub(crate) const FACT_SCHEMA: &str = "agent-rally.fact.v1";
@@ -1562,6 +1563,7 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
         CliCommand::Run(args) => command_run(args),
         CliCommand::Sessions(args) => command_sessions(args),
         CliCommand::Inject(args) => command_inject(args),
+        CliCommand::SessionLifecycle(args) => command_session_lifecycle(args),
         CliCommand::Session(args) => command_session_action(args),
         CliCommand::Retrospective(args) => command_retrospective(args),
         CliCommand::Rotate(args) => command_rotate(args),
@@ -2569,6 +2571,16 @@ fn ensure_presence_tiered_for_session(
     tier: Option<&str>,
     from_session_id: &str,
 ) -> Result<()> {
+    ensure_presence_tiered_for_session_with_evidence(room, tool, tier, from_session_id, &[])
+}
+
+fn ensure_presence_tiered_for_session_with_evidence(
+    room: &RoomStore,
+    tool: &str,
+    tier: Option<&str>,
+    from_session_id: &str,
+    extra_evidence: &[String],
+) -> Result<()> {
     let facts = room.facts()?;
     if facts.iter().any(|fact| {
         fact.kind == FactKind::Presence
@@ -2578,6 +2590,10 @@ fn ensure_presence_tiered_for_session(
                 Some(tool),
                 Some(from_session_id),
             )
+            && (extra_evidence.is_empty()
+                || extra_evidence
+                    .iter()
+                    .all(|marker| fact.evidence.contains(marker)))
     }) {
         return Ok(());
     }
@@ -2605,7 +2621,13 @@ fn ensure_presence_tiered_for_session(
         // never return `Stale` (it needs all four signals present), and the
         // "adaptive" window always fell back to the default cadence. The reader
         // and its doc comment described a writer that did not exist.
-        evidence: presence_signal_evidence(room),
+        evidence: {
+            let mut evidence = presence_signal_evidence(room);
+            evidence.extend(extra_evidence.iter().cloned());
+            evidence.sort();
+            evidence.dedup();
+            evidence
+        },
         target: None,
         ref_id: None,
         status: None,
@@ -9150,6 +9172,229 @@ fn command_inject_ledger(
     )?;
     let text =
         format!("inject agent={agent_for_text} delivery_state={delivery_state} ack={has_ack}",);
+    Ok(Output::new(json, text, body))
+}
+
+#[derive(JsonSchema, Serialize)]
+struct SessionLifecycleData {
+    session: SessionLifecyclePayload,
+}
+
+#[derive(JsonSchema, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum SessionLifecyclePayload {
+    Ensure {
+        lease: session_identity::SessionLease,
+        environment: BTreeMap<String, String>,
+        shell_export: String,
+    },
+    Close {
+        tool: String,
+        session_id: String,
+        released_claim_ids: Vec<String>,
+        close_fact: Box<Fact>,
+    },
+}
+
+fn infer_session_adapter(tool: &str) -> String {
+    tool.split_once(':')
+        .map_or(tool, |(adapter, _)| adapter)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn checked_raw_session_id(raw: String) -> Result<String> {
+    let raw = raw.trim().to_string();
+    if raw.is_empty() || raw.chars().any(char::is_control) || raw.len() > 200 {
+        return Err(RallyError::Usage(
+            "session id must be nonempty, at most 200 bytes, and contain no control characters"
+                .to_string(),
+        ));
+    }
+    Ok(raw)
+}
+
+fn command_session_lifecycle(args: SessionLifecycleArgs) -> Result<Output> {
+    match args.subcommand {
+        cli::SessionLifecycleSubcommand::Ensure(ensure) => {
+            command_session_ensure(args.json, ensure)
+        }
+        cli::SessionLifecycleSubcommand::Close(close) => command_session_close(args.json, close),
+    }
+}
+
+fn command_session_ensure(json: bool, args: SessionEnsureArgs) -> Result<Output> {
+    let inherited = args
+        .session_id
+        .or_else(|| env::var("RALLY_SESSION_ID").ok());
+    let reused = inherited.is_some();
+    let raw_session_id = checked_raw_session_id(inherited.unwrap_or_else(|| new_id("lease")))?;
+    let adapter = args
+        .adapter
+        .unwrap_or_else(|| infer_session_adapter(&args.tool));
+    let capabilities = session_identity::SessionCapabilities::for_adapter(
+        &adapter,
+        args.strict,
+        args.native_hook,
+        args.lifecycle_close,
+        args.live_delivery,
+    );
+    let identity =
+        session_identity::ProtocolSessionIdentity::from_managed_lease(&raw_session_id, &args.tool);
+    let mut evidence = capabilities.evidence_markers();
+    evidence.push("protocol:session_state=active".to_string());
+    evidence.push(format!("protocol:session_adapter={adapter}"));
+
+    let room = RoomStore::open()?;
+    with_watchdog_command_commit(|| {
+        ensure_presence_tiered_for_session_with_evidence(
+            &room,
+            &args.tool,
+            None,
+            identity.from_session_id(),
+            &evidence,
+        )
+    })?;
+
+    let lease = session_identity::SessionLease {
+        raw_session_id: raw_session_id.clone(),
+        session_id: identity.session_id.clone(),
+        endpoint_id: identity.endpoint_id,
+        tool: args.tool.clone(),
+        adapter,
+        reused,
+        capabilities,
+    };
+    let environment = BTreeMap::from([
+        ("RALLY_SESSION_ID".to_string(), raw_session_id.clone()),
+        ("RALLY_AGENT_ID".to_string(), raw_session_id.clone()),
+        ("RALLY_TOOL_ID".to_string(), args.tool.clone()),
+    ]);
+    let shell_export = format!(
+        "export RALLY_SESSION_ID={} RALLY_AGENT_ID={} RALLY_TOOL_ID={}",
+        shell_quote(&raw_session_id),
+        shell_quote(&raw_session_id),
+        shell_quote(&args.tool),
+    );
+    let body = envelope(
+        "session",
+        SCHEMA_SESSION,
+        SessionLifecycleData {
+            session: SessionLifecyclePayload::Ensure {
+                lease: lease.clone(),
+                environment,
+                shell_export,
+            },
+        },
+    )?;
+    let text = format!(
+        "session ensure tool={} session_id={} reused={}",
+        lease.tool, lease.session_id, lease.reused
+    );
+    Ok(Output::new(json, text, body))
+}
+
+fn command_session_close(json: bool, args: SessionCloseArgs) -> Result<Output> {
+    let raw_session_id = args
+        .session_id
+        .or_else(|| env::var("RALLY_SESSION_ID").ok())
+        .ok_or_else(|| {
+            RallyError::Usage(
+                "session close requires --session-id or a parent-exported RALLY_SESSION_ID; refusing to guess from this short-lived process"
+                    .to_string(),
+            )
+        })?;
+    let raw_session_id = checked_raw_session_id(raw_session_id)?;
+    let identity =
+        session_identity::ProtocolSessionIdentity::from_managed_lease(&raw_session_id, &args.tool);
+    let session_id = identity.from_session_id().to_string();
+    let room = RoomStore::open()?;
+    let snapshot = room.snapshot()?;
+    let claims = snapshot
+        .active_claims
+        .iter()
+        .filter(|claim| {
+            claim.tool.as_deref() == Some(args.tool.as_str())
+                && claim.from_session_id.as_deref() == Some(session_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let mut released_claim_ids = claims
+        .iter()
+        .map(|claim| claim.event_id.clone())
+        .collect::<Vec<_>>();
+    released_claim_ids.sort();
+    let mut scope = claims
+        .iter()
+        .flat_map(|claim| claim.scope.iter().cloned())
+        .collect::<Vec<_>>();
+    scope.sort();
+    scope.dedup();
+    let operation_material = format!("{}:{}", session_id, released_claim_ids.join(","));
+    let event_id = stable_operation_id("session-close", &operation_material);
+    let existing = room
+        .facts()?
+        .into_iter()
+        .find(|fact| fact.event_id == event_id);
+    let close_fact = if let Some(existing) = existing {
+        existing
+    } else {
+        let fact = Fact {
+            from_session_id: Some(session_id.clone()),
+            schema: FACT_SCHEMA.to_string(),
+            event_id,
+            seq: 0,
+            thread_id: stable_operation_id("session-close-thread", &session_id),
+            kind: FactKind::SessionClosed,
+            tool: Some(args.tool.clone()),
+            role: None,
+            subject: format!(
+                "session closed: {} (released {} exact-session claim(s))",
+                session_id,
+                released_claim_ids.len()
+            ),
+            scope,
+            created_at: now_string(),
+            summary: None,
+            evidence: vec![
+                "protocol:session_state=closed".to_string(),
+                format!("protocol:released_claims={}", released_claim_ids.len()),
+            ],
+            target: None,
+            ref_id: None,
+            status: Some("closed".to_string()),
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        with_watchdog_command_commit(|| room.append_fact_verified(&fact))?.into_fact_reporting()
+    };
+    let still_owned = room.snapshot()?.active_claims.into_iter().any(|claim| {
+        claim.tool.as_deref() == Some(args.tool.as_str())
+            && claim.from_session_id.as_deref() == Some(session_id.as_str())
+    });
+    if still_owned {
+        return Err(RallyError::Message(format!(
+            "session close committed but exact-session claims remain for {session_id}"
+        )));
+    }
+    let body = envelope(
+        "session",
+        SCHEMA_SESSION,
+        SessionLifecycleData {
+            session: SessionLifecyclePayload::Close {
+                tool: args.tool.clone(),
+                session_id: session_id.clone(),
+                released_claim_ids: released_claim_ids.clone(),
+                close_fact: Box::new(close_fact),
+            },
+        },
+    )?;
+    let text = format!(
+        "session close tool={} session_id={} released_claims={}",
+        args.tool,
+        session_id,
+        released_claim_ids.len()
+    );
     Ok(Output::new(json, text, body))
 }
 
@@ -18299,6 +18544,10 @@ fn help_text() -> String {
         "  rally run <claude|codex|opencode|gemini> [--name <name>] [--backend <auto|tmux|cmux|ptyd>] [--dry-run] [--json]",
         "    managed run ids auto-number active agents, e.g. claude-01 / claude_code:01",
         "  rally sessions [--reap] [--json] [--tmux-bin <path>] [--cmux-bin <path>]",
+        "  rally session ensure --tool <tool> [--session-id <id>] [--adapter <host>] [--strict] [--native-hook] [--lifecycle-close] [--live-delivery] [--json]",
+        "    mint or reuse one parent-exported lease and report each adapter guarantee as enforced, advisory, or unmanaged",
+        "  rally session close --tool <tool> [--session-id <id>] [--json]",
+        "    close one exact tool/session lease and release only claims authored by that lease",
         "  rally inject <session|name|tool> (--text <text>|--handoff <event-id>) [--timeout-seconds <n>] [--json]",
         "    --handoff waits for target-authored Rally ACK by default; without that evidence, branch on reached_target, queued, and fallback_plan",
         "  rally attach <session|name|tool> [--dry-run] [--json]",

@@ -595,6 +595,26 @@ fn envelope_sessions() {
     ws.cleanup();
 }
 
+/// `session ensure` — establishes the host-neutral parent lease and returns
+/// the standard `data.session` lifecycle envelope.
+#[test]
+fn envelope_session_ensure() {
+    let ws = Workspace::new("session-ensure");
+    let body = ws.json(&[
+        "session",
+        "ensure",
+        "--json",
+        "--tool",
+        "test-agent",
+        "--session-id",
+        "contract-lease",
+    ]);
+    assert_envelope_contract("session", &body);
+    assert_eq!(body["schema"], "agent-rally.command.session.v1");
+    assert_eq!(body["data"]["session"]["action"], "ensure");
+    ws.cleanup();
+}
+
 // ─── Session actions (attach/capture/stop) ────────────────────────────────────
 // These three commands require an active managed session in the room ledger.
 // They are covered by the user_journey tests which assert schema validation at

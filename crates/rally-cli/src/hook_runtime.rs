@@ -1473,6 +1473,23 @@ pub(crate) fn capabilities() -> Value {
             "mutation": MUTATION_TOOLS,
         },
         "max_targets": MAX_TARGETS,
+        "coordination_contract": {
+            "version": 1,
+            "levels": ["enforced", "advisory", "unmanaged"],
+            "lease_command": "rally session ensure",
+            "close_command": "rally session close",
+            "identity": "parent_lease_or_host_session",
+            "visibility": "ledger_enforced",
+            "atomic_claims": "native_before_write_transaction",
+            "lifecycle_close": "adapter_attested",
+            "delivery": "receipt_attested",
+            "blocking_by_host": {
+                "claude_code": "strict_native_hook",
+                "cursor": "strict_native_hook",
+                "gemini": "strict_native_hook",
+                "codex": "advisory"
+            }
+        },
     })
 }
 
@@ -2585,6 +2602,14 @@ mod tests {
         assert_eq!(
             capabilities["native_effects"]["mutation"][0],
             json!("apply_patch")
+        );
+        assert_eq!(
+            capabilities["coordination_contract"]["blocking_by_host"]["codex"],
+            "advisory"
+        );
+        assert_eq!(
+            capabilities["coordination_contract"]["blocking_by_host"]["claude_code"],
+            "strict_native_hook"
         );
     }
 
