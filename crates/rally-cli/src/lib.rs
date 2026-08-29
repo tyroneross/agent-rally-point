@@ -11397,10 +11397,12 @@ mod tests {
 
     #[test]
     fn session_freshness_window_uses_effective_coordination_config() {
-        let mut coord = crate::hooks_config::CoordinationConfig::default();
-        coord.default_cadence_secs = 17;
-        coord.miss_multiplier = 4;
-        coord.grace_secs = 9;
+        let coord = crate::hooks_config::CoordinationConfig {
+            default_cadence_secs: 17,
+            miss_multiplier: 4,
+            grace_secs: 9,
+            ..Default::default()
+        };
         assert_eq!(session_current_window_secs(&coord), 77);
     }
 
