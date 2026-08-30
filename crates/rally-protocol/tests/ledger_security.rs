@@ -36,6 +36,7 @@ fn directive(to: &str, text: &str) -> Directive {
         seq: 0,
         to: to.to_string(),
         from: "claude_code:test".to_string(),
+        message: Default::default(),
         kind: DirectiveKind::Deliver,
         itype: InterruptType::Addition,
         text: Some(text.to_string()),

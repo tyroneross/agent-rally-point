@@ -271,6 +271,16 @@ rally lead assign  --tool <you> --to <tool> [--user-designated] --json   # set l
 rally lead relinquish --tool <lead> --json                      # drop the title (reopens the seat)
 # Lead auto-assigns to the first FRONTIER agent to enter (rally enter --tier frontier).
 
+# Direct communication is typed independently from room authority.
+rally inject <target> --tool <you> --intent inform --responsibility investigator --text "<evidence>" --json
+rally inject <target> --tool <you> --intent request --responsibility reviewer --text "<non-binding ask>" --json
+# Omit --intent only for a controlling directive; the default is directive and
+# retains lead/self/target-consent authorization. Non-controlling delivery does
+# not grant consent for a later directive and cannot use --urgent.
+# `peer` is a viewer-relative relation, never a stored role; new `enter` and
+# `say` writes reject `--role peer`. Room seat, work responsibility, actor kind,
+# message intent, and authority basis are separate.
+
 # Claimable backlog + plan/status bus:
 rally backlog add --tool <you> --id <id> --intent "<what>" [--target <owner>] [--status planned] [--expected-by "<when>"] [--owns <path>] [--depends-on <id>] --json
 rally backlog update --tool <you> --id <id> [--status in_progress|blocked] [--expected-by "<next checkpoint>"] --json

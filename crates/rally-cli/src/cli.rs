@@ -4,6 +4,7 @@ use crate::SessionAction;
 use crate::backends::Backend;
 use crate::error::{RallyError, Result};
 use crate::store::FactKind;
+use rally_protocol::{MessageIntent, WorkResponsibility};
 
 #[allow(clippy::large_enum_variant)] // short-lived dispatch enum; boxing adds indirection for no runtime benefit
 pub(crate) enum CliCommand {
@@ -487,6 +488,11 @@ pub(crate) struct InjectArgs {
     /// Identity of the agent sending the injection. Defaults to "unknown" when
     /// omitted. Stored in the coordination channel so recipients know the source.
     pub(crate) tool: String,
+    /// Semantic intent. Defaults to `directive` for backward compatibility.
+    pub(crate) intent: MessageIntent,
+    /// Scoped work responsibility asserted by the sender. This does not grant
+    /// room authority.
+    pub(crate) responsibility: WorkResponsibility,
     /// Plan F sync override. When `true`, the Directive is written with
     /// `urgent: true` AND the daemon performs an immediate PTY-write
     /// instead of waiting for the agent's next checkpoint. RESTRICTED to
@@ -1976,6 +1982,32 @@ fn inject_parser() -> impl Parser<InjectArgs> {
     let bins = backend_bins_parser();
     let tool = optional_string_arg("tool", "TOOL")
         .map(|value| value.unwrap_or_else(|| "unknown".to_string()));
+    let intent = string_arg("intent", "INTENT")
+        .parse(|value| match value.as_str() {
+            "inform" => Ok(MessageIntent::Inform),
+            "request" => Ok(MessageIntent::Request),
+            "propose" => Ok(MessageIntent::Propose),
+            "directive" => Ok(MessageIntent::Directive),
+            _ => Err(RallyError::Usage(format!(
+                "--intent must be inform, request, propose, or directive; got {value}"
+            ))),
+        })
+        .fallback(MessageIntent::Directive);
+    let responsibility = string_arg("responsibility", "RESPONSIBILITY")
+        .parse(|value| match value.as_str() {
+            "investigator" => Ok(WorkResponsibility::Investigator),
+            "planner" => Ok(WorkResponsibility::Planner),
+            "implementer" => Ok(WorkResponsibility::Implementer),
+            "verifier" => Ok(WorkResponsibility::Verifier),
+            "reviewer" => Ok(WorkResponsibility::Reviewer),
+            "integrator" => Ok(WorkResponsibility::Integrator),
+            "operator" => Ok(WorkResponsibility::Operator),
+            "unspecified" => Ok(WorkResponsibility::Unspecified),
+            _ => Err(RallyError::Usage(format!(
+                "--responsibility must be investigator, planner, implementer, verifier, reviewer, integrator, operator, or unspecified; got {value}"
+            ))),
+        })
+        .fallback(WorkResponsibility::Unspecified);
     // Plan F sync override. Restricted by the daemon to Stop|Retraction
     // semantics — see InjectArgs::urgent docstring + F plan §sync override.
     let urgent = long("urgent")
@@ -1991,6 +2023,8 @@ fn inject_parser() -> impl Parser<InjectArgs> {
         timeout_seconds,
         bins,
         tool,
+        intent,
+        responsibility,
         urgent,
         target
     )
@@ -2004,6 +2038,8 @@ fn inject_parser() -> impl Parser<InjectArgs> {
             timeout_seconds,
             bins,
             tool,
+            intent,
+            responsibility,
             urgent,
             target,
         )| {
@@ -2017,6 +2053,8 @@ fn inject_parser() -> impl Parser<InjectArgs> {
                 timeout_seconds,
                 bins,
                 tool,
+                intent,
+                responsibility,
                 urgent,
             }
         },
@@ -2766,5 +2804,47 @@ mod o26_db_only_migration_cli_tests {
         assert_eq!(doctor.engagement.as_deref(), Some("alpha"));
         assert!(doctor.apply);
         assert!(doctor.json);
+    }
+}
+
+#[cfg(test)]
+mod inject_message_cli_tests {
+    use super::*;
+
+    fn inject_args(args: &[&str]) -> InjectArgs {
+        let args = args
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        let CliParse::Command(command) = parse_cli(&args).expect("inject command parses") else {
+            panic!("inject must parse as a command");
+        };
+        let CliCommand::Inject(args) = *command else {
+            panic!("expected inject command");
+        };
+        args
+    }
+
+    #[test]
+    fn inject_defaults_to_controlling_directive() {
+        let args = inject_args(&["inject", "codex:target", "--text", "work"]);
+        assert_eq!(args.intent, MessageIntent::Directive);
+        assert_eq!(args.responsibility, WorkResponsibility::Unspecified);
+    }
+
+    #[test]
+    fn inject_parses_non_controlling_intent_and_scoped_responsibility() {
+        let args = inject_args(&[
+            "inject",
+            "codex:target",
+            "--text",
+            "evidence",
+            "--intent",
+            "inform",
+            "--responsibility",
+            "investigator",
+        ]);
+        assert_eq!(args.intent, MessageIntent::Inform);
+        assert_eq!(args.responsibility, WorkResponsibility::Investigator);
     }
 }

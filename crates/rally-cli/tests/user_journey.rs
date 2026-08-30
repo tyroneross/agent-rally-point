@@ -3016,10 +3016,13 @@ fn rally_uses_native_cmux_managed_session_commands() {
     // The label is asserted here, on the `commands` the envelope reports,
     // because that array IS the delivered bytes; the security contract itself
     // is graded in tests/inject_security.rs.
-    assert_eq!(
-        cmux_inject["data"]["inject"]["commands"][1][4],
-        "[rally: UNVERIFIED SENDER (none stated)] hello cmux"
-    );
+    let cmux_body = cmux_inject["data"]["inject"]["commands"][1][4]
+        .as_str()
+        .expect("cmux inject body");
+    assert!(cmux_body.starts_with(
+        "[rally: UNVERIFIED SENDER (none stated) | intent=directive(declared) | control=yes(derived)"
+    ));
+    assert!(cmux_body.ends_with("] hello cmux"));
     assert_eq!(cmux_inject["data"]["inject"]["commands"][2][1], "send-key");
     assert_eq!(cmux_inject["data"]["inject"]["commands"][2][4], "enter");
 

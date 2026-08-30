@@ -177,6 +177,7 @@ use next::{
 };
 use obligations::{InboxResult, build_inbox};
 use output::{CliError, Output, RenderedOutput};
+use rally_protocol::{ActorKind, AuthorityBasis, MessageContext, MessageIntent, RoomSeat};
 use rallyd_core::ServeConfig;
 use route_findings::{Finding, RoutingSummary, route_findings};
 use store::{
@@ -2681,10 +2682,26 @@ fn ensure_presence_tiered_for_session_with_evidence(
     Ok(())
 }
 
+/// `peer` describes a relationship between a viewer and somebody else; it is
+/// not a stable responsibility that can be stored on an actor. Keep legacy
+/// rows queryable, but refuse new facts that would preserve the ambiguity.
+fn reject_viewer_relative_role(role: Option<&str>) -> Result<()> {
+    if role.is_some_and(|value| value.eq_ignore_ascii_case("peer")) {
+        return Err(RallyError::Usage(
+            "--role peer is viewer-relative and cannot be stored. Use a scoped responsibility \
+             such as investigator, planner, implementer, verifier, reviewer, integrator, or \
+             operator."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn command_enter(args: EnterArgs) -> Result<Output> {
     let tool = args.tool;
     let session_id = args.session_id.unwrap_or_else(|| format!("session-{tool}"));
     let role = args.role;
+    reject_viewer_relative_role(role.as_deref())?;
     let paths = normalize_paths(args.paths);
     // R5: persist `--engagement <label>` before opening the room so the
     // RoomStore picks it up on construction (matching env-var precedence).
@@ -3053,6 +3070,7 @@ fn command_say(args: SayArgs) -> Result<Output> {
              by hand. Use a descriptive role instead, or let the reaper write the fact."
         )));
     }
+    reject_viewer_relative_role(args.role.as_deref())?;
     if args.tool == SYSTEM_TOOL {
         return Err(RallyError::Usage(format!(
             "--tool {SYSTEM_TOOL} is the reserved author for rally's own machine-initiated \
@@ -8329,6 +8347,8 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     let dry_run = args.dry_run;
     let target = args.target;
     let sender_tool = args.tool;
+    let intent = args.intent;
+    let responsibility = args.responsibility;
     let urgent = args.urgent;
     // SEC-006: `Directive.from` is caller-supplied. The write-side gate here
     // rejects a malformed / traversal / control-char sender id so a garbage
@@ -8350,6 +8370,24 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     // covers this binary's delivery paths.
     rally_protocol::ledger::validate_agent_id(&sender_tool)
         .map_err(|e| RallyError::Usage(format!("invalid --tool sender id: {e}")))?;
+    if sender_tool == SYSTEM_TOOL {
+        return Err(RallyError::Usage(format!(
+            "--tool {SYSTEM_TOOL} is the reserved author for Rally's machine-initiated writes; \
+             it cannot be claimed by a manual inject. Pass the sending agent's own id instead."
+        )));
+    }
+    if urgent && !intent.is_controlling() {
+        return Err(RallyError::Usage(format!(
+            "--urgent is reserved for controlling directives; --intent {} is non-controlling",
+            intent.as_str()
+        )));
+    }
+    if args.handoff.is_some() && intent != MessageIntent::Directive {
+        return Err(RallyError::Usage(
+            "--handoff generates a controlling Rally instruction and requires --intent directive"
+                .to_string(),
+        ));
+    }
 
     // Two-arm target resolution: managed session (legacy dual-delivery,
     // unchanged), or rally-termd-registered ledger agent (ledger-only). See
@@ -8359,15 +8397,24 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
     // RC-041 gap 3B: WHO may inject into WHOM. Runs after resolution because
     // the rule is about the target's identity, and before either arm because
     // both deliver. `--dry-run` is exempt: it plans and delivers nothing.
-    if !dry_run {
-        let target_tool = match &inject_target {
-            InjectTarget::Managed(session) => session.tool.clone(),
-            InjectTarget::LedgerAgent(agent_id) => agent_id.clone(),
-        };
-        if let Some(refusal) = inject_authorization_refusal(&sender_tool, &target_tool) {
-            return Err(RallyError::Usage(refusal));
-        }
+    let target_tool = match &inject_target {
+        InjectTarget::Managed(session) => session.tool.clone(),
+        InjectTarget::LedgerAgent(agent_id) => agent_id.clone(),
+    };
+    let authorization = inject_authorization(&sender_tool, &target_tool, intent);
+    if !dry_run && let Some(refusal) = authorization.refusal.clone() {
+        return Err(RallyError::Usage(refusal));
     }
+    let message = MessageContext {
+        intent,
+        actor_kind: inject_actor_kind(&sender_tool),
+        caller_session_id: (sender_tool != INJECT_SENDER_UNIDENTIFIED)
+            .then(|| current_protocol_session(Some(&sender_tool)).session_id),
+        room_seat: authorization.room_seat,
+        lead_epoch: authorization.lead_epoch,
+        responsibility,
+        authority_basis: authorization.authority_basis,
+    };
 
     match inject_target {
         InjectTarget::Managed(session) => command_inject_managed(
@@ -8375,6 +8422,7 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
             dry_run,
             urgent,
             sender_tool,
+            message,
             *session,
             args.handoff,
             args.text,
@@ -8387,6 +8435,7 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
             dry_run,
             urgent,
             sender_tool,
+            message,
             agent_id,
             args.handoff,
             args.text,
@@ -8412,21 +8461,96 @@ const INJECT_SENDER_UNIDENTIFIED: &str = "unknown";
 /// who leads the room, and turning it into a refusal would convert a local
 /// SQLite hiccup into a room-wide coordination outage — the RC-038 failure
 /// shape, arriving from the other direction.
-fn inject_authorization_refusal(sender_tool: &str, target_tool: &str) -> Option<String> {
-    let room = RoomStore::open().ok()?;
-    let snapshot = room.snapshot().ok()?;
-    // Consent = the TARGET named this sender in an open handoff. That is the
-    // one invitation in the fact vocabulary the target itself authors; a
-    // handoff the SENDER wrote would be the sender authorizing itself.
+#[derive(Debug)]
+struct InjectAuthorization {
+    refusal: Option<String>,
+    room_seat: RoomSeat,
+    lead_epoch: Option<i64>,
+    authority_basis: AuthorityBasis,
+}
+
+/// Resolve authorization and at-send room metadata from one snapshot so the
+/// gate and the recipient-visible context cannot disagree.
+fn inject_authorization(
+    sender_tool: &str,
+    target_tool: &str,
+    intent: MessageIntent,
+) -> InjectAuthorization {
+    let Ok(room) = RoomStore::open() else {
+        return InjectAuthorization {
+            refusal: None,
+            room_seat: RoomSeat::Unknown,
+            lead_epoch: None,
+            authority_basis: if intent.is_controlling() {
+                AuthorityBasis::Unverified
+            } else {
+                AuthorityBasis::NotRequired
+            },
+        };
+    };
+    let Ok(snapshot) = room.snapshot() else {
+        return InjectAuthorization {
+            refusal: None,
+            room_seat: RoomSeat::Unknown,
+            lead_epoch: None,
+            authority_basis: if intent.is_controlling() {
+                AuthorityBasis::Unverified
+            } else {
+                AuthorityBasis::NotRequired
+            },
+        };
+    };
+    // Consent = the TARGET named this sender in an open handoff. A message the
+    // SENDER wrote is never consent; non-controlling content facts use Artifact
+    // and therefore never enter this projection.
     let target_invited_sender = snapshot.open_handoffs.iter().any(|fact| {
         fact.tool.as_deref() == Some(target_tool) && fact.target.as_deref() == Some(sender_tool)
     });
-    inject_authority_refusal(
+    let (refusal, authority_basis) = inject_authority_decision(
         sender_tool,
         target_tool,
         snapshot.lead.as_deref(),
         target_invited_sender,
-    )
+        intent,
+    );
+    let room_seat = if snapshot.lead.as_deref() == Some(sender_tool) {
+        RoomSeat::Lead
+    } else if snapshot
+        .squads
+        .iter()
+        .any(|squad| squad.tool == sender_tool)
+    {
+        RoomSeat::Participant
+    } else {
+        RoomSeat::Unjoined
+    };
+    InjectAuthorization {
+        refusal,
+        room_seat,
+        lead_epoch: snapshot.lead_epoch,
+        authority_basis,
+    }
+}
+
+fn inject_actor_kind(sender_tool: &str) -> ActorKind {
+    // Only Rally's reserved machine author may render as `system`. Manual
+    // inject rejects that author before reaching this function. Names that
+    // merely claim a system-like prefix remain services, so actor kind cannot
+    // imply authority; the separate authority basis carries that decision.
+    if sender_tool == SYSTEM_TOOL {
+        return ActorKind::System;
+    }
+    if matches!(sender_tool, "build-loop" | "system") {
+        return ActorKind::Service;
+    }
+    match sender_tool.split_once(':').map(|(kind, _)| kind) {
+        Some("human") => ActorKind::Human,
+        Some("service") => ActorKind::Service,
+        Some("system") | Some("rally") | Some("build-loop") => ActorKind::Service,
+        Some(_) => ActorKind::Agent,
+        None if sender_tool == INJECT_SENDER_UNIDENTIFIED => ActorKind::Unknown,
+        None => ActorKind::Agent,
+    }
 }
 
 /// The inject authorization rule, as a pure function of ledger-derived state.
@@ -8474,34 +8598,102 @@ fn inject_authorization_refusal(sender_tool: &str, target_tool: &str) -> Option<
 /// tier as `claim_authority::breadth_violation`, which likewise trusts a
 /// self-declared `owner_tool`. Closing rule 5 needs a caller credential this
 /// protocol does not have — say so rather than let the check imply one exists.
+#[cfg(test)]
 fn inject_authority_refusal(
     sender_tool: &str,
     target_tool: &str,
     lead: Option<&str>,
     target_invited_sender: bool,
 ) -> Option<String> {
-    if sender_tool == target_tool
-        || target_invited_sender
-        || sender_tool == INJECT_SENDER_UNIDENTIFIED
-    {
-        return None;
+    inject_authority_decision(
+        sender_tool,
+        target_tool,
+        lead,
+        target_invited_sender,
+        MessageIntent::Directive,
+    )
+    .0
+}
+
+fn inject_authority_decision(
+    sender_tool: &str,
+    target_tool: &str,
+    lead: Option<&str>,
+    target_invited_sender: bool,
+    intent: MessageIntent,
+) -> (Option<String>, AuthorityBasis) {
+    if !intent.is_controlling() {
+        return (None, AuthorityBasis::NotRequired);
     }
-    let lead = lead?;
+    if sender_tool == target_tool {
+        return (None, AuthorityBasis::SelfTarget);
+    }
+    if target_invited_sender {
+        return (None, AuthorityBasis::TargetConsent);
+    }
+    if sender_tool == INJECT_SENDER_UNIDENTIFIED {
+        return (None, AuthorityBasis::Unverified);
+    }
+    let Some(lead) = lead else {
+        return (None, AuthorityBasis::LeaderlessBootstrap);
+    };
     if lead == sender_tool {
-        return None;
+        return (None, AuthorityBasis::LeadLease);
     }
-    Some(format!(
-        "inject refused: {sender_tool} does not hold the lead seat and {target_tool} has not \
-         opened a handoff to it, so {sender_tool} may not write into {target_tool}'s session. \
-         {lead} holds the lead seat. To fix: ask {lead} to inject, or post \
-         `rally say handoff --tool {sender_tool} --target {target_tool} --subject <what you need>` \
-         and let {target_tool} pull it on its next `rally next`."
-    ))
+    (
+        Some(format!(
+            "inject refused: {sender_tool} does not hold the lead seat and {target_tool} has not \
+             opened a handoff to it, so {sender_tool} may not write a controlling directive into \
+             {target_tool}'s session. {lead} holds the lead seat. To send non-controlling context, \
+             use --intent inform, request, or propose only after rewriting it as genuinely \
+             non-controlling context; do not relabel this refused directive. To direct work, ask \
+             {lead} to inject, or \
+             post `rally say handoff --tool {sender_tool} --target {target_tool} --subject <what you need>` \
+             and let {target_tool} pull it on its next `rally next`."
+        )),
+        AuthorityBasis::Unverified,
+    )
 }
 
 #[cfg(test)]
 mod inject_authority_tests {
-    use super::inject_authority_refusal;
+    use super::{inject_authority_decision, inject_authority_refusal};
+    use rally_protocol::{AuthorityBasis, MessageIntent};
+
+    #[test]
+    fn non_controlling_intents_need_no_lead_or_target_consent() {
+        for intent in [
+            MessageIntent::Inform,
+            MessageIntent::Request,
+            MessageIntent::Propose,
+        ] {
+            let (refusal, basis) = inject_authority_decision(
+                "codex:02",
+                "codex:01",
+                Some("claude_code:00"),
+                false,
+                intent,
+            );
+            assert!(
+                refusal.is_none(),
+                "{intent:?} must be deliverable laterally"
+            );
+            assert_eq!(basis, AuthorityBasis::NotRequired);
+        }
+    }
+
+    #[test]
+    fn unknown_future_intent_remains_controlling() {
+        let (refusal, basis) = inject_authority_decision(
+            "codex:02",
+            "codex:01",
+            Some("claude_code:00"),
+            false,
+            MessageIntent::Unknown,
+        );
+        assert!(refusal.is_some());
+        assert_eq!(basis, AuthorityBasis::Unverified);
+    }
 
     #[test]
     fn self_inject_is_allowed_even_under_a_lead() {
@@ -8597,6 +8789,7 @@ fn command_inject_managed(
     dry_run: bool,
     urgent: bool,
     sender_tool: String,
+    message: MessageContext,
     session: ManagedSession,
     handoff: Option<String>,
     text_arg: Option<String>,
@@ -8643,9 +8836,9 @@ fn command_inject_managed(
     // fact in the channel from the originating `rally say handoff`.
     let content_fact = if is_text_inject {
         let fact = if let Some(ref r) = room {
-            inject_content_fact(r, &sender_tool, &session.tool, &text)?
+            inject_content_fact(r, &sender_tool, &session.tool, &message, &text)?
         } else {
-            inject_content_fact_dry_run(&sender_tool, &session.tool, &text)
+            inject_content_fact_dry_run(&sender_tool, &session.tool, &message, &text)
         };
         Some(fact)
     } else {
@@ -8671,11 +8864,16 @@ fn command_inject_managed(
     // is no better source to resolve it from: rally sets no ambient
     // caller-identity variable, and the ledger write on this same path records
     // the identical placeholder in `Directive.from`. So the honest fix is to
-    // render it AS a placeholder — `state_inject_sender` is simply not called,
-    // and the label says `(none stated)`. The label itself is never skipped.
-    if sender_tool != INJECT_SENDER_UNIDENTIFIED {
-        backend_runner.state_inject_sender(&sender_tool);
-    }
+    // render it AS a placeholder — pass an empty sender into the typed message
+    // renderer, which displays `(none stated)`. The label itself is never skipped.
+    backend_runner.state_inject_message(
+        if sender_tool == INJECT_SENDER_UNIDENTIFIED {
+            ""
+        } else {
+            &sender_tool
+        },
+        &message,
+    );
     let live_target = if dry_run {
         session.target.clone()
     } else {
@@ -8699,7 +8897,14 @@ fn command_inject_managed(
     ) = if dry_run {
         (None, None, "pending")
     } else {
-        match inject_via_ledger(&repo_root()?, &session.tool, &sender_tool, &text, urgent) {
+        match inject_via_ledger(
+            &repo_root()?,
+            &session.tool,
+            &sender_tool,
+            &message,
+            &text,
+            urgent,
+        ) {
             Ok(seq) => (Some(seq), Some(session.tool.clone()), "pending"),
             Err(_) => (None, Some(session.tool.clone()), "failed"),
         }
@@ -8942,6 +9147,7 @@ fn command_inject_managed(
         wake_intent,
         commands: command_plan_json(&commands),
         sender_tool,
+        message: backends::InjectMessageData::from(&message),
         content_fact,
         delivered,
         // Compatibility contract: these two fields retain the immediate
@@ -8994,6 +9200,7 @@ fn command_inject_ledger(
     dry_run: bool,
     urgent: bool,
     sender_tool: String,
+    message: MessageContext,
     agent_id: String,
     handoff: Option<String>,
     text_arg: Option<String>,
@@ -9034,9 +9241,9 @@ fn command_inject_ledger(
 
     let content_fact = if is_text_inject {
         let fact = if let Some(ref r) = room {
-            inject_content_fact(r, &sender_tool, &agent_id, &text)?
+            inject_content_fact(r, &sender_tool, &agent_id, &message, &text)?
         } else {
-            inject_content_fact_dry_run(&sender_tool, &agent_id, &text)
+            inject_content_fact_dry_run(&sender_tool, &agent_id, &message, &text)
         };
         Some(fact)
     } else {
@@ -9052,7 +9259,14 @@ fn command_inject_ledger(
         if dry_run {
             (None, None, "pending")
         } else {
-            match inject_via_ledger(&repo_root()?, &agent_id, &sender_tool, &text, urgent) {
+            match inject_via_ledger(
+                &repo_root()?,
+                &agent_id,
+                &sender_tool,
+                &message,
+                &text,
+                urgent,
+            ) {
                 Ok(seq) => (Some(seq), Some(agent_id.clone()), "pending"),
                 Err(_) => (None, Some(agent_id.clone()), "failed"),
             }
@@ -9172,6 +9386,7 @@ fn command_inject_ledger(
         wake_intent,
         commands: command_plan_json(&commands),
         sender_tool,
+        message: backends::InjectMessageData::from(&message),
         content_fact,
         // Compatibility contract: the ledger-only path never runs a
         // synchronous backend, so `delivered` stays false and
@@ -10401,22 +10616,35 @@ fn append_next_wake_intent(
 
 /// Build the coordination fact that records inject message content.
 ///
-/// Uses `FactKind::Handoff` — it carries tool/target/subject/summary semantics
-/// and represents "sender has information for recipient". The "inject:" subject
-/// prefix distinguishes it from work-transfer handoffs.
+/// Controlling directives retain `FactKind::Handoff`. Non-controlling messages
+/// use `FactKind::Artifact`, which carries tool/target/subject/summary semantics
+/// without entering the target-consent graph used by inject authorization.
 ///
 /// Subject is truncated to 120 chars so ledger lines stay readable in `rally room`.
 /// Full text lands in summary so nothing is lost.
-fn make_inject_content_fact(sender_tool: &str, recipient_tool: &str, text: &str) -> Fact {
+fn make_inject_content_fact(
+    sender_tool: &str,
+    recipient_tool: &str,
+    message: &MessageContext,
+    text: &str,
+) -> Fact {
     let subject_text: String = text.chars().take(120).collect();
-    let subject = format!("inject: {subject_text}");
+    let subject = format!("{}: {subject_text}", message.intent.as_str());
     Fact {
-        from_session_id: None,
+        from_session_id: message.caller_session_id.clone(),
         schema: FACT_SCHEMA.to_string(),
         event_id: new_id("inject"),
         seq: 0,
         thread_id: format!("inject-{}", sanitize_id(sender_tool)),
-        kind: FactKind::Handoff,
+        // A non-controlling message must not enter `open_handoffs`, because an
+        // open handoff authored by the target is the consent input that can
+        // authorize a later controlling directive. Artifact preserves room
+        // visibility without minting consent.
+        kind: if message.intent.is_controlling() {
+            FactKind::Handoff
+        } else {
+            FactKind::Artifact
+        },
         tool: Some(sender_tool.to_string()),
         role: None,
         subject,
@@ -10431,6 +10659,11 @@ fn make_inject_content_fact(sender_tool: &str, recipient_tool: &str, text: &str)
         evidence: vec![
             format!("sender:{sender_tool}"),
             format!("pid:{}", std::process::id()),
+            format!("message_intent:{}", message.intent.as_str()),
+            format!("actor_kind:{}", message.actor_kind.as_str()),
+            format!("room_seat:{}", message.room_seat.as_str()),
+            format!("responsibility:{}", message.responsibility.as_str()),
+            format!("authority_basis:{}", message.authority_basis.as_str()),
         ],
         target: Some(recipient_tool.to_string()),
         ref_id: None,
@@ -10517,9 +10750,10 @@ fn inject_content_fact(
     room: &RoomStore,
     sender_tool: &str,
     recipient_tool: &str,
+    message: &MessageContext,
     text: &str,
 ) -> Result<Fact> {
-    let fact = make_inject_content_fact(sender_tool, recipient_tool, text);
+    let fact = make_inject_content_fact(sender_tool, recipient_tool, message, text);
     // This coordination fact is supporting evidence, not the inject command's
     // primary commit point. The watchdog is armed only around the durable
     // Directive append so it cannot report `committed: true` before delivery
@@ -10529,8 +10763,13 @@ fn inject_content_fact(
 }
 
 /// Return the content fact without appending (dry-run path).
-fn inject_content_fact_dry_run(sender_tool: &str, recipient_tool: &str, text: &str) -> Fact {
-    make_inject_content_fact(sender_tool, recipient_tool, text)
+fn inject_content_fact_dry_run(
+    sender_tool: &str,
+    recipient_tool: &str,
+    message: &MessageContext,
+    text: &str,
+) -> Fact {
+    make_inject_content_fact(sender_tool, recipient_tool, message, text)
 }
 
 /// Append a `wake_intent` Fact for an inject. The Fact's subject + summary
@@ -10647,6 +10886,7 @@ fn inject_via_ledger(
     repo: &std::path::Path,
     target_tool: &str,
     sender_tool: &str,
+    message: &MessageContext,
     text: &str,
     urgent: bool,
 ) -> Result<u64> {
@@ -10655,17 +10895,22 @@ fn inject_via_ledger(
 
     let ledger_root = repo.join(".rally");
     let inbox = FileInbox::open(&ledger_root).map_err(RallyError::io("open .rally for inject"))?;
+    // rally-termd consumes Directive.text directly, so the ledger must carry
+    // the same Rally-authored boundary the live backend renders. Both paths
+    // call one renderer independently; neither trusts a sender-authored prefix.
+    let deliverable_text = backends::deliverable_inject_text(sender_tool, message, text);
 
     let directive = Directive {
         seq: 0, // FileInbox assigns the next monotonic seq.
         to: target_tool.to_string(),
         from: sender_tool.to_string(),
+        message: message.clone(),
         kind: DirectiveKind::Deliver,
         // P2 only delivers ADDITION semantics. Revision/Retraction land
         // when P4 surfaces `--urgent` and the InterruptBench-style
         // semantics shipped on top.
         itype: InterruptType::Addition,
-        text: Some(text.to_string()),
+        text: Some(deliverable_text),
         urgent,
         ts: now_ts(),
     };
@@ -12992,7 +13237,14 @@ mod tests {
 
         let msg = "BLOCKED need creds for staging";
         // inject_content_fact appends to the given room store directly.
-        let fact = inject_content_fact(&room, "sender:1", "claude_code:01", msg).unwrap();
+        let fact = inject_content_fact(
+            &room,
+            "sender:1",
+            "claude_code:01",
+            &MessageContext::default(),
+            msg,
+        )
+        .unwrap();
 
         // Returned fact has the right fields.
         assert_eq!(fact.tool.as_deref(), Some("sender:1"), "tool is sender");
@@ -13027,6 +13279,109 @@ mod tests {
             recorded.subject
         );
         assert_eq!(recorded.summary.as_deref(), Some(msg));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn non_controlling_content_never_enters_target_consent_handoffs() {
+        let root = unique_root("inject-non-controlling-no-consent");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        let message = MessageContext {
+            intent: MessageIntent::Request,
+            authority_basis: AuthorityBasis::NotRequired,
+            ..MessageContext::default()
+        };
+
+        let fact = inject_content_fact(
+            &room,
+            "codex:sender",
+            "claude_code:target",
+            &message,
+            "Please review this evidence if useful.",
+        )
+        .unwrap();
+        assert_eq!(fact.kind, FactKind::Artifact);
+        let snapshot = room.snapshot().unwrap();
+        assert!(
+            snapshot.open_handoffs.is_empty(),
+            "a non-controlling message must not mint consent for a later directive"
+        );
+        let (refusal, _) = inject_authority_decision(
+            "codex:sender",
+            "claude_code:target",
+            Some("claude_code:lead"),
+            snapshot.open_handoffs.iter().any(|handoff| {
+                handoff.tool.as_deref() == Some("claude_code:target")
+                    && handoff.target.as_deref() == Some("codex:sender")
+            }),
+            MessageIntent::Directive,
+        );
+        assert!(refusal.is_some(), "the later directive must remain refused");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn urgent_non_controlling_message_is_refused_before_target_resolution() {
+        let result = command_inject(InjectArgs {
+            json: true,
+            dry_run: false,
+            target: "target-does-not-need-to-exist".into(),
+            text: Some("notice".into()),
+            handoff: None,
+            require_ack: false,
+            timeout_seconds: 1,
+            bins: BackendBins::default(),
+            tool: "codex:sender".into(),
+            intent: MessageIntent::Inform,
+            responsibility: rally_protocol::WorkResponsibility::Investigator,
+            urgent: true,
+        });
+        let Err(error) = result else {
+            panic!("urgent non-controlling message must be refused");
+        };
+        assert!(error.to_string().contains("--urgent is reserved"));
+    }
+
+    #[test]
+    fn ledger_and_live_backend_render_the_same_typed_message() {
+        use rally_protocol::Inbox;
+        use rally_protocol::ledger::FileInbox;
+
+        let root = unique_root("inject-ledger-live-parity");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join(".rally")).unwrap();
+        let message = MessageContext {
+            intent: MessageIntent::Inform,
+            actor_kind: ActorKind::Agent,
+            caller_session_id: Some("sess:codex:sender#live".into()),
+            room_seat: RoomSeat::Participant,
+            lead_epoch: Some(17),
+            responsibility: rally_protocol::WorkResponsibility::Investigator,
+            authority_basis: AuthorityBasis::NotRequired,
+        };
+        let sender = "codex:sender";
+        let target = "claude_code:target";
+        let raw = "Evidence only; no action is required.";
+
+        inject_via_ledger(&root, target, sender, &message, raw, false).unwrap();
+        let inbox = FileInbox::open(root.join(".rally")).unwrap();
+        let directive = inbox.read_since(target, 0).unwrap().remove(0);
+
+        let mut runner = BackendRunner::new(Backend::Cmux, BackendBins::default());
+        runner.state_inject_message(sender, &message);
+        let commands = runner.inject_commands("workspace", raw);
+        let live_text = commands
+            .iter()
+            .find(|command| command.get(1).map(String::as_str) == Some("send"))
+            .and_then(|command| command.get(4))
+            .expect("cmux send text");
+
+        assert_eq!(directive.message, message);
+        assert_eq!(directive.text.as_deref(), Some(live_text.as_str()));
+        assert!(live_text.contains("intent=inform(declared) | control=no(derived)"));
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -13194,8 +13549,14 @@ mod tests {
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
-        let fact =
-            inject_content_fact(&room, "claude_code:sender-1", "claude_code:target", "hi").unwrap();
+        let fact = inject_content_fact(
+            &room,
+            "claude_code:sender-1",
+            "claude_code:target",
+            &MessageContext::default(),
+            "hi",
+        )
+        .unwrap();
 
         assert!(
             fact.evidence
@@ -13224,7 +13585,14 @@ mod tests {
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
-        let fact = inject_content_fact(&room, "alpha", "beta", "hello verified").unwrap();
+        let fact = inject_content_fact(
+            &room,
+            "alpha",
+            "beta",
+            &MessageContext::default(),
+            "hello verified",
+        )
+        .unwrap();
         // Re-read ALL facts from the store (which scans canonical segments) and
         // assert the event_id we got back is present.  append_fact_verified already
         // does this internally and would have returned Err if it failed, so this
@@ -13247,10 +13615,15 @@ mod tests {
     fn inject_content_fact_truncates_subject_preserves_summary() {
         let long_msg = "X".repeat(200);
         // make_inject_content_fact is pure — no store needed.
-        let fact = make_inject_content_fact("sender:2", "codex:01", &long_msg);
+        let fact = make_inject_content_fact(
+            "sender:2",
+            "codex:01",
+            &MessageContext::default(),
+            &long_msg,
+        );
 
-        // Subject starts with "inject: " (8 chars) + up to 120 chars of text.
-        let content_in_subject: String = fact.subject.chars().skip("inject: ".len()).collect();
+        // Subject starts with the intent + separator, then up to 120 chars.
+        let content_in_subject: String = fact.subject.chars().skip("directive: ".len()).collect();
         assert_eq!(
             content_in_subject.len(),
             120,
@@ -13271,7 +13644,12 @@ mod tests {
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
         // dry_run path goes through inject_content_fact_dry_run — no room append.
-        let _fact = inject_content_fact_dry_run("sender:3", "codex:01", "dry run message");
+        let _fact = inject_content_fact_dry_run(
+            "sender:3",
+            "codex:01",
+            &MessageContext::default(),
+            "dry run message",
+        );
 
         let facts = room.facts().unwrap();
         assert!(
@@ -19110,7 +19488,7 @@ fn help_text() -> String {
         "    close one exact tool/session lease and release only claims authored by that lease",
         "  rally session current [--tool <tool>] [--json]  # bounded current leases with freshness and omission counts",
         "  rally session history [--tool <tool>] [--limit <1..100>] [--json]  # explicit lease transitions",
-        "  rally inject <session|name|tool> (--text <text>|--handoff <event-id>) [--timeout-seconds <n>] [--json]",
+        "  rally inject <session|name|tool> (--text <text>|--handoff <event-id>) [--tool <sender>] [--intent inform|request|propose|directive] [--responsibility investigator|planner|implementer|verifier|reviewer|integrator|operator|unspecified] [--timeout-seconds <n>] [--json]",
         "    --handoff waits for target-authored Rally ACK by default; without that evidence, branch on reached_target, queued, and fallback_plan",
         "  rally attach <session|name|tool> [--dry-run] [--json]",
         "  rally capture <session|name|tool> [--lines <n>] [--dry-run] [--json]",

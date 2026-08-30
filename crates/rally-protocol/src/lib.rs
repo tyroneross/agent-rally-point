@@ -60,6 +60,231 @@ pub mod store_wire;
 // Directive — rally writes; daemon (or self-acking agent) reads.
 // ---------------------------------------------------------------------------
 
+/// Why a delivered message was sent.
+///
+/// This is independent of [`DirectiveKind`]: `DirectiveKind::Deliver` says the
+/// transport should submit text, while `MessageIntent` says whether the text is
+/// allowed to control the recipient. Unknown future values fail closed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageIntent {
+    /// Information supplied for the recipient's awareness.
+    Inform,
+    /// A non-binding request the recipient may accept or refuse.
+    Request,
+    /// A proposed approach or decision for consideration.
+    Propose,
+    /// A controlling instruction, subject to Rally authority checks.
+    #[default]
+    Directive,
+    /// A future intent this build does not understand. Controlling by default.
+    #[serde(other)]
+    Unknown,
+}
+
+impl MessageIntent {
+    /// Whether this intent may change another session's goal or actions.
+    pub const fn is_controlling(self) -> bool {
+        matches!(self, Self::Directive | Self::Unknown)
+    }
+
+    /// Stable wire/display spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inform => "inform",
+            Self::Request => "request",
+            Self::Propose => "propose",
+            Self::Directive => "directive",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Kind of actor claimed by the sender at delivery time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorKind {
+    /// Human operator.
+    Human,
+    /// Interactive or managed model agent.
+    Agent,
+    /// Non-interactive service process.
+    Service,
+    /// Deterministic Rally/system process.
+    System,
+    /// Actor kind was absent or not understood.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl ActorKind {
+    /// Stable wire/display spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Agent => "agent",
+            Self::Service => "service",
+            Self::System => "system",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The sender's observed Rally room seat when the message was written.
+///
+/// This is audit metadata, not a durable grant. `lead_epoch` in
+/// [`MessageContext`] binds the observation to one room projection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomSeat {
+    /// Held the room lead lease at the observed lead epoch.
+    Lead,
+    /// Appeared as a room squad but did not hold the lead lease.
+    Participant,
+    /// Did not appear in the room projection at send time.
+    Unjoined,
+    /// Room state was unavailable or legacy metadata omitted the field.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl RoomSeat {
+    /// Stable wire/display spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lead => "lead",
+            Self::Participant => "participant",
+            Self::Unjoined => "unjoined",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Scoped work responsibility asserted by the sender.
+///
+/// Responsibility never grants room authority. In particular, there is no
+/// `Peer` variant: peer is an observer-relative relationship, not a durable
+/// responsibility.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkResponsibility {
+    /// Investigates facts, causes, or options without owning implementation.
+    Investigator,
+    /// Defines task decomposition and dependencies.
+    Planner,
+    /// Produces the scoped implementation.
+    Implementer,
+    /// Runs acceptance checks against defined criteria.
+    Verifier,
+    /// Reviews quality, correctness, or risk independently of implementation.
+    Reviewer,
+    /// Reconciles accepted outputs into the shared candidate.
+    Integrator,
+    /// Operates or monitors the runtime without owning product decisions.
+    Operator,
+    /// No responsibility was asserted.
+    #[default]
+    Unspecified,
+    /// A future responsibility this build does not understand.
+    #[serde(other)]
+    Unknown,
+}
+
+impl WorkResponsibility {
+    /// Stable wire/display spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Investigator => "investigator",
+            Self::Planner => "planner",
+            Self::Implementer => "implementer",
+            Self::Verifier => "verifier",
+            Self::Reviewer => "reviewer",
+            Self::Integrator => "integrator",
+            Self::Operator => "operator",
+            Self::Unspecified => "unspecified",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Evidence basis for treating a message as controlling at send time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorityBasis {
+    /// Sender held the observed room lead lease.
+    LeadLease,
+    /// A task assignment granted scoped control authority.
+    TaskAssignment,
+    /// Target opened a handoff to this sender.
+    TargetConsent,
+    /// Human/service principal supplied an out-of-band grant.
+    PrincipalGrant,
+    /// Sender and target are the same logical tool id. This does not prove an
+    /// exact session identity because `--tool` remains self-asserted.
+    SelfTarget,
+    /// No lead seat existed, so Rally allowed the documented bootstrap path.
+    LeaderlessBootstrap,
+    /// The message is non-controlling, so no control authority is required.
+    NotRequired,
+    /// Legacy or otherwise unverified authority context.
+    #[default]
+    #[serde(other)]
+    Unverified,
+}
+
+impl AuthorityBasis {
+    /// Stable wire/display spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LeadLease => "lead_lease",
+            Self::TaskAssignment => "task_assignment",
+            Self::TargetConsent => "target_consent",
+            Self::PrincipalGrant => "principal_grant",
+            Self::SelfTarget => "self_target",
+            Self::LeaderlessBootstrap => "leaderless_bootstrap",
+            Self::NotRequired => "not_required",
+            Self::Unverified => "unverified",
+        }
+    }
+}
+
+/// Typed sender and authority metadata attached to one delivered message.
+///
+/// Identity and responsibility fields are claims/observations made at send
+/// time. They make the boundary recognizable without pretending Rally has
+/// authenticated the caller.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageContext {
+    /// Why the message was sent and whether it is controlling.
+    #[serde(default)]
+    pub intent: MessageIntent,
+    /// Claimed actor class.
+    #[serde(default)]
+    pub actor_kind: ActorKind,
+    /// Calling process's current protocol session, when resolvable. This is
+    /// observed locally but is not authenticated as belonging to `from`.
+    #[serde(
+        default,
+        alias = "sender_session_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub caller_session_id: Option<String>,
+    /// Room seat observed when the message was written.
+    #[serde(default)]
+    pub room_seat: RoomSeat,
+    /// Lead decision sequence associated with `room_seat`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_epoch: Option<i64>,
+    /// Scoped work responsibility asserted by the sender.
+    #[serde(default)]
+    pub responsibility: WorkResponsibility,
+    /// Evidence basis for control, or `not_required` for non-controlling intent.
+    #[serde(default)]
+    pub authority_basis: AuthorityBasis,
+}
+
 /// A push directive appended to an agent's inbox in the `.rally` ledger.
 ///
 /// `(to, seq)` is the canonical dedup key — the daemon MUST dedup on this
@@ -78,6 +303,11 @@ pub struct Directive {
     pub to: String,
     /// Author tool id (e.g. `claude_code:lead-01`, `rally-cli`, `build-loop`).
     pub from: String,
+    /// Message semantics and claimed/observed sender context. Missing on legacy
+    /// rows, which safely default to a controlling directive with unverified
+    /// authority and unknown sender context.
+    #[serde(default)]
+    pub message: MessageContext,
     /// What to do (deliver text / read scrollback / stop the agent).
     pub kind: DirectiveKind,
     /// Interrupt semantic (InterruptBench taxonomy). Serialised as `"type"`

@@ -34,6 +34,19 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}-{}", N.fetch_add(1, Ordering::Relaxed))
 }
 
+fn assert_typed_directive_text(text: Option<&str>, payload: &str) {
+    let text = text.expect("Directive.text");
+    assert!(
+        text.starts_with("[rally: UNVERIFIED SENDER "),
+        "ledger delivery must retain the same typed receiver boundary as live delivery: {text}"
+    );
+    assert!(text.contains("intent=directive(declared) | control=yes(derived)"));
+    assert!(
+        text.ends_with(&format!("] {payload}")),
+        "payload drift: {text}"
+    );
+}
+
 fn post_target_ack_after_delay(
     sandbox: &ChannelSandbox,
     target_tool: &str,
@@ -182,7 +195,7 @@ fn inject_writes_directive_to_ledger_for_managed_session() {
     assert_eq!(d.from, "claude_code:test-sender");
     assert_eq!(d.kind, DirectiveKind::Deliver);
     assert_eq!(d.itype, InterruptType::Addition);
-    assert_eq!(d.text.as_deref(), Some("hello agent"));
+    assert_typed_directive_text(d.text.as_deref(), "hello agent");
     assert!(!d.urgent, "P2 default is async (urgent=false)");
     assert!(d.ts > 0.0, "timestamp must be set");
 }
@@ -204,11 +217,9 @@ fn inject_assigns_monotonic_sequence_across_multiple_calls() {
     let seqs: Vec<u64> = directives.iter().map(|d| d.seq).collect();
     assert_eq!(seqs, vec![1, 2, 3]);
 
-    let texts: Vec<&str> = directives
-        .iter()
-        .map(|d| d.text.as_deref().unwrap_or(""))
-        .collect();
-    assert_eq!(texts, vec!["msg 1", "msg 2", "msg 3"]);
+    for (directive, payload) in directives.iter().zip(["msg 1", "msg 2", "msg 3"]) {
+        assert_typed_directive_text(directive.text.as_deref(), payload);
+    }
 }
 
 #[test]
@@ -598,7 +609,7 @@ fn inject_to_unregistered_valid_agent_id_writes_ledger_directive() {
         "Directive.to is the agent-id, not a session.tool"
     );
     assert_eq!(d.from, "claude_code:test-sender");
-    assert_eq!(d.text.as_deref(), Some("wake up"));
+    assert_typed_directive_text(d.text.as_deref(), "wake up");
     assert!(!d.urgent);
 }
 

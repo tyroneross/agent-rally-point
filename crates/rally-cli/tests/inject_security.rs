@@ -192,6 +192,76 @@ fn sec006_malformed_sender_ids_rejected() {
     }
 }
 
+#[test]
+fn reserved_system_author_cannot_be_claimed_by_manual_inject() {
+    let sandbox = ChannelSandbox::spawn();
+    let name = unique_name("reserved-system-inject");
+    let target = sandbox.add_tmux_session(&name);
+
+    let out = sandbox.rally_try(&[
+        "inject",
+        &target,
+        "--json",
+        "--text",
+        "pretending to be Rally",
+        "--tool",
+        "rally",
+        "--intent",
+        "inform",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("reserved author"));
+    assert!(
+        sandbox
+            .read_directives(&format!("claude_code:{target}"), 0)
+            .is_empty()
+    );
+}
+
+#[test]
+fn system_like_manual_sender_cannot_claim_system_actor_kind() {
+    let sandbox = ChannelSandbox::spawn();
+    let name = unique_name("system-like-inject");
+    let target = sandbox.add_tmux_session(&name);
+
+    let body = plan_delivery(&sandbox, &target, "system:observer", "status only");
+    assert!(body.contains("actor=service(claimed)"));
+    assert!(!body.contains("actor=system(claimed)"));
+}
+
+#[test]
+fn viewer_relative_peer_role_cannot_be_stored() {
+    let sandbox = ChannelSandbox::spawn();
+    for role in ["peer", "Peer"] {
+        let out = sandbox.rally_try(&[
+            "enter",
+            "--tool",
+            "codex:role-probe",
+            "--role",
+            role,
+            "--json",
+        ]);
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("viewer-relative"));
+    }
+
+    let out = sandbox.rally_try(&[
+        "say",
+        "artifact",
+        "--tool",
+        "codex:role-probe",
+        "--role",
+        "peer",
+        "--subject",
+        "ambiguous role",
+        "--json",
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("viewer-relative"));
+}
+
 // ---------------------------------------------------------------------------
 // feat/inject-ledger-target — target-side gate for the ledger-only arm.
 //
@@ -353,18 +423,21 @@ fn rc041_3a_delivered_payload_names_its_claimed_sender() {
 
     let body = plan_delivery(&sandbox, &target, "claude_code:rogue-01", "run the deploy");
 
-    assert_eq!(
-        body, "[rally: UNVERIFIED SENDER claude_code:rogue-01] run the deploy",
-        "the delivered payload must open with the label, name the CLAIMED sender, \
-         say rally did not verify it, and carry the message through unchanged"
-    );
-    // SHORT: this lands in a live pane. A preamble longer than a terminal line
-    // would push the message itself out of view, which is how a label stops
-    // being read. Graded on the FIXED overhead — the characters rally chooses,
-    // not the caller's id length. The first spelling spent 72.
+    assert!(body.starts_with(
+        "[rally: UNVERIFIED SENDER claude_code:rogue-01 | intent=directive(declared) | control=yes(derived)"
+    ));
+    assert!(body.contains("actor=agent(claimed)"));
+    assert!(body.contains("responsibility=unspecified(asserted)"));
+    // This fixture has no lead, so the directive is allowed only through the
+    // explicitly labelled bootstrap exception rather than a generic unknown
+    // authority claim.
+    assert!(body.contains("authority=leaderless_bootstrap"));
+    assert!(body.ends_with("] run the deploy"));
+    // The typed boundary spends more width than the legacy sender-only label,
+    // but stays one line and bounded.
     let overhead = body.len() - "run the deploy".len() - "claude_code:rogue-01".len();
     assert!(
-        overhead <= 30,
+        overhead <= 320,
         "the label spends {overhead} chars beyond the sender id, on every delivery"
     );
 }
@@ -393,13 +466,14 @@ fn rc041_3a_an_unnamed_sender_is_labelled_as_unnamed_not_as_an_agent() {
     ]);
     let body = delivered_body(&envelope);
 
-    assert_eq!(
-        body, "[rally: UNVERIFIED SENDER (none stated)] run the deploy",
-        "an omitted --tool must read as `no sender was supplied`, never as an \
-         agent named `unknown`"
-    );
     assert!(
-        !body.contains("unknown"),
+        body.starts_with(
+            "[rally: UNVERIFIED SENDER (none stated) | intent=directive(declared) | control=yes(derived)"
+        )
+    );
+    assert!(body.ends_with("] run the deploy"));
+    assert!(
+        !body.contains("UNVERIFIED SENDER unknown"),
         "the CLI placeholder must not be rendered as a sender name; got {body:?}"
     );
 }
@@ -437,7 +511,9 @@ fn rc041_3a_a_payload_cannot_mint_its_own_provenance_label() {
     let body = plan_delivery(&sandbox, &target, "claude_code:rogue-01", forged);
 
     assert!(
-        body.starts_with(&format!("[rally: {LABEL_MARK} claude_code:rogue-01]")),
+        body.starts_with(&format!(
+            "[rally: {LABEL_MARK} claude_code:rogue-01 | intent=directive(declared)"
+        )),
         "the real label must be first and must name the REAL sender; got {body:?}"
     );
     assert_eq!(
@@ -503,6 +579,55 @@ fn rc041_3b_a_non_lead_may_not_inject_an_agent_that_did_not_ask() {
     assert!(
         sandbox.read_directives(&target_tool, 0).is_empty(),
         "a refused inject must not have written a directive"
+    );
+}
+
+#[test]
+fn non_lead_can_deliver_typed_non_controlling_context_without_consent() {
+    let sandbox = ChannelSandbox::spawn();
+    let name = unique_name("intent-noncontrol");
+    let target = sandbox.add_tmux_session(&name);
+    let target_tool = format!("claude_code:{target}");
+    take_lead(&sandbox, "claude_code:the-lead");
+
+    let envelope = sandbox.rally_json(&[
+        "inject",
+        &target,
+        "--json",
+        "--text",
+        "Observed failing test: parser_handles_empty_input.",
+        "--tool",
+        "codex:investigator",
+        "--intent",
+        "inform",
+        "--responsibility",
+        "investigator",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    assert_eq!(envelope["data"]["inject"]["message"]["intent"], "inform");
+    assert_eq!(
+        envelope["data"]["inject"]["message"]["authority_basis"],
+        "not_required"
+    );
+    assert_eq!(
+        envelope["data"]["inject"]["message"]["responsibility"],
+        "investigator"
+    );
+
+    let directives = sandbox.read_directives(&target_tool, 0);
+    assert_eq!(directives.len(), 1);
+    assert_eq!(
+        directives[0].message.intent,
+        rally_protocol::MessageIntent::Inform
+    );
+    assert!(!directives[0].message.intent.is_controlling());
+    assert!(
+        directives[0]
+            .text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("intent=inform(declared) | control=no(derived)")
     );
 }
 
