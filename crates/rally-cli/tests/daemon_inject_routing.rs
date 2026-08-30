@@ -716,6 +716,32 @@ fn inject_to_ptyd_session_is_daemon_only_sanitized_with_receipt() {
         data["daemon_receipt_state"], "sent",
         "the daemon Receipt state must be surfaced; {data}"
     );
+    assert_eq!(
+        data["delivered"], true,
+        "the v1 compatibility field retains synchronous RPC success; {data}"
+    );
+    assert_eq!(
+        data["delivery_state"], "delivered",
+        "the v1 compatibility state retains the attempt-time result; {data}"
+    );
+    assert_eq!(
+        data["delivery_reason"], "sent_unverified",
+        "sender-side ptyd transport evidence must not become receiver truth; {data}"
+    );
+    assert_eq!(
+        data["reached_target"], false,
+        "bytes flushed to a PTY do not prove the TUI submitted or accepted the prompt; {data}"
+    );
+    assert_eq!(
+        data["queued"], true,
+        "the durable copy must remain actionable until target-authored evidence arrives; {data}"
+    );
+    assert!(
+        data["delivery_detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("not confirmed received")),
+        "guidance must state the evidence ceiling; {data}"
+    );
     // ZERO tmux send-keys — the pane is daemon-owned.
     assert_eq!(sb.tmux_send_keys_count(), 0);
 
@@ -1214,6 +1240,12 @@ fn real_ptyd_inject_actually_submits_and_is_received() {
         data["daemon_receipt_state"], "sent",
         "confirm:\"sent\" must yield a 'sent' receipt within the 3s timeout; {data}"
     );
+    assert_eq!(
+        data["delivery_reason"], "sent_unverified",
+        "the sender-side receipt must remain below receiver truth even when this test's independent pane oracle later proves submission; {data}"
+    );
+    assert_eq!(data["reached_target"], false, "{data}");
+    assert_eq!(data["queued"], true, "{data}");
 
     // 3. THE ORACLE: read the pane scrollback and assert the child RECEIVED +
     //    processed the SUBMITTED line. Poll up to ~3s for the GOT:<token> line.

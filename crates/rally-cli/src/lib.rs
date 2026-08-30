@@ -9107,10 +9107,10 @@ fn command_inject_managed(
         }
     };
 
-    // Reconcile delivery_state: legacy sync success => Delivered; otherwise
-    // the Pending state propagated from the ledger write stands (the daemon
-    // will post a Receipt once P3 ships, at which point this field updates
-    // out-of-band via `rally status`).
+    // Reconcile the compatibility delivery_state: a successful synchronous
+    // transport attempt remains `delivered` for v1 callers. The additive
+    // disposition below is the receiver-truth surface and stays
+    // `sent_unverified` until target-authored evidence arrives.
     //
     // Failure cases (both produce `delivery_state: "failed"`):
     //   1. Ledger write failed (`delivery_state_initial == "failed"`).
@@ -9127,7 +9127,10 @@ fn command_inject_managed(
         && !legacy_sent_unverified;
     // F4 + RPC honesty: a daemon-routed send that hit a pane mismatch or an RPC
     // error is a REAL failure (the directive stays Pending on the ledger, but
-    // this inject did not deliver). A successful Receipt is `delivered`.
+    // this inject did not deliver). A successful Receipt proves only that ptyd
+    // reached its requested transport ceiling. Even `seen` may be input/paste
+    // echo, and `sent` is only bytes flushed to the PTY; neither is a
+    // target-authored Rally acknowledgement.
     let daemon_delivery_failed = matches!(
         ptyd_delivery,
         PtydDelivery::Mismatch { .. } | PtydDelivery::Failed { .. }
@@ -9158,6 +9161,13 @@ fn command_inject_managed(
         DeliveryDisposition::FailedDaemonSend
     } else if legacy_tmux_cmux_failed {
         DeliveryDisposition::FailedBackendInject
+    } else if matches!(ptyd_delivery, PtydDelivery::Sent { .. }) {
+        // Keep the legacy `delivered`/`delivery_state` compatibility fields
+        // above, but do not promote sender-side daemon evidence into final
+        // receiver truth. Live Claude dogfood proved that `state=sent` can
+        // leave a prompt visible but unsubmitted. A later target-authored ACK
+        // upgrades this disposition through `after_target_ack`.
+        DeliveryDisposition::SentUnverified
     } else if delivered {
         DeliveryDisposition::Delivered
     } else if legacy_sent_unverified {
@@ -9254,7 +9264,8 @@ fn command_inject_managed(
         // there is no pre-wait diagnosis to surface.
         target_injectability: None,
     };
-    let has_ack = ack.is_some();
+    let reached_target = inject_payload.reached_target;
+    let delivery_reason = inject_payload.delivery_reason;
     let body = envelope(
         "inject",
         SCHEMA_INJECT,
@@ -9262,7 +9273,10 @@ fn command_inject_managed(
             inject: inject_payload,
         },
     )?;
-    let text = format!("inject session={session_id_for_text} delivered={delivered} ack={has_ack}",);
+    let text = format!(
+        "inject session={session_id_for_text} delivery_reason={delivery_reason} \
+         reached_target={reached_target} ack_state={ack_state}",
+    );
     Ok(Output::new(json, text, body))
 }
 

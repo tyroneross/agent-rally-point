@@ -429,11 +429,12 @@ pub(crate) struct InjectData {
     /// pair it with `delivery_reason`; SEC-009 policy rejection skips the
     /// selected synchronous transport intentionally.
     pub(crate) delivery_path: &'static str,
-    /// ptyd pane-ownership flip: the `state` of the daemon's `agent.send`
-    /// Receipt (`sent|seen|acted`) when `delivery_path == "daemon"` and the send
-    /// succeeded; `None` for non-daemon paths or a failed/mismatched daemon
-    /// send. Lets a caller see how far the daemon delivery got without scraping
-    /// the ledger.
+    /// ptyd pane-ownership flip: the transport `state` of the daemon's
+    /// `agent.send` Receipt (`sent|seen|acted`) when `delivery_path == "daemon"`
+    /// and the send succeeded; `None` for non-daemon paths or a
+    /// failed/mismatched daemon send. This is sender-side transport evidence,
+    /// not proof that the target accepted or submitted the prompt. Pair it with
+    /// `verified_received`, `reached_target`, and `ack_state`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) daemon_receipt_state: Option<String>,
     /// ptyd pane-ownership flip: when a daemon-routed send FAILED (RPC error or
