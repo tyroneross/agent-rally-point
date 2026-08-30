@@ -1,6 +1,7 @@
 ---
 name: rally-workflows
 description: Use when fanning out work across multiple agents, running a dynamic workflow, or splitting a workstream across hosts, terminals, or machines through Agent Rally Point. NOT for one session's own coordination loop (use `agent-rally-point`), and NOT the per-task quality gate (use `mini-loop`). Defines the workstream descriptor + task-packet protocol and the per-task rally coordination loop; host-neutral.
+user-invocable: false
 ---
 
 <!--

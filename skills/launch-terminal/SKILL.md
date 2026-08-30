@@ -1,6 +1,7 @@
 ---
 name: launch-terminal
 description: Use when asked to launch a fresh Claude (or Codex) terminal session — optionally with Remote Control visible on the user's phone — as a rally-managed session that is named, injectable, and verifiable. Triggers on "launch a fresh terminal", "spin up a new Claude session", "start a session I can see on my phone", "launch a reviewer session". Not for coordinating with an already-running session (use agent-rally-point) and not for multi-agent fan-out design (use rally-workflows).
+user-invocable: false
 ---
 
 # Launch Terminal — a fresh, named, remotely visible agent session
