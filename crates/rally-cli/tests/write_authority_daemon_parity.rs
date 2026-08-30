@@ -275,7 +275,14 @@ impl Room {
             .env("RALLY_HOOKS", "off")
             .env("RALLY_DAEMON_AUTOSTART", "0")
             .env("RALLY_SESSION_ID", session_id)
-            .env("RALLY_HOOK_TIMEOUT_MS", WATCHDOG_BUDGET_MS);
+            .env("RALLY_HOOK_TIMEOUT_MS", WATCHDOG_BUDGET_MS)
+            // On GitHub Actions these ambient vars outrank RALLY_SESSION_ID in
+            // EndpointInputs::from_env (Cloud source > Managed source), landing
+            // writes under cloud:github-actions:<run-id> instead of the session
+            // this test is asserting about. Same class as the user_journey fix
+            // at 72aed10; repro: GITHUB_ACTIONS=true GITHUB_RUN_ID=1 cargo test.
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID");
         if let Some(token) = close_token {
             command.env("RALLY_SESSION_CLOSE_TOKEN", token);
         } else {
