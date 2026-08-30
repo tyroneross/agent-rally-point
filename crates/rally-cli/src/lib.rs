@@ -7312,7 +7312,7 @@ fn command_run(args: RunArgs) -> Result<Output> {
             }
             _ => backend, // Tmux fallback — no live rally daemon.
         }
-    } else if backend == Backend::Ptyd {
+    } else if backend.is_ptyd() {
         let sock = daemon_client::rally_owned_socket().ok_or_else(|| {
             RallyError::Usage(
                 "--backend ptyd requires HOME to resolve the rally ptyd socket".to_string(),
@@ -7323,7 +7323,9 @@ fn command_run(args: RunArgs) -> Result<Output> {
             // hermetic test of "no socket, no binary" asserts the error path).
             daemon_client::autostart_daemon(&sock).map_err(RallyError::Command)?;
         }
-        Backend::Ptyd
+        // Preserve `ptyd-strict` after the shared daemon readiness check so
+        // the spawn result can enforce its no-downgrade contract.
+        backend
     } else {
         backend
     };
@@ -7358,7 +7360,9 @@ fn command_run(args: RunArgs) -> Result<Output> {
                 daemon_registered: false,
                 daemon_pane: None,
                 daemon_socket: None,
-            },
+                ..ManagedSession::default()
+            }
+            .with_adapter(backend),
         }
     } else {
         reserve_numbered_session(
@@ -7443,7 +7447,7 @@ fn command_run(args: RunArgs) -> Result<Output> {
     if dry_run {
         // Dry-run: no launch, no daemon contact. The envelope advertises the
         // planned target only.
-    } else if backend == Backend::Ptyd {
+    } else if backend.is_ptyd() {
         // ----- ptyd pane-ownership spawn path (design-1 + design-3 start) -----
         // 1. ensure a rally-dedicated workspace so the pane never lands in the
         //    user's focused tab; 2. agent.start (focus:false) → pane id;
@@ -7465,12 +7469,34 @@ fn command_run(args: RunArgs) -> Result<Output> {
                 // treating this as spawn failure would reap a successful pane.
                 return Err(error);
             }
-            PtydSpawnResult::FellBackToTmux { warning } => {
+            PtydSpawnResult::RegistrationFailed { detail } if backend == Backend::PtydStrict => {
+                // Strict daemon mode never changes transport families. The
+                // helper attempted exact-pane cleanup; its detail reports
+                // whether cleanup succeeded. Close the reservation and
+                // worktree before returning an explicit failure.
+                if let (Some(path), Some(branch)) =
+                    (provisioned_path.as_deref(), session.branch.as_deref())
+                {
+                    let _ = run_worktree::cleanup(&repo, path, branch, "git");
+                }
+                if let Some(fact) = &reservation.fact
+                    && let Err(cleanup_err) = append_stopped_session_record(&room, &session, fact)
+                {
+                    return Err(RallyError::Message(format!(
+                        "ptyd strict launch refused: {detail}; additionally failed to mark managed session stopped: {cleanup_err}"
+                    )));
+                }
+                return Err(RallyError::Command(format!(
+                    "ptyd strict launch refused after daemon registration failure: {detail}"
+                )));
+            }
+            PtydSpawnResult::RegistrationFailed { detail } => {
                 // The ptyd pane was already reaped inside the helper. Relaunch
                 // under tmux so the agent actually runs; switch the runner +
                 // recorded backend to tmux for the rest of this command.
-                run_warning = Some(warning);
+                run_warning = Some(format!("{detail}; fell back to tmux launch"));
                 session.backend = Backend::Tmux.as_str().to_string();
+                session.set_adapter(Backend::Tmux);
                 backend_runner = BackendRunner::new(Backend::Tmux, bins.clone());
                 let tmux_target = backend_target(Backend::Tmux, &session.session_id);
                 session.target = tmux_target.clone();
@@ -7632,10 +7658,10 @@ enum PtydSpawnResult {
     /// The pane was spawned AND registered: `session` is daemon-owned, its
     /// `target`/`daemon_pane`/`daemon_registered` fields are set.
     Daemon,
-    /// F2: the pane spawned but `agent.register` failed. The spawned pane has
-    /// already been reaped (`agent.stop`); the caller must relaunch under tmux
-    /// and surface `warning` in the run envelope.
-    FellBackToTmux { warning: String },
+    /// The pane spawned but `agent.register` failed. Exact-pane cleanup was
+    /// attempted; `detail` records whether it succeeded. The caller chooses
+    /// legacy tmux fallback or strict failure without a transport downgrade.
+    RegistrationFailed { detail: String },
     /// The spawn RPC itself failed — no pane exists to reap.
     Failed(RallyError),
     /// The pane is live and registered, but its follow-up durable session
@@ -7649,9 +7675,9 @@ enum PtydSpawnResult {
 /// refreshes the durable session fact so `rally sessions` shows the binding.
 ///
 /// F2 (register-fail safety): if `agent.register` fails AFTER a successful
-/// `agent.start`, the just-spawned pane is reaped via `agent.stop` (no silent
-/// orphan), and the function returns `FellBackToTmux` so the caller relaunches
-/// under tmux with a loud warning.
+/// `agent.start`, the function attempts to close the exact spawned pane via
+/// `pane.close`, records the cleanup outcome, and returns `RegistrationFailed`
+/// so the caller can use legacy tmux fallback or fail strict daemon control.
 fn ptyd_spawn_and_register(
     runner: &BackendRunner,
     room: &RoomStore,
@@ -7687,11 +7713,14 @@ fn ptyd_spawn_and_register(
         Some(s) => s.to_string(),
         None => {
             // Should not happen (ptyd_ensure_workspace already required it), but
-            // be safe: reap + fall back.
-            let _ = runner.ptyd_stop(&session.name);
-            return PtydSpawnResult::FellBackToTmux {
-                warning: "ptyd register skipped: rally socket unresolved; fell back to tmux"
-                    .to_string(),
+            // be safe: reap the exact pane and let the caller choose its
+            // failure posture. Do not claim a successful reap if cleanup fails.
+            let reap_note = match runner.ptyd_close_pane(&pane_id) {
+                Ok(()) => "spawned pane reaped".to_string(),
+                Err(e) => format!("WARNING: failed to reap spawned pane ({e})"),
+            };
+            return PtydSpawnResult::RegistrationFailed {
+                detail: format!("ptyd register skipped: rally socket unresolved; {reap_note}"),
             };
         }
     };
@@ -7722,10 +7751,8 @@ fn ptyd_spawn_and_register(
                 Ok(()) => "spawned pane reaped".to_string(),
                 Err(e) => format!("WARNING: failed to reap spawned pane ({e})"),
             };
-            PtydSpawnResult::FellBackToTmux {
-                warning: format!(
-                    "ptyd agent.register failed ({reason}); {reap_note}; fell back to tmux launch"
-                ),
+            PtydSpawnResult::RegistrationFailed {
+                detail: format!("ptyd agent.register failed ({reason}); {reap_note}"),
             }
         }
     }
@@ -7834,7 +7861,9 @@ fn command_adopt(args: AdoptArgs) -> Result<Output> {
         daemon_registered: false,
         daemon_pane: None,
         daemon_socket: None,
-    };
+        ..ManagedSession::default()
+    }
+    .with_adapter(resolved_backend);
 
     // Append the session fact under the same context-version race guard as
     // run uses.
@@ -7932,7 +7961,9 @@ fn reserve_numbered_session(
             daemon_registered: false,
             daemon_pane: None,
             daemon_socket: None,
-        };
+            ..ManagedSession::default()
+        }
+        .with_adapter(input.backend);
         let fact = session_fact(&session, "active", None);
         match with_watchdog_command_commit(|| {
             room.append_session_fact_if_context(&fact, context_version)
@@ -11334,7 +11365,9 @@ fn backend_target(backend: Backend, session_id: &str) -> String {
         // ptyd's real target is the daemon pane id, assigned at spawn time. This
         // is only a pre-spawn placeholder for the reserved session record; the
         // ptyd spawn path overwrites `session.target` with the pane id.
-        Backend::Ptyd => format!("rally-ptyd-{}", sanitize_id(session_id)),
+        Backend::Ptyd | Backend::PtydStrict => {
+            format!("rally-ptyd-{}", sanitize_id(session_id))
+        }
     }
 }
 
@@ -12175,7 +12208,26 @@ mod tests {
             daemon_registered: false,
             daemon_pane: None,
             daemon_socket: None,
+            ..ManagedSession::default()
         }
+    }
+
+    #[test]
+    fn legacy_managed_session_without_adapter_metadata_stays_readable() {
+        let legacy = serde_json::json!({
+            "session_id": "legacy-01",
+            "name": "legacy-01",
+            "agent": "claude",
+            "tool": "claude_code:01",
+            "backend": "tmux",
+            "cwd": "/tmp",
+            "target": "rally-legacy-01"
+        });
+        let session: ManagedSession = serde_json::from_value(legacy).unwrap();
+        assert!(session.adapter_schema.is_empty());
+        assert!(session.adapter_id.is_empty());
+        assert!(session.adapter_delivery_grade.is_empty());
+        assert!(session.adapter_operations.is_empty());
     }
 
     #[test]
@@ -19596,7 +19648,7 @@ fn help_text() -> String {
         "  rally daemon serve|start|stop|status [--json]  # per-repo rallyd store daemon",
         "  rally claims-refresh --tool <tool> --lane <lane> --manifest <path> [--json]",
         "  rally self-exit-check --tool <tool> [--persistent] [--required-streak <n>] [--json]",
-        "  rally run <claude|codex|opencode|gemini> [--name <name>] [--backend <auto|tmux|cmux|ptyd>] [--dry-run] [--json]",
+        "  rally run <claude|codex|opencode|gemini> [--name <name>] [--backend <auto|tmux|cmux|ptyd|ptyd-strict>] [--dry-run] [--json]",
         "    managed run ids auto-number active agents, e.g. claude-01 / claude_code:01",
         "  rally sessions [--reap] [--json] [--tmux-bin <path>] [--cmux-bin <path>]",
         "  rally session ensure --tool <tool> [--session-id <id>] [--adapter <host>] [--strict] [--native-hook] [--lifecycle-close] [--live-delivery] [--json]",

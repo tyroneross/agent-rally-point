@@ -201,7 +201,7 @@ fn top_level_help_and_docs_advertise_ptyd_backend() {
     );
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(
-        help.contains("--backend <auto|tmux|cmux|ptyd>"),
+        help.contains("--backend <auto|tmux|cmux|ptyd|ptyd-strict>"),
         "top-level help must list every supported run backend; help:\n{help}"
     );
 
@@ -217,8 +217,8 @@ fn top_level_help_and_docs_advertise_ptyd_backend() {
     // that does not run. Pinning an example's exact bytes to check a list of
     // values makes the example uncorrectable; check the values.
     assert!(
-        readme.contains("--backend <auto|tmux|cmux|ptyd>"),
-        "README must document ptyd and auto as supported run backends"
+        readme.contains("--backend <auto|tmux|cmux|ptyd|ptyd-strict>"),
+        "README must document ptyd, ptyd-strict, and auto as supported run backends"
     );
     assert!(
         readme.contains("rally run claude"),
@@ -226,7 +226,7 @@ fn top_level_help_and_docs_advertise_ptyd_backend() {
     );
     let rally = fs::read_to_string(repo.join("RALLY.md")).expect("RALLY.md");
     assert!(
-        rally.contains("Run backends are `auto`, `tmux`, `cmux`, and `ptyd`."),
+        rally.contains("Run backends are `auto`, `tmux`, `cmux`, `ptyd`, and `ptyd-strict`."),
         "RALLY.md must document the supported run backends"
     );
 

@@ -53,7 +53,10 @@ pane a human will attach to by name.
    at https://claude.ai/code/session_…" — report that URL to the user, then
    dismiss the dialog with one more `Enter`.
 4. **Channel test**: `rally inject <name> --text "<short hello>" --json` and
-   confirm `delivered: true`. Only now is the session usable by peers.
+   inspect the receipt honestly. A successful transport write can report
+   `delivery_reason: "sent_unverified"`, `reached_target: false`, and
+   `queued: true`; wait for a target-authored ACK before treating it as read.
+   Only a confirmed target acknowledgement makes the session usable by peers.
 
 ## Hand back to the user
 
@@ -64,7 +67,7 @@ the session runs in a worktree or the shared checkout.
 ## Operate
 
 ```bash
-rally inject <name> --text "..." --json   # deliver a message (confirm delivered: true)
+rally inject <name> --text "..." --json   # inspect delivery_reason and target ACK
 rally capture <name> --json               # read session output via the backend
 rally attach <name> --json                # attach to the runtime surface where supported
 rally stop <name> --json                  # stop cleanly (releases claims, cleans worktree)

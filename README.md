@@ -332,7 +332,8 @@ rally claims --json
 
 ```bash
 rally run claude                                  # becomes claude-01, tool claude_code:01
-rally run claude --backend <auto|tmux|cmux|ptyd>  # auto = ptyd if live, else tmux
+rally run claude --backend <auto|tmux|cmux|ptyd|ptyd-strict>
+# auto = ptyd if live, else tmux; ptyd-strict refuses any mux fallback
 rally inject <session|name|tool> --handoff <event-id> --json
 ```
 

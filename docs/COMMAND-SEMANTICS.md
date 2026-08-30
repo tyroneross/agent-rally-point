@@ -88,7 +88,7 @@ therefore receive distinct operation identities.
 
 | Command | Ledger write | Cache write | Runtime write | Audit-safe | Notes |
 |---|---:|---:|---:|---:|---|
-| `rally run` | yes | yes | yes | no | Starts Claude/Codex/OpenCode/Gemini in a managed worktree or shared checkout. Backends: `auto`, `tmux`, `cmux`, `ptyd`. |
+| `rally run` | yes | yes | yes | no | Starts Claude/Codex/OpenCode/Gemini in a managed worktree or shared checkout. Backends: `auto`, `tmux`, `cmux`, `ptyd`, `ptyd-strict`; the strict daemon mode reaps and fails instead of changing to a mux backend. |
 | `rally sessions` | no | yes | optional | yes | Lists managed sessions; `--reap` tombstones stale sessions and is not audit-safe. |
 | `rally inject` | yes | yes | yes | no | Writes a directive and may deliver through ptyd/tmux/cmux; `--handoff` waits for target-authored evidence. |
 | `rally attach` | no | yes | yes | no | Attaches to a managed runtime surface when supported by that backend. |

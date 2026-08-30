@@ -135,7 +135,7 @@ rally inject <session|name|tool> --handoff <event-id> --json  # e.g. claude-01
 rally capture <session|name|tool> --json
 ```
 
-Run backends are `auto`, `tmux`, `cmux`, and `ptyd`. `auto` selects the
+Run backends are `auto`, `tmux`, `cmux`, `ptyd`, and `ptyd-strict`. `auto` selects the
 rally-owned ptyd path only when that daemon socket is live, otherwise tmux.
 
 First-class `rally run` launch targets are currently Claude, Codex, OpenCode,

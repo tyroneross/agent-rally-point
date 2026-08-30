@@ -1,3 +1,4 @@
+use rally_protocol::adapter::{AdapterDeliveryGrade, AdapterOperation, AgentAdapterDescriptorV1};
 use rally_protocol::{MessageContext, MessageIntent};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -60,6 +61,20 @@ pub(crate) struct ManagedSession {
     pub(crate) agent: String,
     pub(crate) tool: String,
     pub(crate) backend: String,
+    /// Versioned descriptor schema for the adapter selected at session start.
+    /// Empty only for legacy records written before the adapter contract.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) adapter_schema: String,
+    /// Stable adapter identity; this is evidence metadata, not authority.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) adapter_id: String,
+    /// Declared direct-delivery truth tier (`managed`, `unverified_transport`,
+    /// or `mailbox`). It never represents target acknowledgement.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) adapter_delivery_grade: String,
+    /// Declared runtime operations; this metadata is not per-session execution proof.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) adapter_operations: Vec<String>,
     pub(crate) cwd: PathBuf,
     pub(crate) target: String,
     /// Filesystem path of the dedicated linked git worktree provisioned for
@@ -96,6 +111,27 @@ pub(crate) struct ManagedSession {
     /// shipped (those fall back to `rally_owned_socket()` resolution).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) daemon_socket: Option<String>,
+}
+
+impl ManagedSession {
+    /// Return this session with metadata for the backend that will own it.
+    pub(crate) fn with_adapter(mut self, backend: Backend) -> Self {
+        self.set_adapter(backend);
+        self
+    }
+
+    /// Bind this session to the descriptor for the backend that actually owns
+    /// it. This is called again on legacy ptyd-to-tmux fallback so the durable
+    /// record never claims the original daemon adapter after a transport change.
+    pub(crate) fn set_adapter(&mut self, backend: Backend) {
+        let descriptor = backend.descriptor();
+        debug_assert!(descriptor.validate().is_ok());
+        let operations = descriptor.operation_names();
+        self.adapter_schema = descriptor.adapter_schema;
+        self.adapter_id = descriptor.adapter_id.0;
+        self.adapter_delivery_grade = descriptor.delivery_grade.as_str().to_string();
+        self.adapter_operations = operations;
+    }
 }
 
 /// Serde skip helper: omit `daemon_registered` from JSON when false so existing
@@ -570,6 +606,9 @@ pub(crate) enum Backend {
     /// `Backend::parse` from `"ptyd"`; `"auto"` prefers it iff the rally-owned
     /// socket is LIVE.
     Ptyd,
+    /// Strict daemon control: use the same ptyd transport as [`Self::Ptyd`],
+    /// but never change transport families if daemon registration fails.
+    PtydStrict,
 }
 
 impl Backend {
@@ -583,6 +622,7 @@ impl Backend {
             "auto" | "tmux" => Ok(Self::Tmux),
             "cmux" => Ok(Self::Cmux),
             "ptyd" => Ok(Self::Ptyd),
+            "ptyd-strict" => Ok(Self::PtydStrict),
             "herdr" => Err(RallyError::Usage(
                 "backend \"herdr\" is removed (Plan F): use the .rally ledger \
                  (rally inject) and the rally-termd daemon; or fall back to tmux/cmux"
@@ -600,11 +640,58 @@ impl Backend {
         raw == "auto"
     }
 
+    /// Whether this backend is daemon-owned rather than mux-owned.
+    pub(crate) fn is_ptyd(self) -> bool {
+        matches!(self, Self::Ptyd | Self::PtydStrict)
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Tmux => "tmux",
             Self::Cmux => "cmux",
             Self::Ptyd => "ptyd",
+            Self::PtydStrict => "ptyd-strict",
+        }
+    }
+}
+
+/// Host-neutral capability boundary for local agent-control implementations.
+///
+/// The existing [`BackendRunner`] remains the imperative implementation for
+/// tmux, cmux, and ptyd. This trait is the stable declaration layer: callers
+/// and session records consume a versioned descriptor rather than inferring
+/// lifecycle or delivery guarantees from a backend name.
+pub(crate) trait AgentAdapter {
+    /// Return the versioned capabilities this adapter declares.
+    fn descriptor(&self) -> AgentAdapterDescriptorV1;
+}
+
+impl AgentAdapter for Backend {
+    fn descriptor(&self) -> AgentAdapterDescriptorV1 {
+        use AdapterOperation::{Capture, Deliver, Probe, Start, Stop};
+
+        let operations = [Start, Deliver, Capture, Stop, Probe];
+        match self {
+            Self::Ptyd => AgentAdapterDescriptorV1::new(
+                "rally.ptyd.v1",
+                AdapterDeliveryGrade::Managed,
+                operations,
+            ),
+            Self::PtydStrict => AgentAdapterDescriptorV1::new(
+                "rally.ptyd-strict.v1",
+                AdapterDeliveryGrade::Managed,
+                operations,
+            ),
+            Self::Tmux => AgentAdapterDescriptorV1::new(
+                "rally.tmux.v1",
+                AdapterDeliveryGrade::UnverifiedTransport,
+                operations,
+            ),
+            Self::Cmux => AgentAdapterDescriptorV1::new(
+                "rally.cmux.v1",
+                AdapterDeliveryGrade::UnverifiedTransport,
+                operations,
+            ),
         }
     }
 }
@@ -732,7 +819,9 @@ impl BackendRunner {
             // surfaced for observability as a single pseudo-command; the actual
             // spawn runs through `command_run`'s ptyd path
             // (`daemon_client::start_agent`), which also does register + F2.
-            Backend::Ptyd => vec![ptyd_start_plan(target, cwd, command, name)],
+            Backend::Ptyd | Backend::PtydStrict => {
+                vec![ptyd_start_plan(target, cwd, command, name)]
+            }
         };
         Ok(commands)
     }
@@ -758,7 +847,7 @@ impl BackendRunner {
         let (bin, dep) = match self.backend {
             Backend::Tmux => (self.tmux_bin.as_str(), "tmux"),
             Backend::Cmux => (self.cmux_bin.as_str(), "cmux"),
-            Backend::Ptyd => return Ok(()),
+            Backend::Ptyd | Backend::PtydStrict => return Ok(()),
         };
         if resolve_executable(bin, std::env::var_os("PATH").as_deref()).is_some() {
             return Ok(());
@@ -777,7 +866,7 @@ impl BackendRunner {
     fn usable_alternatives(&self) -> Vec<&'static str> {
         let path = std::env::var_os("PATH");
         let mut out = Vec::new();
-        if self.backend != Backend::Ptyd && self.ptyd_socket.is_some() {
+        if !self.backend.is_ptyd() && self.ptyd_socket.is_some() {
             out.push("ptyd");
         }
         if self.backend != Backend::Tmux
@@ -811,7 +900,7 @@ impl BackendRunner {
             // `command_run` drives the ptyd spawn directly (it needs the pane
             // id for register + F2 rollback), so this generic path is not the
             // ptyd entry point. Reject it loudly rather than silently no-op.
-            Backend::Ptyd => Err(RallyError::Command(
+            Backend::Ptyd | Backend::PtydStrict => Err(RallyError::Command(
                 "internal: ptyd sessions must start via command_run's ptyd path, \
                  not BackendRunner::start"
                     .to_string(),
@@ -845,12 +934,6 @@ impl BackendRunner {
         crate::daemon_client::ensure_rally_workspace(socket, label).map_err(RallyError::Command)
     }
 
-    /// Stop (reap) a ptyd-owned pane by daemon name (`agent.stop`).
-    pub(crate) fn ptyd_stop(&self, name: &str) -> Result<()> {
-        let socket = self.require_ptyd_socket()?;
-        crate::daemon_client::stop_agent(socket, name).map_err(RallyError::Command)
-    }
-
     /// [G]: Reap a ptyd-owned pane by its PANE ID (`pane.close`) — used by F2
     /// register-fail rollback, which holds the exact pane id it just spawned. By
     /// id (not name) so a label collision can't reap the wrong pane.
@@ -861,7 +944,9 @@ impl BackendRunner {
 
     pub(crate) fn live_target(&self, session: &ManagedSession) -> Result<String> {
         match self.backend {
-            Backend::Tmux | Backend::Cmux | Backend::Ptyd => Ok(session.target.clone()),
+            Backend::Tmux | Backend::Cmux | Backend::Ptyd | Backend::PtydStrict => {
+                Ok(session.target.clone())
+            }
         }
     }
 
@@ -894,7 +979,7 @@ impl BackendRunner {
             // Observability-only plan line: the real ptyd inject is the
             // `agent.send` RPC driven by command_inject_managed (with the F4
             // pane cross-check + Receipt fact). No keystrokes are ever sent.
-            Backend::Ptyd => vec![cmd![
+            Backend::Ptyd | Backend::PtydStrict => vec![cmd![
                 "ptyd-rpc",
                 "agent.send",
                 "--to",
@@ -1006,12 +1091,12 @@ impl BackendRunner {
             ]],
             // A ptyd pane is attached via EasyTerminal / `ptyd attach`, not a
             // tmux client. Surface the real command rather than fake one.
-            Backend::Ptyd => vec![cmd!["ptyd", "attach", target]],
+            Backend::Ptyd | Backend::PtydStrict => vec![cmd!["ptyd", "attach", target]],
         }
     }
 
     pub(crate) fn attach(&self, target: &str) -> Result<()> {
-        if self.backend == Backend::Ptyd {
+        if self.backend.is_ptyd() {
             // Don't pretend to attach: a ptyd pane lives inside the daemon /
             // EasyTerminal, not a tmux client the CLI can hand the TTY to.
             return Err(RallyError::Usage(format!(
@@ -1042,7 +1127,7 @@ impl BackendRunner {
                 lines,
             ]],
             // ptyd capture is the `agent.read` RPC against the pane id.
-            Backend::Ptyd => vec![cmd![
+            Backend::Ptyd | Backend::PtydStrict => vec![cmd![
                 "ptyd-rpc",
                 "agent.read",
                 "--name",
@@ -1054,7 +1139,7 @@ impl BackendRunner {
     }
 
     pub(crate) fn capture(&self, target: &str, lines: usize) -> Result<String> {
-        if self.backend == Backend::Ptyd {
+        if self.backend.is_ptyd() {
             // design-3 capture arm: the agent.read scrollback verb.
             let socket = self.require_ptyd_socket()?;
             return crate::daemon_client::read_agent(socket, target, lines)
@@ -1073,12 +1158,14 @@ impl BackendRunner {
                 target
             ]],
             // ptyd stop is the `agent.stop` RPC (reaps the PTY child daemon-side).
-            Backend::Ptyd => vec![cmd!["ptyd-rpc", "agent.stop", "--name", target]],
+            Backend::Ptyd | Backend::PtydStrict => {
+                vec![cmd!["ptyd-rpc", "agent.stop", "--name", target]]
+            }
         }
     }
 
     pub(crate) fn stop(&self, target: &str) -> Result<()> {
-        if self.backend == Backend::Ptyd {
+        if self.backend.is_ptyd() {
             // design-3 stop arm: agent.stop RPC.
             let socket = self.require_ptyd_socket()?;
             return crate::daemon_client::stop_agent(socket, target).map_err(RallyError::Command);
@@ -1093,7 +1180,7 @@ impl BackendRunner {
         match self.backend {
             Backend::Tmux => probe_tmux_liveness(&self.tmux_bin, targets),
             Backend::Cmux => probe_cmux_liveness(&self.cmux_bin, targets),
-            Backend::Ptyd => self.probe_ptyd_liveness(targets),
+            Backend::Ptyd | Backend::PtydStrict => self.probe_ptyd_liveness(targets),
         }
     }
 
@@ -2384,7 +2471,9 @@ fn shell_words(words: &[String]) -> Result<String> {
 }
 #[cfg(test)]
 mod tests {
-    use super::{DeliveryDisposition, InjectData, RunData, SessionActionData, SessionsData};
+    use super::{
+        AgentAdapter, DeliveryDisposition, InjectData, RunData, SessionActionData, SessionsData,
+    };
     // Plan F functional core (Chunk 3): herdr_command, parse_herdr_agents_tab,
     // and resolve_agent_pane_from_list removed with the Backend::Herdr arm.
     use super::{Backend, BackendRunner, verify_needle};
@@ -2404,7 +2493,58 @@ mod tests {
         ActorKind, AuthorityBasis, MessageContext, MessageIntent, RoomSeat, WorkResponsibility,
     };
     use schemars::schema_for;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn builtin_adapters_declare_every_operation_and_expose_command_plans() {
+        use rally_protocol::adapter::{AGENT_ADAPTER_SCHEMA_V1, AdapterOperation};
+
+        let expected_operations = [
+            AdapterOperation::Start,
+            AdapterOperation::Deliver,
+            AdapterOperation::Capture,
+            AdapterOperation::Stop,
+            AdapterOperation::Probe,
+        ];
+        for backend in [
+            Backend::Tmux,
+            Backend::Cmux,
+            Backend::Ptyd,
+            Backend::PtydStrict,
+        ] {
+            let descriptor = backend.descriptor();
+            descriptor.validate().unwrap();
+            assert_eq!(descriptor.adapter_schema, AGENT_ADAPTER_SCHEMA_V1);
+            for operation in expected_operations {
+                assert!(
+                    descriptor.supports_operation(operation),
+                    "{} must declare {}",
+                    backend.as_str(),
+                    operation.as_str()
+                );
+            }
+
+            let runner = BackendRunner::new(backend, BackendBins::default());
+            assert!(
+                !runner
+                    .start_commands(
+                        "adapter-target",
+                        Path::new("/tmp"),
+                        &["agent".into()],
+                        "name"
+                    )
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                !runner
+                    .inject_commands("adapter-target", "directive")
+                    .is_empty()
+            );
+            assert!(!runner.capture_commands("adapter-target", 8).is_empty());
+            assert!(!runner.stop_commands("adapter-target").is_empty());
+        }
+    }
 
     #[test]
     fn delivery_queue_flag_tracks_whether_a_durable_copy_was_confirmed() {

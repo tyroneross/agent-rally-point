@@ -52,6 +52,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod adapter;
 pub mod delivery;
 pub mod ledger;
 pub mod store_wire;

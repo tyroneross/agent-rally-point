@@ -63,6 +63,9 @@ struct DoubleConfig {
     /// When true, `agent.register` replies with an `identity_conflict` error
     /// (drives the F2 register-fail → tmux fallback path).
     register_conflict: bool,
+    /// When true, `pane.close` reports an error so rollback evidence must
+    /// surface manual-cleanup risk rather than claim a successful reap.
+    pane_close_error: bool,
     /// When set, `agent.send` returns a Receipt whose `pane_id` is THIS value
     /// instead of `pane_id` (drives the F4 daemon_pane_mismatch path).
     send_pane_override: Option<String>,
@@ -231,6 +234,10 @@ fn spawn_double_daemon(socket: PathBuf, cfg: DoubleConfig) -> RequestLog {
                     "id": id, "result": { "type": "ok" }
                 }),
                 // [G]: reap-by-id verb (ptyd main.rs:567).
+                Some("pane.close") if cfg.pane_close_error => serde_json::json!({
+                    "id": id,
+                    "error": { "code": "close_failed", "message": "simulated close failure" }
+                }),
                 Some("pane.close") => serde_json::json!({
                     "id": id, "result": { "type": "ok" }
                 }),
@@ -663,6 +670,51 @@ fn run_backend_ptyd_spawns_daemon_owned_pane() {
     );
 }
 
+/// `ptyd-strict` uses the daemon-owned happy path unchanged, but its session
+/// record must preserve the strict backend so later failure handling cannot
+/// silently regain the legacy tmux fallback.
+#[test]
+fn run_backend_ptyd_strict_spawns_daemon_owned_pane() {
+    let sb = Sandbox::with_config(DoubleConfig {
+        pane_id: "ptyd-pane-strict-happy".to_string(),
+        ..Default::default()
+    });
+
+    let run = sb.rally(&[
+        "run",
+        "claude",
+        "--json",
+        "--name",
+        "ptyd-strict-target",
+        "--shared",
+        "--backend",
+        "ptyd-strict",
+        "--tmux-bin",
+        sb.tmux_spy.to_str().unwrap(),
+    ]);
+    let session = &run["data"]["run"]["session"];
+    assert_eq!(session["backend"], "ptyd-strict", "session={session}");
+    assert_eq!(session["daemon_registered"], true, "session={session}");
+    assert_eq!(session["daemon_pane"], "ptyd-pane-strict-happy");
+    assert_eq!(session["target"], "ptyd-pane-strict-happy");
+    assert_eq!(session["adapter_schema"], "rally.agent-adapter.v1");
+    assert_eq!(session["adapter_id"], "rally.ptyd-strict.v1");
+    assert_eq!(session["adapter_delivery_grade"], "managed");
+    assert_eq!(
+        session["adapter_operations"],
+        serde_json::json!(["start", "deliver", "capture", "stop", "probe"])
+    );
+
+    assert_eq!(count_method(&sb.log, "workspace.create"), 1);
+    assert_eq!(count_method(&sb.log, "agent.start"), 1);
+    assert_eq!(count_method(&sb.log, "agent.register"), 1);
+    assert_eq!(
+        sb.tmux_new_session_count(),
+        0,
+        "strict happy path must remain daemon-only"
+    );
+}
+
 /// (b) inject to a ptyd-spawned session: delivery_path "daemon", ZERO send-keys,
 /// the double received the SANITIZED text (raw \r and \x1b stripped), a Receipt
 /// fact is present in the ledger, and the daemon receipt state is surfaced.
@@ -859,6 +911,11 @@ fn ptyd_register_failure_reaps_pane_and_falls_back_to_tmux() {
         session["backend"], "tmux",
         "F2 must fall back to tmux; {session}"
     );
+    assert_eq!(session["adapter_id"], "rally.tmux.v1", "session={session}");
+    assert_eq!(
+        session["adapter_delivery_grade"], "unverified_transport",
+        "session={session}"
+    );
     assert_ne!(session["daemon_registered"], true);
     // F2 [G]: the spawned pane was reaped BY PANE ID via pane.close (not by
     // name via agent.stop), and the closed pane is the one that was spawned.
@@ -894,6 +951,124 @@ fn ptyd_register_failure_reaps_pane_and_falls_back_to_tmux() {
     assert!(
         data["warning"].as_str().unwrap_or("").contains("register"),
         "the run envelope must carry the F2 warning; data={data}"
+    );
+}
+
+/// Strict daemon mode keeps the same rollback safety but refuses to relaunch
+/// under tmux when registration fails. The error must leave no running daemon
+/// pane or mux-backed substitute behind.
+#[test]
+fn ptyd_strict_register_failure_reaps_pane_without_tmux_fallback() {
+    let sb = Sandbox::with_config(DoubleConfig {
+        pane_id: "ptyd-pane-strict".to_string(),
+        register_conflict: true,
+        ..Default::default()
+    });
+
+    let out = Command::new(RALLY_BIN)
+        .args([
+            "run",
+            "claude",
+            "--json",
+            "--name",
+            "ptyd-strict-f2",
+            "--shared",
+            "--backend",
+            "ptyd-strict",
+            // Keep this focused on the strict rollback result rather than the
+            // host-wide three-second watchdog under parallel test contention.
+            "--timeout-ms",
+            "20000",
+            "--tmux-bin",
+            sb.tmux_spy.to_str().unwrap(),
+        ])
+        .current_dir(&sb.cwd)
+        .env("HOME", &sb.home)
+        .env("RALLY_HOOK_TIMEOUT_MS", "20000")
+        .env("PTYD_SOCKET_PATH", &sb.socket)
+        .env("RALLY_PTYD_SOCKET", &sb.socket)
+        .env_remove("PWD")
+        .output()
+        .expect("spawn rally");
+
+    assert!(
+        !out.status.success(),
+        "strict registration failure must fail"
+    );
+    assert_eq!(
+        count_method(&sb.log, "pane.close"),
+        1,
+        "the spawned pane must be reaped on strict registration failure"
+    );
+    assert_eq!(
+        sb.tmux_new_session_count(),
+        0,
+        "strict daemon mode must never relaunch under tmux"
+    );
+    let rendered = format!(
+        "stdout={}\\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        rendered.contains("ptyd strict launch refused"),
+        "error must name the strict refusal: {rendered}"
+    );
+}
+
+/// A strict rollback reports an unsuccessful pane reap truthfully. It may not
+/// fall back to tmux or say the orphan was cleaned up when `pane.close` fails.
+#[test]
+fn ptyd_strict_register_failure_surfaces_unreaped_pane_warning() {
+    let sb = Sandbox::with_config(DoubleConfig {
+        pane_id: "ptyd-pane-strict-unreaped".to_string(),
+        register_conflict: true,
+        pane_close_error: true,
+        ..Default::default()
+    });
+
+    let out = Command::new(RALLY_BIN)
+        .args([
+            "run",
+            "claude",
+            "--json",
+            "--name",
+            "ptyd-strict-close-failure",
+            "--shared",
+            "--backend",
+            "ptyd-strict",
+            "--timeout-ms",
+            "20000",
+            "--tmux-bin",
+            sb.tmux_spy.to_str().unwrap(),
+        ])
+        .current_dir(&sb.cwd)
+        .env("HOME", &sb.home)
+        .env("RALLY_HOOK_TIMEOUT_MS", "20000")
+        .env("PTYD_SOCKET_PATH", &sb.socket)
+        .env("RALLY_PTYD_SOCKET", &sb.socket)
+        .env_remove("PWD")
+        .output()
+        .expect("spawn rally");
+
+    assert!(
+        !out.status.success(),
+        "strict registration failure must fail"
+    );
+    assert_eq!(count_method(&sb.log, "pane.close"), 1);
+    assert_eq!(sb.tmux_new_session_count(), 0);
+    let rendered = format!(
+        "stdout={}\\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        rendered.contains("WARNING: failed to reap spawned pane"),
+        "failed cleanup must be explicit for manual recovery: {rendered}"
+    );
+    assert!(
+        !rendered.contains("spawned pane reaped"),
+        "failed cleanup must not be reported as successful: {rendered}"
     );
 }
 
@@ -1017,50 +1192,52 @@ fn backend_auto_without_live_socket_uses_tmux() {
     );
 }
 
-/// (f) explicit `--backend ptyd`, no live socket, no RALLY_PTYD_BIN, empty PATH
-/// dir → a CLEAR autostart-failure error (the real binary can't be hermetically
-/// started here, so this asserts the error message path).
+/// Explicit daemon backends (`ptyd` and `ptyd-strict`) must both fail clearly
+/// when no live socket or ptyd binary is available. Strict mode must never
+/// reinterpret this as permission to use tmux.
 #[test]
-fn backend_ptyd_no_socket_no_binary_errors_clearly() {
-    let root = std::env::temp_dir().join(unique("ptyd-no-bin"));
-    let cwd = root.join("cwd");
-    let home = root.join("home");
-    let empty_path = root.join("empty-path");
-    fs::create_dir_all(cwd.join(".git")).unwrap();
-    fs::create_dir_all(&home).unwrap();
-    fs::create_dir_all(&empty_path).unwrap();
-    let dead_socket = root.join("nonexistent.sock");
+fn daemon_backends_no_socket_no_binary_error_clearly() {
+    for backend in ["ptyd", "ptyd-strict"] {
+        let root = std::env::temp_dir().join(unique(&format!("{backend}-no-bin")));
+        let cwd = root.join("cwd");
+        let home = root.join("home");
+        let empty_path = root.join("empty-path");
+        fs::create_dir_all(cwd.join(".git")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&empty_path).unwrap();
+        let dead_socket = root.join("nonexistent.sock");
 
-    let out = Command::new(RALLY_BIN)
-        .args([
-            "run",
-            "claude",
-            "--json",
-            "--name",
-            "no-bin",
-            "--shared",
-            "--backend",
-            "ptyd",
-        ])
-        .current_dir(&cwd)
-        .env("HOME", &home)
-        .env("RALLY_PTYD_SOCKET", &dead_socket)
-        // Empty PATH dir → `ptyd` is not resolvable; no RALLY_PTYD_BIN set.
-        .env("PATH", &empty_path)
-        .env_remove("RALLY_PTYD_BIN")
-        .env_remove("PTYD_SOCKET_PATH")
-        .env_remove("PWD")
-        .output()
-        .expect("spawn rally");
-    assert!(
-        !out.status.success(),
-        "ptyd run with no socket + no binary must FAIL, not succeed"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("ptyd") && (stderr.contains("not live") || stderr.contains("binary")),
-        "error must clearly explain the missing rally ptyd daemon/binary; stderr: {stderr}"
-    );
+        let out = Command::new(RALLY_BIN)
+            .args([
+                "run",
+                "claude",
+                "--json",
+                "--name",
+                "no-bin",
+                "--shared",
+                "--backend",
+                backend,
+            ])
+            .current_dir(&cwd)
+            .env("HOME", &home)
+            .env("RALLY_PTYD_SOCKET", &dead_socket)
+            // Empty PATH dir → `ptyd` is not resolvable; no RALLY_PTYD_BIN set.
+            .env("PATH", &empty_path)
+            .env_remove("RALLY_PTYD_BIN")
+            .env_remove("PTYD_SOCKET_PATH")
+            .env_remove("PWD")
+            .output()
+            .expect("spawn rally");
+        assert!(
+            !out.status.success(),
+            "{backend} run with no socket + no binary must FAIL, not succeed"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("ptyd") && (stderr.contains("not live") || stderr.contains("binary")),
+            "error must clearly explain the missing rally ptyd daemon/binary; stderr: {stderr}"
+        );
+    }
 }
 
 // ===========================================================================
