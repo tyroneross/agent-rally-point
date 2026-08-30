@@ -105,7 +105,10 @@ impl Workspace {
         value["data"]["say"]["fact"]["event_id"]
             .as_str()
             .unwrap_or_else(|| {
-                panic!("claim event id missing from response shape (command={:?}): {value}", value["command"])
+                panic!(
+                    "claim event id missing from response shape (command={:?}): {value}",
+                    value["command"]
+                )
             })
             .to_string()
     }
