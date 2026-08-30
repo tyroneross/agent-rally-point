@@ -3020,7 +3020,7 @@ fn rally_uses_native_cmux_managed_session_commands() {
         .as_str()
         .expect("cmux inject body");
     assert!(cmux_body.starts_with(
-        "[RALLY MESSAGE FRAME | sender=(none stated) (claimed; unverified) | intent=directive (declared or defaulted) | control-attempt=yes (derived from intent)"
+        "[RALLY MESSAGE FRAME | sender=(none stated) (claimed, unverified) | intent=directive | control-attempt=yes"
     ));
     assert!(cmux_body.ends_with("] hello cmux"));
     assert_eq!(cmux_inject["data"]["inject"]["commands"][2][1], "send-key");

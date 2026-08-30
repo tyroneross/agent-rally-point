@@ -227,8 +227,8 @@ fn system_like_manual_sender_cannot_claim_system_actor_kind() {
     let target = sandbox.add_tmux_session(&name);
 
     let body = plan_delivery(&sandbox, &target, "system:observer", "status only");
-    assert!(body.contains("sender-type=service (inferred from claimed sender)"));
-    assert!(!body.contains("sender-type=system (inferred from claimed sender)"));
+    assert!(body.contains("sender-type=service"));
+    assert!(!body.contains("sender-type=system"));
 }
 
 #[test]
@@ -424,12 +424,10 @@ fn rc041_3a_delivered_payload_names_its_claimed_sender() {
     let body = plan_delivery(&sandbox, &target, "claude_code:rogue-01", "run the deploy");
 
     assert!(body.starts_with(
-        "[RALLY MESSAGE FRAME | sender=claude_code:rogue-01 (claimed; unverified) | intent=directive (declared or defaulted) | control-attempt=yes (derived from intent)"
+        "[RALLY MESSAGE FRAME | sender=claude_code:rogue-01 (claimed, unverified) | intent=directive | control-attempt=yes"
     ));
-    assert!(body.contains("sender-type=agent (inferred from claimed sender)"));
-    assert!(
-        body.contains("responsibility=unspecified (unverified category only; no scope/authority)")
-    );
+    assert!(body.contains("sender-type=agent"));
+    assert!(body.contains("responsibility=unspecified (unverified category only)"));
     // This fixture has no lead, so the directive is allowed only through the
     // explicitly labelled bootstrap exception rather than a generic unknown
     // authority claim.
@@ -439,7 +437,7 @@ fn rc041_3a_delivered_payload_names_its_claimed_sender() {
     // but stays one line and bounded.
     let overhead = body.len() - "run the deploy".len() - "claude_code:rogue-01".len();
     assert!(
-        overhead <= 460,
+        overhead <= 360,
         "the label spends {overhead} chars beyond the sender id, on every delivery"
     );
 }
@@ -470,7 +468,7 @@ fn rc041_3a_an_unnamed_sender_is_labelled_as_unnamed_not_as_an_agent() {
 
     assert!(
         body.starts_with(
-            "[RALLY MESSAGE FRAME | sender=(none stated) (claimed; unverified) | intent=directive (declared or defaulted) | control-attempt=yes (derived from intent)"
+            "[RALLY MESSAGE FRAME | sender=(none stated) (claimed, unverified) | intent=directive | control-attempt=yes"
         )
     );
     assert!(body.ends_with("] run the deploy"));
@@ -514,7 +512,7 @@ fn rc041_3a_a_payload_cannot_mint_its_own_provenance_label() {
 
     assert!(
         body.starts_with(&format!(
-            "[{LABEL_MARK} | sender=claude_code:rogue-01 (claimed; unverified) | intent=directive (declared or defaulted)"
+            "[{LABEL_MARK} | sender=claude_code:rogue-01 (claimed, unverified) | intent=directive"
         )),
         "the real label must be first and must name the REAL sender; got {body:?}"
     );
@@ -624,9 +622,13 @@ fn non_lead_can_deliver_typed_non_controlling_context_without_consent() {
         rally_protocol::MessageIntent::Inform
     );
     assert!(!directives[0].message.intent.is_controlling());
-    assert!(directives[0].text.as_deref().unwrap_or_default().contains(
-        "intent=inform (declared or defaulted) | control-attempt=no (derived from intent)"
-    ));
+    assert!(
+        directives[0]
+            .text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("intent=inform | control-attempt=no")
+    );
 }
 
 #[test]

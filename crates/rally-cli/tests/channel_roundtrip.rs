@@ -40,9 +40,7 @@ fn assert_typed_directive_text(text: Option<&str>, payload: &str) {
         text.starts_with("[RALLY MESSAGE FRAME | sender="),
         "ledger delivery must retain the same typed receiver boundary as live delivery: {text}"
     );
-    assert!(text.contains(
-        "intent=directive (declared or defaulted) | control-attempt=yes (derived from intent)"
-    ));
+    assert!(text.contains("intent=directive | control-attempt=yes"));
     assert!(
         text.ends_with(&format!("] {payload}")),
         "payload drift: {text}"

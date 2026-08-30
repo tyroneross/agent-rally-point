@@ -13456,9 +13456,7 @@ mod tests {
 
         assert_eq!(directive.message, message);
         assert_eq!(directive.text.as_deref(), Some(live_text.as_str()));
-        assert!(live_text.contains(
-            "intent=inform (declared or defaulted) | control-attempt=no (derived from intent)"
-        ));
+        assert!(live_text.contains("intent=inform | control-attempt=no"));
 
         std::fs::remove_dir_all(&root).ok();
     }

@@ -231,7 +231,7 @@ fn inject_timeout_marks_committed_only_after_directive_is_durable() {
         .expect("durable directive text");
     assert!(
         text.starts_with(
-            "[RALLY MESSAGE FRAME | sender=codex (claimed; unverified) | intent=directive (declared or defaulted) | control-attempt=yes (derived from intent)"
+            "[RALLY MESSAGE FRAME | sender=codex (claimed, unverified) | intent=directive | control-attempt=yes"
         ),
         "durable directive must preserve its typed receiver boundary: {text}"
     );
