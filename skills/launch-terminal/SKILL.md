@@ -8,12 +8,24 @@ description: Use when asked to launch a fresh Claude (or Codex) terminal session
 Launch through rally so the session is MANAGED: named, injectable, liveness-tracked,
 and cleanly stoppable. A bare `tmux new-session claude` gives none of that.
 
+## Two different "remote controls" — say which one you mean
+
+- **Rally remote delivery** (agent-facing): the managed lifecycle itself.
+  `rally run` makes the session addressable for `rally inject` / `capture` /
+  `attach` / `stop`. No flag needed — being managed IS the enablement.
+- **Claude Remote Control** (human-facing): the claude.ai / mobile-app bridge.
+  Separate feature; see the `/rc` verification step below.
+
 ## Launch
 
 ```bash
-rally run claude --name <name> --backend tmux --json     # worktree-isolated (default)
-rally run claude --name <name> --backend tmux --shared   # share the live checkout (no worktree)
+rally run claude --name <name> --backend auto --json     # worktree-isolated (default)
+rally run claude --name <name> --backend auto --shared   # share the live checkout (no worktree)
 ```
+
+`--backend auto` uses rally's ptyd remote-delivery daemon when available and
+falls back to `tmux`. Pass `--backend tmux` explicitly only when you need a
+pane a human will attach to by name.
 
 - `<name>` is what the user sees everywhere — their phone, `rally sessions`,
   the tmux target (`rally-claude-<name>`). Pick a human-meaningful name.
@@ -48,8 +60,22 @@ Report: the name (as it appears on their phone), the claude.ai session URL,
 the terminal attach command (`tmux attach -t rally-claude-<name>`), and whether
 the session runs in a worktree or the shared checkout.
 
+## Operate
+
+```bash
+rally inject <name> --text "..." --json   # deliver a message (confirm delivered: true)
+rally capture <name> --json               # read session output via the backend
+rally attach <name> --json                # attach to the runtime surface where supported
+rally stop <name> --json                  # stop cleanly (releases claims, cleans worktree)
+```
+
+For an ALREADY-open terminal, `rally adopt` registers it as managed — but only
+after positively identifying its tmux/cmux target; adopting a guessed pane
+delivers keystrokes into the wrong window.
+
 ## Teardown
 
-`rally sessions --reap --apply` sweeps dead sessions; a worktree-isolated
-session's worktree is cleaned at stop. Never `kill -9` the pane while it holds
-unreleased claims — stop it properly so claims release.
+Prefer `rally stop <name>` per session. `rally sessions --reap --apply` sweeps
+dead sessions in bulk; a worktree-isolated session's worktree is cleaned at
+stop. Never `kill -9` the pane while it holds unreleased claims — stop it
+properly so claims release.
