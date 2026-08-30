@@ -37,10 +37,12 @@ fn unique_name(prefix: &str) -> String {
 fn assert_typed_directive_text(text: Option<&str>, payload: &str) {
     let text = text.expect("Directive.text");
     assert!(
-        text.starts_with("[rally: UNVERIFIED SENDER "),
+        text.starts_with("[RALLY MESSAGE FRAME | sender="),
         "ledger delivery must retain the same typed receiver boundary as live delivery: {text}"
     );
-    assert!(text.contains("intent=directive(declared) | control=yes(derived)"));
+    assert!(text.contains(
+        "intent=directive (declared or defaulted) | control-attempt=yes (derived from intent)"
+    ));
     assert!(
         text.ends_with(&format!("] {payload}")),
         "payload drift: {text}"

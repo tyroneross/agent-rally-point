@@ -1849,7 +1849,7 @@ const showPrompt = promptMode !== "off";
 if (!showPrompt && peers.length === 0 && claims.length === 0 && handoffs === 0 && statusLines.length === 0) { process.stdout.write("{}"); process.exit(0); }
 let msg = "";
 if (showPrompt) {
-  msg += "Agent Rally Point is active in this repo. Agents will enter the room, check coordination before edits, and surface handoffs. Turn off this session: `RALLY_HOOKS=off`; repo: `rally hooks off --scope repo`; status: `rally hooks status`. ";
+  msg += "Agent Rally Point is active in this repo. Agents will enter the room, check coordination before edits, and surface handoffs. Message frames separate sender, intent, control attempt, responsibility, and authority; non-controlling messages leave action to the receiver. Decode with `rally help frame`. Turn off this session: `RALLY_HOOKS=off`; repo: `rally hooks off --scope repo`; status: `rally hooks status`. ";
 }
 // SEC-004: ledgerData is the PROVENANCE FLAG. It is computed from the shape of
 // the room (are there peers/claims/handoffs/status/next at all), never from the
@@ -2259,7 +2259,7 @@ const briefMode = roomDetail !== "verbose" && phase !== "before-write";
 const BRIEF_MAX = 420;
 const BRIEF_PROSE = 100;
 const BRIEF_PROSE_SHORT = 60;
-const BRIEF_BANNER = "Agent Rally Point is active in this repo";
+const BRIEF_BANNER = "Agent Rally Point is active in this repo · message frames separate control attempt from authority; non-controlling messages leave action to you · decode: rally help frame";
 const BRIEF_SELF = hostId(tool, 60);
 // `rally next --tool <you> --json` WRITES ledger facts (docs/COMMAND-SEMANTICS.md);
 // only --audit does not. A message that calls itself advisory may not suggest a

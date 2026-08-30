@@ -1600,11 +1600,17 @@ install_stub "$prompt_bin"
   mkdir -p "$repo/.rally"
   cd "$repo"
   out=$(RALLY_BIN="$prompt_bin" "$HOOK" start claude_code </dev/null 2>/dev/null)
+  out_verbose=$(RALLY_HOOK_ROOM_DETAIL=verbose RALLY_BIN="$prompt_bin" "$HOOK" start claude_code </dev/null 2>/dev/null)
   rc=$?
-  if [ "$rc" = "0" ] && printf '%s' "$out" | grep -q "Agent Rally Point is active in this repo"; then
+  if [ "$rc" = "0" ] \
+    && printf '%s' "$out" | grep -q "Agent Rally Point is active in this repo" \
+    && printf '%s' "$out" | grep -q "rally help frame" \
+    && printf '%s' "$out" | grep -q "control attempt from authority" \
+    && printf '%s' "$out_verbose" | grep -q "rally help frame" \
+    && printf '%s' "$out_verbose" | grep -q "control attempt"; then
     exit 0
   else
-    printf 'rc=%s out=[%s]' "$rc" "$out" >&2
+    printf 'rc=%s out=[%s] verbose=[%s]' "$rc" "$out" "$out_verbose" >&2
     exit 1
   fi
 )

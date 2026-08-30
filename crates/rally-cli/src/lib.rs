@@ -1523,6 +1523,15 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
     {
         thread::sleep(Duration::from_millis(ms));
     }
+    // The frame decoder must work before repo/store discovery so a recipient
+    // can interpret an injected turn even in a fresh directory.
+    if args.len() == 2 && args[0] == "help" && args[1] == "frame" {
+        return Ok(Output::new(
+            false,
+            backends::message_frame_help_text(),
+            json!({}),
+        ));
+    }
     if args.is_empty()
         || matches!(
             args.first().map(String::as_str),
@@ -8485,28 +8494,10 @@ fn inject_authorization(
     intent: MessageIntent,
 ) -> InjectAuthorization {
     let Ok(room) = RoomStore::open() else {
-        return InjectAuthorization {
-            refusal: None,
-            room_seat: RoomSeat::Unknown,
-            lead_epoch: None,
-            authority_basis: if intent.is_controlling() {
-                AuthorityBasis::Unverified
-            } else {
-                AuthorityBasis::NotRequired
-            },
-        };
+        return unavailable_room_inject_authorization(intent);
     };
     let Ok(snapshot) = room.snapshot() else {
-        return InjectAuthorization {
-            refusal: None,
-            room_seat: RoomSeat::Unknown,
-            lead_epoch: None,
-            authority_basis: if intent.is_controlling() {
-                AuthorityBasis::Unverified
-            } else {
-                AuthorityBasis::NotRequired
-            },
-        };
+        return unavailable_room_inject_authorization(intent);
     };
     // Consent = the TARGET named this sender in an open handoff. A message the
     // SENDER wrote is never consent; non-controlling content facts use Artifact
@@ -8537,6 +8528,19 @@ fn inject_authorization(
         room_seat,
         lead_epoch: snapshot.lead_epoch,
         authority_basis,
+    }
+}
+
+fn unavailable_room_inject_authorization(intent: MessageIntent) -> InjectAuthorization {
+    InjectAuthorization {
+        refusal: None,
+        room_seat: RoomSeat::Unknown,
+        lead_epoch: None,
+        authority_basis: if intent.is_controlling() {
+            AuthorityBasis::Unverified
+        } else {
+            AuthorityBasis::NotRequired
+        },
     }
 }
 
@@ -8665,8 +8669,10 @@ fn inject_authority_decision(
 
 #[cfg(test)]
 mod inject_authority_tests {
-    use super::{inject_authority_decision, inject_authority_refusal};
-    use rally_protocol::{AuthorityBasis, MessageIntent};
+    use super::{
+        inject_authority_decision, inject_authority_refusal, unavailable_room_inject_authorization,
+    };
+    use rally_protocol::{AuthorityBasis, MessageIntent, RoomSeat};
 
     #[test]
     fn non_controlling_intents_need_no_lead_or_target_consent() {
@@ -8701,6 +8707,67 @@ mod inject_authority_tests {
         );
         assert!(refusal.is_some());
         assert_eq!(basis, AuthorityBasis::Unverified);
+    }
+
+    #[test]
+    fn unreadable_room_compatibility_is_visible_and_never_claims_authority() {
+        let directive = unavailable_room_inject_authorization(MessageIntent::Directive);
+        assert!(directive.refusal.is_none());
+        assert_eq!(directive.room_seat, RoomSeat::Unknown);
+        assert_eq!(directive.lead_epoch, None);
+        assert_eq!(directive.authority_basis, AuthorityBasis::Unverified);
+
+        let request = unavailable_room_inject_authorization(MessageIntent::Request);
+        assert!(request.refusal.is_none());
+        assert_eq!(request.room_seat, RoomSeat::Unknown);
+        assert_eq!(request.authority_basis, AuthorityBasis::NotRequired);
+    }
+
+    #[test]
+    fn directive_authority_bases_stay_distinct_from_seat_and_intent() {
+        let cases = [
+            (
+                "codex:self",
+                "codex:self",
+                Some("claude_code:lead"),
+                false,
+                AuthorityBasis::SelfTarget,
+            ),
+            (
+                "claude_code:lead",
+                "codex:target",
+                Some("claude_code:lead"),
+                false,
+                AuthorityBasis::LeadLease,
+            ),
+            (
+                "codex:sender",
+                "codex:target",
+                Some("claude_code:lead"),
+                true,
+                AuthorityBasis::TargetConsent,
+            ),
+            (
+                "codex:sender",
+                "codex:target",
+                None,
+                false,
+                AuthorityBasis::LeaderlessBootstrap,
+            ),
+            (
+                "unknown",
+                "codex:target",
+                Some("claude_code:lead"),
+                false,
+                AuthorityBasis::Unverified,
+            ),
+        ];
+        for (sender, target, lead, consent, expected) in cases {
+            let (refusal, basis) =
+                inject_authority_decision(sender, target, lead, consent, MessageIntent::Directive);
+            assert!(refusal.is_none(), "case {expected:?} unexpectedly refused");
+            assert_eq!(basis, expected);
+        }
     }
 
     #[test]
@@ -13389,7 +13456,9 @@ mod tests {
 
         assert_eq!(directive.message, message);
         assert_eq!(directive.text.as_deref(), Some(live_text.as_str()));
-        assert!(live_text.contains("intent=inform(declared) | control=no(derived)"));
+        assert!(live_text.contains(
+            "intent=inform (declared or defaulted) | control-attempt=no (derived from intent)"
+        ));
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -19447,6 +19516,7 @@ fn help_text() -> String {
         "rally: repo-local coordination room for parallel agents",
         "",
         "Usage:",
+        "  rally help frame  # store-free decoder for sender, intent, control, responsibility, and authority fields",
         "  rally init [--json]",
         "  rally hooks status [--json]",
         "  rally hooks on|off [--scope <repo|user>] [--json]",
