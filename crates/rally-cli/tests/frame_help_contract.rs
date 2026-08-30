@@ -35,9 +35,13 @@ fn tmp_dir(label: &str) -> PathBuf {
     dir
 }
 
-fn run_help_frame(cwd: &PathBuf) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_rally"))
-        .args(["help", "frame"])
+fn run_help_frame(cwd: &PathBuf, json: bool) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rally"));
+    command.args(["help", "frame"]);
+    if json {
+        command.arg("--json");
+    }
+    command
         .current_dir(cwd)
         .env_remove("GITHUB_ACTIONS")
         .env_remove("GITHUB_RUN_ID")
@@ -90,7 +94,7 @@ fn glossary(text: &str) -> BTreeMap<String, [String; 3]> {
 #[test]
 fn help_frame_is_store_free_and_initializes_nothing() {
     let dir = tmp_dir("outside");
-    let output = run_help_frame(&dir);
+    let output = run_help_frame(&dir, false);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "stderr: {stderr}");
@@ -104,9 +108,29 @@ fn help_frame_is_store_free_and_initializes_nothing() {
 }
 
 #[test]
+fn help_frame_json_returns_the_decoder_without_initializing_a_room() {
+    let dir = tmp_dir("json");
+    let output = run_help_frame(&dir, true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON envelope");
+    assert_eq!(value["command"], "help-frame");
+    assert_eq!(value["schema"], "agent-rally.command.help-frame.v1");
+    assert!(
+        value["data"]["frame"]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Rally message frame\n")
+    );
+    assert!(!dir.join(".rally").exists());
+    assert!(!dir.join(".git").exists());
+    fs::remove_dir_all(dir).expect("remove isolated help directory");
+}
+
+#[test]
 fn help_frame_defines_exactly_the_runtime_fields_with_complete_semantics() {
     let dir = tmp_dir("glossary");
-    let output = run_help_frame(&dir);
+    let output = run_help_frame(&dir, false);
     fs::remove_dir_all(dir).expect("remove isolated help directory");
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).expect("UTF-8 help output");
@@ -130,7 +154,7 @@ fn help_frame_defines_exactly_the_runtime_fields_with_complete_semantics() {
 #[test]
 fn help_frame_keeps_status_duty_intent_and_authority_semantically_separate() {
     let dir = tmp_dir("meaning");
-    let output = run_help_frame(&dir);
+    let output = run_help_frame(&dir, false);
     fs::remove_dir_all(dir).expect("remove isolated help directory");
     let text = String::from_utf8(output.stdout).expect("UTF-8 help output");
     let rows = glossary(&text);

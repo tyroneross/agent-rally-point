@@ -1600,17 +1600,17 @@ install_stub "$prompt_bin"
   mkdir -p "$repo/.rally"
   cd "$repo"
   out=$(RALLY_BIN="$prompt_bin" "$HOOK" start claude_code </dev/null 2>/dev/null)
-  out_verbose=$(RALLY_HOOK_ROOM_DETAIL=verbose RALLY_BIN="$prompt_bin" "$HOOK" start claude_code </dev/null 2>/dev/null)
   rc=$?
-  if [ "$rc" = "0" ] \
-    && printf '%s' "$out" | grep -q "Agent Rally Point is active in this repo" \
+  out_verbose=$(RALLY_HOOK_ROOM_DETAIL=verbose RALLY_BIN="$prompt_bin" "$HOOK" start claude_code </dev/null 2>/dev/null)
+  rc_verbose=$?
+  if [ "$rc" = "0" ] && [ "$rc_verbose" = "0" ] \
+    && printf '%s' "$out" | grep -q "Agent Rally active" \
     && printf '%s' "$out" | grep -q "rally help frame" \
-    && printf '%s' "$out" | grep -q "control attempt from authority" \
     && printf '%s' "$out_verbose" | grep -q "rally help frame" \
     && printf '%s' "$out_verbose" | grep -q "control attempt"; then
     exit 0
   else
-    printf 'rc=%s out=[%s] verbose=[%s]' "$rc" "$out" "$out_verbose" >&2
+    printf 'rc=%s rc_verbose=%s out=[%s] verbose=[%s]' "$rc" "$rc_verbose" "$out" "$out_verbose" >&2
     exit 1
   fi
 )
@@ -2567,7 +2567,7 @@ install_stub "$reg_bin"
   out=$(RALLY_BIN="$reg_bin" "$HOOK" start claude_code </dev/null 2>/dev/null)
   rc=$?
   if [ "$rc" != "0" ]; then printf 'rc=%s\n' "$rc" >&2; exit 1; fi
-  if ! printf '%s' "$out" | grep -q "Agent Rally Point is active in this repo"; then
+  if ! printf '%s' "$out" | grep -q "Agent Rally active"; then
     printf 'regression: missing room-awareness message: [%s]\n' "$out" >&2; exit 1
   fi
   exit 0
@@ -2596,7 +2596,7 @@ if command -v node >/dev/null 2>&1; then
     if printf '%s' "$out" | grep -q "not found on PATH"; then
       printf 'binary not resolved — got not-found advisory: %s\n' "$out" >&2; exit 1
     fi
-    if ! printf '%s' "$out" | grep -q "active in this repo"; then
+    if ! printf '%s' "$out" | grep -q "Agent Rally active"; then
       printf 'expected room-awareness (binary resolved+used): %s\n' "$out" >&2; exit 1
     fi
     exit 0

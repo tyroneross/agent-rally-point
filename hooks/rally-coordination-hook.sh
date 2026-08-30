@@ -2259,7 +2259,8 @@ const briefMode = roomDetail !== "verbose" && phase !== "before-write";
 const BRIEF_MAX = 420;
 const BRIEF_PROSE = 100;
 const BRIEF_PROSE_SHORT = 60;
-const BRIEF_BANNER = "Agent Rally Point is active in this repo · message frames separate control attempt from authority; non-controlling messages leave action to you · decode: rally help frame";
+// One clause only: `briefLadder` owns the ` · ` grammar between clauses.
+const BRIEF_BANNER = "Agent Rally active; frame: rally help frame";
 const BRIEF_SELF = hostId(tool, 60);
 // `rally next --tool <you> --json` WRITES ledger facts (docs/COMMAND-SEMANTICS.md);
 // only --audit does not. A message that calls itself advisory may not suggest a

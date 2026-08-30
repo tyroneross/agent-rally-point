@@ -192,6 +192,7 @@ use backends::{
 const SCHEMA_MIGRATE_LEGACY: &str = "agent-rally.command.migrate-legacy.v1";
 const SCHEMA_DOCTOR: &str = "agent-rally.command.doctor.v1";
 const SCHEMA_VERSION: &str = "agent-rally.command.version.v1";
+const SCHEMA_HELP_FRAME: &str = "agent-rally.command.help-frame.v1";
 const SCHEMA_WHOAMI: &str = "agent-rally.command.whoami.v1";
 const SCHEMA_OWNERS: &str = "agent-rally.command.owners.v1";
 // Work surface schemas
@@ -1525,12 +1526,20 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
     }
     // The frame decoder must work before repo/store discovery so a recipient
     // can interpret an injected turn even in a fresh directory.
-    if args.len() == 2 && args[0] == "help" && args[1] == "frame" {
-        return Ok(Output::new(
-            false,
-            backends::message_frame_help_text(),
-            json!({}),
-        ));
+    let wants_json = args.iter().any(|arg| arg == "--json");
+    let frame_args = args
+        .iter()
+        .filter(|arg| arg.as_str() != "--json")
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if frame_args == ["help", "frame"] && args.len() == 2 + usize::from(wants_json) {
+        let text = backends::message_frame_help_text();
+        let body = envelope_value(
+            "help-frame",
+            SCHEMA_HELP_FRAME,
+            json!({"frame": {"text": text}}),
+        )?;
+        return Ok(Output::new(wants_json, text, body));
     }
     if args.is_empty()
         || matches!(
