@@ -86,12 +86,27 @@ impl Workspace {
                 "--subject",
                 "owns it",
                 "--json",
+                // Override the hook-safety default (3000ms) with a generous
+                // ceiling. Under parallel test/build load this process's
+                // bootstrap + ledger append can occasionally exceed 3s; when
+                // that happens the CLI's own watchdog fires first and returns
+                // a `command: "watchdog"` envelope (no `data.say.fact`) even
+                // though the mutation itself succeeds, which previously made
+                // the `.expect("claim event id")` below panic. The 3s default
+                // exists to protect live write-hooks from stuck I/O, which
+                // doesn't apply to this test driver, so widening it here does
+                // not mask a product race — it lets the command finish under
+                // load instead of racing an unrelated safety timer.
+                "--timeout-ms",
+                "30000",
             ],
         );
         assert_eq!(value["ok"], true, "claim failed: {value}");
         value["data"]["say"]["fact"]["event_id"]
             .as_str()
-            .expect("claim event id")
+            .unwrap_or_else(|| {
+                panic!("claim event id missing from response shape (command={:?}): {value}", value["command"])
+            })
             .to_string()
     }
 
