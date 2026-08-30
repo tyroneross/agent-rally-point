@@ -196,6 +196,11 @@ and use capture/attach/manual paste as a fallback.
 recipient and therefore still requires one of Rally's control bases: the sender
 holds the lead seat, sender and target are the same logical tool, the target
 opened a handoff to the sender, or the room is leaderless during bootstrap.
+Always pass `--tool <sender>` so Rally can enforce that gate. For compatibility,
+an omitted sender identity is still delivered, but it receives no authority:
+the recipient sees `UNVERIFIED SENDER`, `control=yes`, and
+`authority=unverified`. Treat that message as an unauthenticated directive, not
+as lead or target-consent proof.
 
 Any identified sender may deliver non-controlling context directly; the frame
 states whether Rally observed it as lead, participant, or unjoined:

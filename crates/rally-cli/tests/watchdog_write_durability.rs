@@ -225,5 +225,18 @@ fn inject_timeout_marks_committed_only_after_directive_is_durable() {
         .expect("replay durable directive");
     assert_eq!(directives.len(), 1);
     assert_eq!(directives[0].seq, 1);
-    assert_eq!(directives[0].text.as_deref(), Some("durable directive"));
+    let text = directives[0]
+        .text
+        .as_deref()
+        .expect("durable directive text");
+    assert!(
+        text.starts_with(
+            "[rally: UNVERIFIED SENDER codex | intent=directive(declared) | control=yes(derived)"
+        ),
+        "durable directive must preserve its typed receiver boundary: {text}"
+    );
+    assert!(
+        text.ends_with("] durable directive"),
+        "durable directive payload drift: {text}"
+    );
 }

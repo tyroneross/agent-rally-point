@@ -30,12 +30,17 @@ rally attach <session>                      # watch live  ·  rally stop <sessio
 `rally inject <session|name|tool> --text "<prompt>"` delivers text into the session input and submits one Enter through the managed backend:
 
 ```bash
-rally inject claude-foo-01 --text "Read docs/HANDOFF.md and continue …"
+rally inject claude-foo-01 \
+  --tool <sender> \
+  --text "Read docs/HANDOFF.md and continue …"
 ```
 
 The default intent is `directive`, which remains lead/self/target-consent
-gated. A non-lead may send useful non-controlling context directly without a
-handoff:
+gated for identified senders. Always pass `--tool`; the legacy omitted-sender
+form remains a compatibility exception and arrives as `UNVERIFIED SENDER`,
+`control=yes`, `authority=unverified` rather than carrying lead or consent
+authority. A non-lead may send useful non-controlling context directly without
+a handoff:
 
 ```bash
 rally inject claude-foo-01 \
