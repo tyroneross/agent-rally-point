@@ -164,6 +164,11 @@ impl Fixture {
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
             .env("RALLY_GLOBAL_INDEX", "1")
             .env("RALLY_HOOKS", "")
+            // `extra_envs` may supply RALLY_SESSION_ID. Remove ambient cloud
+            // identity first so those cases exercise the requested managed
+            // lease under GitHub Actions too.
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

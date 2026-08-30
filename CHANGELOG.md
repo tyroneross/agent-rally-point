@@ -7,6 +7,14 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Changed — daemon transport receipts no longer claim receiver delivery
+
+Successful ptyd `sent`, `seen`, and `acted` receipts remain sender-side
+transport evidence. Rally preserves the v1 `delivered` and `delivery_state`
+compatibility fields, but its additive truth reports `sent_unverified`, keeps
+the durable copy queued, and requires target-authored acknowledgement before
+setting `reached_target=true`. Durable Receipt prose uses the same boundary.
+
 ### Added — release gate fails on documented commands the binary rejects
 
 `scripts/check_command_conformance.py` runs inside

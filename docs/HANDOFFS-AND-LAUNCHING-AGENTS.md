@@ -59,7 +59,12 @@ use that typed boundary rather than infer authority from tone or from the word
 
 - `--require-ack` requires `--handoff <event-id>` or `--ref` — it does **not** work with free `--text`. For a plain steer, omit it.
 - `--urgent` is refused for `inform`, `request`, and `propose`; those intents are non-controlling.
-- `delivered=true ack=false` is normal for a `--text` inject (no ack channel).
+- A plain `--text` inject has no target-authored ACK channel. Treat
+  `delivered` and `delivery_state` as compatibility fields for the immediate
+  transport attempt; branch on `delivery_reason`, `reached_target`, and
+  `queued`. In particular, a ptyd `sent` receipt reports
+  `delivery_reason=sent_unverified`, `reached_target=false`, and `queued=true`
+  until separate target-authored evidence arrives.
 - Inject only works against a **`rally run`-managed** session. Fact-only / externally-launched agents are not injectable via `rally inject` — but see "Delivering to a non-managed agent" below for the watch-based path.
 - Capture before the first real inject if the host can show startup prompts. Codex may stop on an update/trust prompt; clear that deliberately before injecting work so the handoff lands at the agent prompt, not in the startup menu.
 - If `rally capture` shows the prompt pasted but not acted on, wait briefly and send one bounded backend-specific Enter as troubleshooting. That is a fallback, not the normal contract.
