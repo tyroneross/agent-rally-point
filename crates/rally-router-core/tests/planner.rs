@@ -23,6 +23,7 @@ fn envelope() -> DeliveryEnvelopeV1 {
             seq: 1,
             from: "claude:lead".into(),
             to: "codex:worker".into(),
+            message: Default::default(),
             kind: DirectiveKind::Deliver,
             itype: InterruptType::Addition,
             text: Some("Build the pure planner".into()),

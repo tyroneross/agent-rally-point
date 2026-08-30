@@ -33,7 +33,27 @@ rally attach <session>                      # watch live  ·  rally stop <sessio
 rally inject claude-foo-01 --text "Read docs/HANDOFF.md and continue …"
 ```
 
+The default intent is `directive`, which remains lead/self/target-consent
+gated. A non-lead may send useful non-controlling context directly without a
+handoff:
+
+```bash
+rally inject claude-foo-01 \
+  --tool codex:investigator-01 \
+  --intent request \
+  --responsibility investigator \
+  --text "Please inspect this failure if useful; this is not a controlling instruction."
+```
+
+Rally renders claimed sender, unbound observed caller session, room seat and
+authority derived for that claim, responsibility, declared intent, and derived
+`control=yes|no` before the payload. The recipient must
+use that typed boundary rather than infer authority from tone or from the word
+`peer`. `peer` is viewer-relative, is not a stored role, and is rejected on new
+`enter` and `say` writes.
+
 - `--require-ack` requires `--handoff <event-id>` or `--ref` — it does **not** work with free `--text`. For a plain steer, omit it.
+- `--urgent` is refused for `inform`, `request`, and `propose`; those intents are non-controlling.
 - `delivered=true ack=false` is normal for a `--text` inject (no ack channel).
 - Inject only works against a **`rally run`-managed** session. Fact-only / externally-launched agents are not injectable via `rally inject` — but see "Delivering to a non-managed agent" below for the watch-based path.
 - Capture before the first real inject if the host can show startup prompts. Codex may stop on an update/trust prompt; clear that deliberately before injecting work so the handoff lands at the agent prompt, not in the startup menu.

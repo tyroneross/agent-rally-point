@@ -71,6 +71,7 @@ fn directive() -> Directive {
         seq: 7,
         to: "codex:worker-01".into(),
         from: "claude_code:lead-01".into(),
+        message: Default::default(),
         kind: DirectiveKind::Deliver,
         itype: InterruptType::Addition,
         text: Some("Implement the parser".into()),

@@ -190,6 +190,37 @@ The durable Rally fact is the contract. Injection is only delivery. If injection
 fails or the agent does not acknowledge receipt, continue from the Rally fact
 and use capture/attach/manual paste as a fallback.
 
+### Direct messages versus directives
+
+`rally inject` defaults to `--intent directive`. A directive may control the
+recipient and therefore still requires one of Rally's control bases: the sender
+holds the lead seat, sender and target are the same logical tool, the target
+opened a handoff to the sender, or the room is leaderless during bootstrap.
+
+Any identified sender may deliver non-controlling context directly; the frame
+states whether Rally observed it as lead, participant, or unjoined:
+
+```bash
+rally inject <session|name|tool> \
+  --tool <sender> \
+  --intent inform|request|propose \
+  --responsibility investigator|planner|implementer|verifier|reviewer|integrator|operator \
+  --text "<message>" \
+  --json
+```
+
+The receiving turn begins with a Rally-authored boundary that names the claimed
+sender, unbound observed caller session, room seat and authority derived for that
+claim, asserted work responsibility, declared message intent, and derived
+`control=yes|no`. These fields do not authenticate the sender. For `control=no`, the
+payload may inform or ask; it does not change the recipient's goal and the
+recipient may accept, refuse, or ignore it. `--urgent` is invalid for
+non-controlling intent.
+
+Do not store `peer` as a role; new `enter` and `say` writes reject it. Peer is a relationship derived from the viewer.
+Rally stores independent axes: room seat, scoped work responsibility, message
+intent, actor kind, and authority basis.
+
 ### Manual or generic session
 
 A manual session is any CLI or editor agent that can run commands but is not
