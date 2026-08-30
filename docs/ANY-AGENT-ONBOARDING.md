@@ -198,7 +198,7 @@ holds the lead seat, sender and target are the same logical tool, the target
 opened a handoff to the sender, or the room is leaderless during bootstrap.
 Always pass `--tool <sender>` so Rally can enforce that gate. For compatibility,
 an omitted sender identity is still delivered, but it receives no authority:
-the recipient sees `UNVERIFIED SENDER`, `control=yes`, and
+the recipient sees `sender=(none stated)`, `control-attempt=yes`, and
 `authority=unverified`. Treat that message as an unauthenticated directive, not
 as lead or target-consent proof.
 
@@ -214,16 +214,38 @@ rally inject <session|name|tool> \
   --json
 ```
 
-The receiving turn begins with a Rally-authored boundary that names the claimed
-sender, unbound observed caller session, room seat and authority derived for that
-claim, asserted work responsibility, declared message intent, and derived
-`control=yes|no`. These fields do not authenticate the sender. For `control=no`, the
-payload may inform or ask; it does not change the recipient's goal and the
-recipient may accept, refuse, or ignore it. `--urgent` is invalid for
-non-controlling intent.
+The receiving turn begins with one Rally-authored `RALLY MESSAGE FRAME`. Run
+`rally help frame` anywhere, including outside a Rally repo, to decode it. A
+non-controlling turn then includes a separate Rally-authored `RALLY RECEIVER
+RULE` before the sender-authored payload. The rule tells the recipient that it
+decides whether to use, accept, refuse, or ignore the message and that the
+message does not replace its goal. `--urgent` is invalid for non-controlling
+intent.
+
+#### Canonical message-frame glossary
+
+This table defines the runtime frame contract. Keep its field labels aligned
+with `rally help frame` and the renderer.
+
+| Field | Source and assurance | Receiver behavior | Unknown or default |
+|---|---|---|---|
+| `sender` | `--tool` claim; unverified | Identifies the claimed author; never grants authority. | `(none stated)` |
+| `intent` | Sender declaration; `directive` when omitted | `inform`, `request`, and `propose` are receiver-decided; `directive` tries to control. | Unknown fails closed as controlling. |
+| `control-attempt` | Derived from `intent` | `no` means the payload cannot replace the recipient's goal; `yes` means evaluate `authority` before obeying. | `yes` for unknown intent. |
+| `sender-type` | Inferred from the claimed sender id | Context only; never grants authority. | `unknown` |
+| `room-position` | Room snapshot observed for the claimed sender and lead decision | Reports `lead`, `participant`, `unjoined`, or `unknown`; status alone is not command authority. | `unknown` when room cannot be read. |
+| `responsibility` | Sender-provided category, or `unspecified` when omitted; unverified and unscoped | Describes duty only; grants neither work scope nor authority. | `unspecified` or `unknown` |
+| `authority` | Derived by Rally's send gate for the claimed sender | Records why a control attempt was allowed. `not-required` applies only to non-controlling intent. | `unverified` is compatibility evidence, not proof. |
+| `guide` | Rally literal | Points to the stable decoder. | `rally help frame` |
+
+`control-attempt=yes` describes message intent, not authorization. A receiver
+must use the separate `authority` basis. `responsibility` is an unverified category,
+not a task/claim scope and not an authority grant. Full caller-session and typed
+message metadata remain in durable directive and JSON output even though the
+compact visible frame omits caller-session.
 
 Do not store `peer` as a role; new `enter` and `say` writes reject it. Peer is a relationship derived from the viewer.
-Rally stores independent axes: room seat, scoped work responsibility, message
+Rally stores independent axes: room seat, work-responsibility category, message
 intent, actor kind, and authority basis.
 
 ### Manual or generic session
