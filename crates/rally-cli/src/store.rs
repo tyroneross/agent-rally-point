@@ -1413,6 +1413,18 @@ fn validate_referenced_handoff(fact: &Fact, facts: &[Fact]) -> Result<()> {
                 .to_string(),
         ));
     }
+    // Self-consistency (above) only proves the handoff agrees with itself. A
+    // handoff also has to agree with the fact it cites: it joins that fact's
+    // thread. Without this, a handoff could assert a correlation naming some
+    // other thread entirely and still append as a canonically bound handoff --
+    // a coordination model contradicting its own referenced artifact.
+    if protocol_marker(fact, "correlation_id") != Some(referenced.thread_id.as_str()) {
+        return Err(RallyError::Usage(format!(
+            "handoff_correlation_foreign: protocol:correlation_id {} does not match thread {} of ref {ref_id}; a referenced handoff joins the thread of the fact it cites",
+            protocol_marker(fact, "correlation_id").unwrap_or_default(),
+            referenced.thread_id
+        )));
+    }
     if policy == "third-party" {
         if referenced.kind == FactKind::Handoff {
             return Err(RallyError::Usage(format!(
@@ -11738,6 +11750,67 @@ mod ledger_tests {
             "{error}"
         );
         assert!(store.facts().unwrap().is_empty());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn raw_referenced_handoff_cannot_correlate_to_a_foreign_thread() {
+        let root = unique_root("referenced-handoff-foreign-correlation");
+        let store = DirectRoomStore::open_direct_at_with_engagement(
+            root.clone(),
+            Some("engagement-alpha".to_string()),
+        )
+        .unwrap();
+        let mut artifact = make_fact("artifact-a", FactKind::Artifact, "src/a.rs", "artifact");
+        artifact.from_session_id = Some("session-author".to_string());
+        store.append_fact(&artifact).unwrap();
+
+        // Self-consistent (thread_id == protocol:correlation_id, so the
+        // `handoff_correlation_mismatch` check is satisfied) yet the thread it
+        // names is not the thread of the artifact it cites.
+        let mut foreign = make_fact("foreign-handoff", FactKind::Handoff, "src/a.rs", "handoff");
+        foreign.tool = Some("reviewer:r".to_string());
+        foreign.target = artifact.tool.clone();
+        foreign.ref_id = Some(artifact.event_id.clone());
+        foreign.from_session_id = Some("session-reviewer".to_string());
+        foreign.thread_id = "someone-elses-thread".to_string();
+        foreign.evidence = vec![
+            "protocol:bridge_version=fact-v1".to_string(),
+            "protocol:event_kind=handoff.requested".to_string(),
+            "protocol:target_policy=ref-author".to_string(),
+            "protocol:to_session_id=session-author".to_string(),
+            "protocol:ref_event_id=artifact-a".to_string(),
+            "protocol:causation_id=artifact-a".to_string(),
+            "protocol:correlation_id=someone-elses-thread".to_string(),
+            "protocol:handoff_id=handoff-a".to_string(),
+            "protocol:idempotency_key=operation-a".to_string(),
+        ];
+        assert_ne!(foreign.thread_id, artifact.thread_id);
+        let error = store.append_fact(&foreign).unwrap_err().to_string();
+        assert!(error.contains("handoff_correlation_foreign"), "{error}");
+        assert_eq!(
+            store.facts().unwrap().len(),
+            1,
+            "a rejected binding must append nothing"
+        );
+
+        // The same handoff on the cited artifact's own thread is accepted.
+        let mut bound = foreign.clone();
+        bound.event_id = "bound-handoff".to_string();
+        bound.thread_id = artifact.thread_id.clone();
+        bound.evidence = bound
+            .evidence
+            .iter()
+            .map(|entry| {
+                if entry.starts_with("protocol:correlation_id=") {
+                    format!("protocol:correlation_id={}", artifact.thread_id)
+                } else {
+                    entry.clone()
+                }
+            })
+            .collect();
+        store.append_fact(&bound).unwrap();
+        assert_eq!(store.facts().unwrap().len(), 2);
         fs::remove_dir_all(root).ok();
     }
 

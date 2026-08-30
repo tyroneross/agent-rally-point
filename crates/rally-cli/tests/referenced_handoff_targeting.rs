@@ -428,6 +428,102 @@ fn third_party_cannot_bypass_a_bound_receiver_or_implicit_reply_state() {
     assert_eq!(reply_count, 0, "rejections must append no reply fact");
 }
 
+/// `protocol:` evidence is reserved on `say handoff`, but not on the other
+/// kinds a handoff is allowed to cite. So an author could plant
+/// `protocol:correlation_id=<foreign>` on an ordinary artifact, and every
+/// handoff citing that artifact used to adopt the planted value as its own
+/// correlation and `thread_id` — a binding that contradicts the thread of the
+/// artifact it cites. Correlation now comes from the cited fact's `thread_id`.
+#[test]
+fn handoff_correlation_comes_from_the_cited_fact_not_a_planted_marker() {
+    let room = Room::new();
+    let poisoned = room.json(
+        "session-author",
+        &[
+            "say",
+            "artifact",
+            "--tool",
+            "author:a",
+            "--subject",
+            "build",
+            "--evidence",
+            "protocol:correlation_id=someone-elses-thread",
+            "--json",
+        ],
+    );
+    assert_eq!(poisoned["ok"], true, "{poisoned}");
+    let artifact = poisoned["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .unwrap();
+    let artifact_thread = poisoned["data"]["say"]["fact"]["thread_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(artifact_thread, "someone-elses-thread");
+
+    let handoff = room.json(
+        "session-reviewer",
+        &[
+            "say",
+            "handoff",
+            "--tool",
+            "reviewer:r",
+            "--ref",
+            artifact,
+            "--subject",
+            "review",
+            "--json",
+        ],
+    );
+    assert_eq!(handoff["ok"], true, "{handoff}");
+    let fact = &handoff["data"]["say"]["fact"];
+    assert_eq!(
+        fact["thread_id"], artifact_thread,
+        "handoff must join the thread of the fact it cites"
+    );
+    let evidence = fact["evidence"].as_array().unwrap();
+    assert!(
+        evidence.contains(&Value::String(format!(
+            "protocol:correlation_id={artifact_thread}"
+        ))),
+        "{evidence:?}"
+    );
+    assert!(
+        !evidence
+            .iter()
+            .any(|entry| entry.as_str() == Some("protocol:correlation_id=someone-elses-thread")),
+        "planted correlation must not survive into the handoff binding: {evidence:?}"
+    );
+
+    // The planted value is also not accepted when named explicitly:
+    // `--thread-id` is still checked against the correlation Rally derived
+    // from the artifact.
+    let explicit = room.json(
+        "session-reviewer",
+        &[
+            "say",
+            "handoff",
+            "--tool",
+            "reviewer:r",
+            "--ref",
+            artifact,
+            "--thread-id",
+            "someone-elses-thread",
+            "--subject",
+            "review",
+            "--json",
+        ],
+    );
+    assert_eq!(explicit["ok"], false, "{explicit}");
+    assert!(
+        explicit["error"]
+            .as_str()
+            .unwrap()
+            .contains("handoff_correlation_mismatch"),
+        "{explicit}"
+    );
+}
+
 #[test]
 fn third_party_resolution_is_exact_and_rejects_zero_multi_and_stale_sessions() {
     let room = Room::new();

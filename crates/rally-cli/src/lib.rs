@@ -3778,9 +3778,17 @@ fn resolve_referenced_handoff_binding(
         (author_tool, author_session, handoff_id)
     };
 
-    let correlation_id = protocol_evidence(referenced, "correlation_id")
-        .unwrap_or(&referenced.thread_id)
-        .to_string();
+    // A referenced handoff joins the thread of the fact it cites, so the
+    // correlation is read from `referenced.thread_id` and never from a
+    // `protocol:correlation_id` marker sitting on that fact. Rally writes that
+    // marker only on handoffs, where the store gate (`validate_referenced_handoff`)
+    // already forces it to equal the fact's own `thread_id` — so for every
+    // Rally-authored row the two agree and preferring the marker buys nothing.
+    // What preferring it *did* buy was a forgery: `protocol:` evidence is only
+    // rejected on `say handoff`, so any other kind could carry a caller-supplied
+    // `protocol:correlation_id` and silently graft every handoff citing it onto a
+    // thread that fact was never part of.
+    let correlation_id = referenced.thread_id.clone();
     let event_envelope = rally_protocol::delivery::EventEnvelope {
         causation_id: Some(ref_id.to_string()),
         correlation_id: Some(correlation_id.clone()),
