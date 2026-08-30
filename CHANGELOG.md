@@ -7,6 +7,64 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Added — unverified handoff closures are labeled `resolved-unverified`
+
+A `rally say resolve` that directly closes a TARGETED or requires-ack handoff
+carries only free-text `--evidence`; when no artifact fact refs that handoff
+there is no reviewable work product behind the closure. The room snapshot now
+projects such resolves into a `resolved_unverified` bucket (each copy stamped
+`status: "resolved-unverified"`, counted in `totals`). Derivation-level and
+charter-clean: the closure stands, nothing is gated, and an artifact remains an
+alternative closer rather than a precondition. The managed-session and
+ledger injection templates now demand the artifact-first completion — `rally
+say artifact --ref <handoff>` (the verified closer), then a resolve refing that
+artifact — instead of instructing a bare evidence-free resolve.
+
+### Added — the Stop hook consults `rally check before-complete --strict`
+
+The check classified owned-open coordination state (active claims, own
+blockers) correctly but had zero hook callers, so an agent could end its turn
+holding a live claim with nothing surfaced. The coordination hook's after-write
+(Stop) phase now runs it and surfaces `allow=false` as a high-severity
+advisory naming the finding; under `RALLY_HOOK_STRICT=1` it becomes
+`decision: "block"`, and a strict block is exempt from the surface-on-change
+dedupe so a second Stop attempt cannot slip past it. Fail-open on any CLI
+error, per the charter.
+
+### Fixed — unobserved sessions no longer escape reaping forever
+
+With `RALLY_OBSERVER_PID` unset, a session's presence stamps carry no
+`observer_pid:` evidence and observed liveness graded Unknown indefinitely —
+sessionful claims were never reap-eligible. A never-observed session now
+fails closed after the same 2h takeover bar the destructive release applies,
+and only with positive quiescence evidence: readable same-repo worktree,
+provably unmoved HEAD, no tracked-or-untracked (non-ignored) file writes
+since the stamp, and — because presence facts are write-once per session
+outside the shipped hook — authored-fact silence measured on the session's
+newest non-system ledger fact, the same clock `takeover_eligible_owners`
+reads. A stamped observer pid whose probe fails still grades Unknown (probe
+failure is not evidence of absence).
+
+What this costs, stated rather than buried: `rally doctor --reap-stale --apply`
+can now release an UNEXPIRED claim held by a never-observed session that has
+been silent past the bar. That release is operator-invoked (the automatic
+`rally enter` path still requires a writer-stamped lease expiry corroborated by
+observed death, and never acts on owner-staleness), and the doctor report names
+it `owner-stale` rather than `lease-expired` so the verdict is visibly a
+heuristic. Any ledger write — including a lease renewal — resets the silence
+clock, as does any non-ignored file written in the stamped worktree. The
+remaining exposure is a live session that writes nothing anywhere for over two
+hours while an operator runs a takeover sweep.
+
+### Changed — the room snapshot cache generation is 4
+
+`RoomSnapshot` gained `resolved_unverified`, which is `#[serde(default)]`, so a
+generation-3 cache written before the label existed would deserialize cleanly
+and hand back an empty bucket. Two independent branches had each claimed
+generation 3; the integration takes 4 rather than reusing a number that can no
+longer tell the two snapshot shapes apart. Existing cache files miss once and
+are rewritten.
+
 ### Changed — daemon transport receipts no longer claim receiver delivery
 
 Successful ptyd `sent`, `seen`, and `acted` receipts remain sender-side

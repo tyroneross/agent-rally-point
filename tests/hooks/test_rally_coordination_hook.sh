@@ -2394,6 +2394,74 @@ T="after-write phase: exit 0 + valid JSON + never block (default)"
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "Stop must stay advisory"; fi
 
 # ----------------------------------------------------------------------
+# Test 9c: after-write wires `rally check before-complete --strict`.
+#
+# Falsifier for the zero-caller gap: the check classified owned-open
+# coordination state correctly but hooks never invoked it, so an agent could
+# end its turn holding a live claim with nothing surfaced. Asserts:
+#   (1) the Stop phase actually CALLS `check before-complete --strict`,
+#   (2) allow=false surfaces an advisory naming the finding (default mode),
+#   (3) default mode still never emits decision:block (charter),
+#   (4) RALLY_HOOK_STRICT=1 turns the same verdict into decision:block,
+#   (5) the strict block survives a repeat Stop (dedupe must not suppress it —
+#       otherwise the agent finishes by trying twice).
+# ----------------------------------------------------------------------
+T="after-write: before-complete stop finding surfaces, blocks only under strict, and the block survives repeats"
+bc_stub="$tmpdir/rally_before_complete_stub"
+cat > "$bc_stub" <<'EOF'
+#!/usr/bin/env bash
+if [ -n "${CALLS:-}" ]; then printf '%s\n' "$*" >> "$CALLS"; fi
+if [ "$1" = "check" ] && [ "$2" = "before-complete" ]; then
+  cat <<'JSON'
+{"data":{"check":{"phase":"before-complete","tool":"claude_code","path":null,"allow":false,"mode":"strict","findings":[{"code":"owned-active-claim","severity":"stop","message":"release or explain this active claim before completion","fact_id":"fact_claim_18d9aa01"}],"agent_visible":{"present":true,"severity":"stop","message":"Rally check found room facts that should stop or redirect this write."}}}}
+JSON
+  exit 4
+elif [ "$1" = "hooks" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"data":{"hooks":{"enabled":true,"prompt":"once"}}}'
+else
+  printf '%s\n' '{}'
+fi
+EOF
+install_stub "$bc_stub"
+(
+  repo="$tmpdir/before-complete-repo"
+  calls="$tmpdir/before-complete.calls"
+  : > "$calls"
+  mkdir -p "$repo/.rally"
+  cd "$repo"
+
+  out=$(CALLS="$calls" RALLY_BIN="$bc_stub" RALLY_SESSION_ID="bc-default" "$HOOK" after-write claude_code </dev/null 2>/dev/null)
+  rc=$?
+  if [ "$rc" != "0" ]; then printf 'default rc=%s\n' "$rc" >&2; exit 1; fi
+  # The hook qualifies the bare host family with the session id
+  # (claude_code:bc-default), so match the tool prefix, not the exact id.
+  if ! grep -Eq "check before-complete --tool claude_code[^ ]* --strict --json" "$calls"; then
+    printf 'hook never invoked check before-complete; calls: %s\n' "$(cat "$calls")" >&2; exit 1
+  fi
+  if ! printf '%s' "$out" | grep -q "before-complete"; then
+    printf 'default: stop finding not surfaced: %s\n' "$out" >&2; exit 1
+  fi
+  if ! printf '%s' "$out" | grep -q "owned-active-claim"; then
+    printf 'default: finding code missing: %s\n' "$out" >&2; exit 1
+  fi
+  if printf '%s' "$out" | grep -q '"decision":"block"'; then
+    printf 'default must stay advisory: %s\n' "$out" >&2; exit 1
+  fi
+
+  out2=$(CALLS="$calls" RALLY_BIN="$bc_stub" RALLY_SESSION_ID="bc-strict" RALLY_HOOK_STRICT=1 "$HOOK" after-write claude_code </dev/null 2>/dev/null)
+  if ! printf '%s' "$out2" | grep -q '"decision":"block"'; then
+    printf 'strict must block: %s\n' "$out2" >&2; exit 1
+  fi
+
+  out3=$(CALLS="$calls" RALLY_BIN="$bc_stub" RALLY_SESSION_ID="bc-strict" RALLY_HOOK_STRICT=1 "$HOOK" after-write claude_code </dev/null 2>/dev/null)
+  if ! printf '%s' "$out3" | grep -q '"decision":"block"'; then
+    printf 'strict block was deduped away on the repeat Stop: %s\n' "$out3" >&2; exit 1
+  fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "Stop must consult check before-complete"; fi
+
+# ----------------------------------------------------------------------
 # Test 8b + 9b: the BRIEF twins of Tests 8 and 9.
 #
 # Tests 8 and 9 above are pinned to verbose because their stub emits

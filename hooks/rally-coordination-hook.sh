@@ -1970,9 +1970,21 @@ elif [ "$phase" = "before-write" ]; then
   fi
 else
   status_json=""
+  before_complete_json=""
   if [ "$phase" = "after-write" ] || [ "$phase" = "idle" ]; then
     _rally_status_idle
     status_json="$(rally_timeout status read --json 2>/dev/null || true)"
+  fi
+  if [ "$phase" = "after-write" ]; then
+    # Stop-phase completion gate: `rally check before-complete --strict`
+    # classifies coordination state this session still owns (active claims,
+    # own blockers) but previously had zero hook callers — an agent could end
+    # its turn holding a live claim and nothing surfaced. The verdict rides a
+    # side channel (RALLY_BEFORE_COMPLETE_JSON) so the brief composer cannot
+    # swallow it. Fail-open on any CLI error/timeout, per the charter; the
+    # translator below renders advisory by default and decision:block only
+    # under RALLY_HOOK_STRICT=1.
+    before_complete_json="$(rally_timeout check before-complete --tool "$tool" --strict --json 2>/dev/null || true)"
   fi
   rally_output="$(rally_timeout next --tool "$tool" --audit --json 2>/dev/null || true)"
 fi
@@ -1991,7 +2003,7 @@ fi
 strict="${RALLY_HOOK_STRICT:-0}"
 
 rally_root="$(find_rally_root 2>/dev/null || pwd)"
-printf '%s' "$rally_output" | RALLY_HOOK_STRICT="$strict" RALLY_HOOK_ROOT="$rally_root" RALLY_HOOK_SESSION="$session" RALLY_STATUS_JSON="${status_json:-}" RALLY_NEXT_JSON="${next_json:-}" node -e '
+printf '%s' "$rally_output" | RALLY_HOOK_STRICT="$strict" RALLY_HOOK_ROOT="$rally_root" RALLY_HOOK_SESSION="$session" RALLY_STATUS_JSON="${status_json:-}" RALLY_NEXT_JSON="${next_json:-}" RALLY_BEFORE_COMPLETE_JSON="${before_complete_json:-}" node -e '
 const fs = require("fs");
 const raw = fs.readFileSync(0, "utf8");
 const phase = process.argv[1] || "idle";
@@ -2898,6 +2910,37 @@ if (!briefMode && (!visible || !visible.present) && promptMode === "always" && p
   };
 }
 
+// ---- before-complete gate (Stop phase / after-write) --------------------
+// `rally check before-complete --strict` classifies coordination state this
+// session still owns (active claims, own blockers). Its verdict arrives on a
+// side channel so neither the brief composer nor the next-envelope fallbacks
+// above can swallow it: allow=false OVERRIDES whatever they rendered, because
+// an unreleased claim outranks any notification. Advisory by default; under
+// RALLY_HOOK_STRICT=1 the stop severity becomes the Stop decision:block below.
+// Finding codes are rally-authored constants; fact ids are ledger data and go
+// through ident() like every other identifier.
+if (phase === "after-write") {
+  let bcParsed = {};
+  try { bcParsed = JSON.parse(process.env.RALLY_BEFORE_COMPLETE_JSON || "{}"); } catch (_) {}
+  const bcCheck = (bcParsed && bcParsed.data && bcParsed.data.check) || {};
+  if (bcCheck.allow === false) {
+    const bcFindings = Array.isArray(bcCheck.findings) ? bcCheck.findings : [];
+    const bcDetail = bcFindings
+      .filter(f => f && f.severity === "stop")
+      .slice(0, 3)
+      .map(f => ident(String(f.code || "finding"), 40) + " " + ident(String(f.fact_id || "?"), 60))
+      .join("; ");
+    visible = {
+      present: true,
+      severity: "stop",
+      message: "Rally before-complete: this session still owns open coordination state — release or explain it before finishing"
+        + (bcDetail ? ": " + bcDetail : "")
+        + " · details: rally check before-complete --tool " + BRIEF_SELF + " --strict --json"
+    };
+    hasLedgerData = true;
+  }
+}
+
 if (!visible.present) { output({}); process.exit(0); }
 
 const event = nativeEvent(tool, phase);
@@ -2941,7 +2984,11 @@ const message = hasLedgerData ? UNTRUSTED_PREAMBLE + decorated : decorated;
 // re-check `rally next` on their own. Not applied to `start` (fires
 // once/session) or `before-write` (edit-scoped + conflict-specific —
 // repetition there is intentional).
-if (phase === "idle" || phase === "after-write") {
+// A STRICT-MODE block is exempt from the dedupe entirely (not merely from the
+// remindSecs window): suppressing an identical block on the second Stop
+// attempt would let the agent finish by trying twice, which defeats the gate
+// the block exists to hold.
+if ((phase === "idle" || phase === "after-write") && !stop) {
   try {
     const root = process.env.RALLY_HOOK_ROOT || process.cwd();
     const sess = (process.env.RALLY_HOOK_SESSION || "anon").replace(/[^A-Za-z0-9_.:-]/g, "_");

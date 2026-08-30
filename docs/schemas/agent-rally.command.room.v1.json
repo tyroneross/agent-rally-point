@@ -60,6 +60,10 @@
             "system_health": {
               "type": "array",
               "description": "System-generated health/telemetry facts (external-intake, unmanaged-agent, duplicate-active-squad-id, binary-drift), split out of current_risks. Omitted when empty."
+            },
+            "resolved_unverified": {
+              "type": "array",
+              "description": "Resolves that closed a targeted or requires-ack handoff with free-text evidence only (no artifact fact refs the handoff). Each projected copy carries status \"resolved-unverified\". Derivation-level label: the closure stands, nothing is gated. Omitted when empty."
             }
           }
         }

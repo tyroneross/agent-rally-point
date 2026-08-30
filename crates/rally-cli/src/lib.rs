@@ -11372,9 +11372,15 @@ fn backend_target(backend: Backend, session_id: &str) -> String {
 }
 
 fn handoff_prompt(session: &ManagedSession, handoff: &str) -> String {
+    // Artifact-first completion: a bare `rally say resolve --ref <handoff>`
+    // closes the handoff with free-text evidence only and projects as
+    // resolved-unverified (see `store::RESOLVED_UNVERIFIED_STATUS`). The
+    // template therefore demands a `rally say artifact` refing the handoff
+    // FIRST (the artifact is the verified closer), then a resolve refing that
+    // artifact to mark it consumed.
     format!(
-        "Rally managed-session injection for {}. Run: rally next --tool {} --json. If it is actionable for handoff {}, execute the suggested Rally completion command or run: rally say resolve --tool {} --ref {} --subject 'resolved via Rally managed session' --json. Do not edit files unless the Rally action explicitly requires it. Do not ask for confirmation after the Rally command succeeds.",
-        session.name, session.tool, handoff, session.tool, handoff
+        "Rally managed-session injection for {}. Run: rally next --tool {} --json. If it is actionable for handoff {}, record your work product first: rally say artifact --tool {} --ref {} --subject '<what you produced>' --evidence '<how you verified it>' --json — the artifact closes the handoff with reviewable evidence. Then mark it consumed: rally say resolve --tool {} --ref <artifact event_id from the previous command> --subject 'resolved via Rally managed session' --json. Do not resolve the handoff id directly without an artifact; that closure projects as resolved-unverified. Do not edit files unless the Rally action explicitly requires it. Do not ask for confirmation after the Rally commands succeed.",
+        session.name, session.tool, handoff, session.tool, handoff, session.tool
     )
 }
 
@@ -11384,8 +11390,10 @@ fn handoff_prompt(session: &ManagedSession, handoff: &str) -> String {
 /// argument and the resolve sender — those are the recipient's identity, not
 /// any session name.
 fn handoff_prompt_ledger(target: &str, handoff: &str) -> String {
+    // Same artifact-first contract as [`handoff_prompt`] — see the comment
+    // there for why the resolve refs the artifact, never the handoff directly.
     format!(
-        "Rally ledger injection for {target}. Run: rally next --tool {target} --json. If it is actionable for handoff {handoff}, execute the suggested Rally completion command or run: rally say resolve --tool {target} --ref {handoff} --subject 'resolved via Rally ledger' --json. Do not edit files unless the Rally action explicitly requires it. Do not ask for confirmation after the Rally command succeeds."
+        "Rally ledger injection for {target}. Run: rally next --tool {target} --json. If it is actionable for handoff {handoff}, record your work product first: rally say artifact --tool {target} --ref {handoff} --subject '<what you produced>' --evidence '<how you verified it>' --json — the artifact closes the handoff with reviewable evidence. Then mark it consumed: rally say resolve --tool {target} --ref <artifact event_id from the previous command> --subject 'resolved via Rally ledger' --json. Do not resolve the handoff id directly without an artifact; that closure projects as resolved-unverified. Do not edit files unless the Rally action explicitly requires it. Do not ask for confirmation after the Rally commands succeed."
     )
 }
 
@@ -11743,6 +11751,53 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The injection templates must demand an artifact-backed completion:
+    /// `rally say artifact --ref <handoff>` FIRST, then a resolve refing that
+    /// artifact — never a direct `rally say resolve --ref <handoff>` with
+    /// free-text evidence. Fails on the pre-fix templates, which instructed
+    /// exactly that direct resolve.
+    #[test]
+    fn injection_templates_demand_artifact_before_resolve() {
+        let session = ManagedSession {
+            session_id: "sess-1".to_string(),
+            name: "worker-1".to_string(),
+            agent: "claude".to_string(),
+            tool: "claude_code:worker-1".to_string(),
+            backend: "tmux".to_string(),
+            ..Default::default()
+        };
+        let handoff = "fact_deadbeef00000001";
+        for prompt in [
+            handoff_prompt(&session, handoff),
+            handoff_prompt_ledger("claude_code:worker-1", handoff),
+        ] {
+            let artifact_cmd =
+                format!("rally say artifact --tool claude_code:worker-1 --ref {handoff}");
+            let artifact_at = prompt.find(&artifact_cmd).unwrap_or_else(|| {
+                panic!("template must demand an artifact refing the handoff: {prompt}")
+            });
+            let resolve_at = prompt
+                .find("rally say resolve")
+                .expect("template must still finish with a resolve");
+            assert!(
+                artifact_at < resolve_at,
+                "the artifact command must come before the resolve: {prompt}"
+            );
+            assert!(
+                !prompt.contains(&format!(
+                    "rally say resolve --tool claude_code:worker-1 --ref {handoff}"
+                )),
+                "the resolve must not ref the handoff directly: {prompt}"
+            );
+            assert!(
+                prompt.contains(
+                    "rally say resolve --tool claude_code:worker-1 --ref <artifact event_id"
+                ),
+                "the resolve must ref the artifact from the previous step: {prompt}"
+            );
+        }
     }
 
     /// `rally --help` must name every command `rally` accepts.

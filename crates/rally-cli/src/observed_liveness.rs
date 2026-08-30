@@ -126,7 +126,7 @@ struct WorktreeProbe {
     readable: bool,
     head: Option<String>,
     dirty_count: Option<usize>,
-    newest_tracked_mtime: Option<DateTime<Utc>>,
+    newest_worktree_mtime: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -267,9 +267,23 @@ fn dirty_count(worktree: &Path) -> Option<usize> {
     })
 }
 
-fn newest_tracked_mtime(worktree: &Path) -> Option<Option<DateTime<Utc>>> {
+fn newest_worktree_mtime(worktree: &Path) -> Option<Option<DateTime<Utc>>> {
+    // `--cached --others --exclude-standard` covers tracked AND untracked
+    // (non-ignored) files: an agent authoring only brand-new files for hours
+    // must still read as filesystem activity, or the takeover-bar branch in
+    // `grade_observation` would count real work as silence (fix-critique
+    // finding, task 2914419f). Ignored files stay out — build artifacts churn
+    // without proving an agent.
     let output = Command::new("git")
-        .args(["-C", worktree.to_str()?, "ls-files", "-z"])
+        .args([
+            "-C",
+            worktree.to_str()?,
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -296,12 +310,12 @@ fn probe_worktree(worktree: &Path, expected_common_dir: &Path) -> WorktreeProbe 
     }
     let head = current_head_sha(worktree);
     let dirty_count = dirty_count(worktree);
-    let newest_tracked_mtime = newest_tracked_mtime(worktree);
+    let newest_worktree_mtime = newest_worktree_mtime(worktree);
     WorktreeProbe {
-        readable: head.is_some() && dirty_count.is_some() && newest_tracked_mtime.is_some(),
+        readable: head.is_some() && dirty_count.is_some() && newest_worktree_mtime.is_some(),
         head,
         dirty_count,
-        newest_tracked_mtime: newest_tracked_mtime.flatten(),
+        newest_worktree_mtime: newest_worktree_mtime.flatten(),
     }
 }
 
@@ -317,7 +331,12 @@ fn process_alive(pid: i32) -> Option<bool> {
     stderr.contains("no such process").then_some(false)
 }
 
-fn grade_observation(stamp: &ObservationStamp, sample: &ProbeSample) -> ObservedLiveness {
+fn grade_observation(
+    stamp: &ObservationStamp,
+    sample: &ProbeSample,
+    now: DateTime<Utc>,
+    last_authored_at: Option<DateTime<Utc>>,
+) -> ObservedLiveness {
     if sample.pid_alive == Some(true) {
         return ObservedLiveness::Live;
     }
@@ -339,7 +358,7 @@ fn grade_observation(stamp: &ObservationStamp, sample: &ProbeSample) -> Observed
         (Some(recorded), Some(current)) if recorded != current
     ) || sample
         .worktree
-        .newest_tracked_mtime
+        .newest_worktree_mtime
         .is_some_and(|mtime| mtime > stamp.reported_at)
     {
         return ObservedLiveness::Live;
@@ -348,6 +367,47 @@ fn grade_observation(stamp: &ObservationStamp, sample: &ProbeSample) -> Observed
     // process: crash residue is dirty too. Without a process verdict or newer
     // filesystem activity, absence of progress is Unknown rather than Stale.
     let _dirty_count = sample.worktree.dirty_count;
+
+    // Fail-closed after the takeover bar for the NEVER-OBSERVED session. A
+    // stamp with no `observer_pid:` evidence (RALLY_OBSERVER_PID unset — e.g.
+    // presence written by the CLI outside the shipped hook) used to grade
+    // Unknown forever, silently exempting the session from reaping no matter
+    // how long it had been silent.
+    //
+    // The silence clock CANNOT be the stamp's own age: presence facts are
+    // written ONCE per session (`ensure_presence_tiered_for_session` early-
+    // returns when one exists), and outside the shipped hook nothing refreshes
+    // them, so `reported_at` measures session age, not silence. An agent
+    // renewing its claim lease every 30 minutes would still age past any bar.
+    // The clock is therefore the session's newest AUTHORED non-system fact
+    // (`last_authored_at`, exact session preferred, tool aggregate fallback) —
+    // the same last-seen clock `takeover_eligible_owners` reads — with the
+    // stamp as its floor.
+    //
+    // Stale requires ALL of: no observer pid ever stamped, a readable same-
+    // repo worktree, a HEAD that provably has not moved since the stamp, no
+    // tracked-or-untracked file written after the stamped beat (checked
+    // above), and authored-fact silence past `TAKEOVER_STALE_SECS` — the
+    // identical 2h bar the destructive takeover release applies. A stamp that
+    // HAS an observer pid whose probe returned no verdict stays Unknown: a
+    // probe failure is not evidence of absence. Accepted residual risk: a
+    // single tool call longer than 2h that writes no ledger fact and touches
+    // no non-ignored file reads as silence — the same residual the takeover
+    // release already accepts ("2h ≫ any plausible work-pause").
+    let head_provably_unmoved = matches!(
+        (&stamp.recorded_head, &sample.worktree.head),
+        (Some(recorded), Some(current)) if recorded == current
+    );
+    let silence_anchor = last_authored_at.map_or(stamp.reported_at, |authored| {
+        authored.max(stamp.reported_at)
+    });
+    if stamp.observer_pid.is_none()
+        && head_provably_unmoved
+        && now.signed_duration_since(silence_anchor).num_seconds()
+            > crate::store::TAKEOVER_STALE_SECS
+    {
+        return ObservedLiveness::Stale;
+    }
     ObservedLiveness::Unknown
 }
 
@@ -389,6 +449,36 @@ pub(crate) fn observe_sessions(room_repo_root: &Path, facts: &[Fact]) -> Observa
         }
     }
 
+    let now = Utc::now();
+    // Newest authored non-system fact per exact session and per tool: the
+    // silence clock for the takeover-bar branch in `grade_observation`.
+    // Presence stamps alone cannot serve — they are write-once per session
+    // outside the shipped hook, so any ledger write (claim renewal, artifact,
+    // status) must reset the clock, matching `takeover_eligible_owners`.
+    let mut authored_by_session: BTreeMap<(String, String), DateTime<Utc>> = BTreeMap::new();
+    let mut authored_by_tool: BTreeMap<String, DateTime<Utc>> = BTreeMap::new();
+    for fact in facts {
+        if crate::store::is_system_authored(fact) {
+            continue;
+        }
+        let Some(tool) = fact.tool.clone() else {
+            continue;
+        };
+        let Ok(at) = DateTime::parse_from_rfc3339(&fact.created_at) else {
+            continue;
+        };
+        let at = at.with_timezone(&Utc);
+        authored_by_tool
+            .entry(tool.clone())
+            .and_modify(|existing| *existing = (*existing).max(at))
+            .or_insert(at);
+        if let Some(session_id) = fact.from_session_id.clone() {
+            authored_by_session
+                .entry((tool, session_id))
+                .and_modify(|existing| *existing = (*existing).max(at))
+                .or_insert(at);
+        }
+    }
     let mut worktrees: BTreeMap<PathBuf, WorktreeProbe> = BTreeMap::new();
     let mut by_session = BTreeMap::new();
     let mut by_session_reported_at = BTreeMap::new();
@@ -401,7 +491,11 @@ pub(crate) fn observe_sessions(room_repo_root: &Path, facts: &[Fact]) -> Observa
             worktree: worktree.clone(),
             pid_alive: stamp.observer_pid.and_then(process_alive),
         };
-        let verdict = grade_observation(&stamp, &sample);
+        let last_authored_at = authored_by_session
+            .get(&(stamp.tool.clone(), stamp.session_key.clone()))
+            .or_else(|| authored_by_tool.get(&stamp.tool))
+            .copied();
+        let verdict = grade_observation(&stamp, &sample, now, last_authored_at);
         let session_key = (stamp.tool.clone(), stamp.session_key.clone());
         by_session.insert(session_key.clone(), verdict);
         by_session_reported_at.insert(session_key, stamp.reported_at);
@@ -454,7 +548,7 @@ mod tests {
                 readable: true,
                 head: Some(head.to_string()),
                 dirty_count: Some(0),
-                newest_tracked_mtime: None,
+                newest_worktree_mtime: None,
             },
             pid_alive,
         }
@@ -464,7 +558,10 @@ mod tests {
     fn gone_process_and_unchanged_head_is_observed_stale() {
         let stamp = stamp();
         let sample = readable_probe(stamp.recorded_head.as_deref().unwrap(), Some(false));
-        assert_eq!(grade_observation(&stamp, &sample), ObservedLiveness::Stale);
+        assert_eq!(
+            grade_observation(&stamp, &sample, Utc::now(), None),
+            ObservedLiveness::Stale
+        );
     }
 
     #[test]
@@ -476,12 +573,115 @@ mod tests {
                 &ProbeSample {
                     pid_alive: Some(false),
                     ..Default::default()
-                }
+                },
+                Utc::now(),
+                None,
             ),
             ObservedLiveness::Unknown
         );
         assert_eq!(
-            grade_observation(&stamp, &readable_probe(&"b".repeat(40), Some(false))),
+            grade_observation(
+                &stamp,
+                &readable_probe(&"b".repeat(40), Some(false)),
+                Utc::now(),
+                None,
+            ),
+            ObservedLiveness::Unknown
+        );
+    }
+
+    /// The observer fail-open gap: a session whose presence stamps never
+    /// carried an `observer_pid:` (RALLY_OBSERVER_PID unset) graded Unknown
+    /// forever and was never reaped. With a readable worktree, an unmoved
+    /// HEAD, and silence past the 2h takeover bar, it now grades Stale.
+    /// Fails on the pre-fix behavior (which returned Unknown here).
+    #[test]
+    fn unobserved_session_past_takeover_bar_fails_closed() {
+        let mut stamp = stamp();
+        stamp.observer_pid = None;
+        stamp.reported_at = Utc::now() - chrono::Duration::hours(3);
+        let sample = readable_probe(stamp.recorded_head.as_deref().unwrap(), None);
+        assert_eq!(
+            grade_observation(&stamp, &sample, Utc::now(), None),
+            ObservedLiveness::Stale,
+            "an unobserved session silent past the takeover bar must not stay Unknown forever"
+        );
+    }
+
+    /// Within the takeover bar the same unobserved session stays Unknown:
+    /// fail-closed only after the identical 2h bar the destructive takeover
+    /// release applies.
+    #[test]
+    fn unobserved_session_within_takeover_bar_stays_unknown() {
+        let mut stamp = stamp();
+        stamp.observer_pid = None;
+        stamp.reported_at = Utc::now() - chrono::Duration::minutes(30);
+        let sample = readable_probe(stamp.recorded_head.as_deref().unwrap(), None);
+        assert_eq!(
+            grade_observation(&stamp, &sample, Utc::now(), None),
+            ObservedLiveness::Unknown
+        );
+    }
+
+    /// Fix-critique falsifier: presence stamps are WRITE-ONCE per session
+    /// outside the shipped hook, so a stamp 3h old proves session age, not
+    /// silence. A session that authored a ledger fact 10 minutes ago (claim
+    /// renewal, artifact, status) is not silent and must stay Unknown even
+    /// though its presence stamp is past the takeover bar. Fails on a version
+    /// that anchors the bar on the stamp's own age.
+    #[test]
+    fn unobserved_session_with_fresh_authored_fact_stays_unknown() {
+        let mut stamp = stamp();
+        stamp.observer_pid = None;
+        stamp.reported_at = Utc::now() - chrono::Duration::hours(3);
+        let sample = readable_probe(stamp.recorded_head.as_deref().unwrap(), None);
+        assert_eq!(
+            grade_observation(
+                &stamp,
+                &sample,
+                Utc::now(),
+                Some(Utc::now() - chrono::Duration::minutes(10)),
+            ),
+            ObservedLiveness::Unknown,
+            "a fresh authored fact must reset the silence clock"
+        );
+        // And an authored fact that is ITSELF past the bar does not rescue.
+        assert_eq!(
+            grade_observation(
+                &stamp,
+                &sample,
+                Utc::now(),
+                Some(Utc::now() - chrono::Duration::hours(3)),
+            ),
+            ObservedLiveness::Stale
+        );
+    }
+
+    /// A probe FAILURE on a stamped observer pid is not evidence of absence —
+    /// only the never-stamped session takes the takeover-bar branch.
+    #[test]
+    fn probe_failure_with_stamped_observer_pid_stays_unknown() {
+        let mut stamp = stamp();
+        stamp.reported_at = Utc::now() - chrono::Duration::hours(3);
+        assert!(stamp.observer_pid.is_some());
+        let sample = readable_probe(stamp.recorded_head.as_deref().unwrap(), None);
+        assert_eq!(
+            grade_observation(&stamp, &sample, Utc::now(), None),
+            ObservedLiveness::Unknown
+        );
+    }
+
+    /// Without a provably-unmoved HEAD (stamp recorded none), the unobserved
+    /// session cannot be demoted: quiescence must be positive evidence.
+    #[test]
+    fn unobserved_session_without_recorded_head_stays_unknown() {
+        let mut stamp = stamp();
+        stamp.observer_pid = None;
+        stamp.recorded_head = None;
+        stamp.reported_at = Utc::now() - chrono::Duration::hours(3);
+        let sample = readable_probe(&"a".repeat(40), None);
+        assert_eq!(
+            grade_observation(&stamp, &sample, Utc::now(), None),
             ObservedLiveness::Unknown
         );
     }
@@ -553,6 +753,58 @@ mod tests {
             ),
             ObservedLiveness::Unknown
         );
+    }
+
+    /// F3 falsifier for the untracked-activity guard: an agent authoring only
+    /// brand-new (untracked, non-ignored) files must read as filesystem
+    /// activity, or the takeover-bar branch counts real work as silence.
+    /// Fails when `newest_worktree_mtime` drops `--others --exclude-standard`:
+    /// the probe then sees only the backdated tracked file, the fresh scratch
+    /// file is invisible, and the 3h-silent unstamped session grades Stale.
+    #[test]
+    fn untracked_file_activity_reads_as_live() {
+        let root = unique_root("untracked-activity");
+        fs::create_dir_all(&root).unwrap();
+        crate::test_git_fixture::fixture_git(&root, &["init"]);
+        fs::write(root.join("tracked.txt"), "tracked\n").unwrap();
+        crate::test_git_fixture::fixture_git(&root, &["add", "tracked.txt"]);
+        crate::test_git_fixture::fixture_git(&root, &["commit", "-m", "fixture"]);
+        // Backdate the tracked file so only the untracked scratch file is
+        // fresh, then write the scratch file an agent would be authoring.
+        std::process::Command::new("touch")
+            .args([
+                "-t",
+                "200001010000",
+                root.join("tracked.txt").to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        fs::write(root.join("scratch-notes.md"), "new work\n").unwrap();
+
+        let common = git_common_dir(&root).expect("fixture common dir");
+        let probe = probe_worktree(&root, &common);
+        assert!(probe.readable);
+        let fresh = probe.newest_worktree_mtime.expect("mtime must be observed");
+        assert!(
+            Utc::now().signed_duration_since(fresh).num_seconds() < 120,
+            "the untracked scratch file must set the newest mtime; got {fresh}"
+        );
+
+        let mut stamp = stamp();
+        stamp.observer_pid = None;
+        stamp.reported_at = Utc::now() - chrono::Duration::hours(3);
+        stamp.recorded_head = current_head_sha(&root);
+        let sample = ProbeSample {
+            worktree: probe,
+            pid_alive: None,
+        };
+        assert_eq!(
+            grade_observation(&stamp, &sample, Utc::now(), None),
+            ObservedLiveness::Live,
+            "untracked-file activity newer than the stamp must protect the session"
+        );
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

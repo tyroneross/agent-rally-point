@@ -1768,6 +1768,17 @@ mod tests {
     /// | observed dead         | `Some(false)`    | REAPED                |
     /// | unavailable/unstamped | `None`           | preserved (fail-closed) |
     ///
+    /// "Unavailable/unstamped" means presence with NO `worktree_path:` stamp
+    /// at all — there is nothing to observe. A session that IS worktree-
+    /// stamped but never carried an `observer_pid:` is a different arm since
+    /// the observer fail-open fix (task 2914419f): with a readable quiescent
+    /// worktree and authored-fact silence past the 2h takeover bar it grades
+    /// Stale, which `ReapMode::Full` accepts as owner-stale authority even on
+    /// an unexpired lease — the SAME authority the takeover release already
+    /// extends at that bar, and an owner renewing its lease authors
+    /// ClaimRenewed facts that reset the silence clock. Graded by
+    /// `unstamped_observer_session_fails_closed_after_takeover_bar`.
+    ///
     /// `automatic_pass_preserves_quiet_live_agent_and_reaps_crashed_agent`
     /// grades the first two arms. The third had no test, which left the
     /// contract able to collapse into two: relaxing the rule to
@@ -1875,6 +1886,316 @@ mod tests {
                 .any(|claim| claim.event_id == live_claim.event_id),
             "observed live is a veto in BOTH modes — a human pass must not close it \
              either"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// End-to-end grade of the observer fail-open fix (task 2914419f, F4):
+    /// a session that stamped its worktree but never an `observer_pid:` used
+    /// to grade Unknown forever and was never reap-eligible. Two directions:
+    ///
+    /// 1. Silent past the 2h takeover bar (presence AND claim both 3h old,
+    ///    quiescent worktree) → observed Stale → a human-invoked
+    ///    `ReapMode::Full` pass reaps it even though its lease has not
+    ///    expired — the previously-preserved case, accepted deliberately: it
+    ///    is the same owner-stale authority the takeover release extends at
+    ///    that bar. Fails on the pre-fix build (Unknown → preserved forever).
+    /// 2. Same shape but the session authored a fact minutes ago → the
+    ///    silence clock resets → observed Unknown → preserved. Fails on a
+    ///    version that anchors the bar on the write-once presence stamp's own
+    ///    age.
+    #[test]
+    fn unstamped_observer_session_fails_closed_after_takeover_bar() {
+        let root = unique_root("unstamped-observer-takeover");
+        init_observed_worktree(&root);
+        // The probe now counts untracked non-ignored files as activity, and
+        // this very test writes ledger facts into `<root>/.rally/` — ignore
+        // the ledger so the fixture models a quiescent per-agent worktree
+        // (the fail-open shape this test grades), then backdate the fixture
+        // files so nothing postdates the 3h-old stamp.
+        fs::write(root.join(".gitignore"), ".rally/\n").unwrap();
+        crate::test_git_fixture::fixture_git(&root, &["add", ".gitignore"]);
+        crate::test_git_fixture::fixture_git(&root, &["commit", "-m", "ignore ledger"]);
+        for fixture_file in ["observed.txt", ".gitignore"] {
+            std::process::Command::new("touch")
+                .args([
+                    "-t",
+                    "200001010000",
+                    root.join(fixture_file).to_str().unwrap(),
+                ])
+                .status()
+                .unwrap();
+        }
+        let room = RoomStore::open_at(root.clone()).unwrap();
+        let head = crate::observed_liveness::current_head_sha(&root).expect("fixture HEAD");
+        let worktree = fs::canonicalize(&root).unwrap();
+        let future_lease = (chrono::Utc::now() + chrono::Duration::hours(4))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        let stamped_presence = |tool: &str, session: &str, ago_secs: i64| Fact {
+            from_session_id: Some(session.to_string()),
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Presence,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: format!("observed presence: {tool}"),
+            scope: Vec::new(),
+            created_at: past_ts(ago_secs),
+            summary: None,
+            // Worktree-stamped, but NO observer_pid: — the fail-open shape.
+            evidence: vec![
+                format!("branch_head_sha:{head}"),
+                format!("worktree_path:{}", worktree.display()),
+            ],
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        let backdated_claim = |event_id: &str, tool: &str, session: &str, ago_secs: i64| Fact {
+            from_session_id: Some(session.to_string()),
+            schema: FACT_SCHEMA.to_string(),
+            event_id: event_id.to_string(),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Claim,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: format!("claim: {tool}/{session}"),
+            scope: vec![format!("file:src/{event_id}.rs")],
+            created_at: past_ts(ago_secs),
+            summary: None,
+            evidence: vec![format!("lease_expires_at:{future_lease}")],
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+
+        // Direction 1 — silent 3h: everything this session ever authored is
+        // past the takeover bar.
+        room.append_fact_verified(&stamped_presence("gone-agent", "session-gone", 3 * 3600))
+            .unwrap();
+        let gone_claim = room
+            .append_fact_verified(&backdated_claim(
+                "claim-gone-unstamped",
+                "gone-agent",
+                "session-gone",
+                3 * 3600,
+            ))
+            .unwrap()
+            .fact;
+
+        // Direction 2 — same 3h-old stamp and claim, but the session authored
+        // a fact minutes ago (any ledger write resets the silence clock).
+        room.append_fact_verified(&stamped_presence("busy-agent", "session-busy", 3 * 3600))
+            .unwrap();
+        let busy_claim = room
+            .append_fact_verified(&backdated_claim(
+                "claim-busy-unstamped",
+                "busy-agent",
+                "session-busy",
+                3 * 3600,
+            ))
+            .unwrap()
+            .fact;
+        let fresh_note = Fact {
+            from_session_id: Some("session-busy".to_string()),
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Artifact,
+            tool: Some("busy-agent".to_string()),
+            role: None,
+            subject: "still here, still working".to_string(),
+            scope: Vec::new(),
+            created_at: now_string(),
+            summary: None,
+            evidence: vec!["progress checkpoint".to_string()],
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&fresh_note).unwrap();
+
+        let operator = run_reap_stale_in_room_with_mode(&room, true, ReapMode::Full).unwrap();
+        let reaped: Vec<&str> = operator
+            .claims_reaped
+            .iter()
+            .map(|entry| entry.claim_id.as_str())
+            .collect();
+        assert_eq!(
+            reaped,
+            vec![gone_claim.event_id.as_str()],
+            "the 3h-silent unstamped-observer session must be reaped, and ONLY it"
+        );
+        let active = room.snapshot().unwrap().active_claims;
+        assert!(
+            active
+                .iter()
+                .any(|claim| claim.event_id == busy_claim.event_id),
+            "a fresh authored fact must preserve the same-shaped session"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// RESIDUAL-RISK CONTROL for the observer fail-open fix (task 2914419f,
+    /// fix-critique's open objection).
+    ///
+    /// The fix trades a fail-OPEN for a fail-CLOSED: a never-observed session
+    /// that is silent past the 2h takeover bar now grades Stale, and
+    /// [`ReapMode::Full`] releases its claims even on an UNEXPIRED lease
+    /// (`unstamped_observer_session_fails_closed_after_takeover_bar` grades
+    /// that, deliberately). The user-visible failure mode that buys is a LIVE
+    /// session — one long tool call, or read-only work on a host with no
+    /// coordination hook to stamp `observer_pid:` — losing claims it still
+    /// holds.
+    ///
+    /// What bounds that failure mode is that it takes a HUMAN: `ReapMode::Full`
+    /// is reachable only from `rally doctor --reap-stale --apply`, and the
+    /// report labels the release `owner-stale` rather than `lease-expired` so
+    /// the operator can see the verdict rests on a heuristic. The AUTOMATIC
+    /// `enter` path is [`ReapMode::LeaseOnly`], which drops the owner-stale
+    /// signal entirely and demands a writer-stamped expiry corroborated by
+    /// observed death.
+    ///
+    /// That bound is the whole argument for keeping the bar at 2h, so it is
+    /// pinned here rather than left to the eligibility expression. Fails on any
+    /// build that lets the owner-stale signal reach the automatic arm — the
+    /// change that would turn an accepted operator-gated risk into silent
+    /// background claim loss for every unstamped session in the fleet.
+    #[test]
+    fn automatic_reap_preserves_a_silent_unstamped_session_on_an_unexpired_lease() {
+        let root = unique_root("unstamped-observer-automatic");
+        init_observed_worktree(&root);
+        // Same quiescent-worktree fixture as the Full-mode sibling: ignore the
+        // ledger this test writes, then backdate the fixture files so nothing
+        // postdates the 3h-old presence stamp.
+        fs::write(
+            root.join(".gitignore"),
+            ".rally/
+",
+        )
+        .unwrap();
+        crate::test_git_fixture::fixture_git(&root, &["add", ".gitignore"]);
+        crate::test_git_fixture::fixture_git(&root, &["commit", "-m", "ignore ledger"]);
+        for fixture_file in ["observed.txt", ".gitignore"] {
+            std::process::Command::new("touch")
+                .args([
+                    "-t",
+                    "200001010000",
+                    root.join(fixture_file).to_str().unwrap(),
+                ])
+                .status()
+                .unwrap();
+        }
+        let room = RoomStore::open_at(root.clone()).unwrap();
+        let head = crate::observed_liveness::current_head_sha(&root).expect("fixture HEAD");
+        let worktree = fs::canonicalize(&root).unwrap();
+        let future_lease = (chrono::Utc::now() + chrono::Duration::hours(4))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        room.append_fact_verified(&Fact {
+            from_session_id: Some("session-quiet".to_string()),
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Presence,
+            tool: Some("quiet-agent".to_string()),
+            role: None,
+            subject: "observed presence: quiet-agent".to_string(),
+            scope: Vec::new(),
+            created_at: past_ts(3 * 3600),
+            summary: None,
+            // Worktree-stamped, no observer_pid: — the fail-closed shape.
+            evidence: vec![
+                format!("branch_head_sha:{head}"),
+                format!("worktree_path:{}", worktree.display()),
+            ],
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        })
+        .unwrap();
+        let quiet_claim = room
+            .append_fact_verified(&Fact {
+                from_session_id: Some("session-quiet".to_string()),
+                schema: FACT_SCHEMA.to_string(),
+                event_id: "claim-quiet-unstamped".to_string(),
+                seq: 0,
+                thread_id: new_id("room"),
+                kind: FactKind::Claim,
+                tool: Some("quiet-agent".to_string()),
+                role: None,
+                subject: "claim: quiet-agent".to_string(),
+                scope: vec!["file:src/quiet.rs".to_string()],
+                created_at: past_ts(3 * 3600),
+                summary: None,
+                evidence: vec![format!("lease_expires_at:{future_lease}")],
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            })
+            .unwrap()
+            .fact;
+
+        // Sanity: the SAME fixture is reap-eligible under the operator-invoked
+        // mode, so a green assertion below cannot come from a fixture that
+        // simply never graded Stale.
+        let operator_preview =
+            run_reap_stale_in_room_with_mode(&room, false, ReapMode::Full).unwrap();
+        assert_eq!(
+            operator_preview
+                .claims_reaped
+                .iter()
+                .map(|entry| entry.claim_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![quiet_claim.event_id.as_str()],
+            "fixture must be owner-stale, or this test proves nothing"
+        );
+        assert_eq!(
+            operator_preview.claims_reaped[0].reason, "owner-stale",
+            "and the operator report must name the heuristic, not a stamped expiry"
+        );
+
+        let automatic = run_reap_stale_in_room_with_mode(&room, true, ReapMode::LeaseOnly).unwrap();
+        assert!(
+            automatic.claims_reaped.is_empty(),
+            "the automatic enter path must never release an unexpired lease on an \
+             owner-staleness heuristic; reaped={:?}",
+            automatic
+                .claims_reaped
+                .iter()
+                .map(|entry| (entry.claim_id.as_str(), entry.reason.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            room.snapshot()
+                .unwrap()
+                .active_claims
+                .iter()
+                .any(|claim| claim.event_id == quiet_claim.event_id),
+            "the claim must still be active after the automatic pass"
         );
 
         fs::remove_dir_all(root).ok();
