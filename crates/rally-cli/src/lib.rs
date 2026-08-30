@@ -9266,6 +9266,7 @@ fn command_inject_managed(
     };
     let reached_target = inject_payload.reached_target;
     let delivery_reason = inject_payload.delivery_reason;
+    let has_ack = ack.is_some();
     let body = envelope(
         "inject",
         SCHEMA_INJECT,
@@ -9274,8 +9275,9 @@ fn command_inject_managed(
         },
     )?;
     let text = format!(
-        "inject session={session_id_for_text} delivery_reason={delivery_reason} \
-         reached_target={reached_target} ack_state={ack_state}",
+        "inject session={session_id_for_text} delivered={delivered} \
+         delivery_reason={delivery_reason} reached_target={reached_target} \
+         ack={has_ack} ack_state={ack_state}",
     );
     Ok(Output::new(json, text, body))
 }
@@ -10772,13 +10774,14 @@ fn make_inject_content_fact(
     }
 }
 
-/// Build a `Receipt` fact recording that the rally ptyd daemon delivered a
-/// directive to a daemon-owned pane (design-4). [D]: this is a SENDER-authored
-/// DELIVERY record — it is authored as `sender_tool` (the actor that initiated
-/// the `agent.send`, same actor as the tmux fallback), NOT the target. It is
-/// NOT an ACK: the ACK that closes a `--require-ack` wait is the TARGET's own
-/// Resolve/Receipt against the handoff `ref_id`, which only the agent posts
-/// (`wait_for_resolution` matches `ref_id == handoff && tool == target`). A
+/// Build a `Receipt` fact recording the rally ptyd daemon's sender-side
+/// transport state for a daemon-owned pane (design-4). [D]: this is a
+/// SENDER-authored DELIVERY record — it is authored as `sender_tool` (the actor
+/// that initiated the `agent.send`, same actor as the tmux fallback), NOT the
+/// target. It is NOT an ACK: the ACK that closes a `--require-ack` wait is the
+/// TARGET's own Resolve/Receipt against the handoff `ref_id`, which only the
+/// agent posts (`wait_for_resolution` matches
+/// `ref_id == handoff && tool == target`). A
 /// sender-fabricated, target-attributed "delivered" claim would be a fake ACK,
 /// so we do neither: no handoff ref, and `status` reflects the REAL receipt
 /// state the daemon returned (`sent`/`seen`/`acted`), not an invented
@@ -10794,8 +10797,9 @@ fn make_inject_content_fact(
 /// and gated; see F5 mutual-exclusion in the plan.
 ///
 /// `receipt_state` is the ptyd `Receipt.state` (`sent`/`seen`/`acted`) — with
-/// the CLI's `confirm:"sent"` ceiling this is `"sent"` (submitted, bytes
-/// written). It is recorded verbatim so the fact never oversells the evidence.
+/// the CLI's `confirm:"sent"` ceiling this is `"sent"` (bytes written with
+/// submission requested, not proof the receiver accepted the prompt). It is
+/// recorded verbatim so the fact never oversells the evidence.
 fn ptyd_receipt_fact(
     sender_tool: &str,
     directive_seq: u64,
@@ -10814,12 +10818,14 @@ fn ptyd_receipt_fact(
         // claim spoofing the agent.
         tool: Some(sender_tool.to_string()),
         role: None,
-        subject: format!("receipt: daemon delivered directive seq {directive_seq}"),
+        subject: format!(
+            "receipt: daemon transport state {receipt_state} for directive seq {directive_seq}"
+        ),
         scope: Vec::new(),
         created_at: now_string(),
         summary: Some(format!(
-            "rally ptyd daemon delivered directive seq {directive_seq} to {target_tool} \
-             (state {receipt_state})"
+            "rally ptyd daemon reported transport state {receipt_state} for directive seq \
+             {directive_seq} to {target_tool}; receiver acceptance is unverified"
         )),
         // Correlate to the Directive by evidence, not a synthetic handoff ref.
         evidence: vec![
@@ -13441,6 +13447,18 @@ mod tests {
             panic!("urgent non-controlling message must be refused");
         };
         assert!(error.to_string().contains("--urgent is reserved"));
+    }
+
+    #[test]
+    fn ptyd_sender_receipt_never_claims_receiver_delivery() {
+        let fact = ptyd_receipt_fact("codex:sender", 42, "claude_code:target", "sent");
+        let summary = fact.summary.as_deref().expect("receipt summary");
+
+        assert!(fact.subject.contains("transport state sent"));
+        assert!(summary.contains("receiver acceptance is unverified"));
+        assert!(!fact.subject.contains("delivered"));
+        assert!(!summary.contains("delivered"));
+        assert_eq!(fact.status.as_deref(), Some("sent"));
     }
 
     #[test]
