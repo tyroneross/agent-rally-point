@@ -4775,6 +4775,20 @@ fn session_close_releases_only_the_exact_same_tool_session_claims() {
         .env("RALLY_NO_WORKTREE", "1")
         .env("RALLY_ENGAGEMENT", "session-close-other-engagement")
         .env("RALLY_SESSION_ID", "parent-a")
+        // Every other subprocess in this test goes through a `Workspace`
+        // helper that strips these two. This raw `Command` did not, so on
+        // GitHub Actions (where both are always set) `EndpointInputs::from_env`
+        // resolved this claim's identity via the higher-precedence Cloud
+        // source (`cloud:github-actions:<run-id>`) instead of the Managed
+        // source `RALLY_SESSION_ID=parent-a` was asking for — landing it on a
+        // *different* `from_session_id` than every other "parent-a" write in
+        // this test, including the session close it's meant to be released
+        // by. Confirmed by local repro: `GITHUB_ACTIONS=true GITHUB_RUN_ID=1
+        // cargo test session_close_releases_only_the_exact_same_tool_session_claims`
+        // reproduces the exact CI failure (released [owner] instead of
+        // [owner, cross_engagement]) without this strip.
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("GITHUB_RUN_ID")
         .args([
             "say",
             "claim",
@@ -4897,6 +4911,12 @@ fn session_close_releases_only_the_exact_same_tool_session_claims() {
         .env("HOME", &workspace.home)
         .env("RALLY_NO_WORKTREE", "1")
         .env("RALLY_SESSION_ID", "parent-a")
+        // See the cross-engagement claim above: `say` derives from_session_id
+        // from the live environment, and on GitHub Actions the ambient cloud
+        // signals otherwise outrank RALLY_SESSION_ID, aiming this write at a
+        // session identity the close never touched.
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("GITHUB_RUN_ID")
         .args([
             "say",
             "claim",
@@ -4924,6 +4944,8 @@ fn session_close_releases_only_the_exact_same_tool_session_claims() {
         .env("HOME", &workspace.home)
         .env("RALLY_NO_WORKTREE", "1")
         .env("RALLY_SESSION_ID", "parent-a")
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("GITHUB_RUN_ID")
         .args([
             "say",
             "artifact",
