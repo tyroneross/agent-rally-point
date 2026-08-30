@@ -127,6 +127,11 @@ impl Fixture {
             .current_dir(&self.repo)
             .env("HOME", &self.home)
             .env("RALLY_GLOBAL_INDEX", "1")
+            // Ambient CI identity vars outrank RALLY_SESSION_ID in
+            // EndpointInputs::from_env; strip so session assertions hold on
+            // GitHub Actions (same class as 72aed10 / write_authority parity).
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
