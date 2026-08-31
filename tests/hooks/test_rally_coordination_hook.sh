@@ -2402,11 +2402,12 @@ if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "Stop must stay advisory"; fi
 #   (1) the Stop phase actually CALLS `check before-complete --strict`,
 #   (2) allow=false surfaces an advisory naming the finding (default mode),
 #   (3) default mode still never emits decision:block (charter),
-#   (4) RALLY_HOOK_STRICT=1 turns the same verdict into decision:block,
-#   (5) the strict block survives a repeat Stop (dedupe must not suppress it —
-#       otherwise the agent finishes by trying twice).
+#   (4) RALLY_HOOK_STRICT=1 keeps Stop advisory because a turn boundary is not
+#       a run-completion boundary,
+#   (5) a repeated Stop never blocks, whether the advisory resurfaces or the
+#       reminder cadence deduplicates it.
 # ----------------------------------------------------------------------
-T="after-write: before-complete stop finding surfaces, blocks only under strict, and the block survives repeats"
+T="after-write: before-complete stop finding surfaces but stays advisory under strict"
 bc_stub="$tmpdir/rally_before_complete_stub"
 cat > "$bc_stub" <<'EOF'
 #!/usr/bin/env bash
@@ -2449,14 +2450,38 @@ install_stub "$bc_stub"
   fi
 
   out2=$(CALLS="$calls" RALLY_BIN="$bc_stub" RALLY_SESSION_ID="bc-strict" RALLY_HOOK_STRICT=1 "$HOOK" after-write claude_code </dev/null 2>/dev/null)
-  if ! printf '%s' "$out2" | grep -q '"decision":"block"'; then
-    printf 'strict must block: %s\n' "$out2" >&2; exit 1
+  if ! printf '%s' "$out2" | grep -q "before-complete"; then
+    printf 'strict: stop finding not surfaced: %s\n' "$out2" >&2; exit 1
+  fi
+  if printf '%s' "$out2" | grep -q '"decision":"block"'; then
+    printf 'strict Stop must stay advisory: %s\n' "$out2" >&2; exit 1
   fi
 
   out3=$(CALLS="$calls" RALLY_BIN="$bc_stub" RALLY_SESSION_ID="bc-strict" RALLY_HOOK_STRICT=1 "$HOOK" after-write claude_code </dev/null 2>/dev/null)
-  if ! printf '%s' "$out3" | grep -q '"decision":"block"'; then
-    printf 'strict block was deduped away on the repeat Stop: %s\n' "$out3" >&2; exit 1
+  if printf '%s' "$out3" | grep -q '"decision":"block"'; then
+    printf 'repeated strict Stop must stay advisory: %s\n' "$out3" >&2; exit 1
   fi
+
+  for host in codex gemini cursor; do
+    host_out=$(CALLS="$calls" RALLY_BIN="$bc_stub" RALLY_SESSION_ID="bc-$host" RALLY_HOOK_STRICT=1 "$HOOK" after-write "$host" </dev/null 2>/dev/null)
+    host_rc=$?
+    if [ "$host_rc" != "0" ]; then
+      printf '%s strict Stop rc=%s\n' "$host" "$host_rc" >&2; exit 1
+    fi
+    if ! printf '%s' "$host_out" | node -e 'JSON.parse(require("fs").readFileSync(0,"utf8"))' 2>/dev/null; then
+      printf '%s strict Stop returned invalid JSON: %s\n' "$host" "$host_out" >&2; exit 1
+    fi
+    if printf '%s' "$host_out" | grep -Eq '"decision":"(block|deny)"|"permission":"deny"|"permissionDecision":"deny"'; then
+      printf '%s strict Stop must stay advisory: %s\n' "$host" "$host_out" >&2; exit 1
+    fi
+    if [ "$host" = "cursor" ]; then
+      if ! printf '%s' "$host_out" | node -e 'const o=JSON.parse(require("fs").readFileSync(0,"utf8")); process.exit(Object.keys(o).length === 0 ? 0 : 1)' 2>/dev/null; then
+        printf 'cursor strict Stop must return exact empty object: %s\n' "$host_out" >&2; exit 1
+      fi
+    elif ! printf '%s' "$host_out" | grep -q 'before-complete' || ! printf '%s' "$host_out" | grep -q 'owned-active-claim'; then
+      printf '%s strict Stop advisory missing finding: %s\n' "$host" "$host_out" >&2; exit 1
+    fi
+  done
   exit 0
 )
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "Stop must consult check before-complete"; fi

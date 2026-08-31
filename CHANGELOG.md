@@ -26,10 +26,10 @@ The check classified owned-open coordination state (active claims, own
 blockers) correctly but had zero hook callers, so an agent could end its turn
 holding a live claim with nothing surfaced. The coordination hook's after-write
 (Stop) phase now runs it and surfaces `allow=false` as a high-severity
-advisory naming the finding; under `RALLY_HOOK_STRICT=1` it becomes
-`decision: "block"`, and a strict block is exempt from the surface-on-change
-dedupe so a second Stop attempt cannot slip past it. Fail-open on any CLI
-error, per the charter.
+advisory naming the finding. Stop remains advisory under
+`RALLY_HOOK_STRICT=1` because it marks an ordinary turn boundary, not run
+completion. Strict enforcement remains at the before-write mutation boundary.
+Fail-open on any CLI error, per the charter.
 
 ### Fixed — unobserved sessions no longer escape reaping forever
 

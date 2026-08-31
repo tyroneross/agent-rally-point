@@ -306,7 +306,7 @@ every posture, because a refusal travels in the hook's JSON, not its exit code.
 
 | Switch (off unless set) | Effect |
 |-------------------------|--------|
-| `RALLY_HOOK_STRICT=1` | The hook emits `permissionDecision: "deny"` / `decision: "block"` on a high-severity signal (`severity == "stop"` or `allow == false`). |
+| `RALLY_HOOK_STRICT=1` | The hook emits `permissionDecision: "deny"` on a high-severity PreToolUse signal (`severity == "stop"` or `allow == false`). Stop remains advisory because it marks a turn boundary, not run completion. |
 | `rally check before-write --strict` | Exits 4 on a stop finding. Step 2 of the loop above passes `--strict`. |
 | `RALLY_BEFORE_WRITE_FAILCLOSED=1` or `--fail-closed` | `check before-write` exits 4 when its snapshot read times out, instead of exiting 0. |
 

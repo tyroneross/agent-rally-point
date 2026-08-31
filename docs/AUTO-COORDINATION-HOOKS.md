@@ -135,7 +135,7 @@ the corresponding adapter.
 | `PreToolUse` — native transaction | When the installed binary reports `before-write` in `rally hook capabilities`, the wrapper execs `rally hook before-write` and that one process does the whole transaction: envelope parse, O33-A classification, hooks-status, working status, per-target check, unowned filter, auto-claim, dedupe and host-envelope render, under a single self-enforced deadline. The rows below describe the behaviour, which is identical on both paths; a binary without the subcommand falls back to the shell/Node pipeline they originally described. `RALLY_NATIVE_HOOK=off` forces the fallback; `RALLY_HOOK_TRACE=1` emits one stderr line of per-stage timings. The capability verdict is cached per binary in `.rally/.hook-seen/native-probe.*.seen`, keyed on the binary's size and fractional mtime. |
 | `PreToolUse` — named mutation | Extracts and canonicalizes every declared target against the validated event `cwd` and physical Rally root. It posts `state=working` once, checks every target before any claim, reads room ownership once, and then creates one aggregate repeated-path claim for the targets not already covered by that agent's claim. If any target denies, times out, errors, or escapes the root, the whole automatic claim is skipped; no prefix is claimed. Advisory `allow: true` warnings remain visible and do not turn into a denial. |
 | `PreToolUse` — unknown or malformed | Inside an enabled Rally repo, fails open with exact `{}`, one bounded rate-limited stderr diagnostic, and zero Rally status/check/claim calls. Outside a Rally repo or when hooks are disabled, it is silent. It never treats an arbitrary `path` field as write ownership. |
-| `Stop` | At turn end (hook phase `after-write`), posts `state=idle` with a next check-in, runs `rally next`, and surfaces any pending coordination obligation or peer status change as an advisory `systemMessage`. Parity with Codex's `Stop` hook; never blocks turn completion (strict mode is the only path that can emit `decision: block`). |
+| `Stop` | At turn end (hook phase `after-write`), posts `state=idle` with a next check-in, runs `rally next`, and surfaces any pending coordination obligation or peer status change as an advisory `systemMessage`. Parity with Codex's `Stop` hook; never blocks turn completion, including under strict mode. |
 
 **Why the Codex matcher remains unset.** Claude's documented matcher keeps its
 hook edit-scoped. OpenAI's Codex 0.144.3 source proves that `apply_patch` sends
@@ -252,9 +252,10 @@ never enforced. The hook NEVER emits `permissionDecision: "deny"` or
 `decision: "block"` by default. Collisions warn; the agent decides.
 
 **Strict mode (opt-in escape hatch).** `RALLY_HOOK_STRICT=1` enables hard
-deny/block on high-severity collisions. Off by default. Documented as an
-explicit deviation from the never-block charter for orchestration paths that
-want hard gates.
+denial on high-severity PreToolUse collisions. Stop remains advisory because a
+normal turn ending is not a run-completion boundary. Strict mode is off by
+default and is an explicit deviation from the never-block charter for
+orchestration paths that want hard mutation gates.
 
 ## Hook Policy And Opt-Out
 
@@ -366,11 +367,11 @@ silently. The hook MUST NEVER stall a host session. Specifically:
 export RALLY_HOOK_STRICT=1
 ```
 
-When set, the hook may emit `permissionDecision: "deny"` (Claude PreToolUse) or
-`decision: "block"` (Stop) on **high-severity** signals only (`severity==stop`
-or `allow==false`). Codex PreToolUse remains fail-open with `systemMessage`
-because Codex rejects the Claude `permissionDecision` field. Low-severity
-warnings always remain advisory.
+When set, the hook may emit `permissionDecision: "deny"` on **high-severity**
+Claude PreToolUse signals only (`severity==stop` or `allow==false`). Codex
+PreToolUse remains fail-open with `systemMessage` because Codex rejects the
+Claude `permissionDecision` field. Stop and low-severity warnings always remain
+advisory.
 
 This contradicts the never-block charter (`rally mission` — *"records and
 exposes only; never enforces"*) and is documented as a deliberate escape hatch

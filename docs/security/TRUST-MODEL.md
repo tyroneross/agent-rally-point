@@ -275,7 +275,7 @@ travels in the hook's JSON, not its exit status. Each switch below is off unless
 
 | Switch | What it does |
 |--------|--------------|
-| `RALLY_HOOK_STRICT=1` | The hook emits `permissionDecision: "deny"` (PreToolUse) or `decision: "block"` (Stop) on a high-severity signal — `severity == "stop"` or `allow == false`. Low-severity findings stay advisory. Codex PreToolUse stays fail-open because Codex rejects the Claude `permissionDecision` field. |
+| `RALLY_HOOK_STRICT=1` | The hook emits `permissionDecision: "deny"` on a high-severity PreToolUse signal — `severity == "stop"` or `allow == false`. Stop stays advisory because it marks a turn boundary, not run completion. Low-severity findings stay advisory. Codex PreToolUse stays fail-open because Codex rejects the Claude `permissionDecision` field. |
 | `rally check before-write --strict` | Exits 4 when a stop finding is present, so a wrapper that reads the exit code aborts the write. The canonical agent loop in `README.md`, `RALLY.md`, and `skills/agent-rally-point/SKILL.md` passes `--strict`, so this path is on for anyone who copies it. |
 | `RALLY_BEFORE_WRITE_FAILCLOSED=1` or `--fail-closed` | Makes `check before-write` exit 4 when its snapshot read exceeds the watchdog timeout, instead of exiting 0 with a neutral envelope. Applies to `check before-write` only. `--fail-open` on the same call reasserts the default. |
 

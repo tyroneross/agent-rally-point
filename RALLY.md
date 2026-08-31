@@ -168,9 +168,10 @@ Default posture: PreToolUse returns `permissionDecision: "allow"` with a warning
 so the edit goes through, and every hook exits 0 even when Rally is broken. The
 switches, each off unless you set it:
 
-- `RALLY_HOOK_STRICT=1` — the hook emits `permissionDecision: "deny"` (PreToolUse)
-  or `decision: "block"` (Stop) on a high-severity signal. The hook still exits 0;
-  the refusal travels in the JSON, not the exit code.
+- `RALLY_HOOK_STRICT=1` — the hook emits `permissionDecision: "deny"` on a
+  high-severity PreToolUse signal. Stop remains advisory because it marks a
+  turn boundary, not run completion. The hook still exits 0; the refusal
+  travels in the JSON, not the exit code.
 - `rally check before-write --strict` — exits 4 when a stop finding is present. The
   Load-Bearing Commands block above passes `--strict`; drop it for warn-only.
 - `RALLY_BEFORE_WRITE_FAILCLOSED=1` (or `--fail-closed`) — makes `check before-write`

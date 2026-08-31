@@ -69,8 +69,10 @@
 #   - Advisory only (default): emits `additionalContext` / `systemMessage`,
 #     never `permissionDecision: "deny"` / `decision: "block"`.
 #   - Strict mode (opt-in, RALLY_HOOK_STRICT=1): high-severity coordination
-#     signals (allow=false or severity=stop) emit a deny/block decision.
-#     Off-charter; documented as an escape hatch.
+#     signals (allow=false or severity=stop) emit a deny decision at the
+#     before-write mutation boundary. Stop remains advisory because it marks a
+#     turn boundary, not run completion. Off-charter; documented as an escape
+#     hatch.
 #
 # Env:
 #   RALLY_HOOK_TIMEOUT_MS  — default wall-clock budget for lifecycle and legacy
@@ -96,7 +98,8 @@
 #                            before v0.2.5). Overrides the persisted
 #                            `rally hooks room-detail` setting for one
 #                            session; any other value is ignored.
-#   RALLY_HOOK_STRICT      — "1" to enable deny/block on high-severity signals.
+#   RALLY_HOOK_STRICT      — "1" to deny high-severity before-write signals;
+#                            Stop remains advisory.
 #   RALLY_HOOK_DEDUPE_SECS — duplicate registration window (default 5 seconds).
 #   RALLY_HOOK_DEDUPE_DIR  — test/diagnostic override for event markers.
 #   RALLY_NATIVE_HOOK      — before-write native-exec switch. "0", "off",
@@ -1982,8 +1985,9 @@ else
     # its turn holding a live claim and nothing surfaced. The verdict rides a
     # side channel (RALLY_BEFORE_COMPLETE_JSON) so the brief composer cannot
     # swallow it. Fail-open on any CLI error/timeout, per the charter; the
-    # translator below renders advisory by default and decision:block only
-    # under RALLY_HOOK_STRICT=1.
+    # translator below always renders Stop as advisory. Strict mode is a
+    # mutation-boundary control; one conversation turn ending is not proof
+    # that the agent completed or abandoned the work behind an active claim.
     before_complete_json="$(rally_timeout check before-complete --tool "$tool" --strict --json 2>/dev/null || true)"
   fi
   rally_output="$(rally_timeout next --tool "$tool" --audit --json 2>/dev/null || true)"
@@ -1998,7 +2002,8 @@ if [ "$have_node" != "1" ]; then
   exit 0
 fi
 
-# RALLY_HOOK_STRICT=1 → translator may emit deny/block on high-severity signals.
+# RALLY_HOOK_STRICT=1 → translator may deny high-severity before-write signals;
+# Stop remains advisory.
 # Default (any other value): force advisory-only.
 strict="${RALLY_HOOK_STRICT:-0}"
 
@@ -2915,8 +2920,8 @@ if (!briefMode && (!visible || !visible.present) && promptMode === "always" && p
 // session still owns (active claims, own blockers). Its verdict arrives on a
 // side channel so neither the brief composer nor the next-envelope fallbacks
 // above can swallow it: allow=false OVERRIDES whatever they rendered, because
-// an unreleased claim outranks any notification. Advisory by default; under
-// RALLY_HOOK_STRICT=1 the stop severity becomes the Stop decision:block below.
+// an unreleased claim outranks any notification. Stop stays advisory in every
+// mode: it marks a turn boundary, not a run-completion boundary.
 // Finding codes are rally-authored constants; fact ids are ledger data and go
 // through ident() like every other identifier.
 if (phase === "after-write") {
@@ -2957,14 +2962,16 @@ const highSeverity = severity === "stop" || allow === false;
 // CHARTER (never-block, default): coordination is recorded + exposed, never
 // enforced. Default `stop=false` so we always emit `additionalContext` /
 // `systemMessage`. STRICT MODE (RALLY_HOOK_STRICT=1) is the documented
-// escape hatch: it lets the high-severity branch emit deny/block. Even in
-// strict mode, every emission is also surfaced as a visible message so the
-// human/agent sees why.
-const stop = strict && highSeverity;
+// escape hatch: it lets the high-severity before-write branch emit a denial.
+// Even in strict mode, every emission is also surfaced as a visible message
+// so the human/agent sees why. Strict enforcement is confined to the mutation
+// boundary. A Stop callback fires after every ordinary turn, when holding a
+// claim is expected and must not trap the agent in a completion loop.
+const stop = strict && highSeverity && phase === "before-write";
 const decorated = highSeverity
   ? (stop
       ? `⚠️ HIGH-SEVERITY coordination signal (STRICT MODE — BLOCKING): ${rawMessage}`
-      : `⚠️ HIGH-SEVERITY coordination signal (advisory — not blocking; Rally never enforces): ${rawMessage}`)
+      : `⚠️ HIGH-SEVERITY coordination signal (advisory — not blocking at this lifecycle boundary): ${rawMessage}`)
   : rawMessage;
 // SEC-004: this is the ONLY place the trust label is added, and the decision
 // reads `hasLedgerData` — provenance — never the message text. Every untrusted
@@ -2984,10 +2991,9 @@ const message = hasLedgerData ? UNTRUSTED_PREAMBLE + decorated : decorated;
 // re-check `rally next` on their own. Not applied to `start` (fires
 // once/session) or `before-write` (edit-scoped + conflict-specific —
 // repetition there is intentional).
-// A STRICT-MODE block is exempt from the dedupe entirely (not merely from the
-// remindSecs window): suppressing an identical block on the second Stop
-// attempt would let the agent finish by trying twice, which defeats the gate
-// the block exists to hold.
+// Strict-mode blocks occur only on before-write, which is intentionally outside
+// this per-turn dedupe. Stop reminders use the same bounded cadence in every
+// mode so a claim-holding agent is informed without being trapped each turn.
 if ((phase === "idle" || phase === "after-write") && !stop) {
   try {
     const root = process.env.RALLY_HOOK_ROOT || process.cwd();
