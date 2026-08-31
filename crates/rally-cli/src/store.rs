@@ -18427,8 +18427,24 @@ mod ledger_tests {
             vec!["cached-open-obligation"]
         );
         let rally_dir = root.join(".rally");
+        // Read back at the SAME projection second the capture used, via the
+        // existing `_at` seam, instead of re-reading the wall clock.
+        // `projection_unix_sec` is whole seconds and the fingerprint compares it
+        // for exact equality (deliberately — a longer TTL could cross a liveness
+        // decision boundary), so a capture and a load that straddle a second
+        // boundary miss. That is correct product behaviour and pure harness
+        // nondeterminism here: this test asserts that serde-skipped internals
+        // round-trip through the cache side channel, not that two clock reads
+        // land in the same second. Observed failing in a loaded pre-push gate
+        // run while passing 5/5 locally.
+        let projection_second = capture
+            .fingerprint
+            .as_ref()
+            .expect("a direct-store capture is always cacheable")
+            .projection_unix_sec;
         write_snapshot_cache(&rally_dir, &capture);
-        let cached = try_load_cached_snapshot(&rally_dir).expect("fresh cache");
+        let cached =
+            try_load_cached_snapshot_at(&rally_dir, projection_second).expect("fresh cache");
         assert_eq!(
             cached
                 .open_obligations
