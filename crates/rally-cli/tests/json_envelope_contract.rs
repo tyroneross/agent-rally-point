@@ -562,7 +562,9 @@ fn envelope_whoami() {
 #[test]
 fn envelope_owners_dirty() {
     let ws = Workspace::new("owners");
-    let body = ws.json(&["owners", "--dirty", "--json"]);
+    // This verifies the JSON schema, not the default watchdog budget. `owners`
+    // also scans git state, so give loaded CI hosts deterministic headroom.
+    let body = ws.json(&["owners", "--dirty", "--json", "--timeout-ms=10000"]);
     assert_envelope_contract("owners", &body);
     assert_eq!(body["schema"], "agent-rally.command.owners.v1");
     ws.cleanup();
