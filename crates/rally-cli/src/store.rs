@@ -2420,7 +2420,14 @@ impl RoomSnapshot {
             active_claims: filter_facts(self.active_claims, query),
             active_blockers: filter_facts(self.active_blockers, query),
             open_handoffs: filter_facts(self.open_handoffs, query),
-            resolved_unverified: filter_facts(self.resolved_unverified, query),
+            // UNFILTERED, for the same reason `open_obligations` below is. The
+            // label's audience is the handoff's SENDER — the party owed the work
+            // product — but `RoomQuery::matches` keys on `fact.tool`/`fact.target`
+            // and the labeled fact is the RECEIVER's resolve, so a filtered
+            // bucket would hide an unverified closure from precisely the peer who
+            // needs it. Resolves also carry no `scope`, so any `--path` query
+            // dropped the bucket wholesale.
+            resolved_unverified: self.resolved_unverified,
             pending_wakes: self.pending_wakes,
             // Carried through UNFILTERED, like `pending_wakes`. An obligation is
             // scoped by its ADDRESSEE, not by the caller's `--path` / `--tool`
@@ -4800,7 +4807,7 @@ impl DirectRoomStore {
                         if claim.from_session_id.is_some() {
                             observed_sessions
                                 .for_claim(claim.tool.as_deref(), claim.from_session_id.as_deref())
-                                == crate::observed_liveness::ObservedLiveness::Stale
+                                .is_stale()
                         } else {
                             fresh.claim_reclaim_eligible(claim, &coord).0
                         }
@@ -4825,9 +4832,16 @@ impl DirectRoomStore {
                         observed_sessions
                             .for_claim(claim.tool.as_deref(), claim.from_session_id.as_deref())
                     };
+                    // Each marker re-checks its OWN flavour. Collapsing
+                    // `stale-unobserved` into `stale` would let a pass that
+                    // acted on inference be re-validated by direct observation
+                    // it never had, and vice versa.
                     match Self::reaper_marker(&fact.evidence, "observed") {
                         Some("stale") => {
                             current == crate::observed_liveness::ObservedLiveness::Stale
+                        }
+                        Some("stale-unobserved") => {
+                            current == crate::observed_liveness::ObservedLiveness::StaleUnobserved
                         }
                         Some("unknown") => {
                             current == crate::observed_liveness::ObservedLiveness::Unknown
@@ -7147,12 +7161,33 @@ pub(crate) const RESOLVED_UNVERIFIED_STATUS: &str = "resolved-unverified";
 /// explicitly demanded an acknowledgement via a `requires_ack` evidence marker.
 /// Broadcast/untargeted handoffs stay out: labeling every casual closure would
 /// drown the signal this label exists to carry.
+/// Is `closer` a completion record for `handoff` by someone entitled to make
+/// one? The answer depends on how the handoff is addressed, and the split is
+/// what keeps the label from contradicting `open_obligations`.
+fn closure_is_a_completion_claim(handoff: &Fact, closer: &Fact) -> bool {
+    match handoff.target.as_deref() {
+        // ADDRESSED — exactly the predicate `open_obligations` reads, so the two
+        // buckets can never disagree about who closed it. `fact_closes_handoff`
+        // would be wrong here: its legacy `from_session_id.is_none()` arm treats
+        // ANY session-less row as a closer, so a wrong peer's legacy row would
+        // be labeled a closure while the obligation stayed open for the real
+        // addressee. This ledger holds 12,746 session-less rows.
+        Some(target) if target != "all" => receiver_ack_closes_obligation(handoff, closer),
+        // BROADCAST or untargeted — `fact_is_addressed_obligation` excludes
+        // these (ack state for a broadcast is per-reader and this bucket cannot
+        // hold per-reader state), so there is no obligation entry to contradict
+        // and no single entitled answerer. Anyone may close it, which is what
+        // `fact_closes_handoff` already encodes, legacy arm included.
+        _ => fact_closes_handoff(handoff, closer),
+    }
+}
+
 fn handoff_requires_verified_resolution(handoff: &Fact) -> bool {
+    // `fact_requires_ack`, not a second copy of its body. ARP-R-01 (see
+    // `evidence_requires_ack` above) is the register entry for what restating a
+    // predicate in this file costs.
     matches!(handoff.target.as_deref(), Some(target) if target != "all")
-        || handoff
-            .evidence
-            .iter()
-            .any(|item| evidence_requires_ack(item))
+        || fact_requires_ack(handoff)
 }
 
 // NOTE (orphaned doc block): the items these paragraphs documented were
@@ -7543,30 +7578,53 @@ fn snapshot_from_facts_with_policy_at(
         .filter(|f| f.kind == "handoff")
         .map(|f| (f.event_id.as_str(), f))
         .collect();
-    let artifact_handoff_refs: BTreeSet<&str> = facts
+    // Only an artifact that would ITSELF have closed the obligation suppresses
+    // the label. A bare `ref_id` match would let the SENDER exempt its own
+    // handoff by attaching a context artifact before any work started, which
+    // contributes no receiver evidence at all.
+    let artifact_closes_obligation: BTreeSet<&str> = facts
         .iter()
-        .filter(|f| f.kind == "artifact")
-        .filter_map(|f| f.ref_id.as_deref())
+        .filter(|f| f.kind == FactKind::Artifact)
+        .filter_map(|artifact| {
+            let handoff = handoffs_by_id.get(artifact.ref_id.as_deref()?)?;
+            closure_is_a_completion_claim(handoff, artifact).then_some(handoff.event_id.as_str())
+        })
         .collect();
     let mut resolved_unverified = facts
         .iter()
-        .filter(|f| f.kind == "resolve" && !is_system_authored(f))
-        .filter(|resolve| {
-            resolve
+        // Resolve AND Receipt. `receiver_ack_closes_obligation` accepts both as
+        // completion records, so labeling only resolves left `rally say receipt
+        // --ref <handoff>` as a one-flag bypass of the whole label.
+        .filter(|f| matches!(f.kind, FactKind::Resolve | FactKind::Receipt))
+        .filter(|f| !is_system_authored(f))
+        .filter(|closer| {
+            closer
                 .ref_id
                 .as_deref()
                 .and_then(|ref_id| handoffs_by_id.get(ref_id))
                 .is_some_and(|handoff| {
-                    // `fact_closes_handoff` carries the full closure contract
-                    // (seq ordering + target/session correlation), so a resolve
-                    // that merely REFS a handoff without closing it — a legacy
-                    // or merged-ledger row a wrong peer wrote — is not labeled:
-                    // the handoff is still open, and reporting it as both open
-                    // and resolved-unverified would contradict the room.
-                    fact_closes_handoff(handoff, resolve)
+                    // For an ADDRESSED handoff this resolves to
+                    // `receiver_ack_closes_obligation`, the SAME predicate
+                    // `open_obligations` reads — not `fact_closes_handoff`.
+                    // The two disagree on exactly one arm, and it matters:
+                    // `handoff_closer_matches_target` returns true for ANY
+                    // closer whose `from_session_id` is None (correct there —
+                    // legacy rows predate session binding and used broad
+                    // completion markers). Labeling off that arm would let a
+                    // session-less row from a WRONG peer mark a handoff
+                    // resolved-unverified while `open_obligations` still holds
+                    // it open — the room asserting a closure and an open
+                    // obligation for one handoff at once. This ledger carries
+                    // 12,746 session-less rows, so that input is real.
+                    closure_is_a_completion_claim(handoff, closer)
                         && handoff_is_protocol_request(handoff)
+                        // Same B18 exclusion `open_handoffs` and
+                        // `fact_is_addressed_obligation` apply: external-intake
+                        // facts are not repo-local coordination work, so a
+                        // closure of one is not a completion claim to grade.
+                        && !handoff.scope.iter().any(|scope| scope == "external-intake")
                         && handoff_requires_verified_resolution(handoff)
-                        && !artifact_handoff_refs.contains(handoff.event_id.as_str())
+                        && !artifact_closes_obligation.contains(handoff.event_id.as_str())
                 })
         })
         // Recency-bounded like the sibling buckets, so the label surfaces
@@ -21019,6 +21077,121 @@ mod resolved_unverified_tests {
         assert!(
             snapshot.resolved_unverified.is_empty(),
             "an artifact-backed closure is the verified path and must not be labeled"
+        );
+    }
+
+    /// A session-less row from a WRONG peer closes the handoff through
+    /// `handoff_closer_matches_target`'s legacy arm but does NOT close the
+    /// receiver's obligation. Labeling it would put the same handoff in
+    /// `open_obligations` and `resolved_unverified` at once. Reds when the label
+    /// reads `fact_closes_handoff` instead of `receiver_ack_closes_obligation`.
+    #[test]
+    fn a_session_less_wrong_peer_closure_is_not_labeled() {
+        let mut handoff = fact(FactKind::Handoff, "alpha");
+        handoff.target = Some("beta".to_string());
+        let handoff_id = handoff.event_id.clone();
+        // No from_session_id anywhere — the legacy shape this ledger holds
+        // 12,746 of.
+        let mut resolve = fact(FactKind::Resolve, "gamma");
+        resolve.ref_id = Some(handoff_id.clone());
+        resolve.evidence = vec!["closing someone else's handoff".to_string()];
+        let snapshot = snap(vec![handoff, resolve]);
+        assert!(
+            snapshot
+                .open_obligations
+                .iter()
+                .any(|f| f.event_id == handoff_id),
+            "fixture must leave the obligation open, or this proves nothing"
+        );
+        assert!(
+            snapshot.resolved_unverified.is_empty(),
+            "and the room must not simultaneously report it resolved-unverified"
+        );
+    }
+
+    /// `rally say receipt --ref <handoff>` records completion exactly as a
+    /// resolve does. Labeling only resolves left it as a one-flag bypass.
+    #[test]
+    fn an_evidence_free_receipt_is_labeled_like_a_resolve() {
+        let mut handoff = fact(FactKind::Handoff, "alpha");
+        handoff.from_session_id = Some("sess-alpha".to_string());
+        handoff.target = Some("beta".to_string());
+        let mut receipt = fact(FactKind::Receipt, "beta");
+        receipt.from_session_id = Some("sess-beta".to_string());
+        receipt.ref_id = Some(handoff.event_id.clone());
+        let snapshot = snap(vec![handoff, receipt]);
+        assert_eq!(snapshot.resolved_unverified.len(), 1);
+        assert_eq!(
+            snapshot.resolved_unverified[0].status.as_deref(),
+            Some(RESOLVED_UNVERIFIED_STATUS)
+        );
+    }
+
+    /// A SENDER-authored artifact on its own handoff is context, not receiver
+    /// evidence, so it must not exempt the closure from the label. Reds when the
+    /// suppressing set is any artifact that merely refs the handoff.
+    #[test]
+    fn a_sender_authored_artifact_does_not_suppress_the_label() {
+        let mut handoff = fact(FactKind::Handoff, "alpha");
+        handoff.from_session_id = Some("sess-alpha".to_string());
+        handoff.target = Some("beta".to_string());
+        let mut sender_context = fact(FactKind::Artifact, "alpha");
+        sender_context.from_session_id = Some("sess-alpha".to_string());
+        sender_context.ref_id = Some(handoff.event_id.clone());
+        sender_context.evidence = vec!["here is the spec".to_string()];
+        let mut receiver_resolve = fact(FactKind::Resolve, "beta");
+        receiver_resolve.from_session_id = Some("sess-beta".to_string());
+        receiver_resolve.ref_id = Some(handoff.event_id.clone());
+        let snapshot = snap(vec![handoff, sender_context, receiver_resolve]);
+        assert_eq!(
+            snapshot.resolved_unverified.len(),
+            1,
+            "the sender's own artifact is not the receiver's work product"
+        );
+    }
+
+    /// B18: external-intake facts are not repo-local coordination work, so
+    /// `open_handoffs` and `fact_is_addressed_obligation` both exclude them. The
+    /// label must agree rather than grade a closure the room does not track.
+    #[test]
+    fn an_external_intake_closure_is_not_labeled() {
+        let mut handoff = fact(FactKind::Handoff, "alpha");
+        handoff.from_session_id = Some("sess-alpha".to_string());
+        handoff.target = Some("beta".to_string());
+        handoff.scope = vec!["external-intake".to_string()];
+        let mut resolve = fact(FactKind::Resolve, "beta");
+        resolve.from_session_id = Some("sess-beta".to_string());
+        resolve.ref_id = Some(handoff.event_id.clone());
+        let snapshot = snap(vec![handoff, resolve]);
+        assert!(snapshot.resolved_unverified.is_empty());
+    }
+
+    /// The label's audience is the SENDER, but the labeled fact is the
+    /// RECEIVER's resolve — so a `--tool <sender>` query that filtered on
+    /// `fact.tool` would hide an unverified closure from the one peer owed the
+    /// work product. Reds when the bucket is run through `filter_facts`.
+    #[test]
+    fn the_label_survives_a_sender_scoped_query() {
+        let mut handoff = fact(FactKind::Handoff, "alpha");
+        handoff.from_session_id = Some("sess-alpha".to_string());
+        handoff.target = Some("beta".to_string());
+        let mut resolve = fact(FactKind::Resolve, "beta");
+        resolve.from_session_id = Some("sess-beta".to_string());
+        resolve.ref_id = Some(handoff.event_id.clone());
+        let mut facts = vec![handoff, resolve];
+        for (i, f) in facts.iter_mut().enumerate() {
+            f.seq = (i + 1) as i64;
+        }
+        let full = snapshot_from_facts_with_policy(&facts, &CoordinationConfig::default(), false);
+        assert_eq!(full.resolved_unverified.len(), 1, "fixture sanity");
+        let sender_view = full.filtered(&RoomQuery {
+            tool: Some("alpha".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            sender_view.resolved_unverified.len(),
+            1,
+            "the sender must still see the unverified closure of its own handoff"
         );
     }
 

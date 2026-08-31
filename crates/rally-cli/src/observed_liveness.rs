@@ -28,7 +28,20 @@ const OBSERVER_PID_PREFIX: &str = "observer_pid:";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ObservedLiveness {
     Live,
+    /// Externally OBSERVED dead: a stamped `observer_pid:` whose probe reported
+    /// the process gone. This is direct evidence about a specific process.
     Stale,
+    /// INFERRED stale: no `observer_pid:` was ever stamped, and the session went
+    /// quiet past the takeover bar with a provably unmoved, quiescent worktree.
+    ///
+    /// Carries the same destructive weight as [`Self::Stale`] for a pass a human
+    /// invoked, and deliberately LESS for the automatic one. The difference is
+    /// not confidence, it is consent: a heuristic may inform an operator who
+    /// chose to run a takeover sweep, but it must not authorize a background
+    /// release performed on an unrelated peer's `rally enter`. Every input the
+    /// inference reads — worktree quiescence, unmoved HEAD, ledger silence — is
+    /// blind to a live agent whose work leaves no trace in those three places.
+    StaleUnobserved,
     Unknown,
 }
 
@@ -36,15 +49,28 @@ impl ObservedLiveness {
     pub(crate) fn as_signal(self) -> Option<bool> {
         match self {
             Self::Live => Some(true),
-            Self::Stale => Some(false),
+            Self::Stale | Self::StaleUnobserved => Some(false),
             Self::Unknown => None,
         }
+    }
+
+    /// Either flavour of stale. Use for the human-invoked reap and for any
+    /// re-check of a decision that pass already made.
+    pub(crate) fn is_stale(self) -> bool {
+        matches!(self, Self::Stale | Self::StaleUnobserved)
+    }
+
+    /// May this verdict corroborate an AUTOMATIC reap? Only direct observation
+    /// qualifies. See [`Self::StaleUnobserved`] for why.
+    pub(crate) fn authorizes_automatic_reap(self) -> bool {
+        matches!(self, Self::Stale)
     }
 
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Live => "live",
             Self::Stale => "stale",
+            Self::StaleUnobserved => "stale-unobserved",
             Self::Unknown => "unknown",
         }
     }
@@ -406,25 +432,30 @@ fn grade_observation(
         && now.signed_duration_since(silence_anchor).num_seconds()
             > crate::store::TAKEOVER_STALE_SECS
     {
-        return ObservedLiveness::Stale;
+        return ObservedLiveness::StaleUnobserved;
     }
     ObservedLiveness::Unknown
 }
 
 fn aggregate(verdicts: impl IntoIterator<Item = ObservedLiveness>) -> ObservedLiveness {
     let mut saw_stale = false;
+    let mut saw_stale_unobserved = false;
     let mut saw_unknown = false;
     for verdict in verdicts {
         match verdict {
             ObservedLiveness::Live => return ObservedLiveness::Live,
             ObservedLiveness::Stale => saw_stale = true,
+            ObservedLiveness::StaleUnobserved => saw_stale_unobserved = true,
             ObservedLiveness::Unknown => saw_unknown = true,
         }
     }
     if saw_unknown {
         ObservedLiveness::Unknown
     } else if saw_stale {
+        // Direct observation outranks inference when one tool has both.
         ObservedLiveness::Stale
+    } else if saw_stale_unobserved {
+        ObservedLiveness::StaleUnobserved
     } else {
         ObservedLiveness::Unknown
     }
@@ -491,10 +522,22 @@ pub(crate) fn observe_sessions(room_repo_root: &Path, facts: &[Fact]) -> Observa
             worktree: worktree.clone(),
             pid_alive: stamp.observer_pid.and_then(process_alive),
         };
-        let last_authored_at = authored_by_session
-            .get(&(stamp.tool.clone(), stamp.session_key.clone()))
-            .or_else(|| authored_by_tool.get(&stamp.tool))
-            .copied();
+        // MAX, not `or_else`. On a host with no stable session identity
+        // (`derive_endpoint` falls back to `proc:<host>:<pid>`, so every rally
+        // invocation mints a fresh id) the per-session entry is ALWAYS present —
+        // `ensure_presence` writes one with that very key — so an `or_else`
+        // fallback can never fire, and the agent's writes from five minutes ago,
+        // filed under the previous invocation's id, stay invisible. Taking the
+        // max can only move the anchor FORWARD, i.e. only ever preserve a
+        // session; a backdated fact planted by a peer cannot lower a maximum.
+        let last_authored_at = [
+            authored_by_session.get(&(stamp.tool.clone(), stamp.session_key.clone())),
+            authored_by_tool.get(&stamp.tool),
+        ]
+        .into_iter()
+        .flatten()
+        .copied()
+        .max();
         let verdict = grade_observation(&stamp, &sample, now, last_authored_at);
         let session_key = (stamp.tool.clone(), stamp.session_key.clone());
         by_session.insert(session_key.clone(), verdict);
@@ -593,18 +636,29 @@ mod tests {
     /// The observer fail-open gap: a session whose presence stamps never
     /// carried an `observer_pid:` (RALLY_OBSERVER_PID unset) graded Unknown
     /// forever and was never reaped. With a readable worktree, an unmoved
-    /// HEAD, and silence past the 2h takeover bar, it now grades Stale.
+    /// HEAD, and silence past the 2h takeover bar, it now grades stale.
     /// Fails on the pre-fix behavior (which returned Unknown here).
+    ///
+    /// The flavour is `StaleUnobserved`, not `Stale`, and the distinction is
+    /// load-bearing rather than cosmetic: nothing here was OBSERVED dead, so
+    /// this grade may inform a human-invoked sweep but must never corroborate
+    /// the automatic one.
     #[test]
     fn unobserved_session_past_takeover_bar_fails_closed() {
         let mut stamp = stamp();
         stamp.observer_pid = None;
         stamp.reported_at = Utc::now() - chrono::Duration::hours(3);
         let sample = readable_probe(stamp.recorded_head.as_deref().unwrap(), None);
+        let verdict = grade_observation(&stamp, &sample, Utc::now(), None);
         assert_eq!(
-            grade_observation(&stamp, &sample, Utc::now(), None),
-            ObservedLiveness::Stale,
+            verdict,
+            ObservedLiveness::StaleUnobserved,
             "an unobserved session silent past the takeover bar must not stay Unknown forever"
+        );
+        assert!(verdict.is_stale());
+        assert!(
+            !verdict.authorizes_automatic_reap(),
+            "an INFERRED grade must never corroborate the automatic reap"
         );
     }
 
@@ -653,12 +707,40 @@ mod tests {
                 Utc::now(),
                 Some(Utc::now() - chrono::Duration::hours(3)),
             ),
-            ObservedLiveness::Stale
+            ObservedLiveness::StaleUnobserved
         );
     }
 
     /// A probe FAILURE on a stamped observer pid is not evidence of absence —
     /// only the never-stamped session takes the takeover-bar branch.
+    /// `readable` is `head && dirty_count && newest_worktree_mtime` all present
+    /// (`probe_worktree`), and `current_head_sha` reads `.git/HEAD` directly
+    /// without spawning git — so a failed `git ls-files` leaves a PRESENT head
+    /// beside ABSENT activity evidence. The `!readable` early return is what
+    /// stops the fail-closed arm from grading stale on absent evidence, which
+    /// would be the fail-open bug's mirror image. That early return had no test
+    /// covering this shape; reds when it is removed.
+    #[test]
+    fn unreadable_worktree_stays_unknown_even_with_an_unmoved_head() {
+        let mut stamp = stamp();
+        stamp.observer_pid = None;
+        stamp.reported_at = Utc::now() - chrono::Duration::hours(3);
+        let sample = ProbeSample {
+            worktree: WorktreeProbe {
+                readable: false,
+                head: stamp.recorded_head.clone(),
+                dirty_count: None,
+                newest_worktree_mtime: None,
+            },
+            pid_alive: None,
+        };
+        assert_eq!(
+            grade_observation(&stamp, &sample, Utc::now(), None),
+            ObservedLiveness::Unknown,
+            "absent filesystem evidence is not evidence of absence"
+        );
+    }
+
     #[test]
     fn probe_failure_with_stamped_observer_pid_stays_unknown() {
         let mut stamp = stamp();
@@ -761,6 +843,94 @@ mod tests {
     /// Fails when `newest_worktree_mtime` drops `--others --exclude-standard`:
     /// the probe then sees only the backdated tracked file, the fresh scratch
     /// file is invisible, and the 3h-silent unstamped session grades Stale.
+    /// The silence clock must not be blind to the SAME agent working under a
+    /// different session id.
+    ///
+    /// On a host with no stable session identity, `derive_endpoint` falls back
+    /// to `proc:<host>:<pid>`, so every rally invocation mints a fresh
+    /// `from_session_id`. `ensure_presence` writes a presence fact keyed by that
+    /// id, which means the per-session anchor is ALWAYS populated for the stamp
+    /// being graded — and an `or_else` fallback to the tool aggregate can
+    /// therefore never fire. The agent's writes from a minute ago, filed under
+    /// the next invocation's id, would be invisible, and every claim on such a
+    /// host would grade stale two hours after it was made no matter how busy the
+    /// agent was. Reds on `or_else`; passes on `max`.
+    #[test]
+    fn a_sibling_session_of_the_same_tool_resets_the_silence_clock() {
+        let root = unique_root("sibling-session-clock");
+        fs::create_dir_all(&root).unwrap();
+        crate::test_git_fixture::fixture_git(&root, &["init"]);
+        fs::write(root.join("tracked.txt"), "tracked\n").unwrap();
+        crate::test_git_fixture::fixture_git(&root, &["add", "tracked.txt"]);
+        crate::test_git_fixture::fixture_git(&root, &["commit", "-m", "fixture"]);
+        std::process::Command::new("touch")
+            .args([
+                "-t",
+                "200001010000",
+                root.join("tracked.txt").to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        let head = current_head_sha(&root).expect("fixture HEAD");
+        let worktree = fs::canonicalize(&root).unwrap();
+
+        let base = |kind: FactKind, session: &str, ago_hours: i64| Fact {
+            from_session_id: Some(session.to_string()),
+            schema: crate::FACT_SCHEMA.to_string(),
+            event_id: crate::new_id("fact"),
+            seq: 0,
+            thread_id: crate::new_id("room"),
+            kind,
+            tool: Some("proc-agent".to_string()),
+            role: None,
+            subject: "fixture".to_string(),
+            scope: Vec::new(),
+            created_at: (Utc::now() - chrono::Duration::hours(ago_hours))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+
+        // Invocation 1, three hours ago: presence stamped, no observer pid.
+        let mut presence = base(FactKind::Presence, "proc-session-1", 3);
+        presence.evidence = vec![
+            format!("branch_head_sha:{head}"),
+            format!("worktree_path:{}", worktree.display()),
+        ];
+        // Invocation 2, one minute ago: the SAME agent, a new proc id.
+        let mut recent = base(FactKind::Artifact, "proc-session-2", 0);
+        recent.subject = "still working".to_string();
+
+        let index = observe_sessions(&root, &[presence, recent.clone()]);
+        assert_eq!(
+            index.for_claim(Some("proc-agent"), Some("proc-session-1")),
+            ObservedLiveness::Unknown,
+            "a sibling session's fresh fact must rescue the graded session"
+        );
+
+        // Non-vacuity: without the sibling's fact the same fixture DOES grade
+        // stale, so the assertion above cannot be passing for another reason.
+        let mut presence_only = base(FactKind::Presence, "proc-session-1", 3);
+        presence_only.evidence = vec![
+            format!("branch_head_sha:{head}"),
+            format!("worktree_path:{}", worktree.display()),
+        ];
+        let alone = observe_sessions(&root, &[presence_only]);
+        assert_eq!(
+            alone.for_claim(Some("proc-agent"), Some("proc-session-1")),
+            ObservedLiveness::StaleUnobserved,
+            "fixture must be stale without the sibling, or this test proves nothing"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn untracked_file_activity_reads_as_live() {
         let root = unique_root("untracked-activity");

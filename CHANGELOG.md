@@ -45,16 +45,50 @@ newest non-system ledger fact, the same clock `takeover_eligible_owners`
 reads. A stamped observer pid whose probe fails still grades Unknown (probe
 failure is not evidence of absence).
 
-What this costs, stated rather than buried: `rally doctor --reap-stale --apply`
-can now release an UNEXPIRED claim held by a never-observed session that has
-been silent past the bar. That release is operator-invoked (the automatic
-`rally enter` path still requires a writer-stamped lease expiry corroborated by
-observed death, and never acts on owner-staleness), and the doctor report names
-it `owner-stale` rather than `lease-expired` so the verdict is visibly a
-heuristic. Any ledger write — including a lease renewal — resets the silence
-clock, as does any non-ignored file written in the stamped worktree. The
-remaining exposure is a live session that writes nothing anywhere for over two
-hours while an operator runs a takeover sweep.
+An inferred grade is now a distinct verdict, `stale-unobserved`, and it can only
+inform a pass a human invoked. `rally doctor --reap-stale --apply` acts on it and
+labels the release `owner-stale` rather than `lease-expired`, so the operator can
+see the verdict rests on a heuristic. The automatic reap that runs on `rally
+enter` refuses it and still demands a process that was actually observed dead.
+
+That refusal is the point, not a detail. On a host with no coordination hook
+there is also nothing to renew a claim's lease, so the lease expires on schedule
+— and the automatic path treats "lease expired" and "owner looks gone" as two
+independent signals when on that host class they share one cause. Without the
+refusal, a hookless agent claiming a single file (a 30-minute lease) and doing a
+three-hour read-only review would have its claim released in the background by
+the next unrelated peer's `rally enter`, with no operator anywhere in the
+sequence.
+
+The silence clock also reads the newest fact authored by the TOOL, not only by
+the exact session. Hosts without a stable session identity mint a fresh session
+id per `rally` invocation, so a per-session-only clock would have been unable to
+see the same agent's writes from a minute earlier.
+
+Remaining exposure, stated rather than buried: a live session that writes no
+ledger fact and touches no non-ignored file for over two hours, while an
+operator runs a takeover sweep. Work in gitignored paths (`.build-loop/`,
+`docs/*PLAN*.md`) is invisible to the file half of the probe — tracked as
+follow-up, and bounded meanwhile by the automatic path's refusal.
+
+### Changed — the `resolved-unverified` label reads closure the way the inbox does
+
+Four ways a closure escaped or wrongly attracted the label, all fixed together:
+a `rally say receipt --ref <handoff>` records completion exactly as a resolve
+does and was never labeled; a session-less row from a WRONG peer counted as a
+closure (this ledger holds 12,746 session-less rows) and would have reported one
+handoff as simultaneously open and resolved-unverified; the SENDER's own context
+artifact on its own handoff suppressed the label while contributing no receiver
+evidence; and `external-intake` facts, which every sibling bucket excludes as
+non-repo-local, were graded anyway. For an addressed handoff the label now reads
+the same predicate `open_obligations` does, so the two cannot disagree about who
+closed what. Broadcast `requires_ack` handoffs keep the open closure rule, since
+no obligation entry exists there to contradict.
+
+The bucket is also now readable: `rally room` prints `resolved_unverified=N` on
+its human line, and the bucket is carried through `--tool` / `--path` queries
+unfiltered — it names the RECEIVER's resolve, so a sender-scoped query used to
+hide the closure from the one peer owed the work product.
 
 ### Changed — the room snapshot cache generation is 4
 

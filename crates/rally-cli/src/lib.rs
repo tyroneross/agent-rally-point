@@ -4316,7 +4316,7 @@ fn command_room(args: RoomArgs) -> Result<Output> {
     // long-gone reads as 380 peers unless the line says how many are current.
     let freshness = snapshot.freshness_counts();
     let text = format!(
-        "room claims={} blockers={} handoffs={} decisions={} risks={} artifacts={} system_health={} squads={} fresh={} stale={}{}",
+        "room claims={} blockers={} handoffs={} decisions={} risks={} artifacts={} system_health={} resolved_unverified={} squads={} fresh={} stale={}{}",
         snapshot.active_claims.len(),
         snapshot.active_blockers.len(),
         snapshot.open_handoffs.len(),
@@ -4324,6 +4324,10 @@ fn command_room(args: RoomArgs) -> Result<Output> {
         snapshot.current_risks.len(),
         snapshot.recent_artifacts.len(),
         snapshot.system_health.len(),
+        // A label nobody reads is not a control. Without this the bucket was
+        // computed, serialized, and visible only to a caller who already knew
+        // the JSON key existed.
+        snapshot.resolved_unverified.len(),
         snapshot.squads.len(),
         freshness.fresh,
         freshness.stale,

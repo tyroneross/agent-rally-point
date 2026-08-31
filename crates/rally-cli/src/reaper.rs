@@ -587,7 +587,7 @@ fn run_reap_stale_in_room_with_budget(
         // Only legacy claims without a session id retain the historical squad
         // timestamp predicate because no more precise owner exists for them.
         let owner_eligible = if claim.from_session_id.is_some() {
-            observed == crate::observed_liveness::ObservedLiveness::Stale
+            observed.is_stale()
         } else {
             legacy_owner_eligible
         };
@@ -622,8 +622,20 @@ fn run_reap_stale_in_room_with_budget(
         // requires the external observed-dead verdict computed above.
         let eligible = match mode {
             ReapMode::Full => owner_eligible || lease_eligible,
+            // `authorizes_automatic_reap`, not `observed_verdict`. Both flavours
+            // of stale flatten to `Liveness::Stale` through `as_signal`, so
+            // reading the flattened verdict here would silently hand the
+            // AUTOMATIC path the inferred-stale grade the fail-closed arm
+            // manufactures for every hookless session — the exact widening this
+            // mode exists to prevent, and one that needs no operator at all: a
+            // hookless agent gets no lease renewal either, so its lease expires
+            // on schedule and `lease_eligible` is satisfied by the same absent
+            // hook that produced the inference. The two signals this arm treats
+            // as independent corroboration would share one cause.
             ReapMode::LeaseOnly => {
-                lease_eligible && observed_verdict == crate::liveness::Liveness::Stale
+                lease_eligible
+                    && observed_verdict == crate::liveness::Liveness::Stale
+                    && observed.authorizes_automatic_reap()
             }
         };
         if !eligible {
@@ -2073,10 +2085,15 @@ mod tests {
     /// observed death.
     ///
     /// That bound is the whole argument for keeping the bar at 2h, so it is
-    /// pinned here rather than left to the eligibility expression. Fails on any
-    /// build that lets the owner-stale signal reach the automatic arm — the
-    /// change that would turn an accepted operator-gated risk into silent
-    /// background claim loss for every unstamped session in the fleet.
+    /// pinned rather than left to the eligibility expression.
+    ///
+    /// SCOPE, stated so this is not read as more than it is: this case pins the
+    /// `owner_eligible` route only, because its lease is 4h in the FUTURE. The
+    /// route that actually widened the automatic path is `observed_verdict`,
+    /// which needs an EXPIRED lease — see
+    /// `automatic_reap_preserves_a_silent_unstamped_session_whose_lease_expired`.
+    /// Neither case asserts `maybe_reap_on_enter`'s own mode argument; the
+    /// end-to-end pair in `tests/attribution.rs` covers that wiring.
     #[test]
     fn automatic_reap_preserves_a_silent_unstamped_session_on_an_unexpired_lease() {
         let root = unique_root("unstamped-observer-automatic");
@@ -2183,6 +2200,132 @@ mod tests {
             automatic.claims_reaped.is_empty(),
             "the automatic enter path must never release an unexpired lease on an \
              owner-staleness heuristic; reaped={:?}",
+            automatic
+                .claims_reaped
+                .iter()
+                .map(|entry| (entry.claim_id.as_str(), entry.reason.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            room.snapshot()
+                .unwrap()
+                .active_claims
+                .iter()
+                .any(|claim| claim.event_id == quiet_claim.event_id),
+            "the claim must still be active after the automatic pass"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// THE control the residual-risk argument actually needs.
+    ///
+    /// Both flavours of stale flatten to `Liveness::Stale` through `as_signal`,
+    /// so before `authorizes_automatic_reap` existed the `LeaseOnly` arm read
+    /// the flattened verdict and accepted the INFERRED grade. That handed the
+    /// automatic path every hookless session whose lease had expired — and on a
+    /// hookless host the lease expires precisely BECAUSE there is no hook to
+    /// renew it, so the arm's two "independent" signals share one cause.
+    ///
+    /// Worked failure this prevents: a hookless host, an agent claiming one file
+    /// (a 30-minute `Small` lease), doing a three-hour read-only review. At
+    /// T+30m the lease is expired; at T+2h the observer infers Stale; the next
+    /// unrelated peer's `rally enter` releases the claim in the background, with
+    /// no operator anywhere in the sequence. Reds without the gate.
+    #[test]
+    fn automatic_reap_preserves_a_silent_unstamped_session_whose_lease_expired() {
+        let root = unique_root("unstamped-observer-expired");
+        init_observed_worktree(&root);
+        fs::write(root.join(".gitignore"), ".rally/\n").unwrap();
+        crate::test_git_fixture::fixture_git(&root, &["add", ".gitignore"]);
+        crate::test_git_fixture::fixture_git(&root, &["commit", "-m", "ignore ledger"]);
+        for fixture_file in ["observed.txt", ".gitignore"] {
+            std::process::Command::new("touch")
+                .args([
+                    "-t",
+                    "200001010000",
+                    root.join(fixture_file).to_str().unwrap(),
+                ])
+                .status()
+                .unwrap();
+        }
+        let room = RoomStore::open_at(root.clone()).unwrap();
+        let head = crate::observed_liveness::current_head_sha(&root).expect("fixture HEAD");
+        let worktree = fs::canonicalize(&root).unwrap();
+        let expired_lease = (chrono::Utc::now() - chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        room.append_fact_verified(&Fact {
+            from_session_id: Some("session-quiet".to_string()),
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: FactKind::Presence,
+            tool: Some("quiet-agent".to_string()),
+            role: None,
+            subject: "observed presence: quiet-agent".to_string(),
+            scope: Vec::new(),
+            created_at: past_ts(3 * 3600),
+            summary: None,
+            // Worktree-stamped, NO observer_pid: — the hookless shape.
+            evidence: vec![
+                format!("branch_head_sha:{head}"),
+                format!("worktree_path:{}", worktree.display()),
+            ],
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        })
+        .unwrap();
+        let quiet_claim = room
+            .append_fact_verified(&Fact {
+                from_session_id: Some("session-quiet".to_string()),
+                schema: FACT_SCHEMA.to_string(),
+                event_id: "claim-quiet-expired".to_string(),
+                seq: 0,
+                thread_id: new_id("room"),
+                kind: FactKind::Claim,
+                tool: Some("quiet-agent".to_string()),
+                role: None,
+                subject: "claim: quiet-agent".to_string(),
+                scope: vec!["file:src/quiet.rs".to_string()],
+                created_at: past_ts(3 * 3600),
+                summary: None,
+                evidence: vec![format!("lease_expires_at:{expired_lease}")],
+                target: None,
+                ref_id: None,
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            })
+            .unwrap()
+            .fact;
+
+        // Non-vacuity: the SAME fixture is reapable by the human-invoked pass,
+        // and on BOTH signals — so a green below cannot come from a fixture that
+        // failed to grade stale or failed to expire.
+        let operator_preview =
+            run_reap_stale_in_room_with_mode(&room, false, ReapMode::Full).unwrap();
+        assert_eq!(
+            operator_preview
+                .claims_reaped
+                .iter()
+                .map(|entry| (entry.claim_id.as_str(), entry.reason.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(quiet_claim.event_id.as_str(), "owner-stale+lease-expired")],
+            "fixture must be both owner-stale and lease-expired, or this test proves nothing"
+        );
+
+        let automatic = run_reap_stale_in_room_with_mode(&room, true, ReapMode::LeaseOnly).unwrap();
+        assert!(
+            automatic.claims_reaped.is_empty(),
+            "an INFERRED stale grade must not corroborate the automatic arm, even on an \
+             expired lease; reaped={:?}",
             automatic
                 .claims_reaped
                 .iter()
