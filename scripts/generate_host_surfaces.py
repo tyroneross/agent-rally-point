@@ -383,6 +383,13 @@ def render_skill(
         if "\n" in value:
             raise GenerationError(f"{path}: multiline {key} is unsupported")
         lines.append(f"{key}: {value}")
+    # `user-invocable: false` keeps a sub-skill out of the host's slash menu, so
+    # a plugin exposes one router rather than its internals. It lives in the
+    # contract because this generator rewrites the whole frontmatter block: a
+    # hand edit to SKILL.md survives exactly until the next regeneration, which
+    # is how the flag added in 7a7dc04 was silently reverted here.
+    if metadata.get("user-invocable") is False:
+        lines.append("user-invocable: false")
     lines.extend(["---", "", body.lstrip("\n")])
     return "\n".join(lines)
 

@@ -96,6 +96,7 @@
     "mini-loop": {
       "name": "mini-loop",
       "description": "Ultra-light per-task quality loop for Rally Flow / dynamic-workflows fan-out. Wrap each fanned-out task in assess → plan → execute → mini-judge to raise accuracy, with zero tools or scripts. Use when running a workstream task and you want it to actually meet its validation + output contract, not just \"be done\".",
+      "user-invocable": false,
       "overlays": {
         "claude_code": {},
         "codex": {}
@@ -104,6 +105,7 @@
     "rally-workflows": {
       "name": "rally-workflows",
       "description": "Use when fanning out work across multiple agents, running a dynamic workflow, or splitting a workstream across hosts, terminals, or machines through Agent Rally Point. NOT for one session's own coordination loop (use `agent-rally-point`), and NOT the per-task quality gate (use `mini-loop`). Defines the workstream descriptor + task-packet protocol and the per-task rally coordination loop; host-neutral.",
+      "user-invocable": false,
       "overlays": {
         "claude_code": {},
         "codex": {}

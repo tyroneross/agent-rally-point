@@ -1,6 +1,7 @@
 ---
 name: mini-loop
 description: Ultra-light per-task quality loop for Rally Flow / dynamic-workflows fan-out. Wrap each fanned-out task in assess → plan → execute → mini-judge to raise accuracy, with zero tools or scripts. Use when running a workstream task and you want it to actually meet its validation + output contract, not just "be done".
+user-invocable: false
 ---
 
 <!--

@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "Single-plugin marketplace hosting agent-rally-point — repo-local coordination surface for parallel coding agents",
-    "version": "0.2.6"
+    "version": "0.2.5"
   },
   "plugins": [
     {

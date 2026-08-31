@@ -56,6 +56,40 @@ class GenerateHostSurfacesTests(unittest.TestCase):
             )
             self.assertEqual(GEN.cargo_version(root), "9.8.7")
 
+    def test_user_invocable_false_survives_regeneration(self) -> None:
+        """A sub-skill hidden from the host slash menu must stay hidden.
+
+        `render_skill` rewrites the whole frontmatter block from the contract, so
+        a `user-invocable: false` added by hand to SKILL.md survives exactly
+        until the next regeneration. That is how the flag added in 7a7dc04 was
+        silently reverted: the generator emitted only `name` and `description`,
+        and the drift check then reported the HAND edit as the stale side.
+
+        Reds if the key is dropped from `render_skill` or from the contract.
+        """
+        config = GEN.load_config(ROOT)
+        hidden = [
+            skill_id
+            for skill_id, meta in config["skills"].items()
+            if meta.get("user-invocable") is False
+        ]
+        self.assertTrue(
+            hidden,
+            "the contract must still declare which sub-skills stay out of the menu",
+        )
+        for skill_id in hidden:
+            for host in ("claude_code", "codex"):
+                rendered = GEN.render_skill(ROOT, config, skill_id, host)
+                self.assertIn(
+                    "user-invocable: false",
+                    rendered.split("---")[1],
+                    f"{skill_id} ({host}) must render the hidden flag in its frontmatter",
+                )
+            on_disk = (ROOT / GEN.SKILL_ROOT / skill_id / "SKILL.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("user-invocable: false", on_disk.split("---")[1])
+
     def test_repository_surfaces_are_current(self) -> None:
         self.assertEqual(GEN.check(ROOT), [])
 
