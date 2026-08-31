@@ -7,6 +7,8 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+## 0.2.6
+
 ### Added — unverified handoff closures are labeled `resolved-unverified`
 
 A `rally say resolve` that directly closes a TARGETED or requires-ack handoff

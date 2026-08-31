@@ -1,6 +1,6 @@
 {
   "name": "agent-rally-point",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "plugins": [
     {
       "name": "agent-rally-point",
