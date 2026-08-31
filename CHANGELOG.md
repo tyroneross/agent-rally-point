@@ -7,6 +7,15 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+## 0.2.7
+
+### Fixed — release auxiliary contract tests include command conformance
+
+The hermetic auxiliary-gate fixture now supplies and verifies the command-
+conformance dependency invoked by the release script. Release CI can therefore
+exercise the intended success and failure contracts instead of exiting early
+because the fixture omitted `scripts/check_command_conformance.py`.
+
 ## 0.2.6
 
 ### Added — unverified handoff closures are labeled `resolved-unverified`

@@ -36,6 +36,18 @@ class ReleaseAuxiliaryGateTests(unittest.TestCase):
         script_dest = self.root / "scripts/run-release-auxiliary-gate.sh"
         script_dest.parent.mkdir(parents=True)
         shutil.copy2(SOURCE_SCRIPT, script_dest)
+        (self.root / "scripts/check_command_conformance.py").write_text(
+            """import os
+import sys
+
+binary = sys.argv[sys.argv.index("--binary") + 1]
+with open(os.environ["AUX_LOG"], "a", encoding="utf-8") as log:
+    log.write(f"conformance:{binary}\\n")
+if binary != os.environ["AUX_BUILT_BINARY"]:
+    raise SystemExit(93)
+""",
+            encoding="utf-8",
+        )
         (self.root / "dynamic-workflows").mkdir()
         (self.root / "dynamic-workflows/package.json").write_text("{}\n", encoding="utf-8")
         self.write_npm_output(tests=3, skipped=0)
@@ -144,6 +156,7 @@ exit "${AUX_SCALE_EXIT:-0}"
             self.commands(),
             [
                 "cargo:build --release -p rally-cli --bin rally --message-format=json-render-diagnostics",
+                f"conformance:{self.built_binary}",
                 "npm:--prefix dynamic-workflows test",
                 f"npm-binary:{self.built_binary}",
                 "scale:--mode both --scales 2,4,6 --max-wall-s 20",
