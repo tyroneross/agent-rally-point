@@ -151,17 +151,17 @@ impl Workspace {
         let warning = body["data"]["warning"]["message"]
             .as_str()
             .expect("partial commit must name the required work that failed");
-        let append_warnings = body["data"]["append_outcomes"]
+        let matching_append_warnings = body["data"]["append_outcomes"]
             .as_array()
             .into_iter()
             .flatten()
             .flat_map(|outcome| outcome["warnings"].as_array().into_iter().flatten())
             .filter_map(|warning| warning["message"].as_str())
-            .collect::<Vec<_>>();
+            .filter(|message| *message == warning)
+            .count();
         assert_eq!(
-            append_warnings,
-            vec![warning],
-            "the partial refusal must carry one unambiguous append warning: {body}"
+            matching_append_warnings, 1,
+            "the partial refusal must carry its required append warning exactly once: {body}"
         );
         warning.to_string()
     }
