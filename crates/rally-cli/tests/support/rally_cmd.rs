@@ -107,9 +107,62 @@ pub fn rally_command_unbudgeted() -> Command {
     Command::new(rally_bin())
 }
 
+/// Is a daemon actually serving this room, judged from `rally daemon status
+/// --json` output?
+///
+/// # The gate this replaces
+///
+/// `rally daemon status` reports a room with no daemon in it as
+/// `{"ok": true, "data": {"daemon": {"live": false, "note": "not running"}}}`
+/// and exits 0 — correctly, since failing to find a daemon is not a command
+/// failure. So a readiness loop written as
+/// `run(["daemon","status","--json"]).status.success()` returns on its FIRST
+/// poll, before the daemon has taken the owner lock, bound a socket, or opened
+/// the store.
+///
+/// Two things follow, and both were observed:
+///
+/// * A test that meant to exercise ROUTED mode instead races the startup
+///   window. Measured on an idle machine: the gate returned at ~50ms while the
+///   daemon first answered at ~230ms, and a mutating command issued in between
+///   completed in ~110ms — through the DIRECT path, which is the mode the test
+///   was trying not to be in.
+/// * Commands issued inside that window can get neither route: the daemon
+///   already holds the owner lock EX, so the daemon-exclusion SH try is
+///   refused, while its socket is bound but not yet answering, so every
+///   identity probe pays the full 3s probe timeout
+///   (AGEN-RALLY-CLI-DURABILITY-m1dn22wz37g8c73m747d3).
+///
+/// Checking `data.daemon.live` asks the question the caller means. Keeping the
+/// predicate here rather than in each test file is the same argument as
+/// [`rally_command`]: a rule every file must remember to apply stops at the
+/// first file that does not.
+#[allow(dead_code)]
+pub fn daemon_is_live(status_stdout: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(status_stdout)
+        .ok()
+        .and_then(|body| {
+            body.pointer("/data/daemon/live")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `daemon_is_live` must reject the shape that fooled the old readiness
+    /// gate: a successful `daemon status` reporting no daemon.
+    #[test]
+    fn not_running_is_not_live() {
+        let not_running = br#"{"ok":true,"data":{"daemon":{"live":false,"note":"not running"}}}"#;
+        let serving = br#"{"ok":true,"data":{"daemon":{"live":true,"pid":123}}}"#;
+        assert!(!daemon_is_live(not_running));
+        assert!(daemon_is_live(serving));
+        assert!(!daemon_is_live(b"not json"));
+        assert!(!daemon_is_live(b""));
+    }
 
     /// The CLI clamps an out-of-band override into `100..=60_000`
     /// (`MIN_WATCHDOG_TIMEOUT_MS`/`MAX_WATCHDOG_TIMEOUT_MS`). A budget outside

@@ -201,11 +201,13 @@ impl Daemon {
         let daemon = Self(child);
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
-            if room
-                .run("daemon-probe", &["daemon", "status", "--json"])
-                .status
-                .success()
-            {
+            // Readiness is `data.daemon.live`, not the exit status. `daemon
+            // status` exits 0 while reporting `live: false`, so the old gate
+            // returned on its first poll and handed the three
+            // `..._in_direct_and_daemon_modes` tests into the startup window
+            // instead of past it. See `rally_cmd::daemon_is_live`.
+            let out = room.run("daemon-probe", &["daemon", "status", "--json"]);
+            if rally_cmd::daemon_is_live(&out.stdout) {
                 return daemon;
             }
             thread::sleep(Duration::from_millis(100));

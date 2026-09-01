@@ -180,14 +180,7 @@ impl Daemon {
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             let out = room.run(&["daemon", "status", "--json"]);
-            let live = serde_json::from_slice::<Value>(&out.stdout)
-                .ok()
-                .and_then(|body| {
-                    body.pointer("/data/daemon/live")
-                        .and_then(Value::as_bool)
-                })
-                .unwrap_or(false);
-            if live {
+            if rally_cmd::daemon_is_live(&out.stdout) {
                 return daemon;
             }
             thread::sleep(Duration::from_millis(100));
@@ -298,6 +291,93 @@ fn a_stale_stamp_is_reported_as_stale_rather_than_as_the_contender() {
         message.contains(&format!("pid={stale_pid}")) && message.contains("STALE"),
         "the stamp from exited pid {stale_pid} must be reported as stale, never as \
          the live contender; got: {message}"
+    );
+}
+
+/// The router must lose to nothing — least of all to its own probe.
+///
+/// # What this is really asserting
+///
+/// `direct_owner_wait_bound()` is `watchdog_remaining() - 250ms`. That 250ms
+/// reserve exists for one reason: so the router refuses with its own typed
+/// `direct-store-busy-unknown`, which names the contender, rather than being cut
+/// off by the wall-clock watchdog, which names nothing.
+///
+/// The reserve did not hold. The router checked its deadline only AFTER each
+/// probe, and one probe against a socket that accepts and never answers costs
+/// the full 3s `PROBE_TIMEOUT` — measured at 3008ms. So the deadline landed
+/// mid-probe and the watchdog fired first. Measured against this same seeded
+/// state before the clamp: a 2,000ms budget produced
+/// `watchdog-timeout-uncommitted-mutation` every time, and an 8,000ms budget did
+/// too, because 8,000 falls between the probe boundaries at 6.0s and 9.0s.
+///
+/// That is why every report of this failure arrived as a watchdog envelope with
+/// no attribution, and why three diagnoses of it had to be guessed from code.
+/// A 2,000ms budget is used here because it makes the pre-clamp failure
+/// deterministic rather than dependent on where the deadline falls on the 3s
+/// probe grid: one unclamped probe (3008ms) always outlives it.
+#[test]
+fn the_router_refuses_within_its_own_bound_instead_of_losing_to_the_watchdog() {
+    let room = Room::new();
+
+    // Bind a socket and never answer on it. A daemon mid-startup presents
+    // exactly this: it has bound and published its socket but its accept loop
+    // is not yet serving, so a connect succeeds and a ping is never answered.
+    let socket_path = room.cwd.join("silent.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    fs::write(
+        room.rally_dir().join("rallyd.sock.addr"),
+        socket_path.to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+
+    // Hold the daemon-owner lock EX, so the daemon-exclusion SH try is refused
+    // and direct opening stays correctly forbidden for the whole wait.
+    let owner = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(room.rally_dir().join("rallyd.owner.lock"))
+        .unwrap();
+    assert_eq!(unsafe { flock(owner.as_raw_fd(), LOCK_EX | LOCK_NB) }, 0);
+
+    let out = room.contended_say();
+    drop(owner);
+    drop(listener);
+
+    // The discriminator is WHICH mechanism ended the command, and it is read
+    // from the envelope rather than from wall clock: the budget is measured
+    // inside the process, while a test's own timing also carries process spawn,
+    // which is neither the router's nor the watchdog's.
+    //
+    // `refusal_text` fails loudly on a watchdog envelope, which IS the
+    // regression — pre-clamp, this command died on the watchdog every time.
+    let message = Room::refusal_text(&out);
+    assert!(
+        message.contains("direct-store-busy-unknown"),
+        "got: {message}"
+    );
+    assert!(
+        message.contains("blocked on rallyd.owner.lock"),
+        "the refusal must still name the contended lock; got: {message}"
+    );
+    // The bound the router reports must be the one derived from THIS budget,
+    // proving the refusal came from the wait under test and not from some other
+    // bounded path. Compared as a range, not an equality: the bound is
+    // `watchdog_remaining() - 250ms` read a few milliseconds into the command,
+    // so it lands just under `budget - 250`, never exactly on it.
+    let ceiling = CONTENDED_BUDGET_MS.parse::<u64>().unwrap() - 250;
+    let reported: u64 = message
+        .split("route within ")
+        .nth(1)
+        .and_then(|rest| rest.split("ms").next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("refusal did not report a bound; got: {message}"));
+    assert!(
+        reported <= ceiling && reported > ceiling - 200,
+        "reported bound {reported}ms is not the one derived from a \
+         {CONTENDED_BUDGET_MS}ms budget (expected just under {ceiling}ms); got: {message}"
     );
 }
 

@@ -4065,8 +4065,13 @@ fn acquire_direct_ownership_or_route_bounded(
     const RETRY_SLEEP: Duration = Duration::from_millis(10);
     let deadline = Instant::now() + bound;
     loop {
+        // Clamp the probe to what is left of THIS wait. Without it a probe
+        // against a socket that accepts and never answers blocks for its own
+        // full 3s timeout past the deadline, spending the 250ms watchdog
+        // reserve that exists so this loop refuses before the watchdog does.
+        let remaining = deadline.saturating_duration_since(Instant::now());
         if let Some(routed) =
-            store_client::probe_live_bounded(root, rally_dir, engagement.clone(), Duration::ZERO)?
+            store_client::probe_live_within(root, rally_dir, engagement.clone(), remaining)?
         {
             return Ok(Some(routed));
         }
@@ -4092,7 +4097,9 @@ fn acquire_direct_ownership_or_route_bounded(
         };
         let now = Instant::now();
         if now >= deadline {
-            return Err(direct_owner_busy_unknown_error(rally_dir, bound, blocked_on));
+            return Err(direct_owner_busy_unknown_error(
+                rally_dir, bound, blocked_on,
+            ));
         }
         thread::sleep(RETRY_SLEEP.min(deadline.saturating_duration_since(now)));
     }

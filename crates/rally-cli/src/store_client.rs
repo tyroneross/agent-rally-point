@@ -32,7 +32,7 @@
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -75,9 +75,7 @@ const ADDR_FILENAME: &str = "rallyd.sock.addr";
 pub(crate) fn daemon_route_state(rally_dir: &Path) -> String {
     let addr_path = rally_dir.join(ADDR_FILENAME);
     let Ok(text) = std::fs::read_to_string(&addr_path) else {
-        return format!(
-            "{ADDR_FILENAME} absent (no daemon has published a socket for this room)"
-        );
+        return format!("{ADDR_FILENAME} absent (no daemon has published a socket for this room)");
     };
     let socket = PathBuf::from(text.trim());
     if socket.as_os_str().is_empty() {
@@ -150,10 +148,6 @@ where
 /// `daemon start` wait-for-ready loop can both size their own waits against
 /// the same named corridor rather than each guessing a number.
 pub(crate) const CORRIDOR_BOUND: Duration = Duration::from_secs(30);
-
-/// Sleep between corridor re-probes when an attempt returns quickly (e.g.
-/// connection refused) rather than blocking for the full per-attempt timeout.
-const CORRIDOR_RETRY_SLEEP: Duration = Duration::from_millis(200);
 
 /// Connect attempts (including the first) before surfacing a transient connect
 /// failure. The rallyd daemon is a single-dispatcher, nonblocking-accept
@@ -301,6 +295,21 @@ pub(crate) fn probe_identity(
     rally_dir: &Path,
     expected_repo_root: &str,
 ) -> Result<Option<StoreIdentity>> {
+    probe_identity_within(rally_dir, expected_repo_root, PROBE_TIMEOUT)
+}
+
+/// [`probe_identity`] with an explicit per-attempt ceiling.
+///
+/// Callers that have their own deadline pass what is left of it. A probe that
+/// outlives its caller's deadline turns a wait the caller sized into one it did
+/// not, which is how the store router's 250ms watchdog reserve was being spent
+/// three seconds at a time — see [`probe_live_within`].
+pub(crate) fn probe_identity_within(
+    rally_dir: &Path,
+    expected_repo_root: &str,
+    per_attempt: Duration,
+) -> Result<Option<StoreIdentity>> {
+    let per_attempt = per_attempt.min(PROBE_TIMEOUT);
     let addr_path = rally_dir.join(ADDR_FILENAME);
     let socket_text = match std::fs::read_to_string(&addr_path) {
         Ok(text) => text,
@@ -311,7 +320,7 @@ pub(crate) fn probe_identity(
         return Ok(None);
     }
     let req = StoreRequest::new(None, StoreOp::Ping);
-    let reply = match round_trip(&socket, &req, PROBE_TIMEOUT, true) {
+    let reply = match round_trip(&socket, &req, per_attempt, true) {
         Ok(reply) => reply,
         Err(_) => return Ok(None),
     };
@@ -351,13 +360,39 @@ pub(crate) fn probe_identity(
 /// default LOCALLY via [`store::resolve_active_engagement_with_env`] — the
 /// SAME function `DirectRoomStore::open_direct_at_with_engagement` uses (G1
 /// parity: both variants resolve an unset default identically).
-pub(crate) fn probe_live(
+///
+/// `remaining` is what is left of the CALLER's deadline. The probe's own
+/// per-attempt timeout is clamped to it, so one probe can never spend time the
+/// caller has not got.
+///
+/// # Why the clamp is load-bearing
+///
+/// The store router waits `watchdog_remaining() - 250ms`, and that 250ms
+/// reserve exists so the router refuses with its own typed
+/// `direct-store-busy-unknown` — which names the contender — instead of being
+/// cut off by the wall-clock watchdog, which cannot.
+///
+/// The reserve did not work. The router checked its deadline only AFTER each
+/// probe, and against a socket that accepts and never answers (exactly what a
+/// daemon mid-startup or mid-wedge presents) a probe blocks for the full
+/// [`PROBE_TIMEOUT`], 3s. Measured against a seeded silent socket, the router
+/// overshot its own bound by +260ms to +1138ms, so at a 2,000ms budget the
+/// watchdog fired first and the command reported
+/// `watchdog-timeout-uncommitted-mutation` with no attribution at all.
+///
+/// That is the shape the flake was observed in, and it explains why raising the
+/// budget never moved the failure rate: the router's bound and the watchdog are
+/// both derived from the same budget, so they scale together and stay within a
+/// coin flip of each other at every budget
+/// (AGEN-RALLY-CLI-DURABILITY-m1dn22wz37g8c73m747d3).
+pub(crate) fn probe_live_within(
     repo_root: &Path,
     rally_dir: &Path,
     engagement: Option<String>,
+    remaining: Duration,
 ) -> Result<Option<RoutedRoomStore>> {
     let canonical = store::canonical_repo_root_string(repo_root);
-    let Some(identity) = probe_identity(rally_dir, &canonical)? else {
+    let Some(identity) = probe_identity_within(rally_dir, &canonical, remaining)? else {
         return Ok(None);
     };
     let resolved_engagement = store::resolve_active_engagement_with_env(rally_dir, engagement);
@@ -369,30 +404,6 @@ pub(crate) fn probe_live(
         log_dir: rally_dir.join(store::LOG_DIRNAME),
         claim_index_path: rally_dir.join(claim_authority::CLAIM_INDEX_FILENAME),
     }))
-}
-
-/// Bounded-block corridor (L12/ADR-01): re-probe until `bound` elapses. Used
-/// ONLY when the SH try-lock was refused (a daemon holds EX but hadn't
-/// answered a ping yet). Returns `None` once the bound is exhausted; the
-/// caller (`store.rs`'s router) turns that into the fail-loud
-/// `wedged_daemon_error`.
-pub(crate) fn probe_live_bounded(
-    repo_root: &Path,
-    rally_dir: &Path,
-    engagement: Option<String>,
-    bound: Duration,
-) -> Result<Option<RoutedRoomStore>> {
-    let deadline = Instant::now() + bound;
-    loop {
-        if let Some(routed) = probe_live(repo_root, rally_dir, engagement.clone())? {
-            return Ok(Some(routed));
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return Ok(None);
-        }
-        std::thread::sleep(CORRIDOR_RETRY_SLEEP.min(deadline.saturating_duration_since(now)));
-    }
 }
 
 /// Stable query context for a mutation whose wire outcome is unknown.
@@ -876,6 +887,9 @@ impl RoutedRoomStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The production path no longer keeps its own deadline here (the router
+    // owns it and passes what remains), so `Instant` is a test-only import.
+    use std::time::Instant;
 
     #[test]
     fn wire_not_started_reconstructs_the_direct_error_class() {
