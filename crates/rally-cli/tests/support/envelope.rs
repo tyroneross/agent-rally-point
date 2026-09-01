@@ -71,9 +71,12 @@ pub fn watchdog_diagnosis(body: &Value) -> Option<String> {
     Some(format!(
         "the command hit the wall-clock watchdog ({code}, budget/elapsed {elapsed}ms) \
          and never reached the code path under test. This is NOT the refusal this \
-         assertion is about. Raise the budget at the ONE place it is set — \
-         TEST_WATCHDOG_TIMEOUT_MS in tests/support/rally_cmd.rs — or find what held \
-         the command; do not add a per-call-site override"
+         assertion is about. FIND WHAT HELD THE COMMAND FIRST: a mutating command \
+         has been measured stalling past 30s before its durable append commits \
+         (AGEN-RALLY-CLI-DURABILITY-m1dn22wz37g8c73m747d3), so a timeout here is \
+         more likely that stall than a budget that is too small. Do not add a \
+         per-call-site override; the budget lives at exactly one place, \
+         TEST_WATCHDOG_TIMEOUT_MS in tests/support/rally_cmd.rs"
     ))
 }
 

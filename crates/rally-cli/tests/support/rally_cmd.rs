@@ -38,13 +38,28 @@ use std::process::Command;
 ///
 /// Sized against two failure modes, not against a benchmark:
 ///
-/// * **Too low** and a loaded machine turns a passing test red at random.
-///   Ten times the production budget clears every observed slow window
-///   (the worst measured single-command wall clock under four parallel
-///   Rust compiles was well under a second; 3000ms was tripped by
-///   scheduling latency, not by work).
+/// * **Too low** and ordinary scheduling latency turns a passing test red.
 /// * **Too high** and a genuinely wedged command hangs the suite instead of
 ///   failing it. 30s is still a bound a human will wait through.
+///
+/// # This budget does NOT make the suite green, and must not be raised
+///
+/// Measured 2026-08-31, unsandboxed, on an otherwise-quiet machine: 20
+/// isolation runs of `referenced_handoff_targeting` at this 30s budget
+/// produced 1 failure, the same 1-in-20 rate measured before the budget
+/// moved off the 3000ms production default. The failing run took 33.26s
+/// against a 5-7s norm, and the envelope was
+/// `watchdog-timeout-uncommitted-mutation` at `timeout_ms: 30000`.
+/// `attribution.rs` blew its own 20s budget the same way in the same
+/// session.
+///
+/// Three seconds is plausibly scheduling jitter. Thirty is not. So a
+/// second, product-side cause sits underneath the missing-choke-point one:
+/// a mutating command occasionally stalls for tens of seconds before its
+/// durable append commits. That is tracked as
+/// `AGEN-RALLY-CLI-DURABILITY-m1dn22wz37g8c73m747d3`, and raising this
+/// number again would only widen the window it hides in. Fifteen files
+/// already tried that one call site at a time.
 ///
 /// Must stay inside `MIN_WATCHDOG_TIMEOUT_MS..=MAX_WATCHDOG_TIMEOUT_MS`
 /// (100..60_000) or the CLI clamps it and this constant stops meaning what
