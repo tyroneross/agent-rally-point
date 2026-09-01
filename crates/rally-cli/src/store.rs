@@ -7,7 +7,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Seek, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -225,6 +225,15 @@ mod unix_lock {
 
     unsafe extern "C" {
         pub(crate) fn flock(fd: i32, operation: i32) -> i32;
+        /// `getppid(2)`. Used only to stamp a lock holder's parent so a waiter
+        /// can tell a test's own direct child from a detached grandchild.
+        pub(crate) fn getppid() -> i32;
+        /// `kill(2)` with signal 0 — the POSIX liveness probe. Used only to
+        /// decide whether a lock-holder STAMP is live or stale. Declared here
+        /// rather than taken as a dependency, matching this module's existing
+        /// hand-declared `flock` (the crate keeps a zero-extra-dependency
+        /// contract).
+        pub(crate) fn kill(pid: i32, sig: i32) -> i32;
     }
 }
 
@@ -2967,6 +2976,183 @@ fn open_named_lock_file(rally_dir: &Path, filename: &str) -> Result<fs::File> {
         .map_err(RallyError::io(format!("open {}", path.display())))
 }
 
+/// Identity a waiter reads back out of a contended lock file.
+///
+/// `held_for` is derived from the stamp's wall-clock timestamp, so it is only
+/// as good as the clock; it is diagnostic text, never a control input.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub(crate) struct LockHolderStamp {
+    pub(crate) pid: i32,
+    pub(crate) ppid: Option<i32>,
+    pub(crate) role: String,
+    pub(crate) verb: String,
+    pub(crate) held_for: Option<Duration>,
+    /// `false` means the stamp is STALE: the stamping process is gone, so the
+    /// kernel already released its lock and whoever holds it now never stamped.
+    pub(crate) alive: bool,
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for LockHolderStamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pid={}", self.pid)?;
+        if let Some(ppid) = self.ppid {
+            write!(f, " ppid={ppid}")?;
+        }
+        write!(f, " role={} verb={}", self.role, self.verb)?;
+        if let Some(held) = self.held_for {
+            write!(f, " held_for={}ms", held.as_millis())?;
+        }
+        write!(
+            f,
+            " {}",
+            if self.alive {
+                "(alive)"
+            } else {
+                "(stamp is STALE — that process is gone)"
+            }
+        )
+    }
+}
+
+/// The leading positional words of this invocation, e.g. `say-handoff` or
+/// `daemon-serve`.
+///
+/// Deliberately narrow: only `^[a-z][a-z0-9-]*$` tokens, at most two, stopping
+/// at the first flag. Subcommand names are a closed vocabulary this crate
+/// defines; argument VALUES are user content (subjects, refs, session ids) and
+/// must never be copied into a file that outlives the command.
+#[cfg(unix)]
+fn holder_verb() -> String {
+    let words: Vec<String> = env::args()
+        .skip(1)
+        .take_while(|arg| {
+            !arg.starts_with('-')
+                && !arg.is_empty()
+                && arg
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        })
+        .take(2)
+        .collect();
+    if words.is_empty() {
+        "unknown".to_string()
+    } else {
+        words.join("-")
+    }
+}
+
+#[cfg(unix)]
+fn unix_millis_now() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// Stamp this process's identity into a named lock file it has just acquired
+/// EXCLUSIVELY.
+///
+/// # Why the lock file carries a body
+///
+/// `flock` is anonymous. A waiter that loses the race learns exactly one bit —
+/// `EWOULDBLOCK` — and nothing about who holds the lock. That is why the
+/// direct-route busy timeout could only ever say "something has it" and refer
+/// the operator to `rally daemon status`, which runs AFTER the contender has
+/// already exited and therefore reports a healthy room. A 30-second stall was
+/// legible as a duration and illegible as a cause.
+///
+/// The EX holder is the one process that can name itself, and on these files it
+/// is also the only writer — SH holders never write, and a second EX holder
+/// cannot exist by definition — so writing identity into the lock body is
+/// race-free with respect to the lock it describes.
+///
+/// Best-effort by construction: a failed stamp must never fail an acquisition
+/// the kernel already granted. A STALE stamp (holder died, kernel released the
+/// lock, nobody re-stamped) is disambiguated on read by a liveness probe.
+#[cfg(unix)]
+fn stamp_exclusive_holder(file: &fs::File, role: &str) {
+    let line = format!(
+        "pid={} ppid={} role={} verb={} since_unix_ms={}\n",
+        std::process::id(),
+        unsafe { unix_lock::getppid() },
+        role,
+        holder_verb(),
+        unix_millis_now(),
+    );
+    let mut handle = file;
+    let _ = handle.rewind();
+    let _ = handle.write_all(line.as_bytes());
+    let _ = handle.flush();
+    let _ = handle.set_len(line.len() as u64);
+}
+
+/// `ESRCH` — "no such process". 3 on both macOS and Linux.
+///
+/// Matched on the RAW errno rather than [`io::ErrorKind`] because Rust does not
+/// map `ESRCH` to `NotFound` (that is `ENOENT`); it falls through to
+/// `Uncategorized`, so an `ErrorKind` comparison reports every dead process as
+/// alive. Caught by `a_stale_stamp_is_reported_as_stale_rather_than_as_the_contender`,
+/// which saw an exited pid reported as the live contender.
+#[cfg(unix)]
+const ESRCH: i32 = 3;
+
+/// POSIX liveness: `kill(pid, 0)`. `Ok` ⇒ alive. `EPERM` ⇒ the process exists
+/// but is not ours ⇒ alive. Only [`ESRCH`] proves death, and an unreadable
+/// errno reports alive, so an ambiguous probe never downgrades a real contender
+/// to a stale stamp.
+#[cfg(unix)]
+fn stamped_pid_is_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    if unsafe { unix_lock::kill(pid, 0) } == 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() != Some(ESRCH)
+}
+
+/// Read back the holder stamp from a named lock file, if one is legible.
+///
+/// `None` means nothing has ever stamped this file (or the body is not a stamp)
+/// — which for a CONTENDED lock is itself evidence: the holder is a build that
+/// predates stamping, or a process that took the lock by some path that does
+/// not stamp.
+#[cfg(unix)]
+pub(crate) fn read_exclusive_holder(rally_dir: &Path, filename: &str) -> Option<LockHolderStamp> {
+    let body = fs::read_to_string(rally_dir.join(filename)).ok()?;
+    let mut pid = None;
+    let mut ppid = None;
+    let mut role = None;
+    let mut verb = None;
+    let mut since = None;
+    for field in body.lines().next()?.split_whitespace() {
+        let (key, value) = field.split_once('=')?;
+        match key {
+            "pid" => pid = value.parse::<i32>().ok(),
+            "ppid" => ppid = value.parse::<i32>().ok(),
+            "role" => role = Some(value.to_string()),
+            "verb" => verb = Some(value.to_string()),
+            "since_unix_ms" => since = value.parse::<u128>().ok(),
+            _ => {}
+        }
+    }
+    let pid = pid?;
+    Some(LockHolderStamp {
+        pid,
+        ppid,
+        role: role.unwrap_or_else(|| "unknown".to_string()),
+        verb: verb.unwrap_or_else(|| "unknown".to_string()),
+        held_for: since.and_then(|since| {
+            u64::try_from(unix_millis_now().saturating_sub(since))
+                .ok()
+                .map(Duration::from_millis)
+        }),
+        alive: stamped_pid_is_alive(pid),
+    })
+}
+
 /// Try to acquire the ownership lock SHARED, non-blocking (ADR-01 direct-open
 /// branch). `Ok(Some(guard))` ⇒ provably no daemon holds EX ⇒ the caller may
 /// open facts.db directly (and MUST hold the guard for its process lifetime,
@@ -3013,6 +3199,7 @@ pub(crate) fn acquire_owner_exclusive_blocking(rally_dir: &Path) -> Result<Owner
             source: io::Error::last_os_error(),
         });
     }
+    stamp_exclusive_holder(&file, "daemon-owner");
     Ok(OwnerGuard { file })
 }
 
@@ -3047,6 +3234,7 @@ pub(crate) fn acquire_owner_exclusive_bounded(
                     path.display()
                 )));
             }
+            stamp_exclusive_holder(&file, "daemon-owner");
             return Ok(OwnerGuard { file });
         }
         let source = io::Error::last_os_error();
@@ -3080,6 +3268,7 @@ pub(crate) fn acquire_named_exclusive_nb(
     let file = open_named_lock_file(rally_dir, filename)?;
     let rc = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_EX | unix_lock::LOCK_NB) };
     if rc == 0 {
+        stamp_exclusive_holder(&file, filename.trim_end_matches(".lock"));
         return Ok(Some(OwnerGuard { file }));
     }
     let err = io::Error::last_os_error();
@@ -3776,12 +3965,82 @@ fn release_direct_owner_for_ack_poll(rally_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn direct_owner_busy_unknown_error(bound: Duration) -> RallyError {
+/// Which of the two locks the router was still losing on when its wait expired.
+///
+/// The two are not the same failure. `DirectExclusive` means another DIRECT
+/// command owns the room and has not exited. `DaemonExclusion` means a daemon
+/// holds the owner lock EX, so direct opening is correctly forbidden — and the
+/// stall is then entirely about why that daemon's socket did not answer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RouteBlockedOn {
+    DirectExclusive,
+    DaemonExclusion,
+}
+
+impl RouteBlockedOn {
+    fn label(self) -> &'static str {
+        match self {
+            Self::DirectExclusive => "direct.owner.lock (another direct command owns the room)",
+            Self::DaemonExclusion => {
+                "rallyd.owner.lock (a daemon holds the room, but its socket did not answer)"
+            }
+        }
+    }
+}
+
+/// Report what the router OBSERVED at the moment its wait expired, not just how
+/// long it waited.
+///
+/// # Why this text exists
+///
+/// The prior message named a duration and a remedy (`rally daemon status`) and
+/// no cause. Both halves were unusable in the case that actually occurs: by the
+/// time an operator runs `daemon status`, the contender has exited and the room
+/// reports healthy, so a 30-second stall left no evidence at all of who held
+/// the lock. Every diagnosis of this failure so far has therefore been reached
+/// by reading code rather than by observing a run.
+///
+/// The contender's own identity is on disk while it holds the lock
+/// ([`stamp_exclusive_holder`]), so the waiter reads it and reports it. Naming
+/// which lock blocked, who holds it, and whether that holder is still alive is
+/// the difference between "something was slow" and a pid to go look at.
+#[cfg(unix)]
+fn direct_route_contention_report(rally_dir: &Path, blocked_on: RouteBlockedOn) -> String {
+    let mut parts = vec![format!("blocked on {}", blocked_on.label())];
+    let self_pid = i32::try_from(std::process::id()).unwrap_or(-1);
+    for filename in [DIRECT_OWNER_LOCK_FILENAME, RALLYD_OWNER_LOCK_FILENAME] {
+        match read_exclusive_holder(rally_dir, filename) {
+            // The waiter re-takes and re-stamps direct EX on every retry before
+            // the daemon-exclusion SH refuses it, so on that path the newest
+            // stamp is its own. Saying so keeps the report from presenting this
+            // process to itself as the contender.
+            Some(stamp) if stamp.pid == self_pid => {
+                parts.push(format!("{filename} last stamped by THIS process"));
+            }
+            Some(stamp) => parts.push(format!("{filename} last stamped by {stamp}")),
+            None => parts.push(format!("{filename} carries no holder stamp")),
+        }
+    }
+    parts.push(store_client::daemon_route_state(rally_dir));
+    format!("observed: {}", parts.join("; "))
+}
+
+#[cfg(not(unix))]
+fn direct_route_contention_report(_rally_dir: &Path, _blocked_on: RouteBlockedOn) -> String {
+    "observed: lock-holder attribution is unix-only".to_string()
+}
+
+fn direct_owner_busy_unknown_error(
+    rally_dir: &Path,
+    bound: Duration,
+    blocked_on: RouteBlockedOn,
+) -> RallyError {
     RallyError::Command(format!(
         "direct-store-busy-unknown: could not establish exclusive direct ownership or a live \
-         daemon route within {}ms; no facts.db write was attempted. Run `rally daemon status`; \
+         daemon route within {}ms; no facts.db write was attempted. {}. Run `rally daemon status`; \
          if the daemon is wedged, run `rally daemon stop` before retrying",
-        bound.as_millis()
+        bound.as_millis(),
+        direct_route_contention_report(rally_dir, blocked_on)
     ))
 }
 
@@ -3814,18 +4073,26 @@ fn acquire_direct_ownership_or_route_bounded(
         if process_owns_direct_room(rally_dir) {
             return Ok(None);
         }
-        if let Some(direct_owner) = acquire_direct_owner_exclusive_nb(rally_dir)? {
-            match acquire_owner_shared_nb(rally_dir)? {
+        // Which lock refused THIS attempt. Recorded per iteration rather than
+        // accumulated: the report wants the state at the moment the wait
+        // expired, and an earlier iteration's refusal may name a contender that
+        // has since exited.
+        let blocked_on = match acquire_direct_owner_exclusive_nb(rally_dir)? {
+            Some(direct_owner) => match acquire_owner_shared_nb(rally_dir)? {
                 Some(daemon_exclusion) => {
                     install_direct_owner_once(rally_dir, direct_owner, daemon_exclusion);
                     return Ok(None);
                 }
-                None => drop(direct_owner),
-            }
-        }
+                None => {
+                    drop(direct_owner);
+                    RouteBlockedOn::DaemonExclusion
+                }
+            },
+            None => RouteBlockedOn::DirectExclusive,
+        };
         let now = Instant::now();
         if now >= deadline {
-            return Err(direct_owner_busy_unknown_error(bound));
+            return Err(direct_owner_busy_unknown_error(rally_dir, bound, blocked_on));
         }
         thread::sleep(RETRY_SLEEP.min(deadline.saturating_duration_since(now)));
     }

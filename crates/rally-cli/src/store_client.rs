@@ -58,6 +58,45 @@ use crate::store::{
 /// hold the daemon's own copy of it.
 const ADDR_FILENAME: &str = "rallyd.sock.addr";
 
+/// Describe the daemon discovery pointer as it stands right now, WITHOUT
+/// probing.
+///
+/// The router's busy timeout needs to distinguish three states that produce
+/// identical `EWOULDBLOCK` symptoms: no daemon was ever here (no pointer), a
+/// daemon published a pointer and then died (pointer present, socket file
+/// gone), and a daemon is present and holding the room but not answering
+/// (pointer and socket both present). Only the third explains a stall that runs
+/// the full bound, because only there does every probe pay the full
+/// [`PROBE_TIMEOUT`] before failing.
+///
+/// Deliberately does not ping: this runs on a path that has already exhausted
+/// its wall-clock budget, and one more 3s probe would push the caller past the
+/// watchdog that is about to fire.
+pub(crate) fn daemon_route_state(rally_dir: &Path) -> String {
+    let addr_path = rally_dir.join(ADDR_FILENAME);
+    let Ok(text) = std::fs::read_to_string(&addr_path) else {
+        return format!(
+            "{ADDR_FILENAME} absent (no daemon has published a socket for this room)"
+        );
+    };
+    let socket = PathBuf::from(text.trim());
+    if socket.as_os_str().is_empty() {
+        return format!("{ADDR_FILENAME} present but empty");
+    }
+    if socket.exists() {
+        format!(
+            "{ADDR_FILENAME} -> {} (socket file present, so every probe paid the full {}ms probe timeout)",
+            socket.display(),
+            PROBE_TIMEOUT.as_millis()
+        )
+    } else {
+        format!(
+            "{ADDR_FILENAME} -> {} (socket file MISSING — the pointer is stale: the daemon exited without clearing it, or the socket was removed underneath it)",
+            socket.display()
+        )
+    }
+}
+
 /// Per-attempt connect+read/write timeout for the identity probe (used both
 /// standalone and inside the bounded-block corridor). Mirrors
 /// `daemon_client::DAEMON_TIMEOUT` — ADR-01 names this the corridor's
