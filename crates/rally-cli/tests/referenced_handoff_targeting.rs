@@ -7,10 +7,22 @@ use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+// The rally binary is spawned through the shared choke point so this file
+// cannot silently inherit the production 3s watchdog budget again. Included
+// by path rather than via `mod support;` so the unrelated ChannelSandbox is
+// not compiled into this binary.
+#[path = "support/envelope.rs"]
+mod envelope;
+#[path = "support/rally_cmd.rs"]
+mod rally_cmd;
+
+use envelope::{assert_refusal, reject_watchdog};
+use rally_cmd::rally_command;
 
 struct Room {
     cwd: PathBuf,
@@ -42,7 +54,7 @@ impl Room {
 
     fn run(&self, session: &str, args: &[&str]) -> Output {
         let inherited = std::env::var("PATH").unwrap_or_default();
-        Command::new(env!("CARGO_BIN_EXE_rally"))
+        rally_command()
             .current_dir(&self.cwd)
             .env("HOME", &self.home)
             .env("RALLY_HOOKS", "off")
@@ -64,7 +76,7 @@ impl Room {
 
     fn run_managed(&self, session: &str, args: &[&str]) -> Output {
         let inherited = std::env::var("PATH").unwrap_or_default();
-        Command::new(env!("CARGO_BIN_EXE_rally"))
+        rally_command()
             .current_dir(&self.cwd)
             .env("HOME", &self.home)
             .env("RALLY_HOOKS", "off")
@@ -78,25 +90,32 @@ impl Room {
     }
 
     fn json(&self, session: &str, args: &[&str]) -> Value {
-        let out = self.run(session, args);
-        let bytes = if out.stdout.is_empty() {
-            &out.stderr
-        } else {
-            &out.stdout
-        };
-        serde_json::from_slice(bytes)
-            .unwrap_or_else(|e| panic!("{args:?}: {e}: {}", String::from_utf8_lossy(bytes)))
+        Self::parse(args, self.run(session, args))
     }
 
     fn json_managed(&self, session: &str, args: &[&str]) -> Value {
-        let out = self.run_managed(session, args);
+        Self::parse(args, self.run_managed(session, args))
+    }
+
+    /// Parse a command's JSON envelope, refusing to hand back a watchdog
+    /// envelope.
+    ///
+    /// This is the choke point for the SILENT half of the watchdog bug. Every
+    /// `ok`-only assertion in this file — 23 of them assert `ok == true`, one
+    /// asserts `ok == false` — is satisfiable by a watchdog envelope, because
+    /// four of the five emission sites are `ok: false` and the post-commit
+    /// projection-abandoned one is `ok: true`. Rejecting the shape once here
+    /// means no assertion downstream has to remember to.
+    fn parse(args: &[&str], out: Output) -> Value {
         let bytes = if out.stdout.is_empty() {
             &out.stderr
         } else {
             &out.stdout
         };
-        serde_json::from_slice(bytes)
-            .unwrap_or_else(|e| panic!("{args:?}: {e}: {}", String::from_utf8_lossy(bytes)))
+        let value: Value = serde_json::from_slice(bytes)
+            .unwrap_or_else(|e| panic!("{args:?}: {e}: {}", String::from_utf8_lossy(bytes)));
+        reject_watchdog(&value, &format!("{args:?}"));
+        value
     }
 
     fn artifact(&self) -> (String, String) {
@@ -167,7 +186,7 @@ struct Daemon(Child);
 impl Daemon {
     fn start(room: &Room) -> Self {
         let inherited = std::env::var("PATH").unwrap_or_default();
-        let child = Command::new(env!("CARGO_BIN_EXE_rally"))
+        let child = rally_command()
             .current_dir(&room.cwd)
             .env("HOME", &room.home)
             .env("RALLY_HOOKS", "off")
@@ -222,13 +241,7 @@ fn referenced_handoff_blocks_wrong_target_before_append_and_binds_author_session
             "--json",
         ],
     );
-    assert_eq!(wrong["ok"], false);
-    assert!(
-        wrong["error"]
-            .as_str()
-            .unwrap()
-            .contains("handoff_target_mismatch")
-    );
+    assert_refusal(&wrong, "handoff_target_mismatch");
     let before = room.json("session-reviewer", &["room", "--json"]);
     assert_eq!(
         before["data"]["room"]["open_handoffs"]
@@ -311,13 +324,7 @@ fn retry_is_idempotent_and_only_exact_bound_receiver_can_reply() {
             "--json",
         ],
     );
-    assert_eq!(spoof["ok"], false);
-    assert!(
-        spoof["error"]
-            .as_str()
-            .unwrap()
-            .contains("handoff_reply_author_mismatch")
-    );
+    assert_refusal(&spoof, "handoff_reply_author_mismatch");
 
     let reply = room.json(
         "session-author",
@@ -381,13 +388,7 @@ fn third_party_cannot_bypass_a_bound_receiver_or_implicit_reply_state() {
             "--json",
         ],
     );
-    assert_eq!(implicit["ok"], false);
-    assert!(
-        implicit["error"]
-            .as_str()
-            .unwrap()
-            .contains("handoff_reply_state_required")
-    );
+    assert_refusal(&implicit, "handoff_reply_state_required");
 
     let attacker_session = room.adopt("attacker", "attacker:x", "pane-one");
     let bypass = room.json(
@@ -410,13 +411,7 @@ fn third_party_cannot_bypass_a_bound_receiver_or_implicit_reply_state() {
             "--json",
         ],
     );
-    assert_eq!(bypass["ok"], false);
-    assert!(
-        bypass["error"]
-            .as_str()
-            .unwrap()
-            .contains("handoff_third_party_reply_forbidden")
-    );
+    assert_refusal(&bypass, "handoff_third_party_reply_forbidden");
 
     let snapshot = room.json("session-author", &["room", "--json"]);
     let reply_count = snapshot["data"]["room"]["open_handoffs"]
@@ -514,14 +509,7 @@ fn handoff_correlation_comes_from_the_cited_fact_not_a_planted_marker() {
             "--json",
         ],
     );
-    assert_eq!(explicit["ok"], false, "{explicit}");
-    assert!(
-        explicit["error"]
-            .as_str()
-            .unwrap()
-            .contains("handoff_correlation_mismatch"),
-        "{explicit}"
-    );
+    assert_refusal(&explicit, "handoff_correlation_mismatch");
 }
 
 #[test]
@@ -546,13 +534,7 @@ fn third_party_resolution_is_exact_and_rejects_zero_multi_and_stale_sessions() {
             "--json",
         ],
     );
-    assert_eq!(zero["ok"], false);
-    assert!(
-        zero["error"]
-            .as_str()
-            .unwrap()
-            .contains("handoff_target_zero_match")
-    );
+    assert_refusal(&zero, "handoff_target_zero_match");
 
     let first = room.adopt("review-one", "reviewer:shared", "pane-one");
     let _second = room.adopt("review-two", "reviewer:shared", "pane-two");
@@ -574,13 +556,7 @@ fn third_party_resolution_is_exact_and_rejects_zero_multi_and_stale_sessions() {
             "--json",
         ],
     );
-    assert_eq!(multi["ok"], false);
-    assert!(
-        multi["error"]
-            .as_str()
-            .unwrap()
-            .contains("handoff_target_multi_match")
-    );
+    assert_refusal(&multi, "handoff_target_multi_match");
 
     let exact = room.json(
         "session-reviewer",
@@ -643,13 +619,7 @@ fn third_party_resolution_is_exact_and_rejects_zero_multi_and_stale_sessions() {
             "--json",
         ],
     );
-    assert_eq!(stale["ok"], false);
-    assert!(
-        stale["error"]
-            .as_str()
-            .unwrap()
-            .contains("handoff_target_zero_match")
-    );
+    assert_refusal(&stale, "handoff_target_zero_match");
 }
 
 #[test]
@@ -749,13 +719,7 @@ fn default_ref_author_rejects_a_stale_managed_author() {
             "--json",
         ],
     );
-    assert_eq!(rejected["ok"], false);
-    assert!(
-        rejected["error"]
-            .as_str()
-            .unwrap()
-            .contains("handoff_target_stale_or_unknown")
-    );
+    assert_refusal(&rejected, "handoff_target_stale_or_unknown");
 }
 
 #[test]
@@ -799,13 +763,7 @@ fn retry_key_requires_full_semantics_and_protocol_namespace_is_reserved() {
             "--json",
         ],
     );
-    assert_eq!(conflict["ok"], false);
-    assert!(
-        conflict["error"]
-            .as_str()
-            .unwrap()
-            .contains("handoff_idempotency_conflict")
-    );
+    assert_refusal(&conflict, "handoff_idempotency_conflict");
     let changed_correlation = room.json(
         "session-reviewer",
         &[
@@ -826,13 +784,7 @@ fn retry_key_requires_full_semantics_and_protocol_namespace_is_reserved() {
             "--json",
         ],
     );
-    assert_eq!(changed_correlation["ok"], false);
-    assert!(
-        changed_correlation["error"]
-            .as_str()
-            .unwrap()
-            .contains("handoff_correlation_mismatch")
-    );
+    assert_refusal(&changed_correlation, "handoff_correlation_mismatch");
 
     let spoof = room.json(
         "session-reviewer",
@@ -850,13 +802,7 @@ fn retry_key_requires_full_semantics_and_protocol_namespace_is_reserved() {
             "--json",
         ],
     );
-    assert_eq!(spoof["ok"], false);
-    assert!(
-        spoof["error"]
-            .as_str()
-            .unwrap()
-            .contains("handoff_protocol_evidence_reserved")
-    );
+    assert_refusal(&spoof, "handoff_protocol_evidence_reserved");
 
     let unreferenced_spoof = room.json(
         "session-reviewer",
@@ -874,13 +820,7 @@ fn retry_key_requires_full_semantics_and_protocol_namespace_is_reserved() {
             "--json",
         ],
     );
-    assert_eq!(unreferenced_spoof["ok"], false);
-    assert!(
-        unreferenced_spoof["error"]
-            .as_str()
-            .unwrap()
-            .contains("handoff_protocol_evidence_reserved")
-    );
+    assert_refusal(&unreferenced_spoof, "handoff_protocol_evidence_reserved");
 }
 
 #[test]

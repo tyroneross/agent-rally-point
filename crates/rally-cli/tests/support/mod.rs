@@ -10,3 +10,7 @@
 //! from in P3).
 
 pub mod channel_sandbox;
+/// Envelope-shape assertions: tell a typed refusal from a watchdog timeout.
+pub mod envelope;
+/// The ONE way to spawn the `rally` binary from a test.
+pub mod rally_cmd;
