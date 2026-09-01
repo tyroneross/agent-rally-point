@@ -170,10 +170,27 @@ echo "check-release-parity: host integration tests" >&2
 if ! python3 -m unittest \
   tests/scripts/test_generate_host_surfaces.py \
   tests/scripts/test_sync_host_integrations.py \
-  tests/scripts/test_check_command_conformance.py >&2; then
+  tests/scripts/test_check_command_conformance.py \
+  tests/scripts/test_lint_sibling_asymmetry.py >&2; then
   echo "check-release-parity: HOST GENERATOR/RECONCILER TESTS FAILED" >&2
   fail=1
 fi
+
+# --- sibling asymmetry ----------------------------------------------------
+# Name the peer file that omits what its peers set.
+#
+# ADVISORY. The lint exits 0 whatever it finds, and this gate does not read its
+# status: `--strict` stays off until its precision is measured out-of-sample.
+# Today it is 2 of 2 on a denominator of 2, with the refinement predicate chosen
+# AFTER seeing the corpus, so a strict gate here would be a rule fitted to its
+# own training set.
+#
+# It runs on BOTH paths — here and in .github/workflows/ci.yml — because
+# `.githooks/pre-push` invokes this script specifically so local and CI cannot
+# silently diverge. Wiring the lint into CI alone would have created exactly
+# the divergence that arrangement exists to prevent.
+echo "check-release-parity: sibling-asymmetry lint (advisory)" >&2
+python3 scripts/lint_sibling_asymmetry.py >&2 || true
 # Run EVERY suite in tests/hooks/, not a hand-maintained list.
 #
 # This was a hardcoded list of three files. Four suites existed that it never
