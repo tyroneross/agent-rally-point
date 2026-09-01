@@ -16,6 +16,38 @@ conformance dependency invoked by the release script. Release CI can therefore
 exercise the intended success and failure contracts instead of exiting early
 because the fixture omitted `scripts/check_command_conformance.py`.
 
+### Fixed — tests no longer inherit the production watchdog budget by omission
+
+Every `rally-cli` test file built its own binary invocation, so each one
+independently inherited the 3-second production watchdog budget
+(`DEFAULT_WATCHDOG_TIMEOUT_MS`) and had to remember to override it. Fifteen files
+had added their own `--timeout-ms` workaround; the one that had not was the one
+that flaked. Tests now have a single place to spawn the binary
+(`tests/support/rally_cmd.rs`) which carries a test-appropriate budget, and
+`referenced_handoff_targeting.rs` is migrated onto it. Production behavior is
+unchanged: `DEFAULT_WATCHDOG_TIMEOUT_MS` remains 3000.
+
+### Fixed — a watchdog timeout can no longer be read as a typed refusal
+
+On timeout the watchdog returns `ok:false` with `error` as an object, or with no
+`error` field, while typed refusals carry `error` as a string. Assertions that
+checked only `ok == false` were therefore satisfied by a timeout and could pass
+for the wrong reason. Envelope parsing now rejects a watchdog envelope loudly
+(`tests/support/envelope.rs`) instead of panicking on a shape mismatch or
+silently accepting it.
+
+### Added — `scripts/lint_sibling_asymmetry.py`
+
+Flags the minority of peer test files that omit a property their siblings set.
+WARN-only, exit 0, and not yet wired into a gate.
+
+### Fixed — release gate tolerates independent projection warnings and slow hosts
+
+`retrospective_sanitizer.rs` now asserts its required append warning appears
+exactly once rather than requiring it to be the only warning, and
+`json_envelope_contract.rs` gives the `owners` contract an explicit budget
+because it scans git state and was measuring the watchdog rather than the schema.
+
 ## 0.2.6
 
 ### Added — unverified handoff closures are labeled `resolved-unverified`
