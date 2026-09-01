@@ -3016,20 +3016,50 @@ impl std::fmt::Display for LockHolderStamp {
     }
 }
 
+/// Longest token accepted into a stamped verb.
+///
+/// Every subcommand and subsubcommand this CLI defines fits well inside this;
+/// the identifiers a positional argument carries (event ids, session ids, refs)
+/// do not. It is a shape filter, not a vocabulary check.
+#[cfg(unix)]
+const MAX_VERB_TOKEN_LEN: usize = 16;
+
 /// The leading positional words of this invocation, e.g. `say-handoff` or
 /// `daemon-serve`.
 ///
-/// Deliberately narrow: only `^[a-z][a-z0-9-]*$` tokens, at most two, stopping
-/// at the first flag. Subcommand names are a closed vocabulary this crate
-/// defines; argument VALUES are user content (subjects, refs, session ids) and
-/// must never be copied into a file that outlives the command.
+/// # What this does and does not promise
+///
+/// The stamp outlives the command, so what goes into it is constrained by
+/// SHAPE, not by trusting the caller: at most two tokens, each matching
+/// `^[a-z][a-z0-9-]{0,15}$`, stopping at the first flag.
+///
+/// That admits subcommand names, which is the intent, and rejects the
+/// positional VALUES this CLI actually passes — event ids, session ids and refs
+/// are longer than [`MAX_VERB_TOKEN_LEN`] or carry characters outside the set.
+/// It is not a proof: a short all-lowercase positional value would pass. So the
+/// honest statement is that the verb is a short lowercase token, and nothing
+/// sensitive can be expressed in one — not that argument values are structurally
+/// excluded. Anything with real content (subjects, bodies, paths, targets)
+/// arrives behind a flag and is cut off before the filter is even reached.
+///
+/// The file itself is `.rally/*.lock`, repo-local and gitignored, so this never
+/// leaves the machine through this path.
 #[cfg(unix)]
 fn holder_verb() -> String {
-    let words: Vec<String> = env::args()
-        .skip(1)
+    verb_from_args(env::args().skip(1))
+}
+
+/// The shape filter itself, separated from `env::args()` so it can be tested.
+/// A rule about what may outlive a command should not be checkable only by
+/// running the command.
+#[cfg(unix)]
+fn verb_from_args(args: impl Iterator<Item = String>) -> String {
+    let words: Vec<String> = args
         .take_while(|arg| {
             !arg.starts_with('-')
                 && !arg.is_empty()
+                && arg.len() <= MAX_VERB_TOKEN_LEN
+                && arg.starts_with(|c: char| c.is_ascii_lowercase())
                 && arg
                     .chars()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
@@ -21495,5 +21525,96 @@ mod resolved_unverified_tests {
         resolve.role = Some(crate::SYSTEM_ROLE.to_string());
         let snapshot = snap(vec![handoff, resolve]);
         assert!(snapshot.resolved_unverified.is_empty());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lock_holder_stamp_tests {
+    //! The lock-holder stamp outlives the command that writes it, so what may
+    //! enter it is constrained by shape rather than by trusting the caller.
+    use super::*;
+
+    fn verb(args: &[&str]) -> String {
+        verb_from_args(args.iter().map(|s| (*s).to_string()))
+    }
+
+    #[test]
+    fn subcommand_words_are_kept_and_flag_values_are_never_reached() {
+        assert_eq!(
+            verb(&["say", "handoff", "--tool", "reviewer:r", "--subject", "x"]),
+            "say-handoff"
+        );
+        assert_eq!(
+            verb(&["daemon", "serve", "--idle-exit-secs", "180"]),
+            "daemon-serve"
+        );
+        assert_eq!(verb(&["enter"]), "enter");
+    }
+
+    /// The case the doc comment has to be honest about: `rally locate <event_id>`
+    /// passes an identifier as a bare positional. The length filter is what
+    /// keeps it out of a file that outlives the command.
+    #[test]
+    fn a_positional_identifier_is_rejected_by_shape() {
+        let got = verb(&["locate", "01j8xqe4m2n7v5t3r9k1bcdefg"]);
+        assert_eq!(got, "locate", "an event id must not be stamped; got {got}");
+
+        // Upper case, punctuation, and over-length all fail the same filter.
+        assert_eq!(verb(&["locate", "01J8XQE4M2N7"]), "locate");
+        // A SHORT all-lowercase id fragment passes every other rule; only the
+        // leading-character rule rejects it. No subcommand starts with a digit.
+        assert_eq!(verb(&["locate", "01j8xq"]), "locate");
+        assert_eq!(verb(&["say", "artifact/with/path"]), "say");
+        assert_eq!(verb(&["room", &"a".repeat(MAX_VERB_TOKEN_LEN + 1)]), "room");
+        // Exactly at the cap is still a plausible subcommand and is kept.
+        assert_eq!(
+            verb(&["room", &"a".repeat(MAX_VERB_TOKEN_LEN)]),
+            format!("room-{}", "a".repeat(MAX_VERB_TOKEN_LEN))
+        );
+    }
+
+    #[test]
+    fn an_invocation_with_no_positional_words_says_unknown() {
+        assert_eq!(verb(&[]), "unknown");
+        assert_eq!(verb(&["--json"]), "unknown");
+        assert_eq!(verb(&["", "say"]), "unknown");
+    }
+
+    /// A stamp must round-trip through the reader, and a stamp for a process
+    /// that no longer exists must read as stale rather than as a live
+    /// contender. Pid 1 is always alive; a pid this test just reaped is not.
+    #[test]
+    fn a_stamp_round_trips_and_liveness_is_read_from_the_pid() {
+        let dir = std::env::temp_dir().join(format!(
+            "stamp-{}-{}",
+            std::process::id(),
+            unix_millis_now()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let file = open_named_lock_file(&dir, "probe.lock").unwrap();
+        stamp_exclusive_holder(&file, "probe");
+
+        let stamp = read_exclusive_holder(&dir, "probe.lock").expect("stamp is legible");
+        assert_eq!(stamp.pid, i32::try_from(std::process::id()).unwrap());
+        assert_eq!(stamp.role, "probe");
+        assert!(stamp.alive, "this process is running");
+        assert!(stamp.held_for.is_some());
+
+        // A pid that cannot exist: one past the top of the allocatable range.
+        fs::write(
+            dir.join("probe.lock"),
+            "pid=2147483646 role=gone verb=x since_unix_ms=1\n",
+        )
+        .unwrap();
+        let stale = read_exclusive_holder(&dir, "probe.lock").expect("stamp is legible");
+        assert!(
+            !stale.alive,
+            "a pid that does not exist must read as stale, not as the contender"
+        );
+
+        fs::write(dir.join("probe.lock"), "this is not a stamp\n").unwrap();
+        assert!(read_exclusive_holder(&dir, "probe.lock").is_none());
+
+        fs::remove_dir_all(&dir).ok();
     }
 }
