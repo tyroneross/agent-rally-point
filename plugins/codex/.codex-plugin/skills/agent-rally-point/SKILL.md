@@ -121,6 +121,33 @@ rally next --tool "$TOOL" --json
 Continue only while the next action is actionable, safe, and inside the user's
 scope.
 
+## Return-Channel Contract
+
+Every task or handoff must say how the result gets back to its intended
+recipient. Record five fields before dispatch: **recipient**, **primary
+channel**, **backup channel**, **ACK deadline**, and **fallback action**. Include
+the result date/time zone, original context, current status, and evidence or
+verification gaps in the returned payload.
+
+Use two delivery paths with different failure modes:
+
+- A `rally run`-managed session may use `rally inject --handoff <event-id>` as
+  the primary notification. The referenced targeted Rally handoff is the
+  durable backup and system of record.
+- An unmanaged agent uses a targeted Rally handoff as primary. Use a configured
+  watcher/native notification, a room-visible locator, or the human-facing
+  task reply as backup; do not pretend `rally inject` can reach it.
+- A file, dashboard, issue, review, or external document may be the primary
+  result surface. Post its absolute path or stable URL in a targeted Rally
+  handoff as the backup locator.
+
+A successful send or inject proves only that the sender or transport accepted
+the message. Only a target-authored ACK proves receipt. If the ACK deadline
+passes, execute the declared backup once and reference the original handoff;
+do not create a second task or repeatedly inject the same instruction. If the
+primary channel is unavailable at dispatch time, use the backup immediately
+and state why.
+
 ## Sending a Handoff Document
 
 When the work produces a handoff **document** rather than a task packet, the document's

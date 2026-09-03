@@ -107,6 +107,27 @@ Default communication order:
 2. Use `rally inject` to deliver the first instruction or urgent steering into a `rally run`-managed session.
 3. Use a committed handoff doc only when the payload is too long or durable enough to review outside the ledger.
 
+### Return-channel contract
+
+Every dispatched task must declare:
+
+```
+Recipient: <resolved live tool/session or human>
+Primary: <inject, targeted Rally handoff, file, dashboard, issue, or review>
+Backup: <a distinct durable or independently delivered channel>
+ACK deadline: <time or task boundary>
+Fallback: <one action if no target-authored ACK arrives>
+```
+
+Always include the result date/time zone, the original task context, status,
+and evidence gaps. For managed agents, post the durable targeted handoff and
+use `rally inject --handoff <event-id>` as the focused primary notification.
+If no target-authored ACK arrives by the deadline, publish one backup locator
+that references the original handoff or notify through the configured watcher;
+do not duplicate the task. For unmanaged agents, skip injection and use the
+targeted Rally handoff as primary. If the result lives in a file, dashboard,
+issue, or review, put its absolute path or stable URL in the backup handoff.
+
 A good handoff doc contains: mission · what's DONE (with the **canonical branch + HEAD**, build status) · PENDING in priority order · verification gaps · cleanup register · conventions/gotchas · key paths · coordination instructions.
 
 **Pin the branch.** State the canonical branch and HEAD explicitly and have the incoming session assert it (`git branch --show-current`). Worktree-isolated workers drift onto side branches and fast-forward to catch up; a handoff that says "on main" when the work is really on a feature branch will mislead the next session.
