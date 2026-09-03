@@ -859,7 +859,13 @@ fi
 # even if the binary is old/missing. macOS ships no `timeout(1)` by default,
 # so we detect a real timeout command and otherwise fall back to a portable
 # perl-alarm shim, with a pure-bash background-kill shim as last resort.
-_rally_budget_ms="${RALLY_HOOK_TIMEOUT_MS:-5000}"
+# MUST stay strictly below the host hook timeout in hooks/hooks.json (5s).
+# They were both 5000ms/5s, so the hook budgeted itself to exactly the wall
+# clock at which the host kills it: its own fail-loud fallback could never be
+# rendered and emitted in time, and the host discarded the output instead
+# ("UserPromptSubmit hook timed out after 5s"). 3000ms leaves ~2s to render and
+# return. Raise the hooks.json timeout first if this is ever raised.
+_rally_budget_ms="${RALLY_HOOK_TIMEOUT_MS:-3000}"
 _rally_budget_s=$(( (_rally_budget_ms + 999) / 1000 ))
 [ "$_rally_budget_s" -lt 1 ] && _rally_budget_s=1
 
@@ -1081,11 +1087,23 @@ process.stdout.write(new Date(Date.now() + secs * 1000).toISOString().replace(/\
 
 _rally_status_idle() {
   wake_after="$(_rally_checkin_iso)"
+  # DETACHED on purpose. This is a presence heartbeat: nothing this hook prints
+  # depends on its result. It is also a ledger MUTATION, so it pays rally's own
+  # mutation watchdog and can contend on the writer lock -- measured at ~0.27s
+  # on an idle machine and unbounded under contention. UserPromptSubmit is a
+  # BLOCKING hook (the turn waits before the prompt reaches the model), so a
+  # write on that path spends the user's latency to record something the user
+  # is not waiting for. Fire and forget instead.
+  #
+  # stdin/stdout/stderr are all redirected so the host never waits on an
+  # inherited descriptor, and the child is disowned so no job-control notice
+  # can reach the hook's own stdout (which must stay pure JSON).
   if [ -n "$wake_after" ]; then
-    rally_timeout status post --tool "$tool" --state idle --wake-after "$wake_after" --json >/dev/null 2>&1 || true
+    { rally_timeout status post --tool "$tool" --state idle --wake-after "$wake_after" --json >/dev/null 2>&1 </dev/null & } 2>/dev/null
   else
-    rally_timeout status post --tool "$tool" --state idle --json >/dev/null 2>&1 || true
+    { rally_timeout status post --tool "$tool" --state idle --json >/dev/null 2>&1 </dev/null & } 2>/dev/null
   fi
+  disown 2>/dev/null || true
 }
 
 _rally_status_working_bounded() {

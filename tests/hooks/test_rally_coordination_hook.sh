@@ -249,6 +249,26 @@ status_start_calls="$tmpdir/rally_status_start.calls"
 )
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "agents must publish state + next check-in"; fi
 
+T="budget invariant: hook self-budget stays strictly below the host hook timeout"
+(
+  # The hook and hooks.json both used to say 5s, so the hook budgeted itself to
+  # exactly the wall clock at which the host kills it -- its fail-loud fallback
+  # could never be rendered in time and the host discarded the output instead.
+  # Internal budget MUST leave headroom to render and return.
+  hook_ms="$(sed -n 's/^_rally_budget_ms="${RALLY_HOOK_TIMEOUT_MS:-\([0-9]*\)}"$/\1/p' "$HOOK" | head -1)"
+  host_s="$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(max(h.get('timeout',0) for g in d['hooks']['UserPromptSubmit'] for h in g['hooks']))" "$REPO_ROOT/hooks/hooks.json" 2>/dev/null)"
+  if [ -z "$hook_ms" ] || [ -z "$host_s" ]; then
+    printf 'could not read budgets: hook_ms=%s host_s=%s\n' "$hook_ms" "$host_s" >&2
+    exit 1
+  fi
+  if [ "$hook_ms" -ge "$(( host_s * 1000 ))" ]; then
+    printf 'hook self-budget %sms is not below host timeout %ss\n' "$hook_ms" "$host_s" >&2
+    exit 1
+  fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "self-budget must leave headroom under the host timeout"; fi
+
 T="status heartbeat: no node still publishes idle and exits 0"
 status_no_node_calls="$tmpdir/rally_status_no_node.calls"
 (
@@ -261,8 +281,24 @@ status_no_node_calls="$tmpdir/rally_status_no_node.calls"
     printf 'hook exited nonzero without node: rc=%s\n' "$rc" >&2
     exit 1
   fi
-  if ! grep -q -- 'status post --tool codex:agent-42 --state idle --json' "$status_no_node_calls"; then
-    printf 'no-node start did not publish idle status without wake-after:\n%s\n' "$(cat "$status_no_node_calls" 2>/dev/null)" >&2
+  # The presence heartbeat is published from a DETACHED child so it never
+  # blocks a prompt, so it is eventually-consistent: the call can land just
+  # after the hook exits. Poll for it instead of sampling once. The guarantee
+  # under test is unchanged -- without node, presence must still be published
+  # -- only its synchrony was relaxed. A hook that never publishes still fails
+  # here, just 3s later.
+  _published=0
+  _waited=0
+  while [ "$_waited" -lt 30 ]; do
+    if grep -q -- 'status post --tool codex:agent-42 --state idle --json' "$status_no_node_calls" 2>/dev/null; then
+      _published=1
+      break
+    fi
+    sleep 0.1
+    _waited=$(( _waited + 1 ))
+  done
+  if [ "$_published" != "1" ]; then
+    printf 'no-node start did not publish idle status without wake-after (waited 3s):\n%s\n' "$(cat "$status_no_node_calls" 2>/dev/null)" >&2
     exit 1
   fi
   exit 0
