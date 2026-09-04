@@ -7904,13 +7904,17 @@ fn command_task_worker(args: TaskWorkerArgs) -> Result<Output> {
     })?;
     let result_path = managed_task_result_path(&repo, task_id);
     let agent = AgentSpec::from_name(&session.agent)?;
-    let mut command = agent.task_command_line(&result_path)?;
+    let command = agent.task_command_line(&result_path)?;
     #[cfg(debug_assertions)]
-    if let Some(test_bin) = env::var_os("RALLY_TASK_AGENT_BIN")
-        && !test_bin.is_empty()
-    {
-        command[0] = test_bin.to_string_lossy().into_owned();
-    }
+    let command = {
+        let mut command = command;
+        if let Some(test_bin) = env::var_os("RALLY_TASK_AGENT_BIN")
+            && !test_bin.is_empty()
+        {
+            command[0] = test_bin.to_string_lossy().into_owned();
+        }
+        command
+    };
     let status = Command::new(&command[0])
         .args(&command[1..])
         .stdin(Stdio::piped())
