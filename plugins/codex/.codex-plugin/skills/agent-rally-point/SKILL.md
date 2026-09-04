@@ -276,10 +276,24 @@ the thing you are looking for.
 Use managed sessions for reliable live delivery into visible panes:
 
 ```bash
+rally run codex --backend tmux --task "<bounded prompt>" --json
 rally run claude --backend tmux --json
 rally inject <session|name|tool> --handoff <event-id> --json
 rally capture <session|name|tool> --json
 ```
+
+Prefer `rally run codex --task "<prompt>"` for one bounded Codex assignment.
+Rally passes the prompt to the long-lived `codex exec` child over private stdin,
+stores the final response under `.rally/task-results/`, then releases
+exact-session claims and closes the session. It removes a clean worktree or
+reports the recovery path for a dirty one. That exit releases the synced-task
+writer lease. Private result files remain until the operator archives or deletes
+them; Rally applies no automatic retention window. The invoking shell may retain
+the `--task` command in its history.
+Use plain `rally run codex` only when the session must remain interactive for
+later `rally inject` steering, and stop that persistent session explicitly when
+finished. A task-scoped session rejects later injection because its prompt is
+fixed at launch.
 
 Rally does not keep agents awake by itself. Treat `rally next --tool "$TOOL"
 --json` as the wake-intent check and `rally inject ... --handoff <event-id>` as

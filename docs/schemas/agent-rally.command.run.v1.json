@@ -28,7 +28,17 @@
                 "backend",
                 "cwd",
                 "target"
-              ]
+              ],
+              "properties": {
+                "task_scoped": {
+                  "type": "boolean",
+                  "description": "True when the managed process owns one prompt and exits naturally after that prompt completes. Omitted for persistent interactive sessions."
+                },
+                "task_id": {
+                  "type": "string",
+                  "description": "Unique bounded-run id used to retain one final result even when a session name is reused."
+                }
+              }
             },
             "commands": { "type": "object" }
           }

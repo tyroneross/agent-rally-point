@@ -30,12 +30,13 @@
 //! opt-out is `--shared` / `--no-worktree` on `rally run`.
 //!
 //! # Cleanup
-//! `cleanup()` removes the worktree directory and, if the per-agent
-//! branch is empty (no unmerged commits), the branch.  If the branch
-//! has unmerged commits, the worktree is removed but the branch is
-//! retained and a `git bundle` is written next to the worktree path
-//! before removal so no work is lost.  Always best-effort — a failure
-//! to clean up never blocks `rally stop`.
+//! `cleanup()` retains any worktree with modified or untracked files and
+//! returns its recovery path in a warning. For a clean worktree, it removes
+//! the directory and, if the per-agent branch is empty (no unmerged commits),
+//! the branch. If a clean branch has unmerged commits, the worktree is removed
+//! but the branch is retained and a `git bundle` is written next to the
+//! worktree path before removal so no committed work is lost. Always
+//! best-effort — a failure to clean up never blocks `rally stop`.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -165,11 +166,13 @@ pub(crate) struct CleanupOutcome {
 
 /// Remove a per-agent worktree and its branch (when safe).
 ///
-/// Bundle-before-remove: if the branch carries unmerged commits relative
-/// to the run base, this writes `<worktree-path>.bundle` first so no
-/// work is lost. Then `git worktree remove --force` removes the
-/// worktree directory and (when safe) `git branch -d` removes the
-/// branch.
+/// Dirty-worktree guard: modified or untracked files retain the worktree in
+/// place and return its recovery path in `warnings`. Bundle-before-remove:
+/// if the clean branch carries unmerged commits relative to the run base,
+/// this writes `<worktree-path>.bundle` first so no committed work is lost.
+/// Then non-forcing `git worktree remove` performs Git's own final dirtiness
+/// check before removing the worktree directory, and (when safe) `git branch
+/// -d` removes the branch.
 ///
 /// This function is best-effort: errors are folded into the `warnings`
 /// list rather than returned, so a stale leftover worktree never
@@ -181,6 +184,60 @@ pub(crate) fn cleanup(
     git_bin: &str,
 ) -> CleanupOutcome {
     let mut warnings = Vec::new();
+
+    // Never force-remove a dirty worktree. A bundle protects commits, but it
+    // cannot preserve modified or untracked files. If status cannot be read,
+    // retain the worktree as the conservative recovery path.
+    if worktree_path.exists() {
+        let status = Command::new(git_bin)
+            .arg("-C")
+            .arg(worktree_path)
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output();
+        match status {
+            Ok(out) if out.status.success() && out.stdout.is_empty() => {}
+            Ok(out) if out.status.success() => {
+                warnings.push(format!(
+                    "rally stop: retained dirty worktree for recovery at {}",
+                    worktree_path.display()
+                ));
+                return CleanupOutcome {
+                    worktree_removed: false,
+                    branch_deleted: false,
+                    bundle_path: None,
+                    warnings,
+                    bundle_failed: false,
+                };
+            }
+            Ok(out) => {
+                warnings.push(format!(
+                    "rally stop: could not inspect worktree {}; retained it for recovery: {}",
+                    worktree_path.display(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+                return CleanupOutcome {
+                    worktree_removed: false,
+                    branch_deleted: false,
+                    bundle_path: None,
+                    warnings,
+                    bundle_failed: false,
+                };
+            }
+            Err(err) => {
+                warnings.push(format!(
+                    "rally stop: could not inspect worktree {}; retained it for recovery: {err}",
+                    worktree_path.display()
+                ));
+                return CleanupOutcome {
+                    worktree_removed: false,
+                    branch_deleted: false,
+                    bundle_path: None,
+                    warnings,
+                    bundle_failed: false,
+                };
+            }
+        }
+    }
     let base = run_base(repo_root, git_bin).unwrap_or_else(|_| "HEAD".to_string());
 
     // 1. If the branch has unmerged commits, bundle before remove.
@@ -236,7 +293,11 @@ pub(crate) fn cleanup(
         bundle_failed = false;
     }
 
-    // 2. Remove the worktree directory.
+    // 2. Remove the worktree directory without --force. Git performs the
+    //    final dirtiness check, closing the gap between our diagnostic preflight
+    //    above and the removal attempt. A refusal retains the recovery path;
+    //    never fall back to remove_dir_all because it cannot protect a writer
+    //    racing with cleanup.
     let mut worktree_removed = false;
     if worktree_path.exists() {
         let remove = Command::new(git_bin)
@@ -244,27 +305,16 @@ pub(crate) fn cleanup(
             .arg(repo_root)
             .arg("worktree")
             .arg("remove")
-            .arg("--force")
             .arg(worktree_path)
             .output();
         match remove {
             Ok(out) if out.status.success() => worktree_removed = true,
             Ok(out) => {
                 warnings.push(format!(
-                    "rally stop: `git worktree remove --force {}` failed: {}",
+                    "rally stop: `git worktree remove {}` refused cleanup; retained it for recovery: {}",
                     worktree_path.display(),
                     String::from_utf8_lossy(&out.stderr).trim()
                 ));
-                // Last-resort fallback: rm -rf the directory and try a prune.
-                if std::fs::remove_dir_all(worktree_path).is_ok() {
-                    worktree_removed = true;
-                    let _ = Command::new(git_bin)
-                        .arg("-C")
-                        .arg(repo_root)
-                        .arg("worktree")
-                        .arg("prune")
-                        .output();
-                }
             }
             Err(err) => warnings.push(format!(
                 "rally stop: could not invoke git worktree remove: {err}"
@@ -572,6 +622,48 @@ mod tests {
             "unmerged branch should still be present after cleanup"
         );
 
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn cleanup_retains_dirty_worktree_and_uncommitted_files() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = tmp_dir("cleanup-dirty");
+        init_test_repo(&repo);
+        fs::write(repo.join("tracked.txt"), b"base").unwrap();
+        crate::test_git_fixture::fixture_git(&repo, &["add", "tracked.txt"]);
+        crate::test_git_fixture::fixture_git(&repo, &["commit", "-m", "tracked base"]);
+        let pw = provision(&repo, "dirty-worker-01", "git").expect("provision");
+
+        fs::write(pw.path.join("tracked.txt"), b"modified").unwrap();
+        fs::write(pw.path.join("untracked.txt"), b"uncommitted").unwrap();
+        let outcome = cleanup(&repo, &pw.path, &pw.branch, "git");
+
+        assert!(!outcome.worktree_removed);
+        assert!(!outcome.branch_deleted);
+        assert!(pw.path.exists(), "dirty worktree must remain recoverable");
+        assert_eq!(fs::read(pw.path.join("tracked.txt")).unwrap(), b"modified");
+        assert_eq!(
+            fs::read(pw.path.join("untracked.txt")).unwrap(),
+            b"uncommitted"
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(pw.path.to_string_lossy().as_ref())),
+            "warning must include recovery path: {:?}",
+            outcome.warnings
+        );
+
+        // Return the fixture to a clean state so the test can remove it.
+        fs::write(pw.path.join("tracked.txt"), b"base").unwrap();
+        fs::remove_file(pw.path.join("untracked.txt")).unwrap();
+        let final_cleanup = cleanup(&repo, &pw.path, &pw.branch, "git");
+        assert!(final_cleanup.worktree_removed);
         fs::remove_dir_all(&repo).ok();
     }
 }

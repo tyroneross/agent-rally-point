@@ -295,7 +295,7 @@ fn temp_path(name: &str) -> PathBuf {
     ))
 }
 
-fn canonical_fact_count(cwd: &Path, kind: &str, ref_id: &str) -> usize {
+fn canonical_fact_rows(cwd: &Path) -> Vec<Value> {
     fs::read_dir(cwd.join(".rally/log"))
         .unwrap()
         .filter_map(Result::ok)
@@ -308,6 +308,12 @@ fn canonical_fact_count(cwd: &Path, kind: &str, ref_id: &str) -> usize {
                 .collect::<Vec<_>>()
         })
         .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+        .collect()
+}
+
+fn canonical_fact_count(cwd: &Path, kind: &str, ref_id: &str) -> usize {
+    canonical_fact_rows(cwd)
+        .into_iter()
         .filter(|row| row["payload"]["kind"] == kind && row["payload"]["ref"] == ref_id)
         .count()
 }
@@ -324,6 +330,14 @@ fn write_executable(path: &Path, body: &str) {
 fn git_available() -> bool {
     Command::new("git")
         .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+fn tmux_available() -> bool {
+    Command::new("tmux")
+        .arg("-V")
         .output()
         .map(|out| out.status.success())
         .unwrap_or(false)
@@ -1835,7 +1849,22 @@ fn rally_stop_tombstones_session_when_backend_stop_fails() {
     let session_id = run["data"]["run"]["session"]["session_id"]
         .as_str()
         .unwrap();
-
+    let tool = run["data"]["run"]["session"]["tool"].as_str().unwrap();
+    let claim = workspace.json_with_session(
+        session_id,
+        &[
+            "say",
+            "claim",
+            "--json",
+            "--tool",
+            tool,
+            "--subject",
+            "managed session claim",
+            "--path",
+            "src/managed.rs",
+        ],
+    );
+    let claim_id = claim["data"]["say"]["fact"]["event_id"].as_str().unwrap();
     let stop = workspace.json(&["stop", session_id, "--json", "--tmux-bin", "/usr/bin/false"]);
     assert_eq!(stop["schema"], "agent-rally.command.session-action.v1");
     assert_eq!(stop["data"]["stop"]["session"]["session_id"], session_id);
@@ -1848,6 +1877,15 @@ fn rally_stop_tombstones_session_when_backend_stop_fails() {
             .len(),
         0,
         "explicit stop must tombstone the session even when backend stop fails"
+    );
+    let room = workspace.json(&["room", "--json"]);
+    assert!(
+        room["data"]["room"]["active_claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|claim| claim["event_id"] != claim_id),
+        "explicit stop must release a normalized managed-session claim: {room:#}"
     );
 
     workspace.cleanup();
@@ -2989,7 +3027,18 @@ fn rally_uses_native_cmux_managed_session_commands() {
         .unwrap();
     let cmux_layout: serde_json::Value = serde_json::from_str(cmux_layout).unwrap();
     assert_eq!(cmux_layout["pane"]["surfaces"][0]["type"], "terminal");
-    assert_eq!(cmux_layout["pane"]["surfaces"][0]["command"], "codex");
+    let cmux_command = cmux_layout["pane"]["surfaces"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert!(
+        cmux_command.contains("RALLY_SESSION_ID=codex-cmux-builder-01"),
+        "{cmux_command}"
+    );
+    assert!(
+        cmux_command.contains("RALLY_TOOL_ID=codex:cmux-builder-01"),
+        "{cmux_command}"
+    );
+    assert!(cmux_command.ends_with(" codex"), "{cmux_command}");
 
     let cmux_inject = workspace.json(&[
         "inject",
@@ -5988,6 +6037,825 @@ fn rally_run_dry_run_reports_planned_worktree_without_touching_disk() {
         "dry-run must not create the worktree on disk"
     );
 
+    workspace.cleanup();
+}
+
+/// Bounded Codex work is launched through Rally's lifecycle worker, carries
+/// the registered identity, and never exposes its prompt in the command plan.
+#[test]
+fn rally_run_codex_task_renders_one_shot_command_and_lifecycle() {
+    let _run_guard = serialize_rally_run();
+    let workspace = Workspace::new("rally-run-codex-task");
+    let prompt = "inspect graph latency; do not mutate state";
+
+    let run = workspace.json(&[
+        "run",
+        "codex",
+        "--json",
+        "--dry-run",
+        "--shared",
+        "--name",
+        "graph-worker",
+        "--tool",
+        "codex:graph-worker",
+        "--task",
+        prompt,
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+
+    assert_eq!(run["data"]["run"]["session"]["task_scoped"], true);
+    let session_id = run["data"]["run"]["session"]["session_id"]
+        .as_str()
+        .unwrap();
+    let start = run["data"]["run"]["commands"]["start"][0]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        start.contains(&format!("RALLY_SESSION_ID={session_id}")),
+        "{start}"
+    );
+    assert!(
+        start.contains("RALLY_TOOL_ID=codex:graph-worker"),
+        "{start}"
+    );
+    assert!(start.contains("RALLY_MANAGED_SESSION_MODE=task"), "{start}");
+    assert!(start.contains("task-worker --session-id"), "{start}");
+    assert!(
+        !start.contains(prompt),
+        "task prompt leaked in argv: {start}"
+    );
+
+    let persistent = workspace.json(&[
+        "run",
+        "codex",
+        "--json",
+        "--dry-run",
+        "--shared",
+        "--name",
+        "persistent-worker",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    assert!(persistent["data"]["run"]["session"]["task_scoped"].is_null());
+    let persistent_start = persistent["data"]["run"]["commands"]["start"][0]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        persistent_start.contains("RALLY_MANAGED_SESSION_MODE=persistent"),
+        "{persistent_start}"
+    );
+    assert!(
+        !persistent_start.contains("codex exec"),
+        "{persistent_start}"
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_run_codex_task_exits_captures_result_and_cleans_lifecycle() {
+    if !git_available() || !tmux_available() {
+        return;
+    }
+    let _run_guard = serialize_rally_run();
+    let workspace = real_repo_workspace("rally-run-codex-task-lifecycle");
+    let fake_codex = workspace.cwd.join("fake-codex.sh");
+    let prompt_capture = workspace.cwd.join("captured-prompt.txt");
+    let argv_capture = workspace.cwd.join("captured-argv.txt");
+    write_executable(
+        &fake_codex,
+        r#"#!/bin/sh
+result=""
+printf '%s\n' "$*" > "$RALLY_TEST_ARGV_CAPTURE"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output-last-message|-o)
+      result="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+prompt=$(cat)
+printf '%s' "$prompt" > "$RALLY_TEST_PROMPT_CAPTURE"
+printf 'completed: %s\n' "$prompt" > "$result"
+"#,
+    );
+
+    let prompt = "-review resume exact prompt";
+    let output = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .current_dir(&workspace.cwd)
+        .env("HOME", &workspace.home)
+        .env("RALLY_DAEMON_AUTOSTART", "0")
+        .env("RALLY_TASK_AGENT_BIN", &fake_codex)
+        .env("RALLY_TEST_PROMPT_CAPTURE", &prompt_capture)
+        .env("RALLY_TEST_ARGV_CAPTURE", &argv_capture)
+        .args([
+            "run",
+            "codex",
+            "--json",
+            "--name",
+            "bounded-lifecycle",
+            "--task",
+            prompt,
+            "--backend",
+            "tmux",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr={} stdout={}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let run: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let session_id = run["data"]["run"]["session"]["session_id"]
+        .as_str()
+        .unwrap();
+    let task_id = run["data"]["run"]["session"]["task_id"].as_str().unwrap();
+    let target = run["data"]["run"]["session"]["target"].as_str().unwrap();
+    let worktree = PathBuf::from(
+        run["data"]["run"]["session"]["worktree_path"]
+            .as_str()
+            .unwrap(),
+    );
+    let command_plan = run["data"]["run"]["commands"].to_string();
+    assert!(
+        !command_plan.contains(prompt),
+        "prompt leaked: {command_plan}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        let live = Command::new("tmux")
+            .args(["has-session", "-t", target])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !live {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !Command::new("tmux")
+            .args(["has-session", "-t", target])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false),
+        "task tmux session stayed live"
+    );
+
+    assert_eq!(fs::read_to_string(&prompt_capture).unwrap(), prompt);
+    let child_argv = fs::read_to_string(&argv_capture).unwrap();
+    assert!(
+        child_argv.contains("exec --output-last-message"),
+        "{child_argv}"
+    );
+    assert!(child_argv.ends_with("-- -\n"), "{child_argv}");
+    assert!(!child_argv.contains(prompt), "prompt leaked in child argv");
+
+    let sessions = workspace.json(&["sessions", "--json"]);
+    assert!(
+        sessions["data"]["sessions"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|session| session["session"]["session_id"] != session_id)
+    );
+    assert!(!worktree.exists(), "task worktree was not removed");
+
+    let result_path = workspace
+        .cwd
+        .join(".rally/task-results")
+        .join(format!("{task_id}.md"));
+    assert_eq!(
+        fs::read_to_string(&result_path).unwrap(),
+        format!("completed: {prompt}\n")
+    );
+    assert_eq!(
+        fs::metadata(&result_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(
+        !workspace
+            .cwd
+            .join(".rally/task-input")
+            .join(format!("{session_id}.prompt"))
+            .exists()
+    );
+
+    let artifacts = workspace.json(&["artifacts", "--json"]);
+    assert!(
+        artifacts
+            .to_string()
+            .contains(result_path.to_string_lossy().as_ref())
+    );
+
+    // Reusing the same session name for a prompt equal to a Codex subcommand
+    // still treats it as stdin task text and preserves a distinct result.
+    let second_prompt = "review";
+    let second_output = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .current_dir(&workspace.cwd)
+        .env("HOME", &workspace.home)
+        .env("RALLY_DAEMON_AUTOSTART", "0")
+        .env("RALLY_TASK_AGENT_BIN", &fake_codex)
+        .env("RALLY_TEST_PROMPT_CAPTURE", &prompt_capture)
+        .env("RALLY_TEST_ARGV_CAPTURE", &argv_capture)
+        .args([
+            "run",
+            "codex",
+            "--json",
+            "--shared",
+            "--name",
+            "bounded-lifecycle",
+            "--task",
+            second_prompt,
+            "--backend",
+            "tmux",
+        ])
+        .output()
+        .unwrap();
+    assert!(second_output.status.success());
+    let second: Value = serde_json::from_slice(&second_output.stdout).unwrap();
+    let second_task_id = second["data"]["run"]["session"]["task_id"]
+        .as_str()
+        .unwrap();
+    let second_target = second["data"]["run"]["session"]["target"].as_str().unwrap();
+    assert_ne!(second_task_id, task_id);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline
+        && Command::new("tmux")
+            .args(["has-session", "-t", second_target])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let second_result = workspace
+        .cwd
+        .join(".rally/task-results")
+        .join(format!("{second_task_id}.md"));
+    assert_eq!(
+        fs::read_to_string(&second_result).unwrap(),
+        "completed: review\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&result_path).unwrap(),
+        format!("completed: {prompt}\n")
+    );
+    assert_eq!(fs::read_to_string(&prompt_capture).unwrap(), second_prompt);
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_run_codex_task_completion_preserves_same_tool_sibling_claim() {
+    if !git_available() || !tmux_available() {
+        return;
+    }
+    let _run_guard = serialize_rally_run();
+    let workspace = real_repo_workspace("rally-run-codex-task-sibling-claim");
+    let fake_codex = workspace.cwd.join("fake-codex-wait.sh");
+    write_executable(
+        &fake_codex,
+        r#"#!/bin/sh
+result=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output-last-message|-o)
+      result="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+release_file=$(cat)
+while [ ! -e "$release_file" ]; do
+  sleep 0.05
+done
+printf 'completed after release\n' > "$result"
+"#,
+    );
+
+    let release_a = workspace.cwd.join("release-a");
+    let release_b = workspace.cwd.join("release-b");
+    let launch = |name: &str, release: &Path| {
+        let output = Command::new(env!("CARGO_BIN_EXE_rally"))
+            .current_dir(&workspace.cwd)
+            .env("HOME", &workspace.home)
+            .env("RALLY_DAEMON_AUTOSTART", "0")
+            .env("RALLY_TASK_AGENT_BIN", &fake_codex)
+            .args([
+                "run",
+                "codex",
+                "--json",
+                "--shared",
+                "--name",
+                name,
+                "--tool",
+                "codex:shared-task",
+                "--task",
+                release.to_str().unwrap(),
+                "--backend",
+                "tmux",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "launch failed: stderr={} stdout={}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let run_a = launch("claim-owner-a", &release_a);
+    let run_b = launch("claim-owner-b", &release_b);
+    let session_a = run_a["data"]["run"]["session"]["session_id"]
+        .as_str()
+        .unwrap();
+    let session_b = run_b["data"]["run"]["session"]["session_id"]
+        .as_str()
+        .unwrap();
+    let target_a = run_a["data"]["run"]["session"]["target"].as_str().unwrap();
+    let target_b = run_b["data"]["run"]["session"]["target"].as_str().unwrap();
+
+    let claim_a = workspace.json_with_session(
+        session_a,
+        &[
+            "say",
+            "claim",
+            "--json",
+            "--tool",
+            "codex:shared-task",
+            "--subject",
+            "task A claim",
+            "--path",
+            "src/task-a.rs",
+        ],
+    );
+    let claim_b = workspace.json_with_session(
+        session_b,
+        &[
+            "say",
+            "claim",
+            "--json",
+            "--tool",
+            "codex:shared-task",
+            "--subject",
+            "task B claim",
+            "--path",
+            "src/task-b.rs",
+        ],
+    );
+    let claim_a_id = claim_a["data"]["say"]["fact"]["event_id"].as_str().unwrap();
+    let claim_b_id = claim_b["data"]["say"]["fact"]["event_id"].as_str().unwrap();
+
+    fs::write(&release_a, "release\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline
+        && Command::new("tmux")
+            .args(["has-session", "-t", target_a])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !Command::new("tmux")
+            .args(["has-session", "-t", target_a])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false),
+        "completed task A remained live"
+    );
+    let room = workspace.json(&["room", "--json"]);
+    let active_claims = room["data"]["room"]["active_claims"].as_array().unwrap();
+    assert!(
+        active_claims
+            .iter()
+            .all(|claim| claim["event_id"] != claim_a_id),
+        "completed task retained its own claim: {room:#}"
+    );
+    assert!(
+        active_claims
+            .iter()
+            .any(|claim| claim["event_id"] == claim_b_id),
+        "task completion released the same-tool sibling claim: {room:#}"
+    );
+    let release_facts = canonical_fact_rows(&workspace.cwd)
+        .into_iter()
+        .filter(|row| row["payload"]["kind"] == "release" && row["payload"]["ref"] == claim_a_id)
+        .collect::<Vec<_>>();
+    assert_eq!(release_facts.len(), 1, "expected one exact release fact");
+    assert_eq!(
+        release_facts[0]["payload"]["from_session_id"],
+        format!("sess:managed:{session_a}#live"),
+        "release fact must use the claimant's normalized managed lease"
+    );
+
+    fs::write(&release_b, "release\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline
+        && Command::new("tmux")
+            .args(["has-session", "-t", target_b])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !Command::new("tmux")
+            .args(["has-session", "-t", target_b])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false),
+        "completed task B remained live"
+    );
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_inject_rejects_task_scoped_session() {
+    let _run_guard = serialize_rally_run();
+    let workspace = Workspace::new("rally-inject-task-scoped");
+    let run = workspace.json(&[
+        "run",
+        "codex",
+        "--json",
+        "--shared",
+        "--name",
+        "one-shot",
+        "--task",
+        "bounded work",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    let session_id = run["data"]["run"]["session"]["session_id"]
+        .as_str()
+        .unwrap();
+
+    let output = workspace.output(&[
+        "inject",
+        session_id,
+        "--text",
+        "second prompt",
+        "--json",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    assert!(!output.status.success());
+    let body = String::from_utf8_lossy(if output.stdout.is_empty() {
+        &output.stderr
+    } else {
+        &output.stdout
+    });
+    assert!(body.contains("task-scoped"), "{body}");
+    assert!(body.contains("prompt was fixed at launch"), "{body}");
+
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_run_codex_task_retains_and_reports_dirty_worktree() {
+    if !git_available() || !tmux_available() {
+        return;
+    }
+    let _run_guard = serialize_rally_run();
+    let workspace = real_repo_workspace("rally-run-codex-task-dirty-worktree");
+    let fake_codex = workspace.cwd.join("fake-codex-dirty.sh");
+    write_executable(
+        &fake_codex,
+        r#"#!/bin/sh
+result=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output-last-message|-o)
+      result="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+prompt=$(cat)
+printf 'uncommitted: %s\n' "$prompt" > agent-output.txt
+printf 'completed: %s\n' "$prompt" > "$result"
+"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .current_dir(&workspace.cwd)
+        .env("HOME", &workspace.home)
+        .env("RALLY_DAEMON_AUTOSTART", "0")
+        .env("RALLY_TASK_AGENT_BIN", &fake_codex)
+        .args([
+            "run",
+            "codex",
+            "--json",
+            "--name",
+            "dirty-task",
+            "--task",
+            "produce a local draft",
+            "--backend",
+            "tmux",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr={} stdout={}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let run: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let session_id = run["data"]["run"]["session"]["session_id"]
+        .as_str()
+        .unwrap();
+    let target = run["data"]["run"]["session"]["target"].as_str().unwrap();
+    let worktree = PathBuf::from(
+        run["data"]["run"]["session"]["worktree_path"]
+            .as_str()
+            .unwrap(),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline
+        && Command::new("tmux")
+            .args(["has-session", "-t", target])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(worktree.exists(), "dirty worktree must remain recoverable");
+    assert_eq!(
+        fs::read_to_string(worktree.join("agent-output.txt")).unwrap(),
+        "uncommitted: produce a local draft\n"
+    );
+    let sessions = workspace.json(&["sessions", "--json"]);
+    assert!(
+        sessions["data"]["sessions"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|session| session["session"]["session_id"] != session_id)
+    );
+    let artifacts = workspace.json(&["artifacts", "--json"]);
+    let artifact_text = artifacts.to_string();
+    assert!(
+        artifact_text.contains("worktree_retained:"),
+        "{artifact_text}"
+    );
+    assert!(
+        artifact_text.contains(worktree.to_string_lossy().as_ref()),
+        "{artifact_text}"
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_run_codex_task_reaps_child_when_stdin_write_fails() {
+    if !git_available() || !tmux_available() {
+        return;
+    }
+    let _run_guard = serialize_rally_run();
+    let workspace = real_repo_workspace("rally-run-codex-task-broken-stdin");
+    let fake_codex = workspace.cwd.join("fake-codex-broken-stdin.py");
+    let pid_capture = workspace.cwd.join("child-pid.txt");
+    write_executable(
+        &fake_codex,
+        r#"#!/usr/bin/python3
+import os
+import time
+
+with open(os.environ["RALLY_TEST_CHILD_PID_CAPTURE"], "w", encoding="utf-8") as handle:
+    handle.write(str(os.getpid()))
+os.close(0)
+time.sleep(30)
+"#,
+    );
+    // Exceed a typical pipe buffer so the child closing stdin forces EPIPE
+    // even if the writer begins before the Python process reaches os.close().
+    let prompt = "x".repeat(96 * 1024);
+    let output = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .current_dir(&workspace.cwd)
+        .env("HOME", &workspace.home)
+        .env("RALLY_DAEMON_AUTOSTART", "0")
+        .env("RALLY_TASK_AGENT_BIN", &fake_codex)
+        .env("RALLY_TEST_CHILD_PID_CAPTURE", &pid_capture)
+        .args([
+            "run",
+            "codex",
+            "--json",
+            "--name",
+            "broken-stdin",
+            "--task",
+            &prompt,
+            "--backend",
+            "tmux",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let run: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let session_id = run["data"]["run"]["session"]["session_id"]
+        .as_str()
+        .unwrap();
+    let target = run["data"]["run"]["session"]["target"].as_str().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline
+        && (!pid_capture.exists()
+            || Command::new("tmux")
+                .args(["has-session", "-t", target])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false))
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let child_pid = fs::read_to_string(&pid_capture)
+        .expect("fake child must publish its pid before closing")
+        .trim()
+        .to_string();
+    assert!(
+        !Command::new("kill")
+            .args(["-0", &child_pid])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false),
+        "stdin failure left child pid {child_pid} alive"
+    );
+    let sessions = workspace.json(&["sessions", "--json"]);
+    assert!(
+        sessions["data"]["sessions"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|session| session["session"]["session_id"] != session_id)
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_run_codex_task_unlink_failure_never_starts_child() {
+    if !git_available() || !tmux_available() {
+        return;
+    }
+    let _run_guard = serialize_rally_run();
+    let workspace = real_repo_workspace("rally-run-codex-task-unlink-failure");
+    let fake_codex = workspace.cwd.join("fake-codex-must-not-start.sh");
+    let started_capture = workspace.cwd.join("child-started.txt");
+    write_executable(
+        &fake_codex,
+        r#"#!/bin/sh
+printf 'started\n' > "$RALLY_TEST_PROMPT_CAPTURE"
+cat >/dev/null
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .current_dir(&workspace.cwd)
+        .env("HOME", &workspace.home)
+        .env("RALLY_DAEMON_AUTOSTART", "0")
+        .env("RALLY_TASK_AGENT_BIN", &fake_codex)
+        .env("RALLY_TEST_PROMPT_CAPTURE", &started_capture)
+        .env("RALLY_TEST_TASK_INPUT_UNLINK_FAILURE", "1")
+        .args([
+            "run",
+            "codex",
+            "--json",
+            "--name",
+            "unlink-failure",
+            "--task",
+            "must remain private",
+            "--backend",
+            "tmux",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let run: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let session_id = run["data"]["run"]["session"]["session_id"]
+        .as_str()
+        .unwrap();
+    let target = run["data"]["run"]["session"]["target"].as_str().unwrap();
+    let prompt_path = workspace
+        .cwd
+        .join(".rally/task-input")
+        .join(format!("{session_id}.prompt"));
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline
+        && Command::new("tmux")
+            .args(["has-session", "-t", target])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !started_capture.exists(),
+        "child started despite unlink failure"
+    );
+    assert!(
+        prompt_path.exists(),
+        "failed unlink must leave an explicit stale-session recovery path"
+    );
+
+    let reap = workspace.json(&["sessions", "--reap", "--json"]);
+    assert!(
+        reap["data"]["sessions"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|session| session["session"]["session_id"] != session_id)
+    );
+    assert!(
+        !prompt_path.exists(),
+        "stale-session reap must remove input"
+    );
+
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_run_task_rejects_unsupported_agent_before_session_reservation() {
+    let _run_guard = serialize_rally_run();
+    let workspace = Workspace::new("rally-run-unsupported-task");
+    let output = workspace.output(&[
+        "run",
+        "claude",
+        "--task",
+        "bounded work",
+        "--json",
+        "--shared",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    assert!(!output.status.success());
+    let body = String::from_utf8_lossy(if output.stdout.is_empty() {
+        &output.stderr
+    } else {
+        &output.stdout
+    });
+    assert!(
+        body.contains("--task is not supported for claude"),
+        "{body}"
+    );
+
+    if workspace.cwd.join(".rally").exists() {
+        let sessions = workspace.json(&["sessions", "--json"]);
+        assert!(
+            sessions["data"]["sessions"]["sessions"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "unsupported task mode must not reserve a managed session"
+        );
+    }
     workspace.cleanup();
 }
 

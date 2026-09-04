@@ -162,10 +162,13 @@ When work spans hosts, terminals, or machines, use managed rally sessions instea
 subagents:
 
 ```bash
-# AGENT is a positional (claude | codex | …); pick a backend you have installed.
-rally run <agent> --name <session> --backend tmux --tool <TOOL> --json   # start a managed session
-# Deliver work as a handoff FACT, then inject its event id (inject takes --handoff/--text, not a file):
-rally say handoff --tool <TOOL> --target <session> --subject "<task.intent>" --json   # → returns <event-id>
+# Bounded Codex work: create the durable handoff, then launch the one task atomically.
+rally say handoff --tool <sender> --target <TOOL> --subject "<task.intent>" --json   # → <event-id>
+rally run codex --name <session> --backend tmux --tool <TOOL> \
+  --task "Read Rally handoff <event-id>, complete it, and publish the required artifact/resolve facts." --json
+
+# Use plain run + inject only for a deliberately persistent, steerable session.
+rally run <agent> --name <session> --backend tmux --tool <TOOL> --json
 rally inject <session> --handoff <event-id> --require-ack --json
 ```
 

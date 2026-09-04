@@ -170,14 +170,15 @@ Use a distinct `--tool` value for every concurrent session, such as `codex:parse
 Rally can launch and message managed coding-agent sessions across supported hosts:
 
 - **`rally run`** launches Claude, Codex, OpenCode, or Gemini through a managed backend. It assigns a unique Rally identity and creates a dedicated linked worktree by default, so the session can be listed, captured, attached to, and stopped predictably.
+- **`rally run codex --task "<prompt>"`** launches bounded Codex work through `codex exec`; Rally feeds the long-lived child over stdin, preserves the final response under `.rally/task-results/`, and automatically closes the session when the task completes. Result files are private local artifacts (mode `0600`) that persist until the operator archives or deletes them; Rally does not apply an automatic retention window. It removes a clean worktree or retains a dirty one with a recovery path. Plain `rally run codex` remains interactive and persistent. The invoking shell may retain the `--task` command in its history.
 - **`rally inject`** queues a prompt or recorded handoff for an existing managed session. It does not target arbitrary terminals. A successful inject means the message was enqueued; the receiving agent's own acknowledgement proves receipt.
 
 Inspect the launch plan before starting the session:
 
 ```bash
-rally run codex --name parser --dry-run --json
-rally run codex --name parser --json
-rally inject parser --text "Review the parser and report findings." --json
+rally run codex --name parser --task "Review the parser and report findings." --dry-run --json
+rally run codex --name parser --task "Review the parser and report findings." --json
+# Use plain run + inject only when the session must remain open for later steering.
 ```
 
 Longer handoffs should remain durable in the Rally ledger or a committed handoff document; injection is the focused delivery path. See [Handoffs and Launching Agents](docs/HANDOFFS-AND-LAUNCHING-AGENTS.md) for backend and acknowledgement details.
@@ -343,14 +344,14 @@ From an initialized target repository, inspect the launch plan first. `rally run
 
 ```bash
 rally run claude --name ui-review --dry-run --json
-rally run codex  --name parser --dry-run --json
+rally run codex  --name parser --task "Review the parser and report findings." --dry-run --json
 ```
 
 Check `data.run.session.tool` and `worktree_path` in each response, then launch only the agents you intend to use:
 
 ```bash
 rally run claude --name ui-review
-rally run codex  --name parser
+rally run codex  --name parser --task "Review the parser and report findings."
 rally sessions --json
 ```
 

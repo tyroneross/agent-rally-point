@@ -9,7 +9,8 @@ Terminal redesign).
 
 ```bash
 cd <repo>                                   # rally is repo-local — cwd must be the repo
-rally run <claude|codex|opencode|gemini> --name <label>
+rally run codex --name <label> --task "<bounded prompt>"  # exits when done
+rally run <claude|codex|opencode|gemini> --name <label>   # persistent TUI
 rally inject <session> --text "<prompt>"    # deliver and submit the first instruction
 rally capture <session> --lines 30          # snapshot what it's doing
 rally attach <session>                      # watch live  ·  rally stop <session> to halt
@@ -17,13 +18,25 @@ rally attach <session>                      # watch live  ·  rally stop <sessio
 
 ## 1. Launching a managed agent
 
-`rally run <claude|codex|opencode|gemini> [--name <label>] [--backend tmux|cmux] [--dry-run] [--json]`
+`rally run <claude|codex|opencode|gemini> [--name <label>] [--task <prompt>] [--backend tmux|cmux] [--dry-run] [--json]`
 
 - **Always `--dry-run --json` first** to see the exact `tmux new-session …` command and the resolved `session_id` / `target` / `tool` before spawning.
 - Run ids auto-number active agents: `claude-<label>-01`, `tool=claude_code:<label>-01`. The tmux target is `rally-<agent>-<label>-NN`.
 - Default backend is `tmux`; `cmux` launches into cmux instead. The legacy `herdr` backend (and its `--herdr-bin` / `--herdr-socket` flags) were removed in Plan F. For Easy Terminal / ptyd integration, use the `.rally` ledger directly: rally writes Directives and the `rally-termd` daemon subscribes.
 - Self-relaunch guard: an agent hosted by an Easy Terminal socket must not launch a build/relaunch lane back into its own host. Start build/relaunch workers outside that ET instance, or detach first; `RALLY_ALLOW_SELF_HOSTED_ET_LAUNCH=1` is only for a consciously detached/non-relaunch launch.
-- The agent starts at its normal prompt with **auto mode on** (Claude Code) — it does nothing until you inject an instruction.
+- `rally run codex --task "<prompt>"` is the bounded path. It starts
+  `codex exec` with the prompt on stdin, stores the last response under
+  `.rally/task-results/`, then releases exact-session claims, closes the managed
+  session, and removes its worktree when clean. A dirty worktree remains at the
+  reported recovery path. The prompt and result files use private permissions.
+  Result files are durable local artifacts and remain until the operator
+  archives or deletes them; Rally applies no automatic retention window. The
+  prompt descriptor is unlinked before the child starts. This removes
+  the prompt from the long-lived child argv and run JSON; the invoking shell may
+  still retain the `--task` command. A task-scoped session cannot accept a later
+  `rally inject`; start a persistent session when steering is required.
+- Without `--task`, the agent starts at its normal prompt with **auto mode on**
+  (Claude Code) and remains persistent until you stop it.
 
 ## 2. Injecting the instruction
 

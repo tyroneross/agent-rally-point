@@ -5,7 +5,7 @@
 
 use chrono::{SecondsFormat, Utc};
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
@@ -748,6 +748,16 @@ fn first_positional_is_long_running_watch(args: &[String]) -> bool {
         .any(|a| a == "--once" || a == "--print-launchd" || a == "--print-systemd")
 }
 
+/// `task-worker` owns a child agent for the full duration of one task. Its
+/// lifetime is intentionally bounded by that child, not by the 3s hook
+/// watchdog used for ordinary Rally commands.
+fn first_positional_is_task_worker(args: &[String]) -> bool {
+    args.iter()
+        .find(|arg| !arg.starts_with('-'))
+        .map(String::as_str)
+        == Some("task-worker")
+}
+
 /// True iff the leading two positionals are `hook before-write`.
 ///
 /// F-4: `command_hook`'s contract is "the exit code is ALWAYS 0" -- the phase
@@ -952,7 +962,7 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
     // outlives any finite hook budget by design. See
     // `first_positional_is_long_running_watch`. `watch --once` deliberately
     // does NOT take this path and keeps its watchdog.
-    if first_positional_is_long_running_watch(&args) {
+    if first_positional_is_long_running_watch(&args) || first_positional_is_task_worker(&args) {
         return run_inline(strip_timeout_flag(args));
     }
 
@@ -1591,6 +1601,7 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
         CliCommand::Check(args) => command_check(args),
         CliCommand::Hook(args) => command_hook(args),
         CliCommand::Run(args) => command_run(args),
+        CliCommand::TaskWorker(args) => command_task_worker(args),
         CliCommand::Sessions(args) => command_sessions(args),
         CliCommand::Inject(args) => command_inject(args),
         CliCommand::SessionLifecycle(args) => command_session_lifecycle(args),
@@ -7276,6 +7287,156 @@ fn command_hook(args: HookArgs) -> Result<Output> {
     }
 }
 
+/// Build the exact child argv for a managed session. The registered Rally
+/// identity is inherited by host hooks and skill bootstrap, so the child cannot
+/// silently enter the room under a second derived tool/session id.
+fn managed_agent_command(agent: &AgentSpec, session: &ManagedSession) -> Result<Vec<String>> {
+    let agent_command = if session.task_scoped {
+        let executable = env::current_exe().map_err(RallyError::io("resolve rally executable"))?;
+        cmd![
+            executable.display(),
+            "task-worker",
+            "--session-id",
+            &session.session_id
+        ]
+    } else {
+        agent.command_line(&session.name)
+    };
+    let mode = if session.task_scoped {
+        "task"
+    } else {
+        "persistent"
+    };
+    let mut command = vec![
+        "env".to_string(),
+        format!("RALLY_SESSION_ID={}", session.session_id),
+        format!("RALLY_AGENT_ID={}", session.session_id),
+        format!("RALLY_TOOL_ID={}", session.tool),
+        format!("RALLY_MANAGED_SESSION_MODE={mode}"),
+    ];
+    #[cfg(debug_assertions)]
+    if session.task_scoped {
+        for key in [
+            "RALLY_TASK_AGENT_BIN",
+            "RALLY_TEST_PROMPT_CAPTURE",
+            "RALLY_TEST_ARGV_CAPTURE",
+            "RALLY_TEST_CHILD_PID_CAPTURE",
+            "RALLY_TEST_TASK_INPUT_UNLINK_FAILURE",
+        ] {
+            if let Some(value) = env::var_os(key)
+                && !value.is_empty()
+            {
+                command.push(format!("{key}={}", value.to_string_lossy()));
+            }
+        }
+    }
+    command.extend(agent_command);
+    Ok(command)
+}
+
+const TASK_INPUT_DIR: &str = "task-input";
+const TASK_RESULT_DIR: &str = "task-results";
+
+fn managed_task_input_path(repo: &Path, session_id: &str) -> PathBuf {
+    repo.join(".rally")
+        .join(TASK_INPUT_DIR)
+        .join(format!("{}.prompt", sanitize_id(session_id)))
+}
+
+fn managed_task_result_path(repo: &Path, task_id: &str) -> PathBuf {
+    repo.join(".rally")
+        .join(TASK_RESULT_DIR)
+        .join(format!("{}.md", sanitize_id(task_id)))
+}
+
+fn create_private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).map_err(RallyError::io(format!("create {}", path.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(RallyError::io(format!("chmod {}", path.display())))?;
+    }
+    Ok(())
+}
+
+fn create_private_file(path: &Path, contents: &[u8], create_new: bool) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        RallyError::Message(format!("task path has no parent: {}", path.display()))
+    })?;
+    create_private_dir(parent)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true);
+    if create_new {
+        options.create_new(true);
+    } else {
+        options.create(true).truncate(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(RallyError::io(format!("create {}", path.display())))?;
+    std::io::Write::write_all(&mut file, contents)
+        .map_err(RallyError::io(format!("write {}", path.display())))?;
+    file.sync_all()
+        .map_err(RallyError::io(format!("sync {}", path.display())))?;
+    Ok(())
+}
+
+#[derive(Deserialize, Serialize)]
+struct ManagedTaskInput {
+    session: ManagedSession,
+    prompt: String,
+}
+
+fn prepare_managed_task(
+    repo: &Path,
+    session: &ManagedSession,
+    prompt: &str,
+) -> Result<(PathBuf, PathBuf)> {
+    let task_id = session
+        .task_id
+        .as_deref()
+        .ok_or_else(|| RallyError::Message("task-scoped session has no task id".to_string()))?;
+    let prompt_path = managed_task_input_path(repo, &session.session_id);
+    let result_path = managed_task_result_path(repo, task_id);
+    let encoded = serde_json::to_vec(&ManagedTaskInput {
+        session: session.clone(),
+        prompt: prompt.to_string(),
+    })
+    .map_err(RallyError::json("encode managed task input"))?;
+    create_private_file(&prompt_path, &encoded, true)?;
+    if let Err(error) = create_private_file(&result_path, b"", true) {
+        let _ = fs::remove_file(&prompt_path);
+        return Err(error);
+    }
+    Ok((prompt_path, result_path))
+}
+
+fn remove_managed_task_files(paths: Option<&(PathBuf, PathBuf)>, include_result: bool) {
+    if let Some((prompt_path, result_path)) = paths {
+        let _ = fs::remove_file(prompt_path);
+        if include_result {
+            let _ = fs::remove_file(result_path);
+        }
+    }
+}
+
+fn remove_managed_task_input(path: &Path) -> std::io::Result<()> {
+    #[cfg(debug_assertions)]
+    if env::var("RALLY_TEST_TASK_INPUT_UNLINK_FAILURE").as_deref() == Ok("1") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected managed task input unlink failure",
+        ));
+    }
+    fs::remove_file(path)
+}
+
 fn command_run(args: RunArgs) -> Result<Output> {
     let RunArgs {
         json,
@@ -7286,9 +7447,20 @@ fn command_run(args: RunArgs) -> Result<Output> {
         backend_raw,
         session_id,
         tool,
+        task,
         bins,
         shared,
     } = args;
+
+    if task
+        .as_deref()
+        .is_some_and(|prompt| prompt.trim().is_empty())
+    {
+        return Err(RallyError::Usage(
+            "--task requires a non-empty prompt".to_string(),
+        ));
+    }
+    let task_scoped = task.is_some();
 
     // Backend resolution for the ptyd pane-ownership flip:
     //   * `--backend auto`: prefer Ptyd iff the RALLY-OWNED socket is LIVE
@@ -7337,6 +7509,13 @@ fn command_run(args: RunArgs) -> Result<Output> {
     let backend_name = backend.as_str().to_string();
     let repo = repo_root()?;
     let agent_spec = AgentSpec::from_name(&agent)?;
+    if task.is_some() {
+        // Validate agent support before reserving a durable session or
+        // provisioning a worktree. Rendering again after reservation is cheap;
+        // this early check prevents a rejected task mode from leaking state.
+        let result_path = managed_task_result_path(&repo, "validation");
+        agent_spec.task_command_line(&result_path)?;
+    }
     // Plan F functional core (Chunk 3): the herdr self-host guard was
     // removed; tmux/cmux do not share Easy Terminal's daemon socket so
     // the reentrancy risk it guarded against no longer exists.
@@ -7357,6 +7536,8 @@ fn command_run(args: RunArgs) -> Result<Output> {
                 agent: agent_spec.agent.to_string(),
                 tool: identity.tool.clone(),
                 backend: backend_name.clone(),
+                task_scoped,
+                task_id: task_scoped.then(|| format!("task-dry-run-{}", identity.session_id)),
                 cwd: repo.clone(),
                 target: backend_target(backend, &identity.session_id),
                 worktree_path: None,
@@ -7376,6 +7557,7 @@ fn command_run(args: RunArgs) -> Result<Output> {
                 requested_name: name,
                 requested_session_id: session_id,
                 requested_tool: tool,
+                task_scoped,
                 backend,
                 backend_name: &backend_name,
                 repo: &repo,
@@ -7436,7 +7618,28 @@ fn command_run(args: RunArgs) -> Result<Output> {
         }
     }
 
-    let command = agent_spec.command_line(&session.name);
+    let task_files = if dry_run {
+        None
+    } else if let Some(prompt) = task.as_deref() {
+        match prepare_managed_task(&repo, &session, prompt) {
+            Ok(paths) => Some(paths),
+            Err(err) => {
+                if let (Some(path), Some(branch)) =
+                    (provisioned_path.as_deref(), session.branch.as_deref())
+                {
+                    let _ = run_worktree::cleanup(&repo, path, branch, "git");
+                }
+                if let Some(fact) = &reservation.fact {
+                    let _ = append_stopped_session_record(&room, &session, fact);
+                }
+                return Err(err);
+            }
+        }
+    } else {
+        None
+    };
+
+    let command = managed_agent_command(&agent_spec, &session)?;
     let mut backend_runner = BackendRunner::new(backend, bins.clone());
     // Backend launches the agent in the worktree (when provisioned) so the
     // agent's HEAD, commits and working tree are isolated from peers.
@@ -7490,6 +7693,7 @@ fn command_run(args: RunArgs) -> Result<Output> {
                         "ptyd strict launch refused: {detail}; additionally failed to mark managed session stopped: {cleanup_err}"
                     )));
                 }
+                remove_managed_task_files(task_files.as_ref(), true);
                 return Err(RallyError::Command(format!(
                     "ptyd strict launch refused after daemon registration failure: {detail}"
                 )));
@@ -7530,6 +7734,7 @@ fn command_run(args: RunArgs) -> Result<Output> {
                                 "backend start failed: {err}; additionally failed to mark managed session stopped: {cleanup_err}"
                             )));
                         }
+                        remove_managed_task_files(task_files.as_ref(), true);
                         return Err(err);
                     }
                 }
@@ -7549,6 +7754,7 @@ fn command_run(args: RunArgs) -> Result<Output> {
                         "ptyd spawn failed: {err}; additionally failed to mark managed session stopped: {cleanup_err}"
                     )));
                 }
+                remove_managed_task_files(task_files.as_ref(), true);
                 return Err(err);
             }
         }
@@ -7576,6 +7782,7 @@ fn command_run(args: RunArgs) -> Result<Output> {
                         "backend start failed: {err}; additionally failed to mark managed session stopped: {cleanup_err}"
                     )));
                 }
+                remove_managed_task_files(task_files.as_ref(), true);
                 return Err(err);
             }
         };
@@ -7617,6 +7824,265 @@ fn command_run(args: RunArgs) -> Result<Output> {
         session.agent, session.backend, session.session_id
     );
     Ok(Output::new(json, text, body))
+}
+
+fn command_task_worker(args: TaskWorkerArgs) -> Result<Output> {
+    let inherited_session = env::var("RALLY_SESSION_ID").ok();
+    if inherited_session.as_deref() != Some(args.session_id.as_str()) {
+        return Err(RallyError::Usage(
+            "task-worker must be started by the matching managed Rally session".to_string(),
+        ));
+    }
+
+    let repo = repo_root()?;
+    let prompt_path = managed_task_input_path(&repo, &args.session_id);
+    let mut prompt_file = match fs::File::open(&prompt_path) {
+        Ok(file) => file,
+        Err(error) => {
+            return Err((RallyError::io(format!(
+                "open managed task input {}",
+                prompt_path.display()
+            )))(error));
+        }
+    };
+    let mut encoded = String::new();
+    if let Err(error) = std::io::Read::read_to_string(&mut prompt_file, &mut encoded) {
+        drop(prompt_file);
+        remove_managed_task_input(&prompt_path).map_err(RallyError::io(format!(
+            "remove unreadable managed task input {}",
+            prompt_path.display()
+        )))?;
+        env::set_current_dir(&repo).map_err(RallyError::io(format!(
+            "switch to canonical repo {}",
+            repo.display()
+        )))?;
+        let _ = finalize_managed_task(&repo, None, &args.session_id, None, 1)?;
+        return Err((RallyError::io("read managed task input"))(error));
+    }
+    // The private descriptor is no longer needed after reading. Unlink it
+    // before decoding or starting the child so failures cannot leave the
+    // prompt discoverable on disk.
+    drop(prompt_file);
+    remove_managed_task_input(&prompt_path).map_err(RallyError::io(format!(
+        "remove managed task input {}; task was not started and the stale session remains recoverable",
+        prompt_path.display()
+    )))?;
+    let input: ManagedTaskInput = match serde_json::from_str(&encoded) {
+        Ok(input) => input,
+        Err(error) => {
+            env::set_current_dir(&repo).map_err(RallyError::io(format!(
+                "switch to canonical repo {}",
+                repo.display()
+            )))?;
+            let _ = finalize_managed_task(&repo, None, &args.session_id, None, 1)?;
+            return Err((RallyError::json("decode managed task input"))(error));
+        }
+    };
+    let session = input.session;
+    if session.session_id != args.session_id {
+        env::set_current_dir(&repo).map_err(RallyError::io(format!(
+            "switch to canonical repo {}",
+            repo.display()
+        )))?;
+        let _ = finalize_managed_task(&repo, None, &args.session_id, None, 1)?;
+        return Err(RallyError::Usage(
+            "managed task input does not match the inherited session".to_string(),
+        ));
+    }
+    if !session.task_scoped {
+        return Err(RallyError::Usage(format!(
+            "task-worker session {} is not task-scoped",
+            session.session_id
+        )));
+    }
+
+    let task_id = session.task_id.as_deref().ok_or_else(|| {
+        RallyError::Usage(format!(
+            "task-worker session {} has no task id",
+            session.session_id
+        ))
+    })?;
+    let result_path = managed_task_result_path(&repo, task_id);
+    let agent = AgentSpec::from_name(&session.agent)?;
+    let mut command = agent.task_command_line(&result_path)?;
+    #[cfg(debug_assertions)]
+    if let Some(test_bin) = env::var_os("RALLY_TASK_AGENT_BIN")
+        && !test_bin.is_empty()
+    {
+        command[0] = test_bin.to_string_lossy().into_owned();
+    }
+    let status = Command::new(&command[0])
+        .args(&command[1..])
+        .stdin(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            let write_result = match child.stdin.take() {
+                Some(mut stdin) => std::io::Write::write_all(&mut stdin, input.prompt.as_bytes()),
+                None => Err(std::io::Error::other(
+                    "bounded agent child did not expose piped stdin",
+                )),
+            };
+            if let Err(error) = write_result {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+            match child.wait() {
+                Ok(status) => Ok(status),
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    Err(error)
+                }
+            }
+        });
+    let exit_code = status
+        .as_ref()
+        .ok()
+        .and_then(std::process::ExitStatus::code)
+        .unwrap_or(1)
+        .clamp(0, u8::MAX as i32) as u8;
+
+    // Cleanup runs from the canonical checkout so removing the linked task
+    // worktree never removes the finalizer's current directory.
+    env::set_current_dir(&repo).map_err(RallyError::io(format!(
+        "switch to canonical repo {}",
+        repo.display()
+    )))?;
+    let finalization = finalize_managed_task(
+        &repo,
+        Some(&session),
+        &session.session_id,
+        Some(&result_path),
+        exit_code,
+    )?;
+
+    if let Err(error) = status {
+        return Err(RallyError::io("start bounded agent process")(error));
+    }
+    Ok(Output::new(
+        false,
+        format!(
+            "managed task complete session={} exit_code={} result={}",
+            session.session_id,
+            exit_code,
+            result_path.display()
+        ),
+        json!({
+            "session_id": session.session_id,
+            "exit_code": exit_code,
+            "result": result_path,
+            "retained_worktree": finalization.retained_worktree,
+        }),
+    )
+    .with_exit_code(exit_code))
+}
+
+#[derive(Debug, Default)]
+struct ManagedTaskFinalization {
+    retained_worktree: Option<PathBuf>,
+}
+
+fn finalize_managed_task(
+    repo: &Path,
+    session_hint: Option<&ManagedSession>,
+    session_id: &str,
+    result_hint: Option<&Path>,
+    exit_code: u8,
+) -> Result<ManagedTaskFinalization> {
+    (|| {
+        let room = RoomStore::open_at(repo.to_path_buf())?;
+        let Some((active_fact, session)) = active_session_facts(&room)?
+            .into_iter()
+            .find(|(_, session)| session.session_id == session_id)
+        else {
+            return Ok(ManagedTaskFinalization::default());
+        };
+        if !session.task_scoped {
+            return Err(RallyError::Usage(format!(
+                "session {session_id} is not task-scoped"
+            )));
+        }
+        if let Some(hint) = session_hint
+            && hint.task_id != session.task_id
+        {
+            return Err(RallyError::Usage(
+                "managed task input task id does not match the active session".to_string(),
+            ));
+        }
+        let result_path = match result_hint {
+            Some(path) => path.to_path_buf(),
+            None => managed_task_result_path(
+                repo,
+                session.task_id.as_deref().ok_or_else(|| {
+                    RallyError::Usage(format!("task session {session_id} has no task id"))
+                })?,
+            ),
+        };
+        let status = if exit_code == 0 { "complete" } else { "failed" };
+        let mut retained_worktree = None;
+        let mut cleanup_evidence = Vec::new();
+        if let (Some(path), Some(branch)) =
+            (session.worktree_path.as_deref(), session.branch.as_deref())
+        {
+            let outcome = run_worktree::cleanup(repo, path, branch, "git");
+            if outcome.worktree_removed {
+                cleanup_evidence.push("worktree_cleanup:removed".to_string());
+            } else if path.exists() {
+                retained_worktree = Some(path.to_path_buf());
+                cleanup_evidence.push(format!("worktree_retained:{}", path.display()));
+            }
+            cleanup_evidence.extend(
+                outcome
+                    .warnings
+                    .iter()
+                    .map(|warning| format!("cleanup_warning:{warning}")),
+            );
+        }
+        let summary = match retained_worktree.as_deref() {
+            Some(path) => format!(
+                "Captured from Codex --output-last-message; this is process output, not a target-authored Rally acknowledgement. Dirty worktree retained for recovery at {}.",
+                path.display()
+            ),
+            None => "Captured from Codex --output-last-message; this is process output, not a target-authored Rally acknowledgement.".to_string(),
+        };
+        let mut evidence = vec![
+            format!("process_exit_code:{exit_code}"),
+            "capture:codex-output-last-message".to_string(),
+        ];
+        evidence.extend(cleanup_evidence);
+        let result_fact = Fact {
+            from_session_id: Some(session.session_id.clone()),
+            schema: FACT_SCHEMA.to_string(),
+            event_id: stable_operation_id(
+                "task-result",
+                session.task_id.as_deref().unwrap_or(&session.session_id),
+            ),
+            seq: 0,
+            thread_id: format!(
+                "task-result-{}",
+                session.task_id.as_deref().unwrap_or(&session.session_id)
+            ),
+            kind: FactKind::Artifact,
+            tool: Some(session.tool.clone()),
+            role: None,
+            subject: format!("managed task {} {status}", session.name),
+            scope: Vec::new(),
+            created_at: now_string(),
+            summary: Some(summary),
+            evidence,
+            target: None,
+            ref_id: None,
+            status: Some(status.to_string()),
+            severity: None,
+            uri: Some(result_path.display().to_string()),
+            session: None,
+        };
+        room.append_fact(&result_fact)?.into_fact_reporting();
+        release_managed_session_claims(&room, &session, "task-complete-release", false)?;
+        append_stopped_session_record(&room, &session, &active_fact)?;
+        Ok(ManagedTaskFinalization { retained_worktree })
+    })()
 }
 
 /// Attempt to register `session`'s pane with the rally-termd daemon so future
@@ -7927,6 +8393,7 @@ struct SessionReservationInput<'a> {
     requested_name: Option<String>,
     requested_session_id: Option<String>,
     requested_tool: Option<String>,
+    task_scoped: bool,
     backend: Backend,
     backend_name: &'a str,
     repo: &'a Path,
@@ -7958,6 +8425,8 @@ fn reserve_numbered_session(
             agent: agent_spec.agent.to_string(),
             tool: identity.tool,
             backend: input.backend_name.to_string(),
+            task_scoped: input.task_scoped,
+            task_id: input.task_scoped.then(|| new_id("task")),
             cwd: input.repo.to_path_buf(),
             target: backend_target(input.backend, &identity.session_id),
             worktree_path: None,
@@ -8173,6 +8642,21 @@ fn command_sessions(args: SessionsArgs) -> Result<Output> {
                 with_watchdog_command_commit(|| {
                     append_stopped_session_record(&room, &view.session, &fact)
                 })?;
+                if view.session.task_scoped {
+                    if let Some(task_id) = view.session.task_id.as_deref() {
+                        let task_paths = (
+                            managed_task_input_path(room.repo_root(), &view.session.session_id),
+                            managed_task_result_path(room.repo_root(), task_id),
+                        );
+                        remove_managed_task_files(Some(&task_paths), false);
+                    }
+                    if let (Some(path), Some(branch)) = (
+                        view.session.worktree_path.as_deref(),
+                        view.session.branch.as_deref(),
+                    ) {
+                        let _ = run_worktree::cleanup(room.repo_root(), path, branch, "git");
+                    }
+                }
                 count += 1;
             }
         }
@@ -8916,6 +9400,12 @@ fn command_inject_managed(
     timeout_seconds: i64,
     bins: BackendBins,
 ) -> Result<Output> {
+    if session.task_scoped {
+        return Err(RallyError::Usage(format!(
+            "managed session {} is task-scoped; its prompt was fixed at launch and it exits after completion. Start a persistent `rally run {}` session to use `rally inject`",
+            session.name, session.agent
+        )));
+    }
     let is_text_inject = text_arg.is_some();
     let text = match (text_arg, handoff.as_deref()) {
         (Some(text), _) => text,
@@ -10276,6 +10766,16 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
             if !dry_run {
                 let _commit_guard = arm_watchdog_command_commit();
                 let _ = backend_runner.stop(&live_target);
+                if session.task_scoped
+                    && let Some(task_id) = session.task_id.as_deref()
+                {
+                    let repo = repo_root().unwrap_or_else(|_| PathBuf::from("."));
+                    let paths = (
+                        managed_task_input_path(&repo, &session.session_id),
+                        managed_task_result_path(&repo, task_id),
+                    );
+                    remove_managed_task_files(Some(&paths), false);
+                }
                 // Cleanup the per-agent worktree (when present) before
                 // marking the session stopped.  Best-effort: warnings are
                 // discarded so `rally stop` never blocks on a leftover
@@ -10286,68 +10786,11 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
                     let repo = repo_root().unwrap_or_else(|_| PathBuf::from("."));
                     let _ = run_worktree::cleanup(&repo, path, branch, "git");
                 }
-                // LEVER 3: self-release the STOPPING SESSION's active claims
-                // before removing the session record. Self-release is
-                // authoritative (bypasses the 2h reclaim bar — the owner is
-                // declaring itself done), keeps SEC-001 dormant (no stale-owner
-                // marker on the release fact). It is a required/auditable part
-                // of stop: an uncertain close returns a typed partial result
-                // instead of silently removing the session record.
-                //
-                // Goal F4: release THAT SESSION's claims, not every claim that
-                // happens to share the stopping tool. Two co-resident sessions
-                // of the SAME tool (e.g. two claude_code sessions) must not
-                // release each other's mid-work claims. Match on the claim's
-                // `from_session_id` (the live session lease that authored the
-                // claim). Fall back to tool-match ONLY for legacy claims that
-                // carry no `from_session_id` (the dominant one-session-per-tool
-                // case stays correct), and never touch a live sibling session's
-                // claims.
-                if let Ok(room) = RoomStore::open()
-                    && let Ok(snap) = room.snapshot()
-                {
-                    let stopping_tool = &session.tool;
-                    let stopping_session = session.session_id.as_str();
-                    for claim in snap.active_claims.iter().filter(|c| {
-                        claim_authority::claim_owner_matches_caller(
-                            c.tool.as_deref(),
-                            c.from_session_id.as_deref(),
-                            Some(stopping_tool.as_str()),
-                            Some(stopping_session),
-                        )
-                    }) {
-                        let release = Fact {
-                            from_session_id: Some(stopping_session.to_string()),
-                            schema: FACT_SCHEMA.to_string(),
-                            event_id: stable_operation_id(
-                                "stop-release",
-                                &format!("{}:{}", session.session_id, claim.event_id),
-                            ),
-                            seq: 0,
-                            thread_id: stable_operation_id(
-                                "stop-release-thread",
-                                &format!("{}:{}", session.session_id, claim.event_id),
-                            ),
-                            kind: FactKind::Release,
-                            tool: Some(stopping_tool.clone()),
-                            role: None,
-                            subject: format!("self-release on stop: {}", claim.event_id),
-                            scope: claim.scope.clone(),
-                            created_at: now_string(),
-                            summary: None,
-                            // No authorized-takeover marker — this is a
-                            // self-release; SEC-001 stays dormant.
-                            evidence: Vec::new(),
-                            target: None,
-                            ref_id: Some(claim.event_id.clone()),
-                            status: None,
-                            severity: None,
-                            uri: None,
-                            session: None,
-                        };
-                        room.append_state_transition_verified(&release)?
-                            .into_fact_reporting();
-                    }
+                // Explicit operator stop keeps the historical compatibility
+                // fallback for sessionless same-tool claims. Session-stamped
+                // sibling claims still retain their own ownership.
+                if let Ok(room) = RoomStore::open() {
+                    release_managed_session_claims(&room, &session, "stop-release", true)?;
                 }
                 remove_session_record(&session.session_id)?;
 
@@ -10610,6 +11053,87 @@ fn append_stopped_session_record(
     ))?
     .into_fact_reporting();
     Ok(())
+}
+
+fn release_managed_session_claims(
+    room: &RoomStore,
+    session: &ManagedSession,
+    operation: &str,
+    allow_legacy_tool_fallback: bool,
+) -> Result<Vec<String>> {
+    let snap = room.snapshot()?;
+    let release_session_id = session_identity::ProtocolSessionIdentity::from_managed_lease(
+        &session.session_id,
+        &session.tool,
+    )
+    .from_session_id()
+    .to_string();
+    let mut released = Vec::new();
+    for claim in snap.active_claims.iter().filter(|claim| {
+        managed_claim_matches_session(
+            claim.tool.as_deref(),
+            claim.from_session_id.as_deref(),
+            session,
+            allow_legacy_tool_fallback,
+        )
+    }) {
+        let release = Fact {
+            from_session_id: Some(release_session_id.clone()),
+            schema: FACT_SCHEMA.to_string(),
+            event_id: stable_operation_id(
+                operation,
+                &format!("{}:{}", session.session_id, claim.event_id),
+            ),
+            seq: 0,
+            thread_id: stable_operation_id(
+                &format!("{operation}-thread"),
+                &format!("{}:{}", session.session_id, claim.event_id),
+            ),
+            kind: FactKind::Release,
+            tool: Some(session.tool.clone()),
+            role: None,
+            subject: format!(
+                "self-release on managed session completion: {}",
+                claim.event_id
+            ),
+            scope: claim.scope.clone(),
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: Some(claim.event_id.clone()),
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_state_transition_verified(&release)?
+            .into_fact_reporting();
+        released.push(claim.event_id.clone());
+    }
+    Ok(released)
+}
+
+fn managed_claim_matches_session(
+    claim_tool: Option<&str>,
+    claim_session: Option<&str>,
+    session: &ManagedSession,
+    allow_legacy_tool_fallback: bool,
+) -> bool {
+    let managed_protocol_session = session_identity::ProtocolSessionIdentity::from_managed_lease(
+        &session.session_id,
+        &session.tool,
+    );
+    let exact = claim_authority::same_session_owner(
+        claim_tool,
+        claim_session,
+        Some(session.tool.as_str()),
+        Some(managed_protocol_session.from_session_id()),
+    );
+    exact
+        || (allow_legacy_tool_fallback
+            && claim_session.is_none()
+            && claim_authority::same_nonblank_tool(claim_tool, Some(session.tool.as_str())))
 }
 
 fn active_session_records(room: &RoomStore) -> Result<Vec<ManagedSession>> {
@@ -11755,6 +12279,50 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn automatic_task_completion_releases_only_exact_session_claims() {
+        let session = ManagedSession {
+            session_id: "session-current".to_string(),
+            tool: "codex:worker".to_string(),
+            ..Default::default()
+        };
+        let current_protocol_session =
+            session_identity::ProtocolSessionIdentity::from_managed_lease(
+                &session.session_id,
+                &session.tool,
+            )
+            .from_session_id()
+            .to_string();
+        assert!(managed_claim_matches_session(
+            Some("codex:other-label"),
+            Some(&current_protocol_session),
+            &session,
+            false,
+        ));
+        assert!(!managed_claim_matches_session(
+            Some("codex:worker"),
+            Some("sess:managed:session-sibling#live"),
+            &session,
+            false,
+        ));
+        assert!(!managed_claim_matches_session(
+            Some("codex:worker"),
+            Some("session-current"),
+            &session,
+            false,
+        ));
+        assert!(!managed_claim_matches_session(
+            Some("codex:worker"),
+            None,
+            &session,
+            false,
+        ));
+        assert!(
+            managed_claim_matches_session(Some("codex:worker"), None, &session, true),
+            "explicit stop may recover a legacy sessionless same-tool claim"
+        );
     }
 
     /// The injection templates must demand an artifact-backed completion:
@@ -13428,6 +13996,33 @@ mod tests {
                 format!("RALLY_SESSION_CLOSE_TOKEN={close_token}"),
             ]
         );
+    }
+
+    #[test]
+    fn managed_launch_command_propagates_registered_identity_and_mode() {
+        let session = ManagedSession {
+            session_id: "lease-1".to_string(),
+            name: "worker-1".to_string(),
+            agent: "codex".to_string(),
+            tool: "codex:graph-worker".to_string(),
+            backend: "tmux".to_string(),
+            task_scoped: true,
+            ..Default::default()
+        };
+        let spec = AgentSpec::from_name("codex").unwrap();
+        let command = managed_agent_command(&spec, &session).unwrap();
+        assert_eq!(
+            &command[..5],
+            &[
+                "env",
+                "RALLY_SESSION_ID=lease-1",
+                "RALLY_AGENT_ID=lease-1",
+                "RALLY_TOOL_ID=codex:graph-worker",
+                "RALLY_MANAGED_SESSION_MODE=task",
+            ]
+        );
+        assert_eq!(&command[6..], &["task-worker", "--session-id", "lease-1"]);
+        assert!(!command.iter().any(|arg| arg == "inspect"));
     }
 
     #[test]
@@ -19707,8 +20302,9 @@ fn help_text() -> String {
         "  rally daemon serve|start|stop|status [--json]  # per-repo rallyd store daemon",
         "  rally claims-refresh --tool <tool> --lane <lane> --manifest <path> [--json]",
         "  rally self-exit-check --tool <tool> [--persistent] [--required-streak <n>] [--json]",
-        "  rally run <claude|codex|opencode|gemini> [--name <name>] [--backend <auto|tmux|cmux|ptyd|ptyd-strict>] [--dry-run] [--json]",
+        "  rally run <claude|codex|opencode|gemini> [--task <prompt>] [--name <name>] [--backend <auto|tmux|cmux|ptyd|ptyd-strict>] [--dry-run] [--json]",
         "    managed run ids auto-number active agents, e.g. claude-01 / claude_code:01",
+        "  rally task-worker --session-id <id>  # internal lifecycle wrapper started by run --task",
         "  rally sessions [--reap] [--json] [--tmux-bin <path>] [--cmux-bin <path>]",
         "  rally session ensure --tool <tool> [--session-id <id>] [--adapter <host>] [--strict] [--native-hook] [--lifecycle-close] [--live-delivery] [--json]",
         "    mint or reuse one parent-exported lease and report each adapter guarantee as enforced, advisory, or unmanaged",

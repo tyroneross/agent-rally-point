@@ -7,6 +7,24 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Fixed — bounded Codex workers release the synced-task writer lease
+
+`rally run codex --task "<prompt>"` now launches the prompt through `codex exec`
+instead of opening a persistent interactive TUI and injecting work later. The
+long-lived child receives the prompt on stdin from a private, immediately
+unlinked descriptor, so neither its argv nor the run JSON contains the prompt.
+The invoking shell may still record the `rally run ... --task` command. Rally
+preserves the final response under `.rally/task-results/`, releases exact-session
+claims, tombstones the session, and removes its linked worktree when clean. A
+dirty worktree is retained with a recovery path. Codex Desktop can then
+reacquire the synced task without the “open in another app” retry loop. Plain
+`rally run codex` remains persistent for intentionally interactive sessions.
+
+Managed children now also inherit their exact registered `RALLY_TOOL_ID` and
+`RALLY_SESSION_ID`, so hooks and skill bootstrap do not create a second Rally
+identity. Task-scoped sessions reject later `rally inject` calls because their
+single prompt is fixed at launch.
+
 ## 0.2.7
 
 ### Fixed — release auxiliary contract tests include command conformance

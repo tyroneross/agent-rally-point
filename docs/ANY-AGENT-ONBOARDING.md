@@ -157,10 +157,19 @@ Current first-class launch targets:
 
 ```bash
 rally run claude --name <lane> --json
-rally run codex --name <lane> --json
+rally run codex --name <lane> --task "<bounded assignment>" --json
 rally run opencode --name <lane> --json
 rally run gemini --name <lane> --json
 ```
+
+Bounded Codex work should use `--task`: Rally passes the prompt to the long-lived
+child over stdin, captures the final response, and closes the managed session
+automatically. It removes a clean worktree or reports the recovery path for a
+dirty one. Private result files under `.rally/task-results/` remain until the
+operator archives or deletes them; Rally applies no automatic retention window.
+The invoking shell may retain the `--task` command in its history.
+Use plain `rally run codex` only for a deliberately persistent session that
+will receive later injections, then stop it explicitly.
 
 For managed targets, the injection contract is:
 
@@ -180,7 +189,7 @@ For managed targets, the injection contract is:
    rally sessions --json
    ```
 
-3. Inject only after the session exists:
+3. For a deliberately persistent session, inject only after it exists:
 
    ```bash
    rally inject <session|name|tool> --handoff <event-id> --json

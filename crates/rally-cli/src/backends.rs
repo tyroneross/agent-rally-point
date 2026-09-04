@@ -52,6 +52,27 @@ impl AgentSpec {
             _ => cmd![self.command],
         }
     }
+
+    /// Build the child command for one bounded task. The prompt is read from
+    /// stdin (`-`), so task text never appears in argv. `--` prevents `-`,
+    /// `review`, or `resume`-shaped prompts from being parsed as options or
+    /// subcommands. Codex writes its final response to `result_path` before it
+    /// exits and releases the synced conversation writer lease.
+    pub(crate) fn task_command_line(&self, result_path: &Path) -> Result<Vec<String>> {
+        match self.agent {
+            "codex" => Ok(cmd![
+                self.command,
+                "exec",
+                "--output-last-message",
+                result_path.display(),
+                "--",
+                "-"
+            ]),
+            other => Err(RallyError::Usage(format!(
+                "--task is not supported for {other}; use codex or launch an interactive managed session"
+            ))),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
@@ -61,6 +82,14 @@ pub(crate) struct ManagedSession {
     pub(crate) agent: String,
     pub(crate) tool: String,
     pub(crate) backend: String,
+    /// True when this process owns one prompt and exits naturally when that
+    /// prompt completes. Absent/false preserves legacy interactive sessions.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) task_scoped: bool,
+    /// Unique id for one bounded execution. Session names may be reused after
+    /// completion; this id keeps prompt/result artifacts from colliding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) task_id: Option<String>,
     /// Versioned descriptor schema for the adapter selected at session start.
     /// Empty only for legacy records written before the adapter contract.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -2494,6 +2523,48 @@ mod tests {
     };
     use schemars::schema_for;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn codex_task_command_is_one_shot_while_plain_command_is_interactive() {
+        let spec = super::AgentSpec::from_name("codex").unwrap();
+        let result = Path::new("/private/result.md");
+        assert_eq!(spec.command_line("worker"), vec!["codex"]);
+        assert_eq!(
+            spec.task_command_line(result).unwrap(),
+            vec![
+                "codex",
+                "exec",
+                "--output-last-message",
+                "/private/result.md",
+                "--",
+                "-"
+            ]
+        );
+
+        let claude = super::AgentSpec::from_name("claude").unwrap();
+        assert!(claude.task_command_line(result).is_err());
+    }
+
+    #[test]
+    fn legacy_managed_session_without_task_scope_remains_persistent() {
+        let session: super::ManagedSession = serde_json::from_value(serde_json::json!({
+            "session_id": "legacy-1",
+            "name": "legacy-1",
+            "agent": "codex",
+            "tool": "codex:legacy-1",
+            "backend": "tmux",
+            "cwd": "/tmp",
+            "target": "rally-legacy-1"
+        }))
+        .unwrap();
+        assert!(!session.task_scoped);
+        assert!(
+            serde_json::to_value(&session)
+                .unwrap()
+                .get("task_scoped")
+                .is_none()
+        );
+    }
 
     #[test]
     fn builtin_adapters_declare_every_operation_and_expose_command_plans() {

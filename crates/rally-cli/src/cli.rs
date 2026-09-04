@@ -20,6 +20,8 @@ pub(crate) enum CliCommand {
     Check(CheckArgs),
     Hook(HookArgs),
     Run(RunArgs),
+    /// Internal lifecycle wrapper used by `rally run codex --task`.
+    TaskWorker(TaskWorkerArgs),
     Sessions(SessionsArgs),
     Inject(InjectArgs),
     /// Host-neutral parent lease lifecycle and current/history views.
@@ -452,6 +454,10 @@ pub(crate) struct RunArgs {
     pub(crate) backend_raw: String,
     pub(crate) session_id: Option<String>,
     pub(crate) tool: Option<String>,
+    /// A bounded prompt to run non-interactively. Currently supported by Codex.
+    /// Rally passes it over stdin, preserves the final response, and closes the
+    /// managed session when `codex exec` exits.
+    pub(crate) task: Option<String>,
     pub(crate) bins: BackendBins,
     /// When true, launch the agent in the canonical shared checkout (today's
     /// behavior) instead of provisioning a dedicated linked worktree.
@@ -459,6 +465,11 @@ pub(crate) struct RunArgs {
     /// Default = false (worktree-per-agent is the default, structural fix for
     /// the shared-branch hazard documented in worktree_guard.rs).
     pub(crate) shared: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TaskWorkerArgs {
+    pub(crate) session_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -936,6 +947,7 @@ pub(crate) const COMMANDS: &[&str] = &[
     "check",
     "hook",
     "run",
+    "task-worker",
     "sessions",
     "inject",
     "session",
@@ -1115,6 +1127,11 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .to_options()
         .command("run")
         .map(CliCommand::Run);
+    let task_worker = task_worker_parser()
+        .to_options()
+        .descr("Internal bounded-task lifecycle worker. Started only by `rally run --task`.")
+        .command("task-worker")
+        .map(CliCommand::TaskWorker);
     let sessions = sessions_parser()
         .to_options()
         .command("sessions")
@@ -1318,6 +1335,7 @@ fn cli_parser() -> OptionParser<CliCommand> {
         check,
         hook,
         run,
+        task_worker,
         sessions,
         inject,
         session_lifecycle,
@@ -1908,6 +1926,7 @@ fn run_parser() -> impl Parser<RunArgs> {
         .parse(|raw| Backend::parse(&raw).map(|backend| (backend, raw)));
     let session_id = optional_string_arg("session-id", "SESSION_ID");
     let tool = optional_string_arg("tool", "TOOL");
+    let task = optional_string_arg("task", "PROMPT");
     let bins = backend_bins_parser();
     let agent = positional::<String>("AGENT");
     // Two spellings, both meaning "opt out of per-agent worktree provisioning".
@@ -1916,10 +1935,21 @@ fn run_parser() -> impl Parser<RunArgs> {
     let no_worktree = long("no-worktree").switch();
     let shared = construct!(shared, no_worktree).map(|(a, b)| a || b);
     construct!(
-        json, dry_run, name, backend, session_id, tool, bins, shared, agent
+        json, dry_run, name, backend, session_id, tool, task, bins, shared, agent
     )
     .map(
-        |(json, dry_run, name, (backend, backend_raw), session_id, tool, bins, shared, agent)| {
+        |(
+            json,
+            dry_run,
+            name,
+            (backend, backend_raw),
+            session_id,
+            tool,
+            task,
+            bins,
+            shared,
+            agent,
+        )| {
             RunArgs {
                 json,
                 dry_run,
@@ -1929,11 +1959,17 @@ fn run_parser() -> impl Parser<RunArgs> {
                 backend_raw,
                 session_id,
                 tool,
+                task,
                 bins,
                 shared,
             }
         },
     )
+}
+
+fn task_worker_parser() -> impl Parser<TaskWorkerArgs> {
+    let session_id = string_arg("session-id", "SESSION_ID");
+    construct!(TaskWorkerArgs { session_id })
 }
 
 fn sessions_parser() -> impl Parser<SessionsArgs> {
@@ -2846,5 +2882,33 @@ mod inject_message_cli_tests {
         ]);
         assert_eq!(args.intent, MessageIntent::Inform);
         assert_eq!(args.responsibility, WorkResponsibility::Investigator);
+    }
+}
+
+#[cfg(test)]
+mod run_task_cli_tests {
+    use super::*;
+
+    fn run_args(args: &[&str]) -> RunArgs {
+        let args = args
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        let CliParse::Command(command) = parse_cli(&args).expect("run command parses") else {
+            panic!("run must parse as a command");
+        };
+        let CliCommand::Run(args) = *command else {
+            panic!("expected run command");
+        };
+        args
+    }
+
+    #[test]
+    fn run_task_prompt_is_explicit_and_plain_run_stays_persistent() {
+        let task = run_args(&["run", "codex", "--task", "inspect the graph"]);
+        assert_eq!(task.task.as_deref(), Some("inspect the graph"));
+
+        let persistent = run_args(&["run", "codex"]);
+        assert!(persistent.task.is_none());
     }
 }

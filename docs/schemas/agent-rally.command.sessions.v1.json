@@ -38,6 +38,14 @@
                   "agent": { "type": "string" },
                   "tool": { "type": "string" },
                   "backend": { "type": "string" },
+                  "task_scoped": {
+                    "type": "boolean",
+                    "description": "True for one-shot task processes; omitted for persistent interactive sessions."
+                  },
+                  "task_id": {
+                    "type": "string",
+                    "description": "Unique bounded-run id for the retained result artifact."
+                  },
                   "cwd": { "type": "string" },
                   "target": { "type": "string" },
                   "worktree_path": { "type": "string" },

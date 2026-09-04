@@ -33,6 +33,9 @@ pane a human will attach to by name.
 - Default provisions a per-agent git worktree; use `--shared` for a
   general-purpose terminal that should sit in the real checkout.
 - `codex` / `opencode` / `gemini` work as the agent argument too.
+- This skill creates a deliberately persistent, steerable terminal. For one
+  bounded Codex assignment, use `rally run codex --task "<prompt>"` instead;
+  that path exits and releases Codex Desktop's synced-task writer lease.
 - The session inherits the user's global config (settings, plugins, MCP).
   Rally passes no extra flags — per-session launch-arg passthrough does not
   exist yet.
@@ -79,7 +82,7 @@ delivers keystrokes into the wrong window.
 
 ## Teardown
 
-Prefer `rally stop <name>` per session. `rally sessions --reap --apply` sweeps
+Prefer `rally stop <name>` per persistent session. `rally sessions --reap --apply` sweeps
 dead sessions in bulk; a worktree-isolated session's worktree is cleaned at
 stop. Never `kill -9` the pane while it holds unreleased claims — stop it
 properly so claims release.

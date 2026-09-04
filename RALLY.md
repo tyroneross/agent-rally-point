@@ -48,6 +48,20 @@ For managed sessions, `rally run` appends readable ids from the active room.
 The first default Claude session is `claude-01` with tool `claude_code:01`; a
 named reviewer is `reviewer-01` with tool `claude_code:reviewer-01`.
 
+For bounded Codex work, pass the prompt at launch:
+
+```bash
+rally run codex --name graph-check --task "Inspect the graph and report evidence." --json
+```
+
+This uses `codex exec` with the prompt on stdin. Rally stores the final response
+under `.rally/task-results/`, then closes the exact managed session and its
+worktree, so the synced-task writer lease exits normally. Result files are
+private local artifacts (mode `0600`) and persist until the operator archives
+or deletes them; Rally applies no automatic retention window. Plain `rally run
+codex` opens a persistent interactive TUI; stop that session explicitly when it
+is no longer needed.
+
 | Host          | tool id       |
 |---------------|---------------|
 | Claude Code   | `claude_code` |
