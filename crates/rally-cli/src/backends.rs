@@ -90,6 +90,14 @@ pub(crate) struct ManagedSession {
     /// completion; this id keeps prompt/result artifacts from colliding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) task_id: Option<String>,
+    /// Exclusive Rally resources acquired before this harness process was
+    /// allowed to start. Empty preserves the legacy unmanaged-admission path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) admission_resources: Vec<String>,
+    /// Claim proving that Rally granted the resource admission. `None` means
+    /// no resource gate was requested (or this is a dry-run plan).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) admission_claim_id: Option<String>,
     /// Versioned descriptor schema for the adapter selected at session start.
     /// Empty only for legacy records written before the adapter contract.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -198,12 +206,24 @@ pub(crate) struct RunData {
     pub(crate) mode: &'static str,
     pub(crate) session: ManagedSession,
     pub(crate) commands: RunCommands,
+    /// Host-neutral pre-launch admission result. The harness starts only after
+    /// every requested exclusive resource is held by this exact session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) admission: Option<SessionAdmission>,
     /// F2: a LOUD warning when a ptyd spawn succeeded but its `agent.register`
     /// failed, forcing a tmux fallback launch (the spawned daemon pane was
     /// reaped first — no silent orphan). `None` on the happy path. Surfaced so
     /// a host never silently believes it got a daemon-owned pane when it didn't.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) warning: Option<String>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct SessionAdmission {
+    pub(crate) state: String,
+    pub(crate) resources: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) claim_id: Option<String>,
 }
 
 #[derive(JsonSchema, Serialize)]

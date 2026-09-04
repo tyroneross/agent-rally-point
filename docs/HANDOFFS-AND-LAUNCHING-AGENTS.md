@@ -18,9 +18,14 @@ rally attach <session>                      # watch live  ·  rally stop <sessio
 
 ## 1. Launching a managed agent
 
-`rally run <claude|codex|opencode|gemini> [--name <label>] [--task <prompt>] [--backend tmux|cmux] [--dry-run] [--json]`
+`rally run <claude|codex|opencode|gemini> [--name <label>] [--task <prompt>] [--resource task:<work-context>] [--backend tmux|cmux] [--dry-run] [--json]`
 
 - **Always `--dry-run --json` first** to see the exact `tmux new-session …` command and the resolved `session_id` / `target` / `tool` before spawning.
+- Pass `--resource task:<stable-work-context-id>` when only one harness may own
+  the context. Rally acquires that exclusive claim before starting the child.
+  If Codex, Claude, or another adapter already owns it, launch fails at Rally's
+  boundary; the second harness never reaches its native "open elsewhere" Retry
+  UI.
 - Run ids auto-number active agents: `claude-<label>-01`, `tool=claude_code:<label>-01`. The tmux target is `rally-<agent>-<label>-NN`.
 - Default backend is `tmux`; `cmux` launches into cmux instead. The legacy `herdr` backend (and its `--herdr-bin` / `--herdr-socket` flags) were removed in Plan F. For Easy Terminal / ptyd integration, use the `.rally` ledger directly: rally writes Directives and the `rally-termd` daemon subscribes.
 - Self-relaunch guard: an agent hosted by an Easy Terminal socket must not launch a build/relaunch lane back into its own host. Start build/relaunch workers outside that ET instance, or detach first; `RALLY_ALLOW_SELF_HOSTED_ET_LAUNCH=1` is only for a consciously detached/non-relaunch launch.
@@ -119,6 +124,31 @@ Default communication order:
 1. Post targeted `handoff`, `decision`, `risk`, `blocker`, `resolve`, and `artifact` facts to the owning repo's Rally ledger.
 2. Use `rally inject` to deliver the first instruction or urgent steering into a `rally run`-managed session.
 3. Use a committed handoff doc only when the payload is too long or durable enough to review outside the ledger.
+
+### Ownership transfer before launch
+
+Handoff delivery and launch admission are separate gates:
+
+1. The outgoing session posts a targeted handoff for
+   `task:<stable-work-context-id>` and checkpoints its state.
+2. The outgoing session closes or stops. Rally releases only claims owned by
+   that exact tool/session pair.
+3. The incoming host adapter requests the same resource before launching:
+
+   ```bash
+   rally run claude --name takeover \
+     --resource task:<stable-work-context-id> --json
+   ```
+
+   A host without a first-class `rally run` adapter calls `rally session ensure
+   --tool <id> --adapter <host> --resource task:<stable-work-context-id> --json`
+   in its outer launcher, then starts the harness only after `admission.state`
+   is `granted`.
+
+Rally owns the exclusive grant. The host owns the wait policy and may redirect
+the operator to the current owner, but redirect is navigation, not authority.
+Rally does not kill the current process or blindly retry; stale-lease recovery
+continues through the existing explicit claim lifecycle.
 
 ### Return-channel contract
 

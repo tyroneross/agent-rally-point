@@ -88,6 +88,14 @@ anything else in the system, in a design whose entire premise is that there is n
 Stated as an invariant: **if something would make Rally execute, schedule, retry, or assign, it
 belongs in the host or an external runner, not here.**
 
+Admission is deliberately on the other side of that boundary. When a host
+explicitly asks to launch or resume a named resource, Rally may atomically grant
+or refuse exclusive ownership before the process starts. Rally does not choose
+the target, decide when to retry, redirect the UI, or kill the current owner;
+those remain host policy. This narrow gate prevents two independent harnesses
+from discovering the collision only after both have tried to open the same work
+context.
+
 The cost is honest: self-managing agents coordinate worse than a good manager would. This is a
 deliberate trade of coordination quality for a boundary that keeps the substrate simple and
 unowned.

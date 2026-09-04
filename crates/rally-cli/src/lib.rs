@@ -7466,6 +7466,196 @@ fn remove_managed_task_input(path: &Path) -> std::io::Result<()> {
     fs::remove_file(path)
 }
 
+fn canonical_admission_resources(resources: Vec<String>) -> Result<Vec<String>> {
+    let mut canonical = resources
+        .into_iter()
+        .map(|raw| {
+            let parsed = crate::resource_scope::ResourceScope::parse_claim_scope(&raw)
+                .ok_or_else(|| {
+                    RallyError::Usage(format!(
+                        "invalid session admission resource {raw:?}; expected a typed scope such as task:<id>"
+                    ))
+                })?;
+            if parsed.access != crate::resource_scope::AccessMode::Exclusive {
+                return Err(RallyError::Usage(format!(
+                    "session admission resource {raw:?} must be exclusive; shared, advisory, and namespace scopes cannot prevent a harness collision"
+                )));
+            }
+            Ok(parsed.canonical_key())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    canonical.sort();
+    canonical.dedup();
+    Ok(canonical)
+}
+
+fn acquire_session_admission(
+    room: &RoomStore,
+    session: &ManagedSession,
+    resources: Vec<String>,
+) -> Result<Option<SessionAdmissionAcquisition>> {
+    let resources = canonical_admission_resources(resources)?;
+    if resources.is_empty() {
+        return Ok(None);
+    }
+    let owner_session = session_identity::ProtocolSessionIdentity::from_managed_lease(
+        &session.session_id,
+        &session.tool,
+    )
+    .from_session_id()
+    .to_string();
+    let facts = room.facts()?;
+    let snapshot = room.snapshot()?;
+    if let Some(existing) = snapshot.active_claims.iter().find(|claim| {
+        claim.tool.as_deref() == Some(session.tool.as_str())
+            && claim.from_session_id.as_deref() == Some(owner_session.as_str())
+            && claim.scope == resources
+            && claim
+                .evidence
+                .iter()
+                .any(|item| item == "protocol:session_admission=v1")
+    }) {
+        return Ok(Some(SessionAdmissionAcquisition {
+            admission: SessionAdmission {
+                state: "granted".to_string(),
+                resources,
+                claim_id: Some(existing.event_id.clone()),
+            },
+            created: false,
+        }));
+    }
+    let prior_generation = facts
+        .iter()
+        .filter(|fact| {
+            fact.kind == FactKind::Claim
+                && fact.tool.as_deref() == Some(session.tool.as_str())
+                && fact.from_session_id.as_deref() == Some(owner_session.as_str())
+                && fact.scope == resources
+                && fact
+                    .evidence
+                    .iter()
+                    .any(|item| item == "protocol:session_admission=v1")
+        })
+        .count();
+    let operation_material = format!(
+        "{}:{}:{}:{prior_generation}",
+        session.tool,
+        owner_session,
+        resources.join(",")
+    );
+    let mut evidence = vec!["protocol:session_admission=v1".to_string()];
+    let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
+    let parsed = resources
+        .iter()
+        .filter_map(|scope| crate::resource_scope::ResourceScope::parse_claim_scope(scope))
+        .collect::<Vec<_>>();
+    let size = crate::decay::classify_work_size(&parsed, resources.len());
+    let lease_secs = crate::decay::reclaim_timeout_secs(
+        size,
+        coord.reclaim_small_minutes,
+        coord.reclaim_large_minutes,
+    );
+    claim_authority::ensure_lease_evidence(&mut evidence, lease_secs);
+    let fact = Fact {
+        from_session_id: Some(owner_session),
+        schema: FACT_SCHEMA.to_string(),
+        event_id: stable_operation_id("session-admission", &operation_material),
+        seq: 0,
+        thread_id: stable_operation_id("session-admission-thread", &operation_material),
+        kind: FactKind::Claim,
+        tool: Some(session.tool.clone()),
+        role: None,
+        subject: format!("session admission: {}", session.name),
+        scope: resources.clone(),
+        created_at: now_string(),
+        summary: Some(
+            "Rally granted these resources before the harness process was allowed to start"
+                .to_string(),
+        ),
+        evidence,
+        target: None,
+        ref_id: None,
+        status: Some("active".to_string()),
+        severity: None,
+        uri: None,
+        session: None,
+    };
+    let outcome = with_watchdog_command_commit(|| room.append_fact_verified(&fact))?;
+    record_append_outcome(&outcome);
+    Ok(Some(SessionAdmissionAcquisition {
+        admission: SessionAdmission {
+            state: "granted".to_string(),
+            resources,
+            claim_id: Some(outcome.fact.event_id),
+        },
+        created: true,
+    }))
+}
+
+struct SessionAdmissionAcquisition {
+    admission: SessionAdmission,
+    created: bool,
+}
+
+struct AdmissionRollback<'a> {
+    room: &'a RoomStore,
+    session: ManagedSession,
+    claim_id: String,
+    scope: Vec<String>,
+    armed: bool,
+}
+
+impl AdmissionRollback<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AdmissionRollback<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let owner_session = session_identity::ProtocolSessionIdentity::from_managed_lease(
+                &self.session.session_id,
+                &self.session.tool,
+            )
+            .from_session_id()
+            .to_string();
+            let operation_material = format!("{}:{}", self.session.session_id, self.claim_id);
+            let release = Fact {
+                from_session_id: Some(owner_session),
+                schema: FACT_SCHEMA.to_string(),
+                event_id: stable_operation_id(
+                    "launch-failed-admission-release",
+                    &operation_material,
+                ),
+                seq: 0,
+                thread_id: stable_operation_id(
+                    "launch-failed-admission-release-thread",
+                    &operation_material,
+                ),
+                kind: FactKind::Release,
+                tool: Some(self.session.tool.clone()),
+                role: None,
+                subject: format!("release failed launch admission: {}", self.claim_id),
+                scope: self.scope.clone(),
+                created_at: now_string(),
+                summary: Some(
+                    "Rally released only the admission acquired for a harness that did not start"
+                        .to_string(),
+                ),
+                evidence: vec!["protocol:session_admission_rollback=v1".to_string()],
+                target: None,
+                ref_id: Some(self.claim_id.clone()),
+                status: None,
+                severity: None,
+                uri: None,
+                session: None,
+            };
+            let _ = self.room.append_state_transition_verified(&release);
+        }
+    }
+}
+
 fn command_run(args: RunArgs) -> Result<Output> {
     let RunArgs {
         json,
@@ -7477,6 +7667,7 @@ fn command_run(args: RunArgs) -> Result<Output> {
         session_id,
         tool,
         task,
+        resources,
         bins,
         shared,
     } = args;
@@ -7490,6 +7681,7 @@ fn command_run(args: RunArgs) -> Result<Output> {
         ));
     }
     let task_scoped = task.is_some();
+    let resources = canonical_admission_resources(resources)?;
 
     // Backend resolution for the ptyd pane-ownership flip:
     //   * `--backend auto`: prefer Ptyd iff the RALLY-OWNED socket is LIVE
@@ -7567,6 +7759,8 @@ fn command_run(args: RunArgs) -> Result<Output> {
                 backend: backend_name.clone(),
                 task_scoped,
                 task_id: task_scoped.then(|| format!("task-dry-run-{}", identity.session_id)),
+                admission_resources: resources.clone(),
+                admission_claim_id: None,
                 cwd: repo.clone(),
                 target: backend_target(backend, &identity.session_id),
                 worktree_path: None,
@@ -7594,6 +7788,58 @@ fn command_run(args: RunArgs) -> Result<Output> {
         )?
     };
     let mut session = reservation.session;
+
+    let admission_acquisition = if dry_run {
+        (!resources.is_empty()).then(|| SessionAdmissionAcquisition {
+            admission: SessionAdmission {
+                state: "planned".to_string(),
+                resources: resources.clone(),
+                claim_id: None,
+            },
+            created: false,
+        })
+    } else {
+        match acquire_session_admission(&room, &session, resources) {
+            Ok(admission) => admission,
+            Err(error) => {
+                if let Some(fact) = &reservation.fact {
+                    let _ = append_stopped_session_record(&room, &session, fact);
+                }
+                return Err(error);
+            }
+        }
+    };
+    let mut admission_rollback = admission_acquisition.as_ref().and_then(|acquisition| {
+        acquisition.created.then(|| {
+            let admission = &acquisition.admission;
+            AdmissionRollback {
+                room: &room,
+                session: session.clone(),
+                claim_id: admission
+                    .claim_id
+                    .clone()
+                    .expect("created admission carries a claim id"),
+                scope: admission.resources.clone(),
+                armed: true,
+            }
+        })
+    });
+    if let Some(admission) = admission_acquisition
+        .as_ref()
+        .map(|acquisition| &acquisition.admission)
+    {
+        session.admission_resources = admission.resources.clone();
+        session.admission_claim_id = admission.claim_id.clone();
+        if !dry_run && let Some(fact) = &reservation.fact {
+            room.append_fact(&session_fact(
+                &session,
+                "active",
+                Some(fact.event_id.clone()),
+            ))?
+            .into_fact_reporting();
+        }
+    }
+    let admission = admission_acquisition.map(|acquisition| acquisition.admission);
 
     // Provision the per-agent worktree (default-on).  Under dry-run we
     // advertise the planned path/branch in the envelope but never touch
@@ -7844,6 +8090,7 @@ fn command_run(args: RunArgs) -> Result<Output> {
                 commands: RunCommands {
                     start: command_plan_json(&start_commands),
                 },
+                admission,
                 warning: run_warning,
             },
         },
@@ -7852,6 +8099,9 @@ fn command_run(args: RunArgs) -> Result<Output> {
         "run agent={} backend={} session={}",
         session.agent, session.backend, session.session_id
     );
+    if let Some(rollback) = &mut admission_rollback {
+        rollback.disarm();
+    }
     Ok(Output::new(json, text, body))
 }
 
@@ -10103,6 +10353,8 @@ enum SessionLifecyclePayload {
         lease: session_identity::SessionLease,
         environment: BTreeMap<String, String>,
         shell_export: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        admission: Option<Box<SessionAdmission>>,
         daemon: SessionDaemonStatus,
     },
     Close {
@@ -10396,6 +10648,7 @@ fn command_session_lifecycle(args: SessionLifecycleArgs) -> Result<Output> {
 }
 
 fn command_session_ensure(json: bool, args: SessionEnsureArgs) -> Result<Output> {
+    let resources = canonical_admission_resources(args.resources.clone())?;
     let inherited = args
         .session_id
         .or_else(|| env::var("RALLY_SESSION_ID").ok());
@@ -10460,6 +10713,33 @@ fn command_session_ensure(json: bool, args: SessionEnsureArgs) -> Result<Output>
         (None, Some(token)) => token,
         (None, None) => uuid::Uuid::new_v4().to_string(),
     };
+    let admission_session = ManagedSession {
+        session_id: raw_session_id.clone(),
+        name: args.tool.clone(),
+        agent: adapter.clone(),
+        tool: args.tool.clone(),
+        backend: "external".to_string(),
+        cwd: room.repo_root().to_path_buf(),
+        target: args.tool.clone(),
+        ..ManagedSession::default()
+    };
+    let admission_acquisition = acquire_session_admission(&room, &admission_session, resources)?;
+    let mut admission_rollback = admission_acquisition.as_ref().and_then(|acquisition| {
+        acquisition.created.then(|| {
+            let admission = &acquisition.admission;
+            AdmissionRollback {
+                room: &room,
+                session: admission_session.clone(),
+                claim_id: admission
+                    .claim_id
+                    .clone()
+                    .expect("created admission carries a claim id"),
+                scope: admission.resources.clone(),
+                armed: true,
+            }
+        })
+    });
+    let admission = admission_acquisition.map(|acquisition| acquisition.admission);
     let mut evidence = capabilities.evidence_markers();
     evidence.push("protocol:session_state=active".to_string());
     evidence.push(format!("protocol:session_adapter={adapter}"));
@@ -10484,6 +10764,10 @@ fn command_session_ensure(json: bool, args: SessionEnsureArgs) -> Result<Output>
         .filter(|session| session.freshness == "fresh")
         .count();
     room.release_direct_ownership_for_daemon_handover()?;
+    if let Some(rollback) = &mut admission_rollback {
+        rollback.disarm();
+    }
+    drop(admission_rollback);
     drop(room);
     let daemon = maybe_activate_session_daemon(fresh_sessions);
 
@@ -10514,6 +10798,7 @@ fn command_session_ensure(json: bool, args: SessionEnsureArgs) -> Result<Output>
                 lease: lease.clone(),
                 environment,
                 shell_export,
+                admission: admission.map(Box::new),
                 daemon: daemon.clone(),
             },
         },

@@ -170,14 +170,15 @@ Use a distinct `--tool` value for every concurrent session, such as `codex:parse
 Rally can launch and message managed coding-agent sessions across supported hosts:
 
 - **`rally run`** launches Claude, Codex, OpenCode, or Gemini through a managed backend. It assigns a unique Rally identity and creates a dedicated linked worktree by default, so the session can be listed, captured, attached to, and stopped predictably.
+- **`--resource task:<work-context>`** makes Rally acquire exclusive ownership before `rally run` starts the harness. Host adapters for any other harness can use the same gate with `rally session ensure --resource task:<work-context>` before opening or resuming that context. A conflict fails at the Rally boundary instead of reaching the host's native "open in another app / Retry" state.
 - **`rally run codex --task "<prompt>"`** launches bounded Codex work through `codex exec`; Rally feeds the long-lived child over stdin, preserves the final response under `.rally/task-results/`, and automatically closes the session when the task completes. Result files are private local artifacts (mode `0600`) that persist until the operator archives or deletes them; Rally does not apply an automatic retention window. It removes a clean worktree or retains a dirty one with a recovery path. Plain `rally run codex` remains interactive and persistent. The invoking shell may retain the `--task` command in its history.
 - **`rally inject`** queues a prompt or recorded handoff for an existing managed session. It does not target arbitrary terminals. A successful inject means the message was enqueued; the receiving agent's own acknowledgement proves receipt.
 
 Inspect the launch plan before starting the session:
 
 ```bash
-rally run codex --name parser --task "Review the parser and report findings." --dry-run --json
-rally run codex --name parser --task "Review the parser and report findings." --json
+rally run codex --name parser --task "Review the parser and report findings." --resource task:parser-review --dry-run --json
+rally run codex --name parser --task "Review the parser and report findings." --resource task:parser-review --json
 # Use plain run + inject only when the session must remain open for later steering.
 ```
 
@@ -334,6 +335,7 @@ rally claims --json
 ```bash
 rally run claude                                  # becomes claude-01, tool claude_code:01
 rally run claude --backend <auto|tmux|cmux|ptyd|ptyd-strict>
+rally run claude --resource task:<work-context>   # admission before launch
 # auto = ptyd if live, else tmux; ptyd-strict refuses any mux fallback
 rally inject <session|name|tool> --handoff <event-id> --json
 ```
@@ -372,6 +374,7 @@ Three decisions shape everything above, and each cost something. [`docs/DESIGN-T
 
 - **Hooks beat a hookless CLI.** Instructing agents to run the commands produced inconsistent compliance that failed silently, because a missed check looks identical to a repo where nobody else is working. Hooks made compliance near-universal and made the repo more intrusive.
 - **Agents self-manage; a manager agent was rejected.** A manager would turn the substrate into a scheduler and a single point of failure. Rally fixed the observability that made silence ambiguous instead — mandated check-ins, worktree isolation for no-shows, lease expiry on claims.
+- **Rally gates ownership but does not choose the next harness.** An explicit `--resource` request is an atomic admission check. The host still decides what to launch, whether to wait, and where to redirect after Rally grants ownership.
 - **Push where available, pull as the floor.** Direct pane delivery arrives now and lets two agents argue a design question in real time. The ledger is what the protocol guarantees.
 
 ## Security and maturity

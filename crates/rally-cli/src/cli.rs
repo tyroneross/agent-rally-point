@@ -458,6 +458,10 @@ pub(crate) struct RunArgs {
     /// Rally passes it over stdin, preserves the final response, and closes the
     /// managed session when `codex exec` exits.
     pub(crate) task: Option<String>,
+    /// Exclusive Rally resource scopes that must be acquired before the
+    /// harness process starts. This is the host-neutral admission boundary
+    /// that keeps a second harness from reaching its native retry UI.
+    pub(crate) resources: Vec<String>,
     pub(crate) bins: BackendBins,
     /// When true, launch the agent in the canonical shared checkout (today's
     /// behavior) instead of provisioning a dedicated linked worktree.
@@ -547,6 +551,9 @@ pub(crate) struct SessionEnsureArgs {
     pub(crate) native_hook: bool,
     pub(crate) lifecycle_close: bool,
     pub(crate) live_delivery: bool,
+    /// Exclusive resources this parent harness lease must own before the host
+    /// opens or resumes the corresponding work context.
+    pub(crate) resources: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1927,6 +1934,7 @@ fn run_parser() -> impl Parser<RunArgs> {
     let session_id = optional_string_arg("session-id", "SESSION_ID");
     let tool = optional_string_arg("tool", "TOOL");
     let task = optional_string_arg("task", "PROMPT");
+    let resources = many_string_arg("resource", "RESOURCE");
     let bins = backend_bins_parser();
     let agent = positional::<String>("AGENT");
     // Two spellings, both meaning "opt out of per-agent worktree provisioning".
@@ -1935,7 +1943,7 @@ fn run_parser() -> impl Parser<RunArgs> {
     let no_worktree = long("no-worktree").switch();
     let shared = construct!(shared, no_worktree).map(|(a, b)| a || b);
     construct!(
-        json, dry_run, name, backend, session_id, tool, task, bins, shared, agent
+        json, dry_run, name, backend, session_id, tool, task, resources, bins, shared, agent
     )
     .map(
         |(
@@ -1946,6 +1954,7 @@ fn run_parser() -> impl Parser<RunArgs> {
             session_id,
             tool,
             task,
+            resources,
             bins,
             shared,
             agent,
@@ -1960,6 +1969,7 @@ fn run_parser() -> impl Parser<RunArgs> {
                 session_id,
                 tool,
                 task,
+                resources,
                 bins,
                 shared,
             }
@@ -2113,6 +2123,7 @@ fn session_lifecycle_parser() -> impl Parser<SessionLifecycleArgs> {
     let live_delivery = long("live-delivery")
         .help("Attest that this session has a receipt-capable live delivery path.")
         .switch();
+    let resources = many_string_arg("resource", "RESOURCE");
     let ensure = construct!(
         ensure_tool,
         ensure_session_id,
@@ -2120,7 +2131,8 @@ fn session_lifecycle_parser() -> impl Parser<SessionLifecycleArgs> {
         strict,
         native_hook,
         lifecycle_close,
-        live_delivery
+        live_delivery,
+        resources
     )
     .map(
         |(
@@ -2131,6 +2143,7 @@ fn session_lifecycle_parser() -> impl Parser<SessionLifecycleArgs> {
             native_hook,
             lifecycle_close,
             live_delivery,
+            resources,
         )| SessionLifecycleSubcommand::Ensure(SessionEnsureArgs {
             tool,
             session_id,
@@ -2139,6 +2152,7 @@ fn session_lifecycle_parser() -> impl Parser<SessionLifecycleArgs> {
             native_hook,
             lifecycle_close,
             live_delivery,
+            resources,
         }),
     )
     .to_options()
@@ -2903,12 +2917,54 @@ mod run_task_cli_tests {
         args
     }
 
+    fn session_ensure_args(args: &[&str]) -> SessionEnsureArgs {
+        let args = args
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        let CliParse::Command(command) = parse_cli(&args).expect("session ensure parses") else {
+            panic!("session ensure must parse as a command");
+        };
+        let CliCommand::SessionLifecycle(SessionLifecycleArgs {
+            subcommand: SessionLifecycleSubcommand::Ensure(args),
+            ..
+        }) = *command
+        else {
+            panic!("expected session ensure command");
+        };
+        args
+    }
+
     #[test]
     fn run_task_prompt_is_explicit_and_plain_run_stays_persistent() {
-        let task = run_args(&["run", "codex", "--task", "inspect the graph"]);
+        let task = run_args(&[
+            "run",
+            "codex",
+            "--task",
+            "inspect the graph",
+            "--resource",
+            "task:graph-root-cause",
+        ]);
         assert_eq!(task.task.as_deref(), Some("inspect the graph"));
+        assert_eq!(task.resources, ["task:graph-root-cause"]);
 
         let persistent = run_args(&["run", "codex"]);
         assert!(persistent.task.is_none());
+        assert!(persistent.resources.is_empty());
+    }
+
+    #[test]
+    fn session_ensure_accepts_repeatable_admission_resources() {
+        let args = session_ensure_args(&[
+            "session",
+            "ensure",
+            "--tool",
+            "aider:reviewer",
+            "--resource",
+            "task:review",
+            "--resource",
+            "device:simulator-1",
+        ]);
+        assert_eq!(args.resources, ["task:review", "device:simulator-1"]);
     }
 }

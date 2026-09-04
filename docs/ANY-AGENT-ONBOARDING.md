@@ -19,8 +19,16 @@ new one only for a genuinely new agent session:
 eval "$(rally session ensure \
   --tool <stable-tool-id> \
   --adapter <host-family> \
+  --resource task:<stable-work-context-id> \
   --json | jq -r '.data.session.shell_export')"
 ```
+
+The outer host adapter must run this command **before** it opens or resumes the
+work context. `--resource` is repeatable and accepts exclusive typed scopes.
+When another live session owns the same scope, Rally refuses admission before
+the new harness starts. The adapter may wait, show the current owner, or offer a
+redirect, but it must not invoke the harness's native retry path. Omit
+`--resource` only when the session has no exclusive work context to protect.
 
 An adapter adds `--native-hook`, `--strict`, `--lifecycle-close`, or
 `--live-delivery` only after it has wired that behavior. The response reports
@@ -162,6 +170,12 @@ rally run opencode --name <lane> --json
 rally run gemini --name <lane> --json
 ```
 
+Add `--resource task:<stable-work-context-id>` when the lane opens a context
+that another harness must not open concurrently. `rally run` acquires the
+resource before it starts the child process. Non-first-class hosts use the same
+admission gate through `rally session ensure`; the adapter name is metadata, so
+the control is not limited to Claude, Codex, OpenCode, or Gemini.
+
 Bounded Codex work should use `--task`: Rally passes the prompt to the long-lived
 child over stdin, captures the final response, and closes the managed session
 automatically. It removes a clean worktree or reports the recovery path for a
@@ -198,6 +212,12 @@ For managed targets, the injection contract is:
 The durable Rally fact is the contract. Injection is only delivery. If injection
 fails or the agent does not acknowledge receipt, continue from the Rally fact
 and use capture/attach/manual paste as a fallback.
+
+For a harness takeover, the outgoing owner posts the handoff, finishes or
+checkpoints its work, and closes its parent lease. Closing releases that exact
+session's admission claim. Only then does the incoming adapter acquire the same
+`task:<stable-work-context-id>` and launch. A redirect after admission may
+improve navigation; it is not the ownership mechanism.
 
 ### Direct messages versus directives
 
