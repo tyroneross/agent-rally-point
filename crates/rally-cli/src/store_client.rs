@@ -46,8 +46,8 @@ use rally_protocol::store_wire::{
 use crate::claim_authority;
 use crate::error::{RallyError, Result};
 use crate::store::{
-    self, AppendOutcome, ConditionalAppendOutcome, Fact, ReadReceipt, RenewClaimLeaseOutcome,
-    RoomSnapshot, SnapshotCacheCapture, SnapshotCacheFingerprint,
+    self, AppendOutcome, ConditionalAppendOutcome, EnterSnapshotContext, Fact, ReadReceipt,
+    RenewClaimLeaseOutcome, RoomSnapshot, SnapshotCacheCapture, SnapshotCacheFingerprint,
 };
 
 /// Discovery pointer filename inside `.rally/` (L7/ADR-02) — the daemon's
@@ -468,7 +468,9 @@ fn mutation_query(op: &StoreOp) -> Option<MutationQuery> {
         StoreOp::Facts
         | StoreOp::RepoWideClaimLifecycleFacts
         | StoreOp::SessionFactsWithContextVersion
+        | StoreOp::ActiveSessionFact { .. }
         | StoreOp::SnapshotWithArchived { .. }
+        | StoreOp::SnapshotForEnter { .. }
         | StoreOp::SnapshotForObligationTarget { .. }
         | StoreOp::SnapshotScoped { .. }
         | StoreOp::SnapshotWithReadersArchived { .. }
@@ -724,6 +726,15 @@ impl RoutedRoomStore {
         }
     }
 
+    pub(crate) fn active_session_fact(&self, session_id: &str) -> Result<Option<Fact>> {
+        match self.dispatch(StoreOp::ActiveSessionFact {
+            session_id: session_id.to_string(),
+        })? {
+            StoreOk::ActiveSessionFact { fact } => fact.map(from_value).transpose(),
+            _ => Err(unexpected_reply("active_session_fact")),
+        }
+    }
+
     /// `RoomStore::snapshot()` is `snapshot_with_archived(false)` composed
     /// locally — mirroring `DirectRoomStore::snapshot()`'s own composition;
     /// there is no separate `StoreOp::Snapshot` wire variant.
@@ -735,6 +746,38 @@ impl RoutedRoomStore {
         match self.dispatch(StoreOp::SnapshotWithArchived { include_archived })? {
             StoreOk::Snapshot { snapshot, .. } => snapshot_from_value(snapshot),
             _ => Err(unexpected_reply("snapshot_with_archived")),
+        }
+    }
+
+    pub(crate) fn snapshot_for_enter(
+        &self,
+        tool: &str,
+        build_id: &str,
+        from_session_id: &str,
+    ) -> Result<EnterSnapshotContext> {
+        match self.dispatch(StoreOp::SnapshotForEnter {
+            tool: tool.to_string(),
+            build_id: build_id.to_string(),
+            from_session_id: from_session_id.to_string(),
+        })? {
+            StoreOk::SnapshotForEnter {
+                snapshot,
+                duplicate_squad_recorded,
+                unmanaged_agent_recorded,
+                has_managed_session,
+                presence_recorded_for_session,
+                last_presence_build_id,
+                binary_drift_recorded,
+            } => Ok(EnterSnapshotContext {
+                snapshot: snapshot_from_value(snapshot)?,
+                duplicate_squad_recorded,
+                unmanaged_agent_recorded,
+                has_managed_session,
+                presence_recorded_for_session,
+                last_presence_build_id,
+                binary_drift_recorded,
+            }),
+            _ => Err(unexpected_reply("snapshot_for_enter")),
         }
     }
 
@@ -1047,8 +1090,8 @@ mod tests {
     }
 
     #[test]
-    fn probe_rejects_a_v5_daemon_after_targeted_read_cutover() {
-        assert_eq!(WIRE_VERSION, 6, "this control grades the v5 to v6 cutover");
+    fn probe_rejects_a_v6_daemon_after_enter_context_cutover() {
+        assert_eq!(WIRE_VERSION, 7, "this control grades the v6 to v7 cutover");
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1069,21 +1112,21 @@ mod tests {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             let request: StoreRequest = serde_json::from_str(line.trim()).unwrap();
-            assert_eq!(request.wire_version, 6);
+            assert_eq!(request.wire_version, 7);
             let response = StoreResponse::Ok(StoreOk::Pong {
                 repo_root: "/expected/repo".to_string(),
                 pid: 42,
-                wire_version: 5,
+                wire_version: 6,
             });
             let mut writer = &stream;
             writeln!(writer, "{}", serde_json::to_string(&response).unwrap()).unwrap();
         });
 
         let error = probe_identity(&rally_dir, "/expected/repo")
-            .expect_err("a v5 daemon must fail a v6 client immediately");
+            .expect_err("a v6 daemon must fail a v7 client immediately");
         assert!(matches!(error, RallyError::IncompatibleWire { .. }));
-        assert!(error.to_string().contains("client speaks 6"));
-        assert!(error.to_string().contains("daemon speaks 5"));
+        assert!(error.to_string().contains("client speaks 7"));
+        assert!(error.to_string().contains("daemon speaks 6"));
         server.join().unwrap();
         std::fs::remove_file(&socket).ok();
         std::fs::remove_dir_all(&rally_dir).ok();

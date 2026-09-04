@@ -1001,6 +1001,14 @@ mod imp {
                     context_version,
                 }
             }
+            StoreOp::ActiveSessionFact { session_id } => StoreOk::ActiveSessionFact {
+                fact: store
+                    .active_session_fact(&session_id)
+                    .map_err(rally_to_wire)?
+                    .as_ref()
+                    .map(to_wire_value)
+                    .transpose()?,
+            },
             StoreOp::SnapshotWithArchived { include_archived } => {
                 let capture = store
                     .snapshot_cache_capture(include_archived)
@@ -1013,6 +1021,25 @@ mod imp {
                         .as_ref()
                         .map(to_wire_value)
                         .transpose()?,
+                }
+            }
+            StoreOp::SnapshotForEnter {
+                tool,
+                build_id,
+                from_session_id,
+            } => {
+                let context = store
+                    .snapshot_for_enter(&tool, &build_id, &from_session_id)
+                    .map_err(rally_to_wire)?;
+                let snapshot = context.snapshot.without_obligation_transport();
+                StoreOk::SnapshotForEnter {
+                    snapshot: snapshot_to_wire(&snapshot)?,
+                    duplicate_squad_recorded: context.duplicate_squad_recorded,
+                    unmanaged_agent_recorded: context.unmanaged_agent_recorded,
+                    has_managed_session: context.has_managed_session,
+                    presence_recorded_for_session: context.presence_recorded_for_session,
+                    last_presence_build_id: context.last_presence_build_id,
+                    binary_drift_recorded: context.binary_drift_recorded,
                 }
             }
             StoreOp::SnapshotForObligationTarget {
@@ -1489,12 +1516,12 @@ mod imp {
         }
 
         #[test]
-        fn daemon_rejects_v5_requests_after_targeted_read_cutover() {
-            assert_eq!(WIRE_VERSION, 6, "this control grades the v5 to v6 cutover");
-            let repo_root = unique_repo_root("reject-v5");
+        fn daemon_rejects_v6_requests_after_enter_context_cutover() {
+            assert_eq!(WIRE_VERSION, 7, "this control grades the v6 to v7 cutover");
+            let repo_root = unique_repo_root("reject-v6");
             let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
             let request = StoreRequest {
-                wire_version: 5,
+                wire_version: 6,
                 engagement: None,
                 deadline_unix_ms: None,
                 mutation_budget_ms: None,
@@ -1503,10 +1530,10 @@ mod imp {
             match dispatch_one(&mut store, "/expected/repo", request) {
                 StoreResponse::Err(error) => {
                     assert_eq!(error.kind, StoreErrorKind::IncompatibleWire);
-                    assert!(error.message.contains("daemon speaks 6"));
-                    assert!(error.message.contains("client sent 5"));
+                    assert!(error.message.contains("daemon speaks 7"));
+                    assert!(error.message.contains("client sent 6"));
                 }
-                other => panic!("v5 request was not rejected: {other:?}"),
+                other => panic!("v6 request was not rejected: {other:?}"),
             }
             std::fs::remove_dir_all(repo_root).ok();
         }
@@ -1780,6 +1807,144 @@ mod imp {
                     panic!("targeted routed snapshot failed under obligation flood: {other:?}")
                 }
             }
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn routed_enter_context_stays_bounded_over_eight_mib_ledger() {
+            let repo_root = unique_repo_root("enter-context-wire-flood");
+            let rally_dir = repo_root.join(".rally");
+            let engagement = "enter-context-wire-flood";
+            std::fs::write(
+                rally_dir.join(crate::store::ACTIVE_ENGAGEMENT_FILENAME),
+                format!("{engagement}\n"),
+            )
+            .unwrap();
+            let log_dir = rally_dir.join(crate::store::LOG_DIRNAME);
+            std::fs::create_dir_all(&log_dir).unwrap();
+            let segment_path = log_dir.join(format!("{engagement}.jsonl"));
+            let mut segment = std::fs::File::create(&segment_path).unwrap();
+            let padding = "x".repeat(16 * 1024);
+            for seq in 1..=520i64 {
+                let (kind, tool, subject, summary) = match seq {
+                    1 => (
+                        crate::store::FactKind::Risk,
+                        Some("worker-01".to_string()),
+                        "unmanaged-agent: worker-01".to_string(),
+                        Some("already recorded".to_string()),
+                    ),
+                    2 => (
+                        crate::store::FactKind::Presence,
+                        Some("peer-01".to_string()),
+                        "peer presence".to_string(),
+                        Some("build_id:old-build".to_string()),
+                    ),
+                    3 => (
+                        crate::store::FactKind::Risk,
+                        Some("worker-01".to_string()),
+                        "binary-drift: new-build vs old-build".to_string(),
+                        Some("already recorded".to_string()),
+                    ),
+                    4 => (
+                        crate::store::FactKind::Risk,
+                        Some("worker-01".to_string()),
+                        "duplicate-active-squad-id: worker-01".to_string(),
+                        Some("already recorded".to_string()),
+                    ),
+                    _ => (
+                        crate::store::FactKind::Lesson,
+                        Some("fixture".to_string()),
+                        format!("ledger padding {seq}"),
+                        Some(padding.clone()),
+                    ),
+                };
+                let mut fact = crate::store::Fact {
+                    schema: crate::FACT_SCHEMA.to_string(),
+                    event_id: format!("enter-context-flood-{seq}"),
+                    seq,
+                    thread_id: "enter-context-flood-thread".to_string(),
+                    kind,
+                    tool,
+                    subject,
+                    summary,
+                    created_at: crate::now_string(),
+                    ..crate::store::Fact::default()
+                };
+                if seq == 5 {
+                    fact.kind = crate::store::FactKind::Session;
+                    fact.tool = Some("worker-01".to_string());
+                    fact.subject = "managed session worker-01 active".to_string();
+                    fact.summary = Some("active codex session via tmux".to_string());
+                    fact.status = Some("active".to_string());
+                    fact.session = Some(crate::backends::ManagedSession {
+                        session_id: "managed-worker-01".to_string(),
+                        name: "worker-01".to_string(),
+                        agent: "codex".to_string(),
+                        tool: "worker-01".to_string(),
+                        backend: "tmux".to_string(),
+                        cwd: repo_root.clone(),
+                        target: "rally-worker-01".to_string(),
+                        ..crate::backends::ManagedSession::default()
+                    });
+                }
+                let event_type = serde_json::to_value(&fact.kind).unwrap();
+                writeln!(
+                    segment,
+                    "{}",
+                    serde_json::json!({
+                        "seq": seq,
+                        "occurred_at": fact.created_at,
+                        "event_type": event_type,
+                        "payload": fact,
+                        "engagement": engagement
+                    })
+                )
+                .unwrap();
+            }
+            segment.sync_all().unwrap();
+            assert!(
+                std::fs::metadata(&segment_path).unwrap().len() > MAX_LINE_BYTES as u64,
+                "fixture must exceed the maximum daemon frame"
+            );
+
+            let cfg = ServeConfig {
+                repo_root: repo_root.clone(),
+                idle_exit_secs: Some(20),
+                foreground: true,
+            };
+            let handle = thread::spawn(move || super::serve_unix(cfg));
+            let socket = wait_for_addr(&rally_dir);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline && !ping_ok(&socket) {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(ping_ok(&socket), "daemon never answered a ping");
+
+            let room = crate::store::RoomStore::open_at(repo_root.clone()).unwrap();
+            assert!(
+                matches!(room, crate::store::RoomStore::Routed(_)),
+                "fixture must exercise the routed client"
+            );
+            for _ in 0..2 {
+                let context = room
+                    .snapshot_for_enter("worker-01", "new-build", "sess:worker-01#live")
+                    .unwrap();
+                assert!(context.duplicate_squad_recorded);
+                assert!(context.unmanaged_agent_recorded);
+                assert!(context.has_managed_session);
+                assert!(!context.presence_recorded_for_session);
+                assert_eq!(context.last_presence_build_id.as_deref(), Some("old-build"));
+                assert!(context.binary_drift_recorded);
+            }
+            let active = room
+                .active_session_fact("managed-worker-01")
+                .unwrap()
+                .expect("exact active session must cross the bounded route");
+            assert_eq!(active.session.unwrap().tool, "worker-01");
+            drop(room);
+
+            super::request_shutdown_for_test();
+            handle.join().unwrap().unwrap();
             std::fs::remove_dir_all(repo_root).ok();
         }
 

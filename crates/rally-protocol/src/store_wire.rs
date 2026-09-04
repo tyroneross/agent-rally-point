@@ -61,7 +61,7 @@ use serde_json::Value;
 /// Wire protocol version. Bumped only on a breaking envelope change. The ping
 /// reply carries this; a client seeing an incompatible version fails
 /// immediately with typed `IncompatibleWire` and never falls back to direct.
-pub const WIRE_VERSION: u32 = 6;
+pub const WIRE_VERSION: u32 = 7;
 
 /// Hard cap on a single request/response line. A longer line is a framing
 /// error (or an abuse) and maps to the transport-error class (R7): the daemon
@@ -174,9 +174,21 @@ pub enum StoreOp {
     /// `RoomStore::session_facts_with_context_version()` →
     /// `(Vec<Fact>, Option<u64>)`.
     SessionFactsWithContextVersion,
+    /// Exact active managed-session fact for one session id. The daemon may
+    /// scan full history internally, but the reply is bounded to zero or one
+    /// fact so task finalization remains available in large routed rooms.
+    ActiveSessionFact { session_id: String },
     /// `RoomStore::snapshot()` (== `snapshot_with_archived(false)`) and
     /// `RoomStore::snapshot_with_archived(include_archived)` → `RoomSnapshot`.
     SnapshotWithArchived { include_archived: bool },
+    /// Bounded pre-write context for `rally enter`. The daemon scans durable
+    /// facts internally but returns only the projection and exact telemetry
+    /// guards needed by the caller, so ledger size cannot overflow one reply.
+    SnapshotForEnter {
+        tool: String,
+        build_id: String,
+        from_session_id: String,
+    },
     /// Target-scoped obligation projection. Counts remain exact while rows are
     /// caller-bounded, so one peer cannot make every daemon snapshot fail.
     SnapshotForObligationTarget {
@@ -227,7 +239,9 @@ impl StoreOp {
             Self::Facts
             | Self::RepoWideClaimLifecycleFacts
             | Self::SessionFactsWithContextVersion
+            | Self::ActiveSessionFact { .. }
             | Self::SnapshotWithArchived { .. }
+            | Self::SnapshotForEnter { .. }
             | Self::SnapshotForObligationTarget { .. }
             | Self::SnapshotScoped { .. }
             | Self::SnapshotWithReadersArchived { .. }
@@ -276,12 +290,24 @@ pub enum StoreOk {
         facts: Vec<Value>,
         context_version: Option<u64>,
     },
+    /// Zero or one exact active managed-session fact.
+    ActiveSessionFact { fact: Option<Value> },
     /// `RoomSnapshot` plus an optional server-captured snapshot-cache
     /// fingerprint. `None` is compatible but never cacheable by a v5 client.
     Snapshot {
         snapshot: Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fingerprint: Option<Value>,
+    },
+    /// Bounded pre-write context for `rally enter`.
+    SnapshotForEnter {
+        snapshot: Value,
+        duplicate_squad_recorded: bool,
+        unmanaged_agent_recorded: bool,
+        has_managed_session: bool,
+        presence_recorded_for_session: bool,
+        last_presence_build_id: Option<String>,
+        binary_drift_recorded: bool,
     },
     /// `RoomSnapshot` (readers projected).
     SnapshotWithReaders { snapshot: Value },
@@ -433,8 +459,8 @@ mod tests {
     }
 
     #[test]
-    fn o26_wire_v6_round_trips_all_query_controls() {
-        assert_eq!(WIRE_VERSION, 6);
+    fn o26_wire_v7_round_trips_all_query_controls() {
+        assert_eq!(WIRE_VERSION, 7);
         let req = StoreRequest::new(
             Some("engagement-alpha".to_string()),
             StoreOp::SnapshotScoped {
@@ -487,6 +513,72 @@ mod tests {
             compatible_without_fingerprint,
             StoreResponse::Ok(StoreOk::Snapshot {
                 fingerprint: None,
+                ..
+            })
+        ));
+
+        let active_session = StoreRequest::new(
+            Some("engagement-alpha".to_string()),
+            StoreOp::ActiveSessionFact {
+                session_id: "managed-worker-01".to_string(),
+            },
+        );
+        let active_session_back: StoreRequest =
+            serde_json::from_str(&serde_json::to_string(&active_session).unwrap()).unwrap();
+        assert!(matches!(
+            active_session_back.op,
+            StoreOp::ActiveSessionFact { ref session_id }
+                if session_id == "managed-worker-01"
+        ));
+        let active_response = StoreResponse::Ok(StoreOk::ActiveSessionFact {
+            fact: Some(serde_json::json!({"event_id": "session-fact"})),
+        });
+        assert!(matches!(
+            serde_json::from_str::<StoreResponse>(
+                &serde_json::to_string(&active_response).unwrap()
+            )
+            .unwrap(),
+            StoreResponse::Ok(StoreOk::ActiveSessionFact { fact: Some(_) })
+        ));
+
+        let enter = StoreRequest::new(
+            Some("engagement-alpha".to_string()),
+            StoreOp::SnapshotForEnter {
+                tool: "codex:01".to_string(),
+                build_id: "0.2.7+candidate".to_string(),
+                from_session_id: "sess:codex:01#live".to_string(),
+            },
+        );
+        let enter_back: StoreRequest =
+            serde_json::from_str(&serde_json::to_string(&enter).unwrap()).unwrap();
+        assert!(matches!(
+            enter_back.op,
+            StoreOp::SnapshotForEnter {
+                ref tool,
+                ref build_id,
+                ref from_session_id,
+            } if tool == "codex:01"
+                && build_id == "0.2.7+candidate"
+                && from_session_id == "sess:codex:01#live"
+        ));
+
+        let enter_response = StoreResponse::Ok(StoreOk::SnapshotForEnter {
+            snapshot: serde_json::json!({"max_seq": 42}),
+            duplicate_squad_recorded: true,
+            unmanaged_agent_recorded: false,
+            has_managed_session: true,
+            presence_recorded_for_session: true,
+            last_presence_build_id: Some("0.2.7+prior".to_string()),
+            binary_drift_recorded: true,
+        });
+        let enter_response_back: StoreResponse =
+            serde_json::from_str(&serde_json::to_string(&enter_response).unwrap()).unwrap();
+        assert!(matches!(
+            enter_response_back,
+            StoreResponse::Ok(StoreOk::SnapshotForEnter {
+                duplicate_squad_recorded: true,
+                unmanaged_agent_recorded: false,
+                binary_drift_recorded: true,
                 ..
             })
         ));

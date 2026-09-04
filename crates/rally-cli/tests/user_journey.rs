@@ -5,6 +5,7 @@ use chrono::DateTime;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -53,9 +54,7 @@ struct DaemonHandle {
     child: Child,
 }
 
-fn maybe_start_daemon(cwd: &Path, home: &Path) -> Option<DaemonHandle> {
-    // Only in daemon-serving mode; `?` returns None when the gate env is unset.
-    std::env::var_os("RALLY_TEST_RALLYD")?;
+fn start_daemon(cwd: &Path, home: &Path) -> DaemonHandle {
     fs::create_dir_all(cwd.join(".rally")).ok();
     let log =
         fs::File::create(cwd.join(".rally").join("rallyd-serve.log")).expect("create daemon log");
@@ -83,12 +82,18 @@ fn maybe_start_daemon(cwd: &Path, home: &Path) -> Option<DaemonHandle> {
                 .map(|v| v["data"]["daemon"]["live"] == Value::Bool(true))
                 .unwrap_or(false)
         {
-            return Some(handle);
+            return handle;
         }
         thread::sleep(Duration::from_millis(50));
     }
     let log = fs::read_to_string(cwd.join(".rally").join("rallyd-serve.log")).unwrap_or_default();
-    panic!("RALLY_TEST_RALLYD=1 but daemon never became ready; serve log:\n{log}");
+    panic!("rally daemon never became ready; serve log:\n{log}");
+}
+
+fn maybe_start_daemon(cwd: &Path, home: &Path) -> Option<DaemonHandle> {
+    // Only in daemon-serving mode; `?` returns None when the gate env is unset.
+    std::env::var_os("RALLY_TEST_RALLYD")?;
+    Some(start_daemon(cwd, home))
 }
 
 impl Drop for DaemonHandle {
@@ -5539,6 +5544,180 @@ fn rally_enter_emits_unmanaged_agent_for_presence_only_tool() {
     workspace.cleanup();
 }
 
+/// A daemon-backed enter must not fetch the full durable ledger to decide
+/// whether a managed tool is unmanaged. The complete command path stays
+/// correct and repeatable even when canonical history exceeds one wire frame.
+#[test]
+fn routed_enter_keeps_managed_identity_over_eight_mib_ledger() {
+    let workspace = Workspace::new("rally-enter-managed-wire-flood");
+    let rally_dir = workspace.cwd.join(".rally");
+    let engagement = "enter-managed-wire-flood";
+    fs::create_dir_all(rally_dir.join("log")).unwrap();
+    fs::write(
+        rally_dir.join("active-engagement"),
+        format!("{engagement}\n"),
+    )
+    .unwrap();
+    let segment_path = rally_dir.join("log").join(format!("{engagement}.jsonl"));
+    let mut segment = fs::File::create(&segment_path).unwrap();
+    let now = "2026-09-04T00:00:00Z";
+    let managed = [
+        ("worker-01", "managed-worker-01", "rally-worker-01"),
+        ("worker-02", "managed-worker-02", "rally-worker-02"),
+    ];
+    for (index, (tool, session_id, target)) in managed.iter().enumerate() {
+        let seq = index as i64 + 1;
+        let payload = json!({
+            "schema": "agent-rally.fact.v1",
+            "event_id": format!("managed-session-{seq}"),
+            "seq": seq,
+            "thread_id": format!("managed-session-thread-{seq}"),
+            "kind": "session",
+            "tool": tool,
+            "role": null,
+            "subject": format!("managed session {tool} active"),
+            "scope": [],
+            "created_at": now,
+            "summary": "active codex session via tmux",
+            "evidence": [],
+            "target": tool,
+            "ref": null,
+            "status": "active",
+            "severity": null,
+            "uri": null,
+            "from_session_id": null,
+            "session": {
+                "session_id": session_id,
+                "name": tool,
+                "agent": "codex",
+                "tool": tool,
+                "backend": "tmux",
+                "cwd": workspace.cwd,
+                "target": target
+            }
+        });
+        writeln!(
+            segment,
+            "{}",
+            json!({
+                "seq": seq,
+                "occurred_at": now,
+                "event_type": "session",
+                "payload": payload,
+                "engagement": engagement
+            })
+        )
+        .unwrap();
+    }
+    let padding = "x".repeat(16 * 1024);
+    for seq in 3..=522i64 {
+        let payload = json!({
+            "schema": "agent-rally.fact.v1",
+            "event_id": format!("enter-ledger-padding-{seq}"),
+            "seq": seq,
+            "thread_id": "enter-ledger-padding-thread",
+            "kind": "lesson",
+            "tool": "fixture",
+            "role": null,
+            "subject": format!("ledger padding {seq}"),
+            "scope": [],
+            "created_at": now,
+            "summary": padding,
+            "evidence": [],
+            "target": null,
+            "ref": null,
+            "status": null,
+            "severity": null,
+            "uri": null,
+            "from_session_id": null,
+            "session": null
+        });
+        writeln!(
+            segment,
+            "{}",
+            json!({
+                "seq": seq,
+                "occurred_at": now,
+                "event_type": "lesson",
+                "payload": payload,
+                "engagement": engagement
+            })
+        )
+        .unwrap();
+    }
+    segment.sync_all().unwrap();
+    assert!(
+        fs::metadata(&segment_path).unwrap().len() > 8 * 1024 * 1024,
+        "fixture must exceed the daemon wire limit"
+    );
+
+    let daemon = start_daemon(&workspace.cwd, &workspace.home);
+    for tool in ["worker-01", "worker-02", "worker-01"] {
+        let entered = workspace.json(&["enter", "--tool", tool, "--json"]);
+        let warnings = entered["data"]["enter"]["warnings"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning["code"] != "unmanaged-agent"),
+            "managed {tool} was falsely classified as unmanaged: {warnings:?}"
+        );
+    }
+    let false_unmanaged_count = canonical_fact_rows(&workspace.cwd)
+        .into_iter()
+        .filter(|row| {
+            row["payload"]["kind"] == "risk"
+                && row["payload"]["subject"]
+                    .as_str()
+                    .is_some_and(|subject| subject.starts_with("unmanaged-agent: worker-"))
+        })
+        .count();
+    assert_eq!(
+        false_unmanaged_count, 0,
+        "repeat enters must not persist false unmanaged telemetry"
+    );
+
+    // Exercise the emitted-telemetry path through the same oversized routed
+    // command boundary. Each tool remains visibly unmanaged on every enter,
+    // but its exact durable risk subject must be appended only once.
+    for tool in ["worker-03", "worker-04", "worker-03"] {
+        let entered = workspace.json(&["enter", "--tool", tool, "--json"]);
+        let warnings = entered["data"]["enter"]["warnings"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|warning| warning["code"] == "unmanaged-agent")
+                .count(),
+            1,
+            "unmanaged {tool} must remain visible without duplicating its fact: {warnings:?}"
+        );
+    }
+    let facts = canonical_fact_rows(&workspace.cwd);
+    for tool in ["worker-03", "worker-04"] {
+        let subject = format!("unmanaged-agent: {tool}");
+        let exact_count = facts
+            .iter()
+            .filter(|row| {
+                row["payload"]["kind"] == "risk"
+                    && row["payload"]["tool"] == tool
+                    && row["payload"]["subject"] == subject
+            })
+            .count();
+        assert_eq!(
+            exact_count, 1,
+            "routed A/B/A enter must append exactly one risk for {tool}"
+        );
+    }
+
+    drop(daemon);
+    workspace.cleanup();
+}
+
 /// C-FLEET: a tool that later runs `rally adopt` flips out of the
 /// unmanaged-agent state. Under Plan F, adoption is limited to tmux/cmux
 /// targets because Herdr is no longer a managed backend.
@@ -6326,6 +6505,190 @@ printf 'completed: %s\n' "$prompt" > "$result"
         format!("completed: {prompt}\n")
     );
     assert_eq!(fs::read_to_string(&prompt_capture).unwrap(), second_prompt);
+    workspace.cleanup();
+}
+
+#[test]
+fn routed_codex_task_finalizes_over_eight_mib_ledger() {
+    if !git_available() || !tmux_available() {
+        return;
+    }
+    let _run_guard = serialize_rally_run();
+    let workspace = real_repo_workspace("rally-run-codex-task-large-routed");
+    let fake_codex = workspace.cwd.join("fake-codex-large-routed.sh");
+    write_executable(
+        &fake_codex,
+        r#"#!/bin/sh
+result=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output-last-message|-o)
+      result="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+prompt=$(cat)
+printf 'completed: %s\n' "$prompt" > "$result"
+"#,
+    );
+
+    // Initialize canonical room metadata, then enlarge the append-only segment
+    // before rallyd takes ownership. The task worker must still resolve its
+    // exact active session through a bounded daemon reply during finalization.
+    workspace.json(&["enter", "--tool", "fixture", "--json"]);
+    let segment_path = fs::read_dir(workspace.cwd.join(".rally/log"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .expect("room initialization must create one active segment");
+    let engagement = segment_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap()
+        .to_string();
+    let mut segment = fs::OpenOptions::new()
+        .append(true)
+        .open(&segment_path)
+        .unwrap();
+    let start_seq = canonical_fact_rows(&workspace.cwd)
+        .iter()
+        .filter_map(|row| row["seq"].as_i64())
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let padding = "x".repeat(16 * 1024);
+    for seq in start_seq..start_seq + 520 {
+        let payload = json!({
+            "schema": "agent-rally.fact.v1",
+            "event_id": format!("task-finalize-padding-{seq}"),
+            "seq": seq,
+            "thread_id": "task-finalize-padding-thread",
+            "kind": "lesson",
+            "tool": "fixture",
+            "role": null,
+            "subject": format!("task finalize ledger padding {seq}"),
+            "scope": [],
+            "created_at": "2026-09-04T00:00:00Z",
+            "summary": padding,
+            "evidence": [],
+            "target": null,
+            "ref": null,
+            "status": null,
+            "severity": null,
+            "uri": null,
+            "from_session_id": null,
+            "session": null
+        });
+        writeln!(
+            segment,
+            "{}",
+            json!({
+                "seq": seq,
+                "occurred_at": "2026-09-04T00:00:00Z",
+                "event_type": "lesson",
+                "payload": payload,
+                "engagement": engagement
+            })
+        )
+        .unwrap();
+    }
+    segment.sync_all().unwrap();
+    assert!(
+        fs::metadata(&segment_path).unwrap().len() > 8 * 1024 * 1024,
+        "fixture must exceed the daemon wire limit"
+    );
+
+    let daemon = start_daemon(&workspace.cwd, &workspace.home);
+    let prompt = "finalize across a bounded daemon query";
+    let output = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .current_dir(&workspace.cwd)
+        .env("HOME", &workspace.home)
+        .env("RALLY_DAEMON_AUTOSTART", "0")
+        .env("RALLY_TASK_AGENT_BIN", &fake_codex)
+        .args([
+            "run",
+            "codex",
+            "--json",
+            "--name",
+            "bounded-large-routed",
+            "--task",
+            prompt,
+            "--backend",
+            "tmux",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr={} stdout={}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let run: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let session_id = run["data"]["run"]["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let task_id = run["data"]["run"]["session"]["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let target = run["data"]["run"]["session"]["target"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let worktree = PathBuf::from(
+        run["data"]["run"]["session"]["worktree_path"]
+            .as_str()
+            .unwrap(),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline
+        && Command::new("tmux")
+            .args(["has-session", "-t", &target])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!worktree.exists(), "task worktree was not removed");
+
+    let rows = canonical_fact_rows(&workspace.cwd);
+    let latest_session = rows
+        .iter()
+        .filter(|row| {
+            row["payload"]["kind"] == "session"
+                && row["payload"]["session"]["session_id"] == session_id
+        })
+        .max_by_key(|row| row["seq"].as_i64().unwrap_or_default())
+        .expect("task session facts must remain queryable canonically");
+    assert_eq!(latest_session["payload"]["status"], "stopped");
+    assert!(rows.iter().any(|row| {
+        row["payload"]["kind"] == "artifact"
+            && row["payload"]["from_session_id"] == session_id
+            && row["payload"]["status"] == "complete"
+    }));
+    let result_path = workspace
+        .cwd
+        .join(".rally/task-results")
+        .join(format!("{task_id}.md"));
+    assert_eq!(
+        fs::read_to_string(result_path).unwrap(),
+        format!("completed: {prompt}\n")
+    );
+
+    drop(daemon);
     workspace.cleanup();
 }
 

@@ -1896,8 +1896,10 @@ pub(crate) struct RoomSnapshot {
     /// System-generated health/telemetry facts (`external-intake`,
     /// `unmanaged-agent`, `duplicate-active-squad-id`, `binary-drift`) split out
     /// of `current_risks` so the risk view shows only human coordination risks.
-    /// Deduped by subject (freshest kept). Auditable here; omitted from JSON when
-    /// empty so existing round-trip tests are unaffected.
+    /// Deduped by prefix class (freshest kept). This bounded view cannot answer
+    /// whether an exact historical subject exists; callers that need subject
+    /// idempotency must consult durable facts. Auditable here; omitted from JSON
+    /// when empty so existing round-trip tests are unaffected.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) system_health: Vec<Fact>,
     pub(crate) recent_artifacts: Vec<Fact>,
@@ -1981,6 +1983,22 @@ pub(crate) struct RoomSnapshot {
     /// erasing the timestamp destructive reclaim must inspect.
     #[serde(skip)]
     pub(crate) author_last_seen: BTreeMap<String, String>,
+}
+
+/// Bounded pre-write state used by `rally enter`.
+///
+/// The durable ledger may be larger than the daemon wire limit. Both direct
+/// and routed stores therefore scan facts on the store side and return only
+/// the projection plus exact telemetry guards needed by the command.
+#[derive(Clone, Debug)]
+pub(crate) struct EnterSnapshotContext {
+    pub(crate) snapshot: RoomSnapshot,
+    pub(crate) duplicate_squad_recorded: bool,
+    pub(crate) unmanaged_agent_recorded: bool,
+    pub(crate) has_managed_session: bool,
+    pub(crate) presence_recorded_for_session: bool,
+    pub(crate) last_presence_build_id: Option<String>,
+    pub(crate) binary_drift_recorded: bool,
 }
 
 /// The `#[serde(skip)]` projections on [`RoomSnapshot`], carried across the
@@ -2731,6 +2749,7 @@ impl From<&RoomSnapshot> for RoomSummary {
 ///   renew_claim_lease                    → RenewClaimLease
 ///   session_facts_with_context_version   → SessionFactsWithContextVersion
 ///   snapshot / snapshot_with_archived    → SnapshotWithArchived
+///   snapshot_for_enter                   → SnapshotForEnter
 ///   snapshot_scoped                      → SnapshotScoped
 ///   snapshot_with_readers_archived       → SnapshotWithReadersArchived
 ///   last_checkpoint_seq                  → LastCheckpointSeq
@@ -4376,11 +4395,34 @@ impl RoomStore {
         }
     }
 
+    pub(crate) fn active_session_fact(&self, session_id: &str) -> Result<Option<Fact>> {
+        match self {
+            RoomStore::Direct(d) => d.active_session_fact(session_id),
+            RoomStore::Routed(r) => r.active_session_fact(session_id),
+        }
+    }
+
     pub(crate) fn snapshot(&self) -> Result<RoomSnapshot> {
         match self {
             RoomStore::Direct(d) => d.snapshot(),
             RoomStore::Routed(r) => r.snapshot(),
         }
+    }
+
+    pub(crate) fn snapshot_for_enter(
+        &self,
+        tool: &str,
+        build_id: &str,
+        from_session_id: &str,
+    ) -> Result<EnterSnapshotContext> {
+        match self {
+            RoomStore::Direct(d) => d.snapshot_for_enter(tool, build_id, from_session_id),
+            RoomStore::Routed(r) => r.snapshot_for_enter(tool, build_id, from_session_id),
+        }
+    }
+
+    pub(crate) fn is_routed(&self) -> bool {
+        matches!(self, RoomStore::Routed(_))
     }
 
     pub(crate) fn snapshot_for_obligation_target(
@@ -5977,6 +6019,11 @@ impl DirectRoomStore {
         Ok((facts, context_version))
     }
 
+    pub(crate) fn active_session_fact(&self, session_id: &str) -> Result<Option<Fact>> {
+        let (facts, _) = self.session_facts_with_context_version()?;
+        Ok(active_session_fact_from_facts(&facts, session_id))
+    }
+
     /// Repo root this store is rooted at (parent of `.rally`). Used to resolve
     /// the coordination policy (`resolve_coordination`).
     pub(crate) fn repo_root(&self) -> &Path {
@@ -5985,6 +6032,23 @@ impl DirectRoomStore {
 
     pub(crate) fn snapshot(&self) -> Result<RoomSnapshot> {
         self.snapshot_with_archived(false)
+    }
+
+    pub(crate) fn snapshot_for_enter(
+        &self,
+        tool: &str,
+        build_id: &str,
+        from_session_id: &str,
+    ) -> Result<EnterSnapshotContext> {
+        let facts = self.facts()?;
+        let coord = crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
+        Ok(enter_snapshot_context_from_facts(
+            &facts,
+            &coord,
+            tool,
+            build_id,
+            from_session_id,
+        ))
     }
 
     /// Snapshot honoring an explicit `include_archived` flag (the
@@ -7722,6 +7786,104 @@ fn snapshot_from_facts_with_policy(
     include_archived: bool,
 ) -> RoomSnapshot {
     snapshot_from_facts_with_policy_at(facts, coord, include_archived, projection_unix_sec())
+}
+
+fn durable_risk_subject_recorded(
+    facts: &[Fact],
+    subject: &str,
+    expected_tool: Option<&str>,
+) -> bool {
+    facts.iter().any(|fact| {
+        fact.kind == FactKind::Risk
+            && fact.subject == subject
+            && expected_tool.is_none_or(|tool| fact.tool.as_deref() == Some(tool))
+    })
+}
+
+fn active_session_fact_from_facts(facts: &[Fact], session_id: &str) -> Option<Fact> {
+    facts
+        .iter()
+        .filter(|fact| {
+            fact.kind == FactKind::Session
+                && fact
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.session_id == session_id)
+        })
+        .max_by_key(|fact| fact.seq)
+        .filter(|fact| fact.status.as_deref() != Some("stopped"))
+        .cloned()
+}
+
+fn enter_snapshot_context_from_facts(
+    facts: &[Fact],
+    coord: &crate::hooks_config::CoordinationConfig,
+    tool: &str,
+    build_id: &str,
+    from_session_id: &str,
+) -> EnterSnapshotContext {
+    let duplicate_squad_subject = format!("duplicate-active-squad-id: {tool}");
+    let unmanaged_agent_subject = format!("unmanaged-agent: {tool}");
+    let last_presence_build_id = facts
+        .iter()
+        .filter(|fact| fact.kind == "presence")
+        .max_by_key(|fact| fact.seq)
+        .and_then(|fact| fact.summary.as_deref())
+        .and_then(|summary| summary.strip_prefix("build_id:"))
+        .map(str::to_string);
+    let binary_drift_recorded = last_presence_build_id.as_deref().is_some_and(|prior_id| {
+        prior_id != build_id
+            && durable_risk_subject_recorded(
+                facts,
+                &format!("binary-drift: {build_id} vs {prior_id}"),
+                None,
+            )
+    });
+    let mut ordered_session_facts = facts
+        .iter()
+        .filter(|fact| fact.kind == FactKind::Session)
+        .collect::<Vec<_>>();
+    ordered_session_facts.sort_by_key(|fact| fact.seq);
+    let mut active_sessions = BTreeMap::<String, &ManagedSession>::new();
+    for fact in ordered_session_facts {
+        if let Some(session) = fact.session.as_ref() {
+            if fact.status.as_deref() == Some("stopped") {
+                active_sessions.remove(&session.session_id);
+            } else {
+                active_sessions.insert(session.session_id.clone(), session);
+            }
+        }
+    }
+    let has_managed_session = active_sessions
+        .values()
+        .any(|session| session.tool == tool || session.session_id == tool || session.name == tool);
+    let presence_recorded_for_session = facts.iter().any(|fact| {
+        fact.kind == FactKind::Presence
+            && crate::claim_authority::same_session_owner(
+                fact.tool.as_deref(),
+                fact.from_session_id.as_deref(),
+                Some(tool),
+                Some(from_session_id),
+            )
+    });
+
+    EnterSnapshotContext {
+        snapshot: snapshot_from_facts_with_policy(facts, coord, false),
+        duplicate_squad_recorded: durable_risk_subject_recorded(
+            facts,
+            &duplicate_squad_subject,
+            None,
+        ),
+        unmanaged_agent_recorded: durable_risk_subject_recorded(
+            facts,
+            &unmanaged_agent_subject,
+            Some(tool),
+        ),
+        has_managed_session,
+        presence_recorded_for_session,
+        last_presence_build_id,
+        binary_drift_recorded,
+    }
 }
 
 fn projection_unix_sec() -> i64 {

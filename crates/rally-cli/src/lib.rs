@@ -2639,6 +2639,38 @@ fn ensure_presence_tiered_for_session_with_evidence(
         return Ok(());
     }
     let snapshot = room.snapshot()?;
+    append_presence_tiered(
+        room,
+        tool,
+        tier,
+        from_session_id,
+        extra_evidence,
+        snapshot.lead.is_none(),
+    )
+}
+
+fn ensure_presence_tiered_from_context(
+    room: &RoomStore,
+    tool: &str,
+    tier: Option<&str>,
+    from_session_id: &str,
+    presence_recorded_for_session: bool,
+    lead_seat_open: bool,
+) -> Result<()> {
+    if presence_recorded_for_session {
+        return Ok(());
+    }
+    append_presence_tiered(room, tool, tier, from_session_id, &[], lead_seat_open)
+}
+
+fn append_presence_tiered(
+    room: &RoomStore,
+    tool: &str,
+    tier: Option<&str>,
+    from_session_id: &str,
+    extra_evidence: &[String],
+    lead_seat_open: bool,
+) -> Result<()> {
     // R9 stale-binary guard: embed the build-id in the presence fact's summary
     // so that `command_enter` can detect when different builds are writing to
     // the same room.  Format: "build_id:<BUILD_ID>" — minimal, no schema bump.
@@ -2681,7 +2713,7 @@ fn ensure_presence_tiered_for_session_with_evidence(
     // First-FRONTIER-enter-is-lead: assert lead only when the seat is open AND
     // this agent is lead-eligible (frontier tier, or undeclared for back-compat).
     let lead_eligible = matches!(tier, None | Some("frontier"));
-    if snapshot.lead.is_none() && lead_eligible {
+    if lead_seat_open && lead_eligible {
         let lead_fact = Fact {
             from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
@@ -2784,7 +2816,18 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
 
     // Snapshot BEFORE writing presence so the cursor window reflects peer work
     // only (not the agent's own enter heartbeat).
-    let snapshot_before = room.snapshot()?;
+    let enter_from_session_id = current_protocol_session(Some(&tool))
+        .from_session_id()
+        .to_string();
+    let store::EnterSnapshotContext {
+        snapshot: snapshot_before,
+        duplicate_squad_recorded,
+        unmanaged_agent_recorded,
+        has_managed_session,
+        presence_recorded_for_session,
+        last_presence_build_id,
+        binary_drift_recorded,
+    } = room.snapshot_for_enter(&tool, BUILD_ID, &enter_from_session_id)?;
     let cursor_before = args
         .since
         .unwrap_or_else(|| room.cursor_for(&tool).unwrap_or(0));
@@ -2807,10 +2850,21 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     // attributed risk facts before this point — the re-order fixes all four
     // at once. The blocks still use `snapshot_before` (pre-presence) for their
     // dedup checks, so behavior is unchanged when none of them fire.
-    with_watchdog_command_commit(|| ensure_presence_tiered(&room, &tool, args.tier.as_deref()))?;
+    with_watchdog_command_commit(|| {
+        ensure_presence_tiered_from_context(
+            &room,
+            &tool,
+            args.tier.as_deref(),
+            &enter_from_session_id,
+            presence_recorded_for_session,
+            snapshot_before.lead.is_none(),
+        )
+    })?;
     // `enter` is a self-authored liveness signal. Advance every claim this tool
     // still owns so the reaper reads the same durable lease the agent renewed.
-    with_watchdog_command_commit(|| renew_owned_claim_leases(&room, &tool).map(|_| ()))?;
+    with_watchdog_command_commit(|| {
+        renew_owned_claim_leases_from(&room, &tool, &snapshot_before.active_claims).map(|_| ())
+    })?;
 
     // Layer 2 — event-driven liveness-lease safety net: when a new agent joins,
     // opportunistically sweep detached `rally-*` orphan tmux sessions that the
@@ -2823,6 +2877,9 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     // B11: warn (non-blocking) when the entering tool is already active in the
     // current engagement.  A second terminal reusing the same id is ambiguous;
     // surfacing it lets the human/lead decide.  Rally never blocks re-entry.
+    // The projection keeps one fact per telemetry prefix class. The bounded
+    // enter context asks the store to scan durable facts once and return the
+    // exact-subject guards without transporting the full ledger.
     let mut warnings: Vec<EnterWarning> = Vec::new();
     if let Some(squad) = snapshot_before
         .squads
@@ -2842,11 +2899,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
         // Idempotency guard (matches the unmanaged-agent arm below): re-entering
         // the same duplicate id must not append a second identical fact, or the
         // room accumulates one row per re-enter and crowds out real risks.
-        let already_recorded = snapshot_before
-            .system_health
-            .iter()
-            .any(|f| f.subject == format!("duplicate-active-squad-id: {tool}"));
-        if !already_recorded {
+        if !duplicate_squad_recorded {
             let risk_fact = build_risk_fact(
                 &tool,
                 format!("duplicate-active-squad-id: {tool}"),
@@ -2871,38 +2924,27 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     // *:l<N>) — those are not expected to be managed sessions. This is the
     // detection arm of the fleet-enforcement rule; the response arm is
     // `rally adopt` (register without relaunch).
-    if is_managed_style_tool(&tool) {
-        let active_sessions = active_session_records(&room).unwrap_or_default();
-        let has_managed = active_sessions
-            .iter()
-            .any(|s| s.tool == tool || s.session_id == tool || s.name == tool);
-        if !has_managed {
-            // DI-1: telemetry facts project into `system_health`, so the
-            // idempotency guard must scan there (not current_risks) or it would
-            // never see the prior fact and re-append on every enter.
-            let already_recorded = snapshot_before.system_health.iter().any(|f| {
-                f.subject == format!("unmanaged-agent: {tool}")
-                    && f.tool.as_deref() == Some(tool.as_str())
-            });
-            let msg = format!(
-                "tool {tool} entered the room but is not under managed-session control (no active `session` fact). Use `rally adopt {tool} --tmux <target>` or `--cmux <target>` to register the running surface so `rally inject/attach/capture/stop` work; or relaunch via `rally run`. Not blocked — informational."
+    if is_managed_style_tool(&tool) && !has_managed_session {
+        // `system_health` keeps one row per telemetry class, so the store
+        // derives an exact-subject guard from durable facts instead.
+        let msg = format!(
+            "tool {tool} entered the room but is not under managed-session control (no active `session` fact). Use `rally adopt {tool} --tmux <target>` or `--cmux <target>` to register the running surface so `rally inject/attach/capture/stop` work; or relaunch via `rally run`. Not blocked — informational."
+        );
+        warnings.push(EnterWarning {
+            code: "unmanaged-agent".to_string(),
+            message: msg.clone(),
+        });
+        if !unmanaged_agent_recorded {
+            let risk_fact = build_risk_fact(
+                &tool,
+                format!("unmanaged-agent: {tool}"),
+                msg,
+                Vec::new(),
+                "warn",
+                Vec::new(),
+                None,
             );
-            warnings.push(EnterWarning {
-                code: "unmanaged-agent".to_string(),
-                message: msg.clone(),
-            });
-            if !already_recorded {
-                let risk_fact = build_risk_fact(
-                    &tool,
-                    format!("unmanaged-agent: {tool}"),
-                    msg,
-                    Vec::new(),
-                    "warn",
-                    Vec::new(),
-                    None,
-                );
-                room.append_fact(&risk_fact)?.into_fact_reporting();
-            }
+            room.append_fact(&risk_fact)?.into_fact_reporting();
         }
     }
 
@@ -2910,15 +2952,6 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     // (any tool) and check if it carries a different build_id than ours.
     // Warn + append a durable risk fact if drift is detected.  Never blocks.
     {
-        let all_facts = room.facts().unwrap_or_default();
-        let last_presence_build_id: Option<String> = all_facts
-            .iter()
-            .filter(|f| f.kind == "presence")
-            .max_by_key(|f| f.seq)
-            .and_then(|f| f.summary.as_deref())
-            .and_then(|s| s.strip_prefix("build_id:"))
-            .map(str::to_string);
-
         if let Some(ref prior_id) = last_presence_build_id
             && prior_id != BUILD_ID
         {
@@ -2933,11 +2966,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
             // Idempotency guard: don't append a duplicate drift fact for the
             // same (this-build vs prior-build) pair on every re-enter.
             let drift_subject = format!("binary-drift: {} vs {}", BUILD_ID, prior_id);
-            let already_recorded = snapshot_before
-                .system_health
-                .iter()
-                .any(|f| f.subject == drift_subject);
-            if !already_recorded {
+            if !binary_drift_recorded {
                 let risk_fact = build_risk_fact(
                     &tool,
                     drift_subject,
@@ -7996,12 +8025,15 @@ fn finalize_managed_task(
 ) -> Result<ManagedTaskFinalization> {
     (|| {
         let room = RoomStore::open_at(repo.to_path_buf())?;
-        let Some((active_fact, session)) = active_session_facts(&room)?
-            .into_iter()
-            .find(|(_, session)| session.session_id == session_id)
-        else {
+        let Some(active_fact) = room.active_session_fact(session_id)? else {
             return Ok(ManagedTaskFinalization::default());
         };
+        let session = active_fact.session.clone().ok_or_else(|| {
+            RallyError::Message(format!(
+                "active session fact {} has no managed-session payload",
+                active_fact.event_id
+            ))
+        })?;
         if !session.task_scoped {
             return Err(RallyError::Usage(format!(
                 "session {session_id} is not task-scoped"
@@ -8870,6 +8902,12 @@ fn sweep_orphan_tmux(
 /// enter path proceeds untouched. Never blocks enter; never reaps a live or
 /// parent-alive session (that policy lives in [`liveness::reapable`]).
 fn opportunistic_orphan_sweep_on_enter(room: &RoomStore) {
+    // A routed client cannot safely transport an unbounded complete set of
+    // managed targets. Skipping this best-effort sweep is fail-safe: it leaves
+    // a possible orphan alone instead of risking a live managed session.
+    if room.is_routed() {
+        return;
+    }
     // Best-effort: resolve the adaptive window; default on any failure.
     let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
     let window = crate::liveness::adaptive_window_secs(
@@ -8886,7 +8924,7 @@ fn opportunistic_orphan_sweep_on_enter(room: &RoomStore) {
     let managed_targets: std::collections::BTreeSet<String> = active_session_records(room)
         .unwrap_or_default()
         .into_iter()
-        .map(|s| s.target)
+        .map(|session| session.target)
         .collect();
     let tmux_bin = BackendBins::default().tmux_bin;
     let _ = sweep_orphan_tmux(room, &tmux_bin, now_epoch, window, &managed_targets);
@@ -14947,18 +14985,13 @@ mod tests {
             assert_eq!(risk_facts[0].severity.as_deref(), Some("warn"));
         }
 
-        // Simulate second enter: idempotency check via current_risks scan.
+        // Simulate second enter: idempotency checks the durable subject history.
         {
             let room = store::RoomStore::open_at(root.clone()).unwrap();
-            let snapshot_before = room.snapshot().unwrap();
-            // DI-1: the idempotency guard scans `system_health` (where telemetry
-            // now lives), matching the production guard.
-            let already_recorded = snapshot_before.system_health.iter().any(|f| {
-                f.subject == format!("unmanaged-agent: {stray_tool}")
-                    && f.tool.as_deref() == Some(stray_tool)
-            });
             assert!(
-                already_recorded,
+                room.snapshot_for_enter(stray_tool, BUILD_ID, "")
+                    .unwrap()
+                    .unmanaged_agent_recorded,
                 "second enter must see the prior risk fact (idempotency gate)"
             );
             // command_enter would skip the append. Verify nothing duplicates.
@@ -14975,8 +15008,59 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    #[test]
+    fn telemetry_idempotency_finds_subject_hidden_by_class_projection() {
+        let root = unique_root("telemetry-durable-subject");
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        let telemetry = [
+            ("worker-01", "unmanaged-agent: worker-01"),
+            ("worker-02", "unmanaged-agent: worker-02"),
+        ];
+
+        for (tool, subject) in telemetry {
+            room.append_fact(&build_risk_fact(
+                tool,
+                subject.to_string(),
+                "test".to_string(),
+                Vec::new(),
+                "warn",
+                Vec::new(),
+                None,
+            ))
+            .unwrap();
+        }
+
+        let first_context = room
+            .snapshot_for_enter(telemetry[0].0, BUILD_ID, "")
+            .unwrap();
+        let projected_subjects = first_context
+            .snapshot
+            .system_health
+            .iter()
+            .filter(|fact| fact.subject.starts_with("unmanaged-agent:"))
+            .map(|fact| fact.subject.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            projected_subjects.len(),
+            1,
+            "system_health intentionally keeps one fact per telemetry class"
+        );
+
+        assert!(first_context.unmanaged_agent_recorded);
+        let second_context = room
+            .snapshot_for_enter(telemetry[1].0, BUILD_ID, "")
+            .unwrap();
+        assert!(second_context.unmanaged_agent_recorded);
+        let wrong_tool_context = room
+            .snapshot_for_enter("different-tool", BUILD_ID, "")
+            .unwrap();
+        assert!(!wrong_tool_context.unmanaged_agent_recorded);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// DI-1: system-generated telemetry (subject-prefixed) projects into
-    /// `system_health` — deduped by subject — while human coordination risks
+    /// `system_health` — deduped by prefix class — while human coordination risks
     /// remain in `current_risks`. Keeps the risk view trustworthy.
     #[test]
     fn di1_telemetry_splits_from_current_risks_and_dedups() {
