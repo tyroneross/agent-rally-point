@@ -1375,10 +1375,35 @@ pub(crate) fn render_before_write(
                 "agent_message": message,
             })
         }
-        // Codex 0.142.5 rejects Claude PreToolUse permissionDecision fields
-        // ("unsupported permissionDecision:allow"). Even in strict mode Codex
-        // receives exactly one key.
-        HostFamily::Codex => json!({"systemMessage": message}),
+        // AUDIENCE, not habit. Codex `systemMessage` is "Surfaced as a warning
+        // in the UI or event stream"; the model-visible field is
+        // `hookSpecificOutput.additionalContext`. Emitting systemMessage alone
+        // delivered the deconfliction advisory to the human and nothing to the
+        // agent about to write a claimed path. A bare `permissionDecision:
+        // "allow"` is an ERROR on Codex when `updatedInput` is absent, and the
+        // rejected envelope discards any additionalContext alongside it, so the
+        // advisory arm carries no permissionDecision key at all. Strict stays
+        // single-key systemMessage: Codex does support deny, but the shell
+        // suite pins one key and no permissionDecision in BOTH modes, and
+        // widening strict is a blocking-semantics change out of scope here.
+        HostFamily::Codex => {
+            if stop {
+                json!({"systemMessage": message})
+            } else {
+                json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": event,
+                        "additionalContext": message,
+                    },
+                    "systemMessage": message,
+                })
+            }
+        }
+        // Claude Code: `systemMessage` is "Warning message shown to the user"
+        // and `permissionDecisionReason` is "shown to the user but not Claude"
+        // on allow (hooks.md:926, :1745). `additionalContext` is the model
+        // channel on PreToolUse (:989). The advisory arm previously emitted
+        // only the two user-only fields.
         HostFamily::ClaudeCode => {
             if stop {
                 json!({"hookSpecificOutput": {
@@ -1391,7 +1416,7 @@ pub(crate) fn render_before_write(
                     "hookSpecificOutput": {
                         "hookEventName": event,
                         "permissionDecision": "allow",
-                        "permissionDecisionReason": message,
+                        "additionalContext": message,
                     },
                     "systemMessage": message,
                 })

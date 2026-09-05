@@ -3052,7 +3052,25 @@ EOF
   # Per-host envelope shapes. The abort is only useful if it lands in the sink
   # the host actually reads, and only charter-compliant if the permission field
   # appears on exactly one host -- Cursor, whose schema forces it.
-  for host_case in "claude_code:systemMessage:no" "codex:systemMessage:no" "gemini:additionalContext:no" "cursor:agent_message:yes"; do
+  #
+  # "the sink the host actually reads" means the MODEL, not the terminal. This
+  # table previously expected systemMessage on claude_code and codex, which
+  # graded the advisory as delivered while the agent about to write an
+  # unclaimed path received nothing. Both hosts document systemMessage as
+  # human-facing and additionalContext as the model channel:
+  #   Claude Code hooks.md:926  systemMessage -- "Warning message shown to the
+  #                             user."
+  #   Claude Code hooks.md:989  additionalContext -- inserted "next to the tool
+  #                             result" on PreToolUse.
+  #   Codex learn.chatgpt.com/docs/hooks -- systemMessage is "Surfaced as a
+  #                             warning in the UI or event stream"; "To add
+  #                             model-visible context without blocking, return
+  #                             hookSpecificOutput.additionalContext".
+  # Reproduced under `claude -p` with a nonce hook: the model quoted the
+  # additionalContext nonce and returned NONE-SEEN for systemMessage.
+  # Cursor keeps agent_message: its preToolUse schema exposes no allow-path
+  # model channel, so that row is a known gap, not a passing grade.
+  for host_case in "claude_code:additionalContext:no" "codex:additionalContext:no" "gemini:additionalContext:no" "cursor:agent_message:yes"; do
     host="${host_case%%:*}"; rest="${host_case#*:}"
     sink="${rest%%:*}"; wants_perm="${rest##*:}"
     hout=$(RALLY_BIN="$slow_bin" "$HOOK" before-write "$host" <<<"$envelope" 2>/dev/null)

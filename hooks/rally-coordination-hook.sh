@@ -1264,10 +1264,26 @@ _rally_abort_envelope() {
       # Cursor's preToolUse schema has no "no opinion" option; the permission
       # field is required. "allow" here is the schema's neutral value and
       # matches the advisory contract the conflict path already uses.
+      # KNOWN GAP: Cursor documents agent_message as "fed back to the agent
+      # when the action is denied", so on the allow path this advisory reaches
+      # the human only. Cursor exposes no allow-path model channel on
+      # preToolUse, so there is nothing to switch to; recorded rather than
+      # papered over.
       printf '{"permission":"allow","agent_message":"%s"}' "$abort_advisory"
       ;;
+    codex|codex:*)
+      # Same audience rule as the conflict path: Codex reads model context from
+      # hookSpecificOutput.additionalContext, and treats systemMessage as a UI
+      # warning. No permissionDecision key -- a bare "allow" is an error on
+      # Codex and takes additionalContext down with it.
+      printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"%s"}}' "$abort_advisory"
+      ;;
     *)
-      printf '{"systemMessage":"%s"}' "$abort_advisory"
+      # Claude Code. systemMessage is user-only (hooks.md:926); additionalContext
+      # is the model channel on PreToolUse (hooks.md:989). An advisory that says
+      # "this edit is proceeding UNCLAIMED" is worthless if the agent making the
+      # edit cannot read it, which is what systemMessage alone meant here.
+      printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"%s"}}' "$abort_advisory"
       ;;
   esac
 }
@@ -3150,10 +3166,28 @@ if (tool === "gemini" || tool.startsWith("gemini")) {
   if (event === "SessionStart" || event === "UserPromptSubmit") {
     output({hookSpecificOutput: {hookEventName: event, additionalContext: message}});
   } else if (event === "PreToolUse") {
-    // Codex v0.142.5 rejects Claude PreToolUse permissionDecision fields
-    // ("unsupported permissionDecision:allow"). Keep Codex fail-open and
-    // visible; Claude remains the only host that receives permissionDecision.
-    output({systemMessage: message});
+    // AUDIENCE, not habit. Codex docs (learn.chatgpt.com/docs/hooks):
+    // systemMessage is "Surfaced as a warning in the UI or event stream",
+    // while "To add model-visible context without blocking, return
+    // hookSpecificOutput.additionalContext". Source agrees — pre_tool_use.rs
+    // routes system_message into UI entries and only additional_contexts_for
+    // _model reaches record_additional_contexts as a developer-role item.
+    // Emitting systemMessage ALONE (the pre-2026-09 behavior) parsed cleanly
+    // and delivered the deconfliction advisory to nobody: the human saw a UI
+    // warning, the agent about to clobber a claimed path saw nothing.
+    // NO permissionDecision key on the advisory path. Codex rejects a bare
+    // "allow" without updatedInput (output_parser.rs "unsupported
+    // permissionDecision:allow") and its own fail-open test pins that the
+    // rejected envelope ALSO discards any additionalContext in the same
+    // object — so adding "allow" here would silently re-break the fix.
+    // STRICT IS DELIBERATELY UNCHANGED. Codex does support deny +
+    // permissionDecisionReason, but "codex schema: before-write conflict"
+    // pins one key and no permissionDecision in BOTH modes, and widening
+    // strict is a blocking-semantics change this fix has no mandate for.
+    // Recorded as a separate question, not smuggled in here.
+    output(stop
+      ? {systemMessage: message}
+      : {hookSpecificOutput: {hookEventName: event, additionalContext: message}, systemMessage: message});
   } else if (event === "Stop") {
     output({systemMessage: message});
   } else {
@@ -3163,14 +3197,28 @@ if (tool === "gemini" || tool.startsWith("gemini")) {
   if (event === "SessionStart" || event === "UserPromptSubmit") {
     output({hookSpecificOutput: {hookEventName: event, additionalContext: message}});
   } else if (event === "PreToolUse") {
-    // Advisory (default): permissionDecision "allow" keeps the edit unblocked
-    // while systemMessage GUARANTEES the deconflict warning surfaces to the
-    // agent (additionalContext is not reliably injected on PreToolUse). Strict
-    // mode is the only path that emits "deny". Verified against the official
-    // Claude Code hooks contract (code.claude.com/docs/en/hooks, 2026-06).
+    // AUDIENCE, not habit. The previous comment here asserted the exact
+    // inverse of the contract and cost the feature its whole purpose:
+    // "systemMessage GUARANTEES the deconflict warning surfaces to the agent
+    // (additionalContext is not reliably injected on PreToolUse)". Both
+    // halves are wrong. Verbatim from code.claude.com/docs/en/hooks.md:
+    //   :926  systemMessage -- "Warning message shown to the user."
+    //   :1745 permissionDecisionReason -- "For "allow" and
+    //         "ask", shown to the user but not Claude. For
+    //         "deny", shown to Claude."
+    //   :989  additionalContext -- inserted "next to the tool result" on
+    //         PreToolUse, wrapped in a system reminder.
+    // So the advisory branch emitted TWO user-only fields and zero bytes to
+    // the model. Reproduced with a nonce hook under `claude -p`: the model
+    // quoted the additionalContext nonce back and reported NONE-SEEN when
+    // only systemMessage + allow-reason were sent.
+    // permissionDecision "allow" is kept: it suppresses the permission prompt
+    // and is accepted here (unlike Codex, which errors on a bare allow).
+    // permissionDecisionReason is dropped from the allow path — it is dead
+    // weight the model never receives; systemMessage already serves the human.
     output(stop
       ? {hookSpecificOutput: {hookEventName: event, permissionDecision: "deny", permissionDecisionReason: message}}
-      : {hookSpecificOutput: {hookEventName: event, permissionDecision: "allow", permissionDecisionReason: message}, systemMessage: message});
+      : {hookSpecificOutput: {hookEventName: event, permissionDecision: "allow", additionalContext: message}, systemMessage: message});
   } else if (event === "Stop") {
     output(stop ? {decision: "block", reason: message} : {systemMessage: message});
   } else {

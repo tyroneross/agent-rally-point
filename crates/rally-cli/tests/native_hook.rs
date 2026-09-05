@@ -447,10 +447,22 @@ fn claude_peer_claim_is_high_severity_advisory() {
 
     assert_eq!(body["hookSpecificOutput"]["permissionDecision"], "allow");
     assert_eq!(body["hookSpecificOutput"]["hookEventName"], "PreToolUse");
-    let reason = body["hookSpecificOutput"]["permissionDecisionReason"]
+    // The advisory must land in the MODEL channel. This assertion used to read
+    // `permissionDecisionReason`, which hooks.md:1745 documents as "For "allow"
+    // and "ask", shown to the user but not Claude" -- so the suite graded a
+    // deconfliction warning as delivered while the agent about to write a
+    // claimed path received nothing. `additionalContext` is the PreToolUse
+    // model channel (hooks.md:989, inserted "next to the tool result").
+    let reason = body["hookSpecificOutput"]["additionalContext"]
         .as_str()
-        .unwrap_or_else(|| panic!("no permissionDecisionReason: {body:#}"));
+        .unwrap_or_else(|| panic!("no additionalContext: {body:#}"));
+    // systemMessage still carries the same text for the operator watching the
+    // terminal; before-write is a model channel, so both readers are served.
     assert_eq!(body["systemMessage"].as_str().unwrap_or(""), reason);
+    assert!(
+        body["hookSpecificOutput"]["permissionDecisionReason"].is_null(),
+        "allow-path permissionDecisionReason is user-only dead weight: {body:#}"
+    );
     assert!(reason.contains("HIGH-SEVERITY"), "{reason}");
     assert!(
         reason.contains("advisory \u{2014} not blocking"),
@@ -555,11 +567,31 @@ fn codex_conflict_never_carries_permission_decision() {
         let body: Value = serde_json::from_str(stdout.trim_end())
             .unwrap_or_else(|e| panic!("codex strict={strict} not JSON: {e}: {stdout}"));
         let keys = sorted_keys(&body);
-        assert_eq!(
-            keys,
-            vec!["systemMessage".to_string()],
-            "codex strict={strict} keys={keys:?}"
-        );
+        // The name of this test is about permissionDecision, and that invariant
+        // is unchanged and asserted below. The key set widened by one: the
+        // advisory arm now also carries hookSpecificOutput.additionalContext,
+        // which is Codex's documented model channel ("To add model-visible
+        // context without blocking, return hookSpecificOutput.additionalContext")
+        // while systemMessage is "Surfaced as a warning in the UI or event
+        // stream". Single-key systemMessage meant the conflict warning reached
+        // the operator and never the agent. Strict keeps one key: Codex does
+        // support deny, but widening strict is a blocking-semantics change the
+        // shell suite pins against, so it is left for a separate decision.
+        let want: Vec<String> = if strict {
+            vec!["systemMessage".to_string()]
+        } else {
+            vec!["hookSpecificOutput".to_string(), "systemMessage".to_string()]
+        };
+        assert_eq!(keys, want, "codex strict={strict} keys={keys:?}");
+        if !strict {
+            assert_eq!(
+                body["hookSpecificOutput"]["additionalContext"]
+                    .as_str()
+                    .unwrap_or(""),
+                body["systemMessage"].as_str().unwrap_or(""),
+                "codex advisory must carry the same text on both channels"
+            );
+        }
         let msg = body["systemMessage"].as_str().unwrap_or("");
         assert!(
             msg.contains("HIGH-SEVERITY"),
