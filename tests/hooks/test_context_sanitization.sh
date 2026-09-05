@@ -764,7 +764,20 @@ ALLOW.forEach(a => {
 const joined = src.join("\n");
 [
   "const rawMessage = line(visible.message, 4000)",
-  "const message = hasLedgerData ? UNTRUSTED_PREAMBLE + decorated : decorated;"
+  // The trust label is now gated on TWO conjuncts: provenance (hasLedgerData)
+  // AND audience. The preamble is prose addressed to a reasoning agent, so on a
+  // channel that reaches no model it instructs nobody while consuming half the
+  // operator message. Every normative statement of ARP-004/SEC-004 is scoped
+  // to model context ("before it reaches the host model context"), so a
+  // human-only channel is outside the requirement rather than an exception to
+  // it, and the per-span controls (the unforgeable "(untrusted)" stamp, the
+  // guillemet exclusion in scrub, hook-authored headline) run on every path.
+  "const message = (hasLedgerData && audience === \"model\") ? UNTRUSTED_PREAMBLE + decorated : decorated;",
+  // The audience decision must stay derived from (tool, phase) alone. Deriving
+  // it from the message would let a peer influence whether the label is applied,
+  // which is the same failure test_sanitizer_block_parity.sh forbids when it
+  // bans testing the assembled message for the preamble marker.
+  "const audience = audienceOf(tool, phase);"
 ].forEach(needle => {
   if (!joined.includes(needle)) problems.push("the sanitized chain changed: expected to find `" + needle + "`");
 });
