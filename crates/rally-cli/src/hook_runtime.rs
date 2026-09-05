@@ -1380,9 +1380,10 @@ pub(crate) fn render_before_write(
         // `hookSpecificOutput.additionalContext`. Emitting systemMessage alone
         // delivered the deconfliction advisory to the human and nothing to the
         // agent about to write a claimed path. A bare `permissionDecision:
-        // "allow"` is an ERROR on Codex when `updatedInput` is absent, and the
-        // rejected envelope discards any additionalContext alongside it, so the
-        // advisory arm carries no permissionDecision key at all. Strict stays
+        // "allow"` is an ERROR on Codex when `updatedInput` is absent. The
+        // parser retains a sibling additionalContext, but a SYNCHRONOUS hook's
+        // pipeline suppresses it after that semantic error, so the advisory arm
+        // carries no permissionDecision key at all. Strict stays
         // single-key systemMessage: Codex does support deny, but the shell
         // suite pins one key and no permissionDecision in BOTH modes, and
         // widening strict is a blocking-semantics change out of scope here.
@@ -1462,7 +1463,19 @@ pub(crate) fn abort_envelope(host: HostFamily, tool: &str, reason: &str) -> Valu
     let advisory = abort_advisory_text(tool, reason);
     match host {
         HostFamily::Cursor => json!({"permission": "allow", "agent_message": advisory}),
-        _ => json!({"systemMessage": advisory}),
+        // AUDIENCE. "this edit is proceeding UNCLAIMED" is addressed to the
+        // agent doing the editing, so it has to land where that agent reads.
+        // The old `_` arm sent systemMessage to Claude Code, Codex AND Gemini,
+        // which is a user-facing warning on all three -- so the native path was
+        // wrong for one MORE host than the shell path, whose Gemini arm was
+        // already correct. Exactly one top-level key, which
+        // "fail-loud: a missed budget advises on stdout" asserts.
+        HostFamily::ClaudeCode | HostFamily::Codex | HostFamily::Gemini => json!({
+            "hookSpecificOutput": {
+                "hookEventName": HostFamily::event_name(host, "before-write"),
+                "additionalContext": advisory,
+            }
+        }),
     }
 }
 
@@ -2415,7 +2428,18 @@ mod tests {
         ] {
             let envelope = abort_envelope(host, "claude_code", "working status timed out");
             let keys: Vec<&String> = envelope.as_object().unwrap().keys().collect();
-            assert_eq!(keys, vec!["systemMessage"], "{host:?}");
+            // Still exactly one top-level key and still no permission field --
+            // that is what this test is named for. The key changed: an
+            // "UNCLAIMED" advisory is addressed to the agent doing the edit, so
+            // it must ride the model channel on all three of these hosts.
+            assert_eq!(keys, vec!["hookSpecificOutput"], "{host:?}");
+            assert!(
+                envelope["hookSpecificOutput"]["additionalContext"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("UNCLAIMED"),
+                "{host:?}"
+            );
         }
         let cursor = abort_envelope(HostFamily::Cursor, "cursor", "working status timed out");
         assert_eq!(cursor["permission"], "allow");
@@ -2666,12 +2690,16 @@ mod tests {
             .collect();
         let rendered = abort_envelope_from_args(&args, "coordination budget exceeded");
         let value: Value = serde_json::from_str(&rendered).unwrap();
+        // The point of this test is that the HOST is derived from argv; the
+        // sink follows from that host. Codex reads model context from
+        // additionalContext, so a watchdog abort now lands there rather than in
+        // a UI-only systemMessage the agent cannot act on.
         assert_eq!(
             value.as_object().unwrap().keys().collect::<Vec<_>>(),
-            vec!["systemMessage"]
+            vec!["hookSpecificOutput"]
         );
         assert!(
-            value["systemMessage"]
+            value["hookSpecificOutput"]["additionalContext"]
                 .as_str()
                 .unwrap()
                 .contains("--tool codex --path <path>")

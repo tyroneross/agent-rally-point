@@ -3235,9 +3235,11 @@ if (tool === "gemini" || tool.startsWith("gemini")) {
     // warning, the agent about to clobber a claimed path saw nothing.
     // NO permissionDecision key on the advisory path. Codex rejects a bare
     // "allow" without updatedInput (output_parser.rs "unsupported
-    // permissionDecision:allow") and its own fail-open test pins that the
-    // rejected envelope ALSO discards any additionalContext in the same
-    // object — so adding "allow" here would silently re-break the fix.
+    // permissionDecision:allow"). The parser RETAINS a sibling
+    // additionalContext, but for a SYNCHRONOUS hook the event pipeline
+    // suppresses it after that semantic error, so the model gets nothing;
+    // adding "allow" here would silently re-break the fix. Async handlers are
+    // the exception and do preserve it. The rally hook is synchronous.
     // STRICT IS DELIBERATELY UNCHANGED. Codex does support deny +
     // permissionDecisionReason, but "codex schema: before-write conflict"
     // pins one key and no permissionDecision in BOTH modes, and widening
