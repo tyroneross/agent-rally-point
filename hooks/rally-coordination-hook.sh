@@ -2872,19 +2872,59 @@ function composeBrief() {
   // chars per span and is part of what the reader receives. taint() itself still
   // runs once, at the single application point below, over the final body.
   //
-  // AUDIENCE FLOOR. Ladder step 2 already drops `waitBranch` and
-  // `escalate` — the "already handled? post the receipt" / "not yours? hand it
-  // back" alternatives. Those are decision branches for an AGENT choosing its
-  // next move. The operator reading a turn-end line in a terminal wants the
-  // headline and the one command, so a human channel starts at that step
-  // instead of reaching it only under budget pressure. Nothing new is dropped
-  // and no new truncation shape is introduced: this picks an existing rung.
-  // The budget still governs from there, so an over-long body keeps climbing.
-  const floor = audience === "human" ? 2 : 0;
+  // THE HUMAN LINE. The audience rule, one level deeper. On a model channel
+  // the message is an INSTRUCTION and every clause earns its bytes. On a
+  // terminal it is a NOTIFICATION: the agent already received the full
+  // instruction on its own channel this same turn, so the operator needs to
+  // know that something is pending and what it is, not how an agent should
+  // dispatch it. Three clauses are agent-only and together were 60% of a
+  // 320-char line:
+  //
+  //   the em-dash elaboration on the headline ("it sits with you until you
+  //     answer or hand it back") is coaching for an agent deciding what to do.
+  //     C6 pins the headline to exactly ONE em-dash clause and the headline is
+  //     hook-authored narration, so taking the text before it is safe and
+  //     general; peer prose is never what gets cut.
+  //   the opaque fact id: a human never types it. Dropped by matching the
+  //     hook-computed `factId`, never by pattern-sniffing the rendered text,
+  //     which is the rule test_sanitizer_block_parity.sh enforces.
+  //   the copy-pasteable command: 105 chars of which 55 are the reader OWN
+  //     session UUID. It exists so an AGENT can run it verbatim. `rally room`
+  //     needs no --tool, is 10 chars, and shows the operator the same state.
+  //     Do NOT shorten the id inside a rendered command instead -- rally
+  //     silently accepts an unregistered --tool value, so a truncated id would
+  //     post under a phantom actor.
+  //
+  // Peer prose still goes through prose()/ident() and still lands inside the
+  // guillemets with the (untrusted) tag. No sanitizer is touched here; this
+  // selects whole clauses, exactly as the structural ladder above does.
+  const HUMAN_MAX = 160;
+  const HUMAN_POINTER = "rally room";
+  function humanLadder(step) {
+    const segs = [];
+    const head = String(big).split(" — ")[0] || String(big);
+    segs.push(head);
+    if (step < 2) {
+      const raw = why(step >= 1 ? BRIEF_PROSE_SHORT : BRIEF_PROSE);
+      const kept = String(raw || "").split(" · ")
+        .filter(c => c && !(factId && c.indexOf(factId) === 0));
+      if (kept.length) segs.push(kept.join(" · "));
+    }
+    if (headsUp) segs.push(headsUp);
+    segs.push(HUMAN_POINTER);
+    return segs.join(" · ");
+  }
   let body = "";
-  for (let step = floor; step <= 4; step++) {
-    body = briefLadder(step);
-    if (taint(body).length <= BRIEF_MAX) break;
+  if (audience === "human") {
+    for (let step = 0; step <= 2; step++) {
+      body = humanLadder(step);
+      if (taint(body).length <= HUMAN_MAX) break;
+    }
+  } else {
+    for (let step = 0; step <= 4; step++) {
+      body = briefLadder(step);
+      if (taint(body).length <= BRIEF_MAX) break;
+    }
   }
   // ledger is false only for `inbox`: no peer-authored span (subject, evidence,
   // tool id, scope, path) is ever rendered in that clause, only integers and
