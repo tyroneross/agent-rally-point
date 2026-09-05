@@ -1106,7 +1106,18 @@ esac\n",
         let body: Value = serde_json::from_str(trimmed)
             .unwrap_or_else(|e| panic!("T-07c not JSON: {e}: {stdout}"));
         assert!(body.get("permissionDecision").is_none() && body.get("decision").is_none());
-        let msg = body["systemMessage"].as_str().unwrap_or("");
+        // Fail-LOUD still, but into the channel the agent reads. A deadline
+        // miss means the edit proceeds UNCLAIMED, which is addressed to the
+        // agent making it; on Claude Code systemMessage is user-only
+        // (hooks.md:926), so this assertion previously passed while the agent
+        // received nothing.
+        assert!(
+            body.get("systemMessage").is_none(),
+            "T-07c abort envelope carries exactly one key: {body:#}"
+        );
+        let msg = body["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or("");
         assert!(
             msg.contains("auto-claim skipped _budget_"),
             "T-07c must carry the reduced reason (finding 3): {msg}"
