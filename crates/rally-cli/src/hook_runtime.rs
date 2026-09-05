@@ -2323,7 +2323,21 @@ mod tests {
         for strict in [false, true] {
             let rendered = render_before_write(HostFamily::Codex, "codex", Some(&check), strict);
             let keys: Vec<&String> = rendered.as_object().unwrap().keys().collect();
-            assert_eq!(keys, vec!["systemMessage"], "strict={strict}");
+            // The permissionDecision invariant this test is named for is
+            // asserted below and unchanged. The advisory arm additionally
+            // carries hookSpecificOutput.additionalContext, which is the
+            // Codex model channel; systemMessage alone reached the operator
+            // and never the agent about to write a claimed path.
+            let want: Vec<&str> = if strict {
+                vec!["systemMessage"]
+            } else {
+                vec!["hookSpecificOutput", "systemMessage"]
+            };
+            assert_eq!(keys, want, "strict={strict}");
+            assert!(
+                rendered["hookSpecificOutput"]["permissionDecision"].is_null(),
+                "strict={strict}: a bare allow is an error on Codex and voids additionalContext with it"
+            );
         }
     }
 
@@ -2347,9 +2361,15 @@ mod tests {
             rendered["hookSpecificOutput"]["hookEventName"],
             "PreToolUse"
         );
+        // hooks.md:1745 -- on "allow", permissionDecisionReason is "shown to
+        // the user but not Claude". The advisory must ride the model channel.
         assert_eq!(
-            rendered["hookSpecificOutput"]["permissionDecisionReason"],
+            rendered["hookSpecificOutput"]["additionalContext"],
             expected
+        );
+        assert!(
+            rendered["hookSpecificOutput"]["permissionDecisionReason"].is_null(),
+            "allow-path permissionDecisionReason never reaches the model"
         );
         assert_eq!(rendered["systemMessage"], expected);
     }

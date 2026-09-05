@@ -580,7 +580,10 @@ fn codex_conflict_never_carries_permission_decision() {
         let want: Vec<String> = if strict {
             vec!["systemMessage".to_string()]
         } else {
-            vec!["hookSpecificOutput".to_string(), "systemMessage".to_string()]
+            vec![
+                "hookSpecificOutput".to_string(),
+                "systemMessage".to_string(),
+            ]
         };
         assert_eq!(keys, want, "codex strict={strict} keys={keys:?}");
         if !strict {
