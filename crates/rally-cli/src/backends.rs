@@ -172,6 +172,8 @@ pub(crate) struct ManagedSession {
     pub(crate) target: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tmux_binding: Option<TmuxBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tmux_binding_error: Option<String>,
     /// Filesystem path of the dedicated linked git worktree provisioned for
     /// this agent, when worktree-per-agent isolation is in effect. `None`
     /// for sessions launched with `--shared`/`--no-worktree`, for sessions
@@ -1051,11 +1053,20 @@ impl BackendRunner {
         crate::daemon_client::close_pane_by_id(socket, pane_id).map_err(RallyError::Command)
     }
 
-    /// Capture the concrete pane/process/server once. Legacy/custom backends
-    /// without a readable tmux identity stay explicitly unbound.
+    /// Capture the concrete pane/process/server once. A new failed binding
+    /// must not acquire the permissive behavior of an old unbound record.
     pub(crate) fn bind_tmux_session(&self, session: &mut ManagedSession) {
         if self.backend == Backend::Tmux {
-            session.tmux_binding = self.tmux_identity(&session.target).ok();
+            match self.tmux_identity(&session.target) {
+                Ok(binding) => {
+                    session.tmux_binding = Some(binding);
+                    session.tmux_binding_error = None;
+                }
+                Err(error) => {
+                    session.tmux_binding = None;
+                    session.tmux_binding_error = Some(error.to_string());
+                }
+            }
         }
     }
 
@@ -1092,6 +1103,11 @@ impl BackendRunner {
     }
 
     pub(crate) fn live_target(&self, session: &ManagedSession) -> Result<String> {
+        if let Some(error) = &session.tmux_binding_error {
+            return Err(RallyError::Command(format!(
+                "tmux binding failed; launch or adopt a new ready target before delivery: {error}"
+            )));
+        }
         if let Some(expected) = &session.tmux_binding {
             let actual = self.tmux_identity(&expected.pane)?;
             if &actual != expected {

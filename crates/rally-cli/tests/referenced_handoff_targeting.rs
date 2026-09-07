@@ -1204,4 +1204,71 @@ fn documented_receiver_ack_executes_against_bound_handoff() {
         ack["data"]["say"]["fact"]["event_id"],
         retry["data"]["say"]["fact"]["event_id"]
     );
+    let withdrawn = room.json(
+        "session-author",
+        &[
+            "retract",
+            ack["data"]["say"]["fact"]["event_id"].as_str().unwrap(),
+            "--tool",
+            "author:a",
+            "--reason",
+            "ACK withdrawn",
+            "--json",
+        ],
+    );
+    assert_eq!(withdrawn["ok"], true, "{withdrawn}");
+    assert_eq!(
+        room.json("session-author", &["inbox", "--tool", "author:a", "--json"])["data"]["inbox"]["count"],
+        1
+    );
+    let retry = room.json(
+        "session-author",
+        &[
+            "inject",
+            "author:a",
+            "--tool",
+            "author:a",
+            "--handoff",
+            handoff,
+            "--timeout-seconds",
+            "1",
+            "--json",
+        ],
+    );
+    assert_ne!(retry["data"]["inject"]["mode"], "already-received");
+    assert_eq!(
+        retry["data"]["inject"]["verified_received"], false,
+        "withdrawn ACK must not satisfy reuse or polling: {retry}"
+    );
+    let withdrawn = room.json(
+        "session-author",
+        &[
+            "retract",
+            handoff,
+            "--tool",
+            "author:a",
+            "--reason",
+            "request withdrawn",
+            "--json",
+        ],
+    );
+    assert_eq!(withdrawn["ok"], true, "{withdrawn}");
+    let retry = room.json(
+        "session-author",
+        &[
+            "inject",
+            "author:a",
+            "--tool",
+            "author:a",
+            "--handoff",
+            handoff,
+            "--timeout-seconds",
+            "1",
+            "--json",
+        ],
+    );
+    assert_ne!(
+        retry["data"]["inject"]["verified_received"], true,
+        "withdrawal is not completion: {retry}"
+    );
 }

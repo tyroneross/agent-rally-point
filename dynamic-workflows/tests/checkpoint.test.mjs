@@ -39,6 +39,12 @@ test('generation chain must exist and match task',t=>{
   const two=putCheckpoint(dir,{...base,generation:2,previous:one.sha256,next_action:'Done'});
   assert.equal(readCheckpoint(two.path).checkpoint.previous,one.sha256);
 });
+test('generation chain rejects a valid envelope stored under another digest',t=>{
+  const dir=sandbox(t), one=putCheckpoint(dir,base);
+  const other=putCheckpoint(dir,{...base,next_action:'Different predecessor'});
+  writeFileSync(one.path,readFileSync(other.path));
+  assert.throws(()=>putCheckpoint(dir,{...base,generation:2,previous:one.sha256}),/predecessor digest/);
+});
 test('partial writes and symlinks are refused',t=>{
   const dir=sandbox(t);writeFileSync(join(dir,'partial'),'{}');
   assert.throws(()=>readCheckpoint(join(dir,'partial')));

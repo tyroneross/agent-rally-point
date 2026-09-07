@@ -8090,7 +8090,10 @@ fn command_run(args: RunArgs) -> Result<Output> {
             }
         };
         backend_runner.bind_tmux_session(&mut session);
-        if actual_target != session.target || session.tmux_binding.is_some() {
+        if actual_target != session.target
+            || session.tmux_binding.is_some()
+            || session.tmux_binding_error.is_some()
+        {
             session.target = actual_target;
             if let Some(fact) = &reservation.fact {
                 room.append_fact(&session_fact(
@@ -8672,7 +8675,7 @@ fn command_adopt(args: AdoptArgs) -> Result<Output> {
     // simply stays on the framed-tmux fallback.
     let mut session = session;
     BackendRunner::new(resolved_backend, BackendBins::default()).bind_tmux_session(&mut session);
-    if session.tmux_binding.is_some() {
+    if session.tmux_binding.is_some() || session.tmux_binding_error.is_some() {
         room.append_fact(&session_fact(
             &session,
             "active",
@@ -12331,14 +12334,12 @@ fn handoff_prompt_ledger(target: &str, handoff: &str) -> String {
 }
 
 fn prior_receiver_ack(facts: &[Fact], handoff: &str, expected_tool: &str) -> Option<Value> {
-    let original = facts.iter().find(|f| f.event_id == handoff)?;
-    if original.target.as_deref() != Some(expected_tool) {
-        return None;
-    }
-    let expected_session = store::strict_handoff_target_session(original);
-    facts.iter().find(|f| f.seq > original.seq && f.ref_id.as_deref() == Some(handoff)
-        && f.tool.as_deref() == Some(expected_tool)
-        && expected_session.is_none_or(|session| f.from_session_id.as_deref() == Some(session))
+    let retracted = retraction::retracted_ids(facts);
+    let original = facts
+        .iter()
+        .find(|f| f.event_id == handoff && !retracted.contains(&f.event_id))?;
+    facts.iter().find(|f| !retracted.contains(&f.event_id)
+        && receiver_response_matches(original, f, expected_tool)
         && (matches!(f.kind, FactKind::Resolve | FactKind::Receipt | FactKind::Artifact)
             || store::handoff_is_protocol_response(f)))
         .map(|f| {
@@ -12346,6 +12347,19 @@ fn prior_receiver_ack(facts: &[Fact], handoff: &str, expected_tool: &str) -> Opt
             json!({"received":true,"resolved":resolved,"handoff_closed":resolved,"blocked":false,"decision":false,
                 "event_id":f.event_id,"tool":f.tool,"expected_tool":expected_tool,"kind":f.kind.as_str(),"subject":f.subject})
         })
+}
+
+// Shared by receipt reuse and the polling path. Raw ledger reads include
+// withdrawals and system cleanup, neither of which is receiver acceptance.
+fn receiver_response_matches(original: &Fact, response: &Fact, expected_tool: &str) -> bool {
+    original.target.as_deref() == Some(expected_tool)
+        && response.seq > original.seq
+        && response.ref_id.as_deref() == Some(original.event_id.as_str())
+        && response.tool.as_deref() == Some(expected_tool)
+        && !retraction::is_retraction(response)
+        && !store::is_system_authored(response)
+        && store::strict_handoff_target_session(original)
+            .is_none_or(|session| response.from_session_id.as_deref() == Some(session))
 }
 
 fn wait_for_resolution(
@@ -12360,14 +12374,16 @@ fn wait_for_resolution(
     let mut ignored_target_responses = BTreeSet::new();
     loop {
         let facts = room.facts()?;
-        let expected_session = facts
+        let retracted = retraction::retracted_ids(&facts);
+        let original = facts
             .iter()
-            .find(|f| f.event_id == handoff)
-            .and_then(store::strict_handoff_target_session)
-            .map(str::to_string);
-        for fact in facts {
+            .find(|f| f.event_id == handoff && !retracted.contains(&f.event_id));
+        for fact in &facts {
             last_seen_seq = last_seen_seq.max(fact.seq);
             if fact.seq > after_seq && fact.ref_id.as_deref() == Some(handoff) {
+                if retracted.contains(&fact.event_id) || retraction::is_retraction(fact) {
+                    continue;
+                }
                 if !matches!(
                     fact.kind,
                     store::FactKind::Resolve
@@ -12375,15 +12391,13 @@ fn wait_for_resolution(
                         | store::FactKind::Artifact
                         | store::FactKind::Blocker
                         | store::FactKind::Decision
-                ) && !store::handoff_is_protocol_response(&fact)
+                ) && !store::handoff_is_protocol_response(fact)
                 {
                     continue;
                 }
-                if fact.tool.as_deref() == Some(expected_tool)
-                    && expected_session
-                        .as_deref()
-                        .is_none_or(|session| fact.from_session_id.as_deref() == Some(session))
-                {
+                if original.is_some_and(|original| {
+                    receiver_response_matches(original, fact, expected_tool)
+                }) {
                     let blocked = fact.kind == store::FactKind::Blocker;
                     let decision = fact.kind == store::FactKind::Decision;
                     let resolved = matches!(
@@ -12405,7 +12419,7 @@ fn wait_for_resolution(
                         "subject": fact.subject
                     }));
                 }
-                ignored_target_responses.insert(fact.event_id);
+                ignored_target_responses.insert(fact.event_id.clone());
             }
         }
         let remaining = deadline.saturating_duration_since(Instant::now());

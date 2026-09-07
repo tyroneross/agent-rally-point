@@ -413,9 +413,12 @@ managed stdin capability.
 New tmux sessions bind the pane id, pane process, tmux server and socket when
 observable. Injection uses that pane even after another pane becomes active.
 A changed binding or copy mode refuses the live send; the durable directive
-remains pending. Legacy or custom test backends without an observable binding
-remain unbound, and should be restarted or explicitly adopted before relying
-on identity protection. Pane existence does not establish host prompt readiness.
+remains pending. A new session whose initial observation fails records
+`tmux_binding_error` and refuses delivery. Recover by launching or adopting a
+new ready target; adopting the same registered target again is refused.
+Historical records without either binding field remain unbound; replace them
+with newly bound sessions before relying on identity protection.
+Pane existence does not establish host prompt readiness.
 
 Small messages queue clear, bracketed paste and submit in one tmux command.
 Large messages use a unique stdin-loaded buffer and raw paste in the same queue,

@@ -9,6 +9,7 @@ import hashlib
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,8 +21,8 @@ def run_probe(binary):
         root = Path(temporary)
         (root / '.git').mkdir()
         socket = root / 'tmux.sock'
-        wrapper = root / 'tmux-wrapper'
-        wrapper.write_text('#!/bin/sh\nexec tmux -S ' + shlex.quote(str(socket)) + ' "$@"\n')
+        wrapper = root / 'tmux'
+        wrapper.write_text('#!/bin/sh\nexec ' + shlex.quote(shutil.which('tmux')) + ' -S ' + shlex.quote(str(socket)) + ' "$@"\n')
         wrapper.chmod(0o700)
         frames = root / 'frames.bin'
         ready = root / 'ready'
@@ -30,7 +31,7 @@ def run_probe(binary):
                          'tty.setraw(0)\n' + f'Path({str(ready)!r}).touch()\n'
                          'while True:\n data=os.read(0,65536)\n if not data: break\n'
                          f' with open({str(frames)!r},"ab",buffering=0) as out: out.write(data)\n')
-        env = {**os.environ, 'RALLY_SESSION_ID': 'optimization-probe-sender',
+        env = {**os.environ, 'RALLY_SESSION_ID': 'optimization-probe-sender', 'PATH':str(root)+os.pathsep+os.environ.get('PATH',''),
                'RALLY_HOOKS': 'off', 'RALLY_HOOK_TIMEOUT_MS': '30000', 'RALLY_DAEMON_AUTOSTART': '0'}
         def tmux(*args):
             return subprocess.run([str(wrapper), *args], capture_output=True, timeout=15)
@@ -97,8 +98,18 @@ def run_probe(binary):
             refused = inject('copy-mode-must-stay-pending')
             assert refused['data']['inject']['delivery_state'] == 'failed'
             assert received() == before
+            adopted = rally('adopt', 'unready', '--agent', 'rosslabs-agent-harness',
+                            '--tmux', pane, '--tool', 'probe:unready')
+            unready = adopted['data']['adopt']['session']
+            assert unready.get('tmux_binding_error'), 'initial failure must be persisted'
             tmux('send-keys', '-t', pane, '-X', 'cancel')
             result['checks']['copy_mode_refuses_and_preserves_input'] = True
+            tmux('select-pane', '-t', other)
+            refused = rally('inject', unready['tool'], '--tool', 'probe:sender', '--intent', 'inform',
+                            '--text', 'initial-binding-failure-must-not-fall-back', '--tmux-bin', str(wrapper))
+            assert refused['data']['inject']['delivery_state'] == 'failed'
+            assert received() == before
+            result['checks']['initial_binding_failure_cannot_fall_back'] = True
             tmux('respawn-pane', '-k', '-t', pane, 'sleep 60')
             refused = inject('replacement-process-must-not-receive')
             assert refused['data']['inject']['delivery_state'] == 'failed'

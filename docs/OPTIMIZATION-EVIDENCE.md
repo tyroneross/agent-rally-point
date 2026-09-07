@@ -14,7 +14,7 @@ notification. Only a receiver-authored response proves acknowledgement.
 | Context consumption | `packet.mjs ... --task <id> --checkpoint <file> --revision <full-sha>` | Verifies hash, run, task and revision before rendering. Source and packaged Codex runtime include the reader. |
 | Custom host launch | `rally run <host-label> --command-json '["/path/to/host"]' ...` | Explicit argv; no invented vendor flags. Custom commands cannot use the built-in `--task` lifecycle. CLI fallback works without a host hook. |
 | Safe stock-tmux delivery | Normal managed `run` / `adopt` / `inject` | Captures pane, process, server and socket identity. Rejects observed copy mode or replacement. Small frames share one send command; large frames use a unique stdin buffer. |
-| Receipt reuse | Inject a previously acknowledged handoff | Returns the original exact receiver receipt without another directive or terminal send. Uncertain, unacknowledged sends are not automatically replayed. |
+| Receipt reuse | Inject a previously acknowledged handoff | Returns the effective exact receiver receipt without another directive or terminal send. Withdrawn responses and retraction artifacts cannot prove receipt. Uncertain, unacknowledged sends are not automatically replayed. |
 | Storage inspection | `python3 scripts/rally_storage.py inventory --rally-dir <directory>` | Streaming inventory. No database or ledger mutation. |
 | Explicit archive compression | `rally_storage.py compress --rally-dir <directory> --file facts.db.corrupt.<stamp>` | Verifies a lossless gzip round trip before replacing one quarantine snapshot. Protects live DB/WAL, ledger, task results and recovery bundles. Restore refuses overwrite. |
 
@@ -30,7 +30,7 @@ Local measurements on 2026-09-07 used macOS and stock tmux 3.6a.
 | Crowded live room: six alternating reads per mode, same release executable and path scope | Full median 261,210 bytes / 0.224 s; compact median 49,903 bytes / 0.119 s | 80.9% smaller output and 47.1% lower median CLI read time in this sample. Views intentionally expose different detail. Not a billed-token or end-to-end model latency comparison. |
 | Routine 800-peer fixture | Compact fits 6,000 bytes and saves over 50% of serialized bytes | Critical context is never cut to force the byte target. The crowded live room above exceeded the target and reported overflow. |
 | Live Claude ↔ Codex pilot | 20/20 synthetic tasks: ten each direction, exact capsule content, correct answers, receiver-authored ACKs | Four provider calls. Tests CLI handoff and receipt semantics; does not test interactive model TUIs or production task generality. |
-| Real stock-tmux fault probe | 7/7 checks passed | Unicode/control sanitization, honest receipt state, 15 KB payload, concurrent frames, active-pane switch, copy mode, and process replacement with durable directive retained. |
+| Real stock-tmux fault probe | 8/8 checks passed | Unicode/control sanitization, honest receipt state, 15 KB payload, concurrent frames, active-pane switch, copy mode, failed initial binding, and process replacement with durable directive retained. |
 | Lossless compression of a copied quarantine snapshot | 7,749,632 input bytes; 6,723,103 bytes saved (86.8%); restored SHA-256 matched | Original repository snapshot remained unchanged. This is potential space reduction, not space already reclaimed from the user's store. |
 
 Deterministic tests cover Codex, Claude, Gemini, Cursor and RossLabs host labels
@@ -68,7 +68,9 @@ its maintenance cost is justified. The implementation follows tmux's
 
 Pane echo does not prove that an LLM accepted a prompt. Identity checks cannot
 eliminate the race between checking a process and writing to its terminal.
-Legacy sessions without a stored binding remain unbound. An application may
+New sessions record an initial binding failure and refuse delivery; recovery
+requires launching or adopting a new ready target. Legacy sessions without either
+binding field remain unbound. An application may
 ignore a valid paste or be busy; missing capture evidence stays unverified.
 No universal exactly-once or never-fails guarantee is made.
 

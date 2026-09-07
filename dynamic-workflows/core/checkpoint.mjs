@@ -62,6 +62,7 @@ export function putCheckpoint(directory, checkpoint) {
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   if (checkpoint.previous) {
     const prior = readCheckpoint(join(directory, `${checkpoint.previous}.json`), { run_id: checkpoint.run_id, task_id: checkpoint.task_id });
+    if (prior.sha256 !== checkpoint.previous) throw new Error('checkpoint predecessor digest differs from requested hash');
     if (prior.checkpoint.generation + 1 !== checkpoint.generation) throw new Error('checkpoint generation gap');
   }
   const result = { sha256, checkpoint: canonical(checkpoint) };
