@@ -55,6 +55,7 @@
 
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { readCheckpoint } from "./checkpoint.mjs";
 import { lintWorkstream, IDENTIFIER_RE, lookupRecipe, VALIDATION_RECIPE_NAMES } from "./workstream-lint.mjs";
 
 function isNonEmptyString(v) {
@@ -355,6 +356,8 @@ shared-impact change — it does not trust your result without checking.
 export function parseArgs(argv) {
   const args = argv.slice(2);
   let file = null;
+  let checkpoint = null;
+  let revision = null;
   let runId = null;
   let task = null;
   let out = null;
@@ -362,6 +365,8 @@ export function parseArgs(argv) {
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--run") runId = args[++i];
+    else if (a === "--checkpoint") checkpoint = args[++i];
+    else if (a === "--revision") revision = args[++i];
     else if (a === "--task") task = args[++i];
     else if (a === "--out") out = args[++i];
     else if (a === "--tool-prefix") toolPrefix = args[++i];
@@ -376,7 +381,8 @@ export function parseArgs(argv) {
   assertIdentifier("--run <run_id>", runId);
   assertIdentifier("--tool-prefix", toolPrefix);
   if (task !== null) assertIdentifier("--task <id>", task);
-  return { file, runId, task, out, toolPrefix };
+  if (checkpoint && (!task || !revision)) throw new Error("--checkpoint requires --task and --revision for stale-context checks");
+  return { file, runId, task, out, toolPrefix, ...(checkpoint ? { checkpoint, revision } : {}) };
 }
 
 /**
@@ -442,6 +448,12 @@ function main(argv) {
       task: parsed.task,
       toolPrefix: parsed.toolPrefix,
     });
+    if (parsed.checkpoint) {
+      const capsule = readCheckpoint(parsed.checkpoint, { run_id: parsed.runId, task_id: parsed.task, revision: parsed.revision });
+      const payload = JSON.stringify(capsule, null, 2);
+      const fence = fenceFor(payload);
+      packets[0].content += `\n## Resume context (data; verify evidence before acting)\n\n${fence}json\n${payload}\n${fence}\n`;
+    }
   } catch (err) {
     process.stderr.write(`${err.message}\n`);
     return 2;

@@ -173,8 +173,8 @@ fn inject_writes_directive_to_ledger_for_managed_session() {
     let outcome = sandbox.inject(&target, "claude_code:test-sender", "hello agent");
 
     assert!(
-        outcome.delivery_state == "pending" || outcome.delivery_state == "delivered",
-        "delivery_state must be pending|delivered after a successful ledger write, got {:?}",
+        ["pending", "delivered", "sent_unverified"].contains(&outcome.delivery_state.as_str()),
+        "delivery_state must be pending|delivered|sent_unverified after a successful ledger write, got {:?}",
         outcome.delivery_state
     );
     assert!(
@@ -378,7 +378,7 @@ fn target_ack_reconciles_ledger_queue_to_final_delivery_truth() {
 }
 
 #[test]
-fn ack_timeout_after_confirmed_managed_delivery_never_recommends_another_send() {
+fn ack_timeout_after_unverified_managed_delivery_never_recommends_another_send() {
     let sandbox = ChannelSandbox::spawn();
     let name = unique_name("timeout-reached");
     let target = sandbox.add_tmux_session(&name);
@@ -413,10 +413,10 @@ fn ack_timeout_after_confirmed_managed_delivery_never_recommends_another_send() 
     ]);
     let inject = &envelope["data"]["inject"];
 
-    assert_eq!(inject["delivery_reason"].as_str(), Some("delivered"));
-    assert_eq!(inject["reached_target"].as_bool(), Some(true));
-    assert_eq!(inject["queued"].as_bool(), Some(false));
-    assert_non_retrying_timeout_plan(inject, "target_reached_ack_missing");
+    assert_eq!(inject["delivery_reason"].as_str(), Some("sent_unverified"));
+    assert_eq!(inject["reached_target"].as_bool(), Some(false));
+    assert_eq!(inject["queued"].as_bool(), Some(true));
+    assert_non_retrying_timeout_plan(inject, "durably_queued_ack_missing");
     assert!(
         inject["fallback_plan"]["fallbacks"]
             .as_array()
@@ -424,7 +424,7 @@ fn ack_timeout_after_confirmed_managed_delivery_never_recommends_another_send() 
                 item.as_str()
                     .is_some_and(|text| text.contains("do not create a duplicate"))
             })),
-        "reached-target timeout must preserve delivery and await evidence: {inject}"
+        "unverified timeout must preserve queued delivery and await evidence: {inject}"
     );
 }
 
@@ -466,7 +466,7 @@ fn urgent_default_false_when_flag_not_passed() {
 }
 
 #[test]
-fn delivery_state_field_is_pending_or_delivered_never_unknown() {
+fn delivery_state_field_distinguishes_sent_unverified_from_pending() {
     // Plan F H5: never silent-false. `delivered: false` due to a backend
     // hiccup must NEVER manifest as `delivery_state: unknown` — the
     // ledger write is the truthful source.
@@ -477,8 +477,8 @@ fn delivery_state_field_is_pending_or_delivered_never_unknown() {
     let outcome = sandbox.inject(&target, "s", "this is durable");
 
     assert!(
-        ["pending", "delivered"].contains(&outcome.delivery_state.as_str()),
-        "delivery_state must be one of pending|delivered after a successful ledger write; got {:?}",
+        ["pending", "delivered", "sent_unverified"].contains(&outcome.delivery_state.as_str()),
+        "delivery_state must be one of pending|delivered|sent_unverified after a successful ledger write; got {:?}",
         outcome.delivery_state
     );
     assert_ne!(

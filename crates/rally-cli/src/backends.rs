@@ -14,43 +14,91 @@ use crate::store::Fact;
 
 #[derive(Clone, Debug)]
 pub(crate) struct AgentSpec {
-    pub(crate) agent: &'static str,
-    pub(crate) tool: &'static str,
-    command: &'static str,
+    pub(crate) agent: String,
+    pub(crate) tool: String,
+    command: String,
+    command_override: Option<Vec<String>>,
 }
 
 impl AgentSpec {
     pub(crate) fn from_name(agent: &str) -> Result<Self> {
         match agent {
             "claude" | "claude_code" | "claude-code" => Ok(Self {
-                agent: "claude",
-                tool: "claude_code",
-                command: "claude",
+                agent: "claude".into(),
+                tool: "claude_code".into(),
+                command: "claude".into(),
+                command_override: None,
             }),
             "codex" => Ok(Self {
-                agent: "codex",
-                tool: "codex",
-                command: "codex",
+                agent: "codex".into(),
+                tool: "codex".into(),
+                command: "codex".into(),
+                command_override: None,
             }),
             "opencode" | "ocode" | "oc" => Ok(Self {
-                agent: "opencode",
-                tool: "opencode",
-                command: "opencode",
+                agent: "opencode".into(),
+                tool: "opencode".into(),
+                command: "opencode".into(),
+                command_override: None,
             }),
             "gemini" => Ok(Self {
-                agent: "gemini",
-                tool: "gemini",
-                command: "gemini",
+                agent: "gemini".into(),
+                tool: "gemini".into(),
+                command: "gemini".into(),
+                command_override: None,
             }),
-            other => Err(RallyError::Usage(format!("unsupported agent {other}"))),
+            other
+                if !other.is_empty()
+                    && other.len() <= 128
+                    && other
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                    && !other.starts_with('-') =>
+            {
+                Ok(Self {
+                    agent: other.into(),
+                    tool: other.into(),
+                    command: other.into(),
+                    command_override: None,
+                })
+            }
+            other => Err(RallyError::Usage(format!(
+                "invalid agent name {other}; use a host label and --command-json for an executable path"
+            ))),
         }
     }
 
     pub(crate) fn command_line(&self, name: &str) -> Vec<String> {
-        match self.agent {
-            "claude" => cmd![self.command, "--name", name],
-            _ => cmd![self.command],
+        if let Some(command) = &self.command_override {
+            return command.clone();
         }
+        match self.agent.as_str() {
+            "claude" => cmd![&self.command, "--name", name],
+            _ => cmd![&self.command],
+        }
+    }
+
+    pub(crate) fn with_command_json(mut self, input: Option<&str>) -> Result<Self> {
+        if let Some(input) = input {
+            if input.len() > 8192 {
+                return Err(RallyError::Usage(
+                    "--command-json exceeds 8192 bytes".into(),
+                ));
+            }
+            let command: Vec<String> = serde_json::from_str(input).map_err(|_| {
+                RallyError::Usage("--command-json must be a JSON argv array".into())
+            })?;
+            if command.is_empty()
+                || command[0].is_empty()
+                || command.iter().any(|s| s.contains('\0'))
+            {
+                return Err(RallyError::Usage(
+                    "--command-json requires a nonempty executable and no NUL bytes".into(),
+                ));
+            }
+            self.command_override = Some(command);
+        }
+        Ok(self)
     }
 
     /// Build the child command for one bounded task. The prompt is read from
@@ -59,9 +107,9 @@ impl AgentSpec {
     /// subcommands. Codex writes its final response to `result_path` before it
     /// exits and releases the synced conversation writer lease.
     pub(crate) fn task_command_line(&self, result_path: &Path) -> Result<Vec<String>> {
-        match self.agent {
+        match self.agent.as_str() {
             "codex" => Ok(cmd![
-                self.command,
+                &self.command,
                 "exec",
                 "--output-last-message",
                 result_path.display(),
@@ -73,6 +121,14 @@ impl AgentSpec {
             ))),
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
+pub(crate) struct TmuxBinding {
+    pane: String,
+    pane_pid: String,
+    server_pid: String,
+    socket: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
@@ -114,6 +170,8 @@ pub(crate) struct ManagedSession {
     pub(crate) adapter_operations: Vec<String>,
     pub(crate) cwd: PathBuf,
     pub(crate) target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tmux_binding: Option<TmuxBinding>,
     /// Filesystem path of the dedicated linked git worktree provisioned for
     /// this agent, when worktree-per-agent isolation is in effect. `None`
     /// for sessions launched with `--shared`/`--no-worktree`, for sessions
@@ -759,6 +817,7 @@ pub(crate) struct BackendRunner {
     inject_sender: Option<String>,
     /// Typed intent/authority context rendered beside the claimed sender.
     inject_message: MessageContext,
+    bulk_buffer: String,
 }
 
 /// Legacy tmux/cmux landing-verify tuning (P1a). A few short retries tolerate
@@ -791,6 +850,7 @@ impl BackendRunner {
         // removed in Plan F. Those fields and their CLI flags have now been
         // deleted at the source; nothing to discard here anymore.
         Self {
+            bulk_buffer: format!("rally-{}", uuid::Uuid::new_v4()),
             backend,
             tmux_bin: bins.tmux_bin,
             cmux_bin: bins.cmux_bin,
@@ -991,12 +1051,58 @@ impl BackendRunner {
         crate::daemon_client::close_pane_by_id(socket, pane_id).map_err(RallyError::Command)
     }
 
-    pub(crate) fn live_target(&self, session: &ManagedSession) -> Result<String> {
-        match self.backend {
-            Backend::Tmux | Backend::Cmux | Backend::Ptyd | Backend::PtydStrict => {
-                Ok(session.target.clone())
-            }
+    /// Capture the concrete pane/process/server once. Legacy/custom backends
+    /// without a readable tmux identity stay explicitly unbound.
+    pub(crate) fn bind_tmux_session(&self, session: &mut ManagedSession) {
+        if self.backend == Backend::Tmux {
+            session.tmux_binding = self.tmux_identity(&session.target).ok();
         }
+    }
+
+    fn tmux_identity(&self, target: &str) -> Result<TmuxBinding> {
+        let command = cmd![
+            &self.tmux_bin,
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            "#{pane_id}\t#{pane_pid}\t#{pid}\t#{socket_path}\t#{pane_dead}\t#{pane_in_mode}"
+        ];
+        let output = run_command_output(&command)?;
+        let fields: Vec<_> = output.trim().split('\t').collect();
+        if fields.len() != 6
+            || !fields[0].starts_with('%')
+            || fields[1].parse::<u32>().is_err()
+            || fields[2].parse::<u32>().is_err()
+            || fields[3].is_empty()
+            || fields[4] != "0"
+            || fields[5] != "0"
+        {
+            return Err(RallyError::Command(
+                "tmux pane identity unavailable, dead or in copy mode; handoff remains pending"
+                    .into(),
+            ));
+        }
+        Ok(TmuxBinding {
+            pane: fields[0].into(),
+            pane_pid: fields[1].into(),
+            server_pid: fields[2].into(),
+            socket: fields[3].into(),
+        })
+    }
+
+    pub(crate) fn live_target(&self, session: &ManagedSession) -> Result<String> {
+        if let Some(expected) = &session.tmux_binding {
+            let actual = self.tmux_identity(&expected.pane)?;
+            if &actual != expected {
+                return Err(RallyError::Command(
+                    "tmux pane/process/server binding changed; refusing delivery to replacement"
+                        .into(),
+                ));
+            }
+            return Ok(actual.pane);
+        }
+        Ok(session.target.clone())
     }
 
     pub(crate) fn inject_commands(&self, target: &str, text: &str) -> Vec<Vec<String>> {
@@ -1010,6 +1116,7 @@ impl BackendRunner {
         // backend can deliver a payload whose sender is unstated.
         let text = self.deliverable(text);
         match self.backend {
+            Backend::Tmux if text.len() > 8192 => vec![self.bulk_tmux_command(target)],
             Backend::Tmux => tmux_inject_commands(&self.tmux_bin, target, &text),
             // cmux kept as the separate-submit sequence: its `send` subcommand
             // accepts literal text only (and `send-key <name>` named keys) —
@@ -1044,7 +1151,63 @@ impl BackendRunner {
         }
     }
 
+    fn bulk_tmux_command(&self, target: &str) -> Vec<String> {
+        cmd![
+            &self.tmux_bin,
+            "load-buffer",
+            "-b",
+            &self.bulk_buffer,
+            "-",
+            ";",
+            "paste-buffer",
+            "-d",
+            "-r",
+            "-b",
+            &self.bulk_buffer,
+            "-t",
+            target
+        ]
+    }
+
     pub(crate) fn inject(&self, target: &str, text: &str) -> Result<()> {
+        let payload = self.deliverable(text);
+        if self.backend == Backend::Tmux && payload.len() > 8192 {
+            // Large frames exceed OS argv limits with one hex argument per
+            // byte. Stock tmux loads stdin, then pastes raw bytes in the same
+            // command queue. Unique buffers prevent cross-writer replacement.
+            use std::io::Write;
+            use std::process::Stdio;
+            let command = self.bulk_tmux_command(target);
+            let mut child = Command::new(&command[0])
+                .args(&command[1..])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| RallyError::Command(format!("tmux bulk spawn: {e}")))?;
+            let mut frame = vec![0x15];
+            frame.extend(frame_line_bytes(&payload));
+            let sent = child.stdin.take().expect("piped stdin").write_all(&frame);
+            if let Err(e) = sent {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(RallyError::Command(format!("tmux bulk stdin: {e}")));
+            }
+            let output = child
+                .wait_with_output()
+                .map_err(|e| RallyError::Command(format!("tmux bulk wait: {e}")))?;
+            if !output.status.success() {
+                // Failure may follow load but precede paste; remove only our
+                // unique buffer, never the user's clipboard or other buffers.
+                let cleanup = cmd![&self.tmux_bin, "delete-buffer", "-b", &self.bulk_buffer];
+                let _ = run_command_output(&cleanup);
+                return Err(RallyError::Command(format!(
+                    "tmux bulk delivery: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
+            return Ok(());
+        }
         run_commands(&self.inject_commands(target, text))
     }
 
@@ -1061,36 +1224,22 @@ impl BackendRunner {
     ///   `Err(_)`    = the send itself failed
     pub(crate) fn inject_and_verify(&self, target: &str, text: &str) -> Result<bool> {
         self.inject(target, text)?;
-        // A short/whitespace-only payload has no stable needle to search for;
-        // a successful send is the best signal available — do not downgrade it.
-        // Needle from the PAYLOAD BODY, not from `deliverable()`: the
-        // provenance label's own tokens are longer than most payload words, so
-        // searching the labelled string would confirm that the label landed
-        // while proving nothing about the message.
+        // Missing evidence is unknown, even if the transport returned success.
         let needle = match verify_needle(&strip_inject_rally_marks(&sanitize_inject_text(text))) {
             Some(n) => n,
-            None => return Ok(true),
+            None => return Ok(false),
         };
-        // Only downgrade to "unverified" when we actually observed pane content
-        // that lacked the payload. If every capture came back empty or errored
-        // (no capture backend, `/usr/bin/true` stub, permission), we simply
-        // cannot verify — and must NOT turn a successful send into a false
-        // negative. `saw_pane_content` gates that distinction.
-        let mut saw_pane_content = false;
         for attempt in 0..LEGACY_VERIFY_ATTEMPTS {
             if attempt > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(LEGACY_VERIFY_BACKOFF_MS));
             }
-            if let Ok(screen) = self.capture(target, LEGACY_VERIFY_CAPTURE_LINES) {
-                if screen.contains(&needle) {
-                    return Ok(true);
-                }
-                if !screen.trim().is_empty() {
-                    saw_pane_content = true;
-                }
+            if let Ok(screen) = self.capture(target, LEGACY_VERIFY_CAPTURE_LINES)
+                && screen.contains(&needle)
+            {
+                return Ok(true);
             }
         }
-        Ok(!saw_pane_content)
+        Ok(false)
     }
 
     /// Deliver `text` to a ptyd-owned pane bound to `identity` via `agent.send`
@@ -1790,13 +1939,12 @@ fn hex_tokens(bytes: &[u8]) -> Vec<String> {
 }
 
 fn tmux_inject_commands(bin: &str, session: &str, text: &str) -> Vec<Vec<String>> {
-    // C-u clears any stale input still sitting at the prompt; kept as its own
-    // prior command (it is a control-key chord, not part of the framed paste).
-    let clear = cmd![bin, "send-keys", "-t", session, "C-u"];
-    // The framed paste + submit CR delivered as a SINGLE hex send-keys write.
-    let mut framed = cmd![bin, "send-keys", "-t", session, "-H"];
+    // One tmux command queues clear + paste + submit together. Separate clear
+    // commands can erase another writer's prompt before our frame is sent.
+    // This is a tmux queue boundary, not proof of application consumption.
+    let mut framed = cmd![bin, "send-keys", "-t", session, "-H", "15"];
     framed.extend(hex_tokens(&frame_line_bytes(text)));
-    vec![clear, framed]
+    vec![framed]
 }
 
 fn probe_tmux_liveness(bin: &str, targets: &[String]) -> Vec<SessionLiveness> {
@@ -2822,14 +2970,14 @@ mod tests {
     }
 
     #[test]
-    fn inject_and_verify_does_not_downgrade_when_capture_is_empty() {
+    fn inject_and_verify_is_unverified_when_capture_is_empty() {
         // `/usr/bin/true`-style stub: send-keys ok, capture-pane returns nothing.
-        // We cannot verify, so we must NOT turn a successful send into a false
-        // negative — preserves the established `--tmux-bin /usr/bin/true` idiom.
+        // Empty capture supplies no landing evidence. Transport success remains
+        // distinguishable from failure, without inventing observed delivery.
         let bin = stub_tmux("empty", "", 0);
         let r = tmux_runner(&bin);
         assert!(
-            iv_retry(&r, "rally-verify-token-ABC123 hello").unwrap(),
+            !iv_retry(&r, "rally-verify-token-ABC123 hello").unwrap(),
             "empty/unavailable capture is unverifiable, not a failed landing"
         );
     }
@@ -3353,20 +3501,17 @@ mod tests {
     #[test]
     fn tmux_inject_clears_then_sends_one_framed_hex_write() {
         let cmds = tmux_inject_commands("tmux", "rally-codex", "do the thing");
-        // Exactly two commands: the C-u clear, then the single framed -H write.
-        assert_eq!(cmds.len(), 2, "must be one clear + one atomic framed write");
         assert_eq!(
-            cmds[0],
-            vec!["tmux", "send-keys", "-t", "rally-codex", "C-u"]
+            cmds.len(),
+            1,
+            "clear and frame share one command queue entry"
         );
-        // The second command is a single send-keys -H with hex tokens for the
-        // whole frame — NOT a separate paste-buffer + Enter pair.
-        let framed = &cmds[1];
+        let framed = &cmds[0];
         assert_eq!(
-            &framed[..5],
-            &["tmux", "send-keys", "-t", "rally-codex", "-H"]
+            &framed[..6],
+            &["tmux", "send-keys", "-t", "rally-codex", "-H", "15"]
         );
-        let hex: Vec<u8> = framed[5..]
+        let hex: Vec<u8> = framed[6..]
             .iter()
             .map(|t| u8::from_str_radix(t, 16).unwrap())
             .collect();

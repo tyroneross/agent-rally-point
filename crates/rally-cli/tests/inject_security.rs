@@ -71,6 +71,12 @@ fn delivered_body(envelope: &serde_json::Value) -> String {
             })
         })
         .expect("a framed send-keys -H write");
+    assert_eq!(
+        framed.first(),
+        Some(&0x15),
+        "clear shares the frame command"
+    );
+    let framed = &framed[1..];
     assert!(
         framed.starts_with(PASTE_START),
         "framed write must open with the paste-start marker"
@@ -406,7 +412,7 @@ fn sec009_urgent_addition_is_not_delivered_by_any_backend() {
     // the gate is specific to urgent, not a blanket break.
     let normal = sandbox.inject(&target, "claude_code:test-sender", "normal do X");
     assert!(
-        normal.delivery_state == "pending" || normal.delivery_state == "delivered",
+        ["pending", "delivered", "sent_unverified"].contains(&normal.delivery_state.as_str()),
         "non-urgent inject must still write/deliver normally; outcome={normal:?}"
     );
 }

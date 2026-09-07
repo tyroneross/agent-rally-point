@@ -34,6 +34,7 @@ GENERATED_DIRS = (Path("plugins/codex/.codex-plugin"),)
 SKILL_ROOT = Path("skills")
 CODEX_ARTIFACT = Path("plugins/codex/.codex-plugin")
 CODEX_WORKFLOW_RUNTIME_FILES = (
+    "checkpoint.mjs",
     "fanout.mjs",
     "limiter.mjs",
     "packet.mjs",

@@ -1616,13 +1616,10 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
             .is_none(),
         "target_injectability must be omitted on the managed_session path",
     );
-    // tmux inject is now TWO commands: a C-u clear, then a SINGLE atomic
-    // bracketed-paste-framed `send-keys -H <hex…>` write whose trailing CR
-    // submits (ptyd frame_line port — replaces the old 4-command set-buffer /
-    // paste-buffer / separate-Enter sequence that never submitted in Codex).
+    // Clear and framed paste share one tmux queue entry.
     let cmds = inject["data"]["inject"]["commands"].as_array().unwrap();
-    assert_eq!(cmds.len(), 2, "framed inject is clear + one atomic write");
-    let second: Vec<&str> = cmds[1]
+    assert_eq!(cmds.len(), 1, "one clear+paste+submit command");
+    let second: Vec<&str> = cmds[0]
         .as_array()
         .unwrap()
         .iter()
@@ -2121,8 +2118,8 @@ fn rally_inject_require_ack_timeout_returns_ok_with_timeout_ack() {
 
     // delivery + content fact must be present (message was recorded before wait).
     assert_eq!(
-        body["data"]["inject"]["delivered"], true,
-        "delivered must be true even on ack-timeout"
+        body["data"]["inject"]["delivered"], false,
+        "empty capture cannot establish landing, regardless of ack timeout"
     );
     // --handoff inject: content_fact is None (handoff fact already in channel).
     // That's expected — just confirm the field exists (it's null/absent for --handoff).
@@ -2532,7 +2529,7 @@ fn rally_next_and_inject_emit_wake_intent_facts() {
     assert_eq!(inject["data"]["inject"]["wake_intent"]["ref"], handoff_id);
     assert_eq!(
         inject["data"]["inject"]["wake_intent"]["status"],
-        "delivered"
+        "sent_unverified"
     );
     assert_eq!(
         inject["data"]["inject"]["require_ack"], true,

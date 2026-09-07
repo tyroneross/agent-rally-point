@@ -1236,7 +1236,16 @@ fn handoff_is_protocol_request(fact: &Fact) -> bool {
         || protocol_marker(fact, "event_kind") == Some("handoff.requested")
 }
 
-fn strict_handoff_target_session(fact: &Fact) -> Option<&str> {
+/// A typed receiver response proves receipt, without asserting task completion.
+pub(crate) fn handoff_is_protocol_response(fact: &Fact) -> bool {
+    is_fact_v1_handoff_bridge(fact)
+        && matches!(
+            protocol_marker(fact, "event_kind"),
+            Some("handoff.acked" | "handoff.accepted" | "handoff.rejected")
+        )
+}
+
+pub(crate) fn strict_handoff_target_session(fact: &Fact) -> Option<&str> {
     (is_fact_v1_handoff_bridge(fact)
         && protocol_marker(fact, "event_kind") == Some("handoff.requested"))
     .then(|| protocol_marker(fact, "to_session_id"))
@@ -7401,7 +7410,8 @@ fn closers_by_ref(facts: &[Fact]) -> BTreeMap<&str, Vec<&Fact>> {
         if !matches!(
             fact.kind,
             FactKind::Resolve | FactKind::Receipt | FactKind::Artifact
-        ) {
+        ) && !handoff_is_protocol_response(fact)
+        {
             continue;
         }
         let Some(ref_id) = fact.ref_id.as_deref() else {
@@ -7417,12 +7427,13 @@ fn closers_by_ref(facts: &[Fact]) -> BTreeMap<&str, Vec<&Fact>> {
 /// Every condition is a falsifier for a way the obligation could otherwise be
 /// closed by someone other than the agent that owes the answer.
 fn receiver_ack_closes_obligation(obligation: &Fact, closer: &Fact) -> bool {
-    // Same closing kinds as `fact_closes_handoff`: a resolve, a receipt, or a
-    // referencing artifact are the three ways an agent records "I handled this".
+    // Receipt obligations also accept typed responses. These do NOT close
+    // open_handoffs: receipt/acceptance must not manufacture task completion.
     if !matches!(
         closer.kind,
         FactKind::Resolve | FactKind::Receipt | FactKind::Artifact
-    ) {
+    ) && !handoff_is_protocol_response(closer)
+    {
         return false;
     }
     // The ledger is append-only; a closer cannot precede what it closes.
@@ -11587,7 +11598,7 @@ const SNAPSHOT_CACHE_FILENAME: &str = "snapshot.cache.json";
 /// hands back an EMPTY bucket — the same silent-empty failure, one field over.
 /// Reusing 3 for both shapes would have made the counter unable to tell them
 /// apart, so the integration takes the next number rather than the shared one.
-const SNAPSHOT_CACHE_GENERATION: u32 = 4;
+const SNAPSHOT_CACHE_GENERATION: u32 = 5;
 
 /// Snapshot and freshness proof captured while one room mutation lock is held.
 /// This pair is the only value accepted by the cache writer.

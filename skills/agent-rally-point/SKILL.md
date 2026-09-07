@@ -76,6 +76,29 @@ Read `next` before broad repo exploration:
 If `actionable` is false, do not invent work from Rally state. If
 `requires_human` is true, ask the user.
 
+## Efficient observation and durable context
+
+Use `rally room --compact --tool "$TOOL" --json` for routine context. Add
+`--path <path>` to retain overlapping claims and scoped blockers, including
+those authored by another host. `--since <max_seq>` reports whether the room
+changed; it never hides an old active obligation. The compact schema differs
+from full room. Check `budget.over_budget` and `inventory` for overflow and
+omitted history, risks, and artifacts. Use full `rally room --json` when those
+are needed. Compact output is advisory; always run the authoritative
+`check before-write` before editing.
+
+Use `rally next --audit --tool "$TOOL" --json` when only observing; this mode
+writes no presence, wake, or read facts. Continue explicit status heartbeats
+while working. The ordinary `next` command retains its lifecycle behavior.
+
+For a cross-host resume, store task context with
+`node dynamic-workflows/core/checkpoint.mjs put <directory> <context.json>`.
+Send its absolute content-addressed path and digest. `packet.mjs --checkpoint
+<path> --task <task> --run <run> --revision <full-git-object-id>` validates the
+capsule before rendering it. Keep goal, constraints, evidence locators and next
+action in the capsule; keep long logs in artifacts. Checkpoint hashes detect
+changes, not authorship. Every host uses the same schema.
+
 ## Core Workflow
 
 1. **Claim before shared edits** when `next` recommends work or when the file is
@@ -186,9 +209,16 @@ before you plan, before you touch a file.** The ACK is two seconds of work and
 it is the only signal that separates "received" from "never delivered." Reading
 a long brief first, then acking, leaves the sender unable to tell which happened.
 
+For a session-bound handoff (`protocol:to_session_id` on the original fact),
+use the typed ACK below. A legacy unbound handoff cannot establish an exact
+receiver session. Its inbox offers the compatible `receipt` command, which
+also closes the legacy handoff; use a newly session-bound request when receipt,
+acceptance and completion must remain separate. Do not invent or override a
+missing target binding.
+
 ```bash
 rally say handoff --tool "$TOOL" --ref <their-event-id> --target <their-tool> \
-  --subject "ACK — <lane>" --summary "Received. Reading the brief now." --json
+  --handoff-state acked --subject "ACK — <lane>" --summary "Received. Reading the brief now." --json
 ```
 
 Then, while you work the handoff, **post a status every ~10 minutes**. Silence

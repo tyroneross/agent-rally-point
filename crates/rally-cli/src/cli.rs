@@ -248,6 +248,7 @@ pub(crate) struct RetractArgs {
 
 #[derive(Clone, Debug)]
 pub(crate) struct RoomArgs {
+    pub(crate) compact: bool,
     pub(crate) json: bool,
     pub(crate) tool: Option<String>,
     pub(crate) role: Option<String>,
@@ -443,6 +444,7 @@ pub(crate) struct HookBeforeWriteArgs {
 
 #[derive(Clone, Debug)]
 pub(crate) struct RunArgs {
+    pub(crate) command_json: Option<String>,
     pub(crate) json: bool,
     pub(crate) dry_run: bool,
     pub(crate) agent: String,
@@ -1657,6 +1659,7 @@ fn say_parser() -> impl Parser<SayArgs> {
 }
 
 fn room_parser() -> impl Parser<RoomArgs> {
+    let compact = long("compact").help("bounded advisory agent view; requires --tool; --since marks changes without hiding active obligations").switch();
     let json = json_flag();
     let tool = optional_string_arg("tool", "TOOL");
     let role = optional_string_arg("role", "ROLE");
@@ -1685,6 +1688,7 @@ fn room_parser() -> impl Parser<RoomArgs> {
         .help("show current action-bearing work and fresh/participating actors; raw history is unchanged")
         .switch();
     construct!(RoomArgs {
+        compact,
         json,
         tool,
         role,
@@ -1923,6 +1927,10 @@ fn hook_parser() -> impl Parser<HookArgs> {
 }
 
 fn run_parser() -> impl Parser<RunArgs> {
+    let command_json = long("command-json")
+        .help("custom host executable and arguments as a JSON array; interactive lifecycle only")
+        .argument::<String>("ARGV_JSON")
+        .optional();
     let json = json_flag();
     let dry_run = dry_run_flag();
     let name = optional_string_arg("name", "NAME");
@@ -1943,7 +1951,18 @@ fn run_parser() -> impl Parser<RunArgs> {
     let no_worktree = long("no-worktree").switch();
     let shared = construct!(shared, no_worktree).map(|(a, b)| a || b);
     construct!(
-        json, dry_run, name, backend, session_id, tool, task, resources, bins, shared, agent
+        json,
+        dry_run,
+        name,
+        backend,
+        session_id,
+        tool,
+        task,
+        resources,
+        bins,
+        shared,
+        command_json,
+        agent
     )
     .map(
         |(
@@ -1957,9 +1976,11 @@ fn run_parser() -> impl Parser<RunArgs> {
             resources,
             bins,
             shared,
+            command_json,
             agent,
         )| {
             RunArgs {
+                command_json,
                 json,
                 dry_run,
                 agent,

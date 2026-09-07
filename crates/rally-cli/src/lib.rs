@@ -116,6 +116,7 @@ macro_rules! cmd {
 }
 
 mod agent_state;
+mod agent_view;
 mod backends;
 mod backlog;
 mod board;
@@ -243,6 +244,7 @@ enum WatchdogMutationState {
         retry_command: String,
     },
     Committed {
+        event_id: Option<String>,
         projection_complete: bool,
         warnings: Vec<Value>,
     },
@@ -554,6 +556,7 @@ pub(crate) fn mark_watchdog_command_commit() {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                 WatchdogMutationState::Committed {
+                    event_id: None,
                     projection_complete: true,
                     warnings: Vec::new(),
                 };
@@ -636,6 +639,7 @@ pub(crate) fn mark_watchdog_append_outcome(outcome: &store::AppendOutcome) {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                 WatchdogMutationState::Committed {
+                    event_id: Some(outcome.fact.event_id.clone()),
                     projection_complete: outcome.projection_complete,
                     warnings,
                 };
@@ -1118,6 +1122,7 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
                             std::process::exit(1);
                         }
                         WatchdogMutationState::Committed {
+                            event_id,
                             projection_complete,
                             warnings,
                         } => {
@@ -1126,6 +1131,7 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
                                 timeout,
                                 projection_complete,
                                 &warnings,
+                                event_id.as_deref(),
                             );
                             std::process::exit(0);
                         }
@@ -1493,6 +1499,7 @@ fn emit_timeout_committed_mutation(
     timeout: Duration,
     projection_complete: bool,
     warnings: &[Value],
+    event_id: Option<&str>,
 ) {
     let message = format!(
         "mutating command exceeded {}ms wall-clock budget after its primary durable append committed; projection/output was abandoned",
@@ -1506,6 +1513,8 @@ fn emit_timeout_committed_mutation(
             "data": {
                 "watchdog": {
                     "committed": true,
+                    "event_id": event_id,
+                    "query_remedy": event_id.map(locate_remedy),
                     "projection_complete": projection_complete,
                     "warnings": warnings,
                     "timeout_ms": timeout.as_millis(),
@@ -4264,6 +4273,9 @@ fn command_release_by_path(
 }
 
 fn command_room(args: RoomArgs) -> Result<Output> {
+    if args.compact {
+        return agent_view::command(args);
+    }
     let room = RoomStore::open()?;
     let json_output = args.json;
     let budget_override = args.budget_bytes;
@@ -7658,6 +7670,7 @@ impl Drop for AdmissionRollback<'_> {
 
 fn command_run(args: RunArgs) -> Result<Output> {
     let RunArgs {
+        command_json,
         json,
         dry_run,
         agent,
@@ -7729,7 +7742,22 @@ fn command_run(args: RunArgs) -> Result<Output> {
 
     let backend_name = backend.as_str().to_string();
     let repo = repo_root()?;
-    let agent_spec = AgentSpec::from_name(&agent)?;
+    let agent_spec = AgentSpec::from_name(&agent)?.with_command_json(command_json.as_deref())?;
+    if !matches!(
+        agent_spec.agent.as_str(),
+        "codex" | "claude" | "gemini" | "opencode"
+    ) && command_json.is_none()
+    {
+        return Err(RallyError::Usage(
+            "custom hosts require --command-json with their executable and arguments".into(),
+        ));
+    }
+    if task.is_some() && command_json.is_some() {
+        return Err(RallyError::Usage(
+            "--command-json uses an interactive host; --task requires a declared task adapter"
+                .into(),
+        ));
+    }
     if task.is_some() {
         // Validate agent support before reserving a durable session or
         // provisioning a worktree. Rendering again after reservation is cheap;
@@ -8061,7 +8089,8 @@ fn command_run(args: RunArgs) -> Result<Output> {
                 return Err(err);
             }
         };
-        if actual_target != session.target {
+        backend_runner.bind_tmux_session(&mut session);
+        if actual_target != session.target || session.tmux_binding.is_some() {
             session.target = actual_target;
             if let Some(fact) = &reservation.fact {
                 room.append_fact(&session_fact(
@@ -8642,6 +8671,15 @@ fn command_adopt(args: AdoptArgs) -> Result<Output> {
     // `rally run`. Fail-open — an adopted tmux/cmux pane the daemon doesn't own
     // simply stays on the framed-tmux fallback.
     let mut session = session;
+    BackendRunner::new(resolved_backend, BackendBins::default()).bind_tmux_session(&mut session);
+    if session.tmux_binding.is_some() {
+        room.append_fact(&session_fact(
+            &session,
+            "active",
+            Some(landed_fact.event_id.clone()),
+        ))?
+        .into_fact_reporting();
+    }
     try_register_session_with_daemon(&room, &Some(landed_fact), &mut session)?;
 
     let body = envelope(
@@ -8786,10 +8824,10 @@ fn numbered_session_identity(
         .as_deref()
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .unwrap_or(agent_spec.agent);
+        .unwrap_or(agent_spec.agent.as_str());
     let stripped_name_base = strip_numbered_suffix(raw_base_name);
     let name_base = if sanitize_id(stripped_name_base).is_empty() {
-        agent_spec.agent
+        agent_spec.agent.as_str()
     } else {
         stripped_name_base
     };
@@ -8827,7 +8865,7 @@ fn next_identity_number(
         note_used_identity_number(&base_key, &sanitize_id(&session.name), &mut used);
         if let Some(tool_suffix) = session
             .tool
-            .strip_prefix(agent_spec.tool)
+            .strip_prefix(agent_spec.tool.as_str())
             .and_then(|suffix| suffix.strip_prefix(':'))
         {
             note_used_identity_number(&base_key, tool_suffix, &mut used);
@@ -9723,13 +9761,15 @@ fn command_inject_managed(
         None
     };
 
-    let ack_after_seq = if effective_require_ack && !dry_run {
-        room.as_ref()
-            .map(|r| r.snapshot().map(|s| s.max_seq))
-            .transpose()?
-    } else {
-        None
+    // A receipt belongs to the logical handoff, not this delivery attempt.
+    // Reuse an existing exact receiver response without writing another
+    // directive or touching the terminal.
+    let prior_ack = match (room.as_ref(), handoff.as_deref()) {
+        (Some(room), Some(id)) => prior_receiver_ack(&room.facts()?, id, &session.tool),
+        _ => None,
     };
+    let already_received = prior_ack.is_some();
+    let ack_after_seq = 0;
 
     // Record message content in the channel BEFORE live delivery so the
     // coordination record is durable even if the backend session is gone.
@@ -9775,12 +9815,15 @@ fn command_inject_managed(
         },
         &message,
     );
+    // Persist the directive even if the bound pane has disappeared. Target
+    // validation gates transport below, never durable acceptance.
     let live_target = if dry_run {
-        session.target.clone()
+        Ok(session.target.clone())
     } else {
-        backend_runner.live_target(&session)?
+        backend_runner.live_target(&session)
     };
-    let commands = backend_runner.inject_commands(&live_target, &text);
+    let commands =
+        backend_runner.inject_commands(live_target.as_deref().unwrap_or(&session.target), &text);
 
     // Plan F: ALWAYS write a typed Directive to the .rally ledger first.
     // This is the new canonical delivery contract — the daemon (rally-termd,
@@ -9795,7 +9838,7 @@ fn command_inject_managed(
         Option<u64>,
         Option<String>,
         &'static str,
-    ) = if dry_run {
+    ) = if dry_run || already_received {
         (None, None, "pending")
     } else {
         match inject_via_ledger(
@@ -9844,7 +9887,7 @@ fn command_inject_managed(
         Mismatch { reason: String },
         Failed { reason: String },
     }
-    let ptyd_delivery = if dry_run || !daemon_routed {
+    let ptyd_delivery = if dry_run || already_received || !daemon_routed {
         PtydDelivery::NotDaemon
     } else if ledger_failed {
         // Ledger write failed — do not attempt the daemon send (we have no
@@ -9891,7 +9934,7 @@ fn command_inject_managed(
     // confirmed is recorded as `legacy_sent_unverified` — an honest middle state,
     // NOT "failed" (it was sent) and NOT "delivered" (unconfirmed).
     let mut legacy_sent_unverified = false;
-    let delivered = if dry_run {
+    let delivered = if dry_run || already_received {
         false
     } else if daemon_routed {
         // ptyd daemon owns delivery: `delivered` (the legacy sync-delivery flag)
@@ -9914,7 +9957,7 @@ fn command_inject_managed(
         // Addition is delivered by NO backend.
         false
     } else {
-        match backend_runner.inject_and_verify(&live_target, &text) {
+        match live_target.and_then(|target| backend_runner.inject_and_verify(&target, &text)) {
             Ok(true) => true,
             Ok(false) => {
                 legacy_sent_unverified = true;
@@ -9937,6 +9980,7 @@ fn command_inject_managed(
     // Plan F functional core (Chunk 3): the herdr backend is removed;
     // the only inject paths left are tmux + cmux + the ledger write.
     let legacy_tmux_cmux_failed = !dry_run
+        && !already_received
         && !daemon_routed
         && !delivered
         && !ledger_failed
@@ -9996,17 +10040,23 @@ fn command_inject_managed(
         // anything consumed it.
         DeliveryDisposition::QueuedAwaitingReceipt
     };
-    let wake_intent = inject_wake_intent_with_room(
-        room.as_ref(),
-        &sender_tool,
-        Some(&session),
-        &session.tool,
-        handoff.as_deref(),
-        &commands,
-        dry_run,
-        disposition,
-    )?;
-    let mut ack = if effective_require_ack && !dry_run {
+    let wake_intent = if already_received {
+        None
+    } else {
+        inject_wake_intent_with_room(
+            room.as_ref(),
+            &sender_tool,
+            Some(&session),
+            &session.tool,
+            handoff.as_deref(),
+            &commands,
+            dry_run,
+            disposition,
+        )?
+    };
+    let mut ack = if prior_ack.is_some() {
+        prior_ack
+    } else if effective_require_ack && !dry_run {
         let handoff = handoff.as_deref().unwrap_or_default();
         // room is always Some here (require_ack && !dry_run guards this branch).
         let ack_room = room
@@ -10016,7 +10066,7 @@ fn command_inject_managed(
         Some(wait_for_resolution(
             handoff,
             timeout,
-            ack_after_seq.unwrap_or(0),
+            ack_after_seq,
             &ack_room,
             &session.tool,
         )?)
@@ -10046,7 +10096,13 @@ fn command_inject_managed(
     };
     let session_id_for_text = session.session_id.clone();
     let inject_payload = InjectData {
-        mode: if dry_run { "dry-run" } else { "inject" },
+        mode: if dry_run {
+            "dry-run"
+        } else if already_received {
+            "already-received"
+        } else {
+            "inject"
+        },
         session: Some(session),
         target_kind: "managed_session",
         handoff,
@@ -10056,7 +10112,11 @@ fn command_inject_managed(
         ack_state,
         fallback_plan,
         wake_intent,
-        commands: command_plan_json(&commands),
+        commands: if already_received {
+            Vec::new()
+        } else {
+            command_plan_json(&commands)
+        },
         sender_tool,
         message: backends::InjectMessageData::from(&message),
         content_fact,
@@ -10148,13 +10208,15 @@ fn command_inject_ledger(
         None
     };
 
-    let ack_after_seq = if effective_require_ack && !dry_run {
-        room.as_ref()
-            .map(|r| r.snapshot().map(|s| s.max_seq))
-            .transpose()?
-    } else {
-        None
+    // A receipt belongs to the logical handoff, not this delivery attempt.
+    // Reuse an existing exact receiver response without writing another
+    // directive or touching the terminal.
+    let prior_ack = match (room.as_ref(), handoff.as_deref()) {
+        (Some(room), Some(id)) => prior_receiver_ack(&room.facts()?, id, &agent_id),
+        _ => None,
     };
+    let already_received = prior_ack.is_some();
+    let ack_after_seq = 0;
 
     let content_fact = if is_text_inject {
         let fact = if let Some(ref r) = room {
@@ -10173,7 +10235,7 @@ fn command_inject_ledger(
     // (double-delivery on the ledger-only path). The managed-session arm
     // above keeps its intentional dual-delivery for P2 tmux/cmux.
     let (directive_seq, directive_to, delivery_state): (Option<u64>, Option<String>, &'static str) =
-        if dry_run {
+        if dry_run || already_received {
             (None, None, "pending")
         } else {
             match inject_via_ledger(
@@ -10204,16 +10266,20 @@ fn command_inject_ledger(
     } else {
         DeliveryDisposition::QueuedNoManagedSession
     };
-    let wake_intent = inject_wake_intent_with_room(
-        room.as_ref(),
-        &sender_tool,
-        None,
-        &agent_id,
-        handoff.as_deref(),
-        &commands,
-        dry_run,
-        disposition,
-    )?;
+    let wake_intent = if already_received {
+        None
+    } else {
+        inject_wake_intent_with_room(
+            room.as_ref(),
+            &sender_tool,
+            None,
+            &agent_id,
+            handoff.as_deref(),
+            &commands,
+            dry_run,
+            disposition,
+        )?
+    };
     // RCA 2026-07-09 follow-up: a LedgerAgent target by definition has no
     // ACTIVE managed session (`resolve_inject_target` arm 2), so pane delivery
     // — and any synchronous ACK it would produce — depends on an external
@@ -10233,12 +10299,14 @@ fn command_inject_ledger(
             "no active managed session for {agent_id}; delivery is ledger-queued (a rally-termd-registered pane may still deliver). For guaranteed live injection, adopt a pane you already started: `rally adopt {agent_id} --tmux <target>`. `rally run <agent>` also mints one, when a backend is installed."
         )),
     };
-    if effective_require_ack && !dry_run {
+    if effective_require_ack && !dry_run && !already_received {
         eprintln!(
             "rally: inject target {agent_id} is not synchronously injectable (presence-only; no active managed session). Waiting up to {timeout}s for an async ACK anyway — a polling agent or a rally-termd-registered pane can still resolve. Size any outer timeout accordingly."
         );
     }
-    let mut ack = if effective_require_ack && !dry_run {
+    let mut ack = if prior_ack.is_some() {
+        prior_ack
+    } else if effective_require_ack && !dry_run {
         let handoff = handoff.as_deref().unwrap_or_default();
         let ack_room = room
             .take()
@@ -10247,7 +10315,7 @@ fn command_inject_ledger(
         Some(wait_for_resolution(
             handoff,
             timeout,
-            ack_after_seq.unwrap_or(0),
+            ack_after_seq,
             &ack_room,
             &agent_id,
         )?)
@@ -10291,7 +10359,13 @@ fn command_inject_ledger(
     });
     set_ack_timeout_fallback(&mut ack, fallback_plan.as_ref());
     let inject_payload = InjectData {
-        mode: if dry_run { "dry-run" } else { "inject" },
+        mode: if dry_run {
+            "dry-run"
+        } else if already_received {
+            "already-received"
+        } else {
+            "inject"
+        },
         session: None,
         target_kind: "ledger_agent",
         handoff,
@@ -10301,7 +10375,11 @@ fn command_inject_ledger(
         ack_state,
         fallback_plan,
         wake_intent,
-        commands: command_plan_json(&commands),
+        commands: if already_received {
+            Vec::new()
+        } else {
+            command_plan_json(&commands)
+        },
         sender_tool,
         message: backends::InjectMessageData::from(&message),
         content_fact,
@@ -12252,6 +12330,24 @@ fn handoff_prompt_ledger(target: &str, handoff: &str) -> String {
     )
 }
 
+fn prior_receiver_ack(facts: &[Fact], handoff: &str, expected_tool: &str) -> Option<Value> {
+    let original = facts.iter().find(|f| f.event_id == handoff)?;
+    if original.target.as_deref() != Some(expected_tool) {
+        return None;
+    }
+    let expected_session = store::strict_handoff_target_session(original);
+    facts.iter().find(|f| f.seq > original.seq && f.ref_id.as_deref() == Some(handoff)
+        && f.tool.as_deref() == Some(expected_tool)
+        && expected_session.is_none_or(|session| f.from_session_id.as_deref() == Some(session))
+        && (matches!(f.kind, FactKind::Resolve | FactKind::Receipt | FactKind::Artifact)
+            || store::handoff_is_protocol_response(f)))
+        .map(|f| {
+            let resolved = matches!(f.kind, FactKind::Resolve | FactKind::Receipt | FactKind::Artifact);
+            json!({"received":true,"resolved":resolved,"handoff_closed":resolved,"blocked":false,"decision":false,
+                "event_id":f.event_id,"tool":f.tool,"expected_tool":expected_tool,"kind":f.kind.as_str(),"subject":f.subject})
+        })
+}
+
 fn wait_for_resolution(
     handoff: &str,
     timeout_seconds: u64,
@@ -12263,7 +12359,13 @@ fn wait_for_resolution(
     let mut last_seen_seq = after_seq;
     let mut ignored_target_responses = BTreeSet::new();
     loop {
-        for fact in room.facts()? {
+        let facts = room.facts()?;
+        let expected_session = facts
+            .iter()
+            .find(|f| f.event_id == handoff)
+            .and_then(store::strict_handoff_target_session)
+            .map(str::to_string);
+        for fact in facts {
             last_seen_seq = last_seen_seq.max(fact.seq);
             if fact.seq > after_seq && fact.ref_id.as_deref() == Some(handoff) {
                 if !matches!(
@@ -12273,10 +12375,15 @@ fn wait_for_resolution(
                         | store::FactKind::Artifact
                         | store::FactKind::Blocker
                         | store::FactKind::Decision
-                ) {
+                ) && !store::handoff_is_protocol_response(&fact)
+                {
                     continue;
                 }
-                if fact.tool.as_deref() == Some(expected_tool) {
+                if fact.tool.as_deref() == Some(expected_tool)
+                    && expected_session
+                        .as_deref()
+                        .is_none_or(|session| fact.from_session_id.as_deref() == Some(session))
+                {
                     let blocked = fact.kind == store::FactKind::Blocker;
                     let decision = fact.kind == store::FactKind::Decision;
                     let resolved = matches!(
@@ -18294,6 +18401,7 @@ mod tests {
             WatchdogMutationState::Committed {
                 projection_complete: true,
                 warnings,
+                ..
             } if warnings.is_empty()
         ));
     }

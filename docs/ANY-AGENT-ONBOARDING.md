@@ -388,3 +388,61 @@ These are product backlog items, not assumptions agents should rely on today:
 
 Until those exist, the portable contract is this document plus the core Rally
 commands above.
+
+
+## Custom launchers and shared context
+
+Codex, Claude, Gemini, Cursor, RossLabs Agent Harness, and future hosts use the
+same Rally identity, handoff, ACK and checkpoint contracts. A host label is
+metadata, not evidence of delivery support or authentication.
+
+For hosts outside the built-in launcher list, provide the executable argv:
+
+```bash
+rally run cursor --command-json '["agent"]' --backend tmux --json
+rally run rosslabs-agent-harness --command-json '["/absolute/path/to/harness"]' --backend tmux --json
+```
+
+The second executable path must be supplied by the harness owner. Rally does
+not infer its flags. The JSON array is shell-quoted as individual arguments;
+it is not evaluated as a shell program. Custom commands have an interactive
+lifecycle: `--task` remains available only to hosts with a declared bounded-task
+adapter. A GUI-only host can use the durable CLI contract without claiming a
+managed stdin capability.
+
+New tmux sessions bind the pane id, pane process, tmux server and socket when
+observable. Injection uses that pane even after another pane becomes active.
+A changed binding or copy mode refuses the live send; the durable directive
+remains pending. Legacy or custom test backends without an observable binding
+remain unbound, and should be restarted or explicitly adopted before relying
+on identity protection. Pane existence does not establish host prompt readiness.
+
+Small messages queue clear, bracketed paste and submit in one tmux command.
+Large messages use a unique stdin-loaded buffer and raw paste in the same queue,
+avoiding one argv item per byte. No clipboard selection is requested. Empty or
+failed capture is `sent_unverified`; visible text is still only transport
+evidence. Only the intended receiver's own ACK establishes receipt.
+
+Use `room --compact --tool <id> --json` for bounded observation and
+`next --audit` for read-only polling. Continue explicit status posts and full
+before-write checks. `dynamic-workflows/core/checkpoint.mjs` stores immutable,
+hashed task capsules; the packet renderer requires matching run, task and git
+revision on resume. These operations require no model-specific package.
+
+Storage inspection: `python3 scripts/rally_storage.py inventory --rally-dir
+<repo>/.rally`. Explicit compression accepts only a named quarantined database
+snapshot and verifies exact decompression before removing its uncompressed
+copy. It cannot select the live database/WAL, ledger, task results or worktree
+recovery bundles. `restore` preserves the original quarantine basename and
+never overwrites existing files. No automatic retention policy is enabled.
+
+
+Typed ACKs now clear the receiver's receipt inbox and satisfy injection ACK
+waits, while the underlying task stays open. Re-injecting an already acknowledged
+handoff returns `mode: already-received`, reuses the receiver's evidence, and
+writes no new directive or wake. Unacknowledged/uncertain sends remain pending;
+Rally does not infer permission for a blind replay. Initial legacy handoffs
+without an exact receiver binding still use the legacy receipt contract. For
+strict handoffs, cite a receiver-authored fact or route a brief artifact to one
+exact managed session with `--target-policy third-party`; resolve that target
+from live session state. A typed reply cannot repair an unbound legacy request.

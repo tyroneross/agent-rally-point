@@ -133,7 +133,7 @@ chmod +x "$F/scripts/build-codex-artifact.sh"
 # Keep this fixture aligned with every Python contract that the real parity
 # dispatcher invokes. A missing stub makes the positive control fail for the
 # fixture itself and masks the gate-scope behavior this suite owns.
-for m in test_generate_host_surfaces test_sync_host_integrations test_check_command_conformance; do
+for m in test_generate_host_surfaces test_sync_host_integrations test_check_command_conformance test_lint_sibling_asymmetry; do
   cat > "$F/tests/scripts/$m.py" <<'PY'
 import unittest
 

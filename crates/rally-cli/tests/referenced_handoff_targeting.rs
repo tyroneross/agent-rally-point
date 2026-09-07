@@ -67,6 +67,7 @@ impl Room {
             // this only ever failed on the runner.
             .env_remove("GITHUB_ACTIONS")
             .env_remove("GITHUB_RUN_ID")
+            .env_remove("RALLY_SESSION_ID")
             .env("TERM_SESSION_ID", session)
             .env("PATH", format!("{}:{inherited}", self.bin.display()))
             .args(args)
@@ -1110,4 +1111,97 @@ fn actionable_room_hides_closed_inventory_but_history_remains_queryable() {
     );
     let history = room.json("session-author", &["locate", &artifact, "--json"]);
     assert_eq!(history["ok"], true, "{history}");
+}
+
+#[test]
+fn documented_receiver_ack_executes_against_bound_handoff() {
+    let room = Room::new();
+    let (artifact, _) = room.artifact();
+    let sent = room.json(
+        "session-reviewer",
+        &[
+            "say",
+            "handoff",
+            "--tool",
+            "reviewer:r",
+            "--ref",
+            &artifact,
+            "--subject",
+            "review",
+            "--json",
+        ],
+    );
+    assert_eq!(sent["ok"], true, "{sent}");
+    let handoff = sent["data"]["say"]["fact"]["event_id"].as_str().unwrap();
+    // Execute the actual documentation, so a stale example cannot pass merely
+    // because a separately maintained test command is correct.
+    let doc = include_str!("../../../skills/agent-rally-point/SKILL.md");
+    let receiving = doc.split("## Receiving a Handoff").nth(1).unwrap();
+    let example = receiving
+        .split("```bash\n")
+        .nth(1)
+        .unwrap()
+        .split("```")
+        .next()
+        .unwrap();
+    let expanded = example
+        .replace("\\\n", " ")
+        .replace("$TOOL", "author:a")
+        .replace("<their-event-id>", handoff)
+        .replace("<their-tool>", "reviewer:r")
+        .replace("<lane>", "contract");
+    let argv = shlex::split(&expanded).unwrap();
+    assert_eq!(argv[0], "rally");
+    let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+    let ack = room.json("session-author", &args);
+    assert_eq!(ack["ok"], true, "{ack}");
+    assert!(
+        ack["data"]["say"]["fact"]["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "protocol:event_kind=handoff.acked")
+    );
+    let inbox = room.json("session-author", &["inbox", "--tool", "author:a", "--json"]);
+    assert_eq!(
+        inbox["data"]["inbox"]["count"], 0,
+        "typed ACK must clear receipt obligation: {inbox}"
+    );
+    let open = room.json("session-author", &["room", "--json"]);
+    assert!(
+        open["data"]["room"]["open_handoffs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["event_id"] == handoff),
+        "ACK must not complete task"
+    );
+    let before_seq = open["data"]["room"]["max_seq"].clone();
+    let repeated = room.json(
+        "session-author",
+        &[
+            "inject",
+            "author:a",
+            "--tool",
+            "author:a",
+            "--handoff",
+            handoff,
+            "--timeout-seconds",
+            "1",
+            "--json",
+        ],
+    );
+    assert_eq!(repeated["data"]["inject"]["mode"], "already-received");
+    assert_eq!(repeated["data"]["inject"]["verified_received"], true);
+    assert_eq!(repeated["data"]["inject"]["ack"]["resolved"], false);
+    assert!(repeated["data"]["inject"]["directive_seq"].is_null());
+    assert_eq!(
+        room.json("session-author", &["room", "--json"])["data"]["room"]["max_seq"],
+        before_seq
+    );
+    let retry = room.json("session-author", &args);
+    assert_eq!(
+        ack["data"]["say"]["fact"]["event_id"],
+        retry["data"]["say"]["fact"]["event_id"]
+    );
 }
