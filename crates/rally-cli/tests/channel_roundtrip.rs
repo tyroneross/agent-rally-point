@@ -25,9 +25,7 @@ use std::thread;
 use std::time::Duration;
 use support::channel_sandbox::ChannelSandbox;
 
-/// `--tmux-bin /usr/bin/true` makes tmux subcommands succeed without doing
-/// anything; that's the existing test idiom (see tests/user_journey.rs). The
-/// per-test counter avoids name collisions when cargo runs tests in parallel.
+/// The per-test counter avoids name collisions when cargo runs tests in parallel.
 fn unique_name(prefix: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
@@ -398,6 +396,7 @@ fn ack_timeout_after_unverified_managed_delivery_never_recommends_another_send()
         .as_str()
         .expect("handoff event_id");
 
+    let tmux_stub = sandbox.tmux_unverified_stub(&target);
     let envelope = sandbox.rally_json(&[
         "inject",
         &target,
@@ -409,7 +408,7 @@ fn ack_timeout_after_unverified_managed_delivery_never_recommends_another_send()
         "--tool",
         "sender:01",
         "--tmux-bin",
-        "/usr/bin/true",
+        &tmux_stub,
     ]);
     let inject = &envelope["data"]["inject"];
 

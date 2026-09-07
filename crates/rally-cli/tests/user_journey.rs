@@ -135,6 +135,13 @@ struct Workspace {
 }
 
 impl Workspace {
+    fn observable_tmux_stub(&self) -> String {
+        let path = self.home.join("observable-tmux");
+        fs::write(&path, "#!/bin/sh\ncase \"$1\" in\n display-message) printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '%1' '101' '202' '/tmp/rally-test.sock' '0' '0' ;;\nesac\nexit 0\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
     fn new(name: &str) -> Self {
         let cwd = temp_path(&format!("{name}-cwd"));
         let home = temp_path(&format!("{name}-home"));
@@ -1538,6 +1545,7 @@ fn rally_entry_and_handoff_split_response_and_work_buckets() {
 fn rally_runs_and_injects_managed_tmux_sessions() {
     let _run_guard = serialize_rally_run();
     let workspace = Workspace::new("rally-run-tmux");
+    let tmux_stub = workspace.observable_tmux_stub();
     let _daemon = maybe_start_daemon(&workspace.cwd, &workspace.home);
 
     let run = workspace.json(&[
@@ -1549,7 +1557,7 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
         "--backend",
         "tmux",
         "--tmux-bin",
-        "/usr/bin/true",
+        &tmux_stub,
     ]);
     assert_eq!(run["schema"], "agent-rally.command.run.v1");
     assert_matches_schema("agent-rally.command.run.v1.json", &run);
@@ -1593,7 +1601,7 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
     );
     assert!(!workspace.cwd.join(".rally/sessions.json").exists());
     let room = workspace.json(&["room", "--json"]);
-    assert_eq!(room["data"]["room"]["max_seq"], 1);
+    assert_eq!(room["data"]["room"]["max_seq"], 2);
 
     let inject = workspace.json(&[
         "inject",
@@ -1602,7 +1610,7 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
         "--text",
         "hello from rally",
         "--tmux-bin",
-        "/usr/bin/true",
+        &tmux_stub,
     ]);
     assert_eq!(inject["schema"], "agent-rally.command.inject.v1");
     assert_matches_schema("agent-rally.command.inject.v1.json", &inject);
@@ -1729,7 +1737,7 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
         "--timeout-seconds",
         "3",
         "--tmux-bin",
-        "/usr/bin/true",
+        &tmux_stub,
     ]);
     resolver.join().unwrap();
     assert_eq!(acked["data"]["inject"]["ack"]["resolved"], true);
@@ -1757,7 +1765,7 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
         "--lines",
         "20",
         "--tmux-bin",
-        "/usr/bin/true",
+        &tmux_stub,
     ]);
     assert_eq!(capture["schema"], "agent-rally.command.session-action.v1");
     assert_matches_schema("agent-rally.command.session-action.v1.json", &capture);
@@ -1769,7 +1777,7 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
         "--lines",
         "20",
         "--tmux-bin",
-        "/usr/bin/true",
+        &tmux_stub,
     ]);
     assert!(capture_text.status.success());
     assert_eq!(
@@ -1783,7 +1791,7 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
         "--json",
         "--dry-run",
         "--tmux-bin",
-        "/usr/bin/true",
+        &tmux_stub,
     ]);
     assert_eq!(attach["schema"], "agent-rally.command.session-action.v1");
     assert_matches_schema("agent-rally.command.session-action.v1.json", &attach);
@@ -1809,13 +1817,7 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
         1
     );
 
-    let stop = workspace.json(&[
-        "stop",
-        "reviewer-01",
-        "--json",
-        "--tmux-bin",
-        "/usr/bin/true",
-    ]);
+    let stop = workspace.json(&["stop", "reviewer-01", "--json", "--tmux-bin", &tmux_stub]);
     assert_eq!(stop["schema"], "agent-rally.command.session-action.v1");
     assert_matches_schema("agent-rally.command.session-action.v1.json", &stop);
     assert_eq!(stop["data"]["stop"]["action"], "stop");
@@ -2527,10 +2529,7 @@ fn rally_next_and_inject_emit_wake_intent_facts() {
         "claude_code:reviewer-01"
     );
     assert_eq!(inject["data"]["inject"]["wake_intent"]["ref"], handoff_id);
-    assert_eq!(
-        inject["data"]["inject"]["wake_intent"]["status"],
-        "sent_unverified"
-    );
+    assert_eq!(inject["data"]["inject"]["wake_intent"]["status"], "failed");
     assert_eq!(
         inject["data"]["inject"]["require_ack"], true,
         "--handoff injects require target ACK by default"
@@ -6052,6 +6051,7 @@ fn rally_stop_removes_per_agent_worktree() {
     }
     let _run_guard = serialize_rally_run();
     let workspace = real_repo_workspace("rally-run-stop-removes-wt");
+    let tmux_stub = workspace.observable_tmux_stub();
 
     let run = workspace.json(&[
         "run",
@@ -6062,7 +6062,7 @@ fn rally_stop_removes_per_agent_worktree() {
         "--backend",
         "tmux",
         "--tmux-bin",
-        "/usr/bin/true",
+        &tmux_stub,
     ]);
     let session_id = run["data"]["run"]["session"]["session_id"]
         .as_str()
@@ -6079,7 +6079,7 @@ fn rally_stop_removes_per_agent_worktree() {
 
     assert!(PathBuf::from(&worktree_path).exists());
 
-    let stop = workspace.json(&["stop", &session_id, "--json", "--tmux-bin", "/usr/bin/true"]);
+    let stop = workspace.json(&["stop", &session_id, "--json", "--tmux-bin", &tmux_stub]);
     assert_eq!(stop["schema"], "agent-rally.command.session-action.v1");
 
     assert!(
@@ -6111,6 +6111,53 @@ fn rally_stop_removes_per_agent_worktree() {
         "empty per-agent branch {branch} must be deleted after stop"
     );
 
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_stop_closes_failed_binding_without_stopping_or_removing_worktree() {
+    if !git_available() {
+        return;
+    }
+    let _run_guard = serialize_rally_run();
+    let workspace = real_repo_workspace("rally-stop-unverified-retains-wt");
+    let run = workspace.json(&[
+        "run",
+        "claude",
+        "--json",
+        "--name",
+        "unbound",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    let session = &run["data"]["run"]["session"];
+    assert!(session["tmux_binding_error"].is_string());
+    let path = PathBuf::from(session["worktree_path"].as_str().unwrap());
+    let stop = workspace.json(&[
+        "stop",
+        session["session_id"].as_str().unwrap(),
+        "--json",
+        "--tmux-bin",
+        "/usr/bin/false",
+    ]);
+    assert_eq!(stop["data"]["stop"]["commands"], json!([]));
+    assert!(
+        stop["data"]["stop"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("backend was not stopped")
+    );
+    assert!(
+        path.exists(),
+        "unverified process may still be using its worktree"
+    );
+    assert_eq!(
+        workspace.json(&["sessions", "--json", "--tmux-bin", "/usr/bin/true"])["data"]["sessions"]
+            ["sessions"],
+        json!([])
+    );
     workspace.cleanup();
 }
 

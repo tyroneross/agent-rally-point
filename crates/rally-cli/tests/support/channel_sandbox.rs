@@ -13,7 +13,7 @@
 //! RAII-cleaned, so a test can:
 //! 1. Spin up a scratch rally workspace (its own `.git/`, isolated `HOME`).
 //! 2. Register a managed session via `rally run --shared --backend tmux
-//!    --tmux-bin /usr/bin/true` (the existing test idiom — no real tmux
+//!    --tmux-bin <observable-test-double>` (stable identity, no real tmux
 //!    needed, no linked worktree, and the session record lands in the
 //!    workspace's `.rally/facts.db`).
 //! 3. Invoke the REAL `rally inject` binary against that workspace.
@@ -128,7 +128,7 @@ impl ChannelSandbox {
 
         let path = self.root.join(format!("tmux-unverified-{managed_name}.sh"));
         let body = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  list-panes) printf '%s\\n%s\\n%s\\n' 'rally-claude-{managed_name}' '@1' '%1' ;;\n  capture-pane) printf '%s\\n' 'unrelated pane content' ;;\nesac\nexit 0\n"
+            "#!/bin/sh\ncase \"$1\" in\n  list-panes) printf '%s\\n%s\\n%s\\n' 'rally-claude-{managed_name}' '@1' '%1' ;;\n  display-message) printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '%1' '101' '202' '/tmp/rally-test.sock' '0' '0' ;;\n  capture-pane) printf '%s\\n' 'unrelated pane content' ;;\nesac\nexit 0\n"
         );
         fs::write(&path, body).expect("write unverified tmux stub");
         let mut permissions = fs::metadata(&path)
@@ -186,10 +186,11 @@ impl ChannelSandbox {
             .expect("spawn rally")
     }
 
-    /// Register a managed tmux-backed session named `name` using `/usr/bin/true`
-    /// as the tmux stub. Returns the rally-assigned target name (e.g.
+    /// Register a managed session using an observable identity test double.
+    /// Returns the rally-assigned target name (e.g.
     /// `reviewer-01` for `--name reviewer`).
     pub fn add_tmux_session(&self, name: &str) -> String {
+        let stub = self.tmux_unverified_stub(&format!("{name}-01"));
         let run = self.rally_json(&[
             "run",
             "claude",
@@ -200,7 +201,7 @@ impl ChannelSandbox {
             "--backend",
             "tmux",
             "--tmux-bin",
-            "/usr/bin/true",
+            &stub,
         ]);
         run["data"]["run"]["session"]["name"]
             .as_str()
@@ -263,6 +264,7 @@ impl ChannelSandbox {
         text: &str,
         urgent: bool,
     ) -> InjectOutcome {
+        let stub = self.tmux_unverified_stub(target);
         let mut args: Vec<&str> = vec![
             "inject",
             target,
@@ -272,7 +274,7 @@ impl ChannelSandbox {
             "--tool",
             sender_tool,
             "--tmux-bin",
-            "/usr/bin/true",
+            &stub,
         ];
         if urgent {
             args.push("--urgent");

@@ -11146,10 +11146,18 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
     // [E]: capture/stop/attach on a ptyd session must reach the SAME daemon the
     // pane was spawned in — pin the socket recorded on the session.
     backend_runner.pin_ptyd_socket(session.daemon_socket.as_deref());
-    let live_target = if dry_run {
+    let target_validation = if dry_run {
+        Ok(session.target.clone())
+    } else {
+        backend_runner.live_target(&session)
+    };
+    // An explicit stop can close a failed registration without sending bytes
+    // to an unverified process. Its files remain for recovery in that case.
+    let stop_without_target = matches!(action, SessionAction::Stop) && target_validation.is_err();
+    let live_target = if stop_without_target {
         session.target.clone()
     } else {
-        backend_runner.live_target(&session)?
+        target_validation?
     };
     let lines = args.lines as usize;
     let (commands, output) = match action {
@@ -11170,11 +11178,18 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
             (commands, output)
         }
         SessionAction::Stop => {
-            let commands = backend_runner.stop_commands(&live_target);
+            let commands = if stop_without_target {
+                Vec::new()
+            } else {
+                backend_runner.stop_commands(&live_target)
+            };
             if !dry_run {
                 let _commit_guard = arm_watchdog_command_commit();
-                let _ = backend_runner.stop(&live_target);
-                if session.task_scoped
+                if !stop_without_target {
+                    let _ = backend_runner.stop(&live_target);
+                }
+                if !stop_without_target
+                    && session.task_scoped
                     && let Some(task_id) = session.task_id.as_deref()
                 {
                     let repo = repo_root().unwrap_or_else(|_| PathBuf::from("."));
@@ -11190,6 +11205,7 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
                 // worktree.
                 if let (Some(path), Some(branch)) =
                     (session.worktree_path.as_deref(), session.branch.as_deref())
+                    && !stop_without_target
                 {
                     let repo = repo_root().unwrap_or_else(|_| PathBuf::from("."));
                     let _ = run_worktree::cleanup(&repo, path, branch, "git");
@@ -11207,13 +11223,14 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
                 // managed target we just stopped, kill it too so it can never
                 // become a detached orphan the reaper has to clean up later.
                 // Best-effort; never blocks the stop path.
-                if let Some(own) = backends::own_rally_tmux_session(&tmux_bin_for_self_kill)
+                if !stop_without_target
+                    && let Some(own) = backends::own_rally_tmux_session(&tmux_bin_for_self_kill)
                     && own != live_target
                 {
                     let _ = backends::kill_tmux_session(&tmux_bin_for_self_kill, &own);
                 }
             }
-            (commands, None)
+            (commands, stop_without_target.then(|| "Registration closed; target identity could not be verified, so the backend was not stopped and any worktree/task files were retained.".to_string()))
         }
     };
     let output_text = output.clone();
@@ -14763,6 +14780,8 @@ mod tests {
         let handoff_id = "handoff-under-test";
         let expected_tool = "claude_code:reviewer-01";
 
+        room.append_fact(&handoff_under_test(handoff_id, expected_tool))
+            .unwrap();
         room.append_fact(&ref_fact(
             FactKind::Artifact,
             expected_tool,
@@ -14790,6 +14809,8 @@ mod tests {
         let handoff_id = "handoff-under-test";
         let expected_tool = "claude_code:reviewer-01";
 
+        room.append_fact(&handoff_under_test(handoff_id, expected_tool))
+            .unwrap();
         room.append_fact(&ref_fact(
             FactKind::Blocker,
             expected_tool,

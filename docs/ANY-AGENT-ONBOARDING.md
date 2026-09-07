@@ -418,6 +418,9 @@ remains pending. A new session whose initial observation fails records
 new ready target; adopting the same registered target again is refused.
 Historical records without either binding field remain unbound; replace them
 with newly bound sessions before relying on identity protection.
+`rally stop` can close a failed registration. When its target identity cannot
+be verified, it sends no stop command and retains worktree/task files; the
+response explicitly reports that the backend was not stopped.
 Pane existence does not establish host prompt readiness.
 
 Small messages queue clear, bracketed paste and submit in one tmux command.
