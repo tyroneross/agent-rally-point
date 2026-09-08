@@ -407,9 +407,15 @@ fn exact_owner_session_can_release_live_claim_by_path() {
         Value::Bool(true),
         "exact owner session must retain the normal path release: {v}"
     );
+    // RALLY_SESSION_ID alone is a parent lease, not proof of a managed runner:
+    // `session ensure` and ordinary onboarding export it too, so only an
+    // explicit RALLY_MANAGED_SESSION_MODE of task/persistent selects the
+    // managed namespace. This fixture sets neither, so the exact owner is a
+    // parent lease. What this test guards is that the exact owner keeps the
+    // normal path release, which is unchanged by the namespace it lands in.
     assert_eq!(
         v["data"]["say"]["fact"]["from_session_id"],
-        "sess:managed:session-owner#live"
+        "sess:parent:session-owner#live"
     );
     assert!(ws.active_claim_owners().is_empty());
     ws.cleanup();
