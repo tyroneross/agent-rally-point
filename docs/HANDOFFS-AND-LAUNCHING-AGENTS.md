@@ -16,6 +16,43 @@ rally capture <session> --lines 30          # snapshot what it's doing
 rally attach <session>                      # watch live  ·  rally stop <session> to halt
 ```
 
+## Stable identity and transport are separate
+
+An ordinary parent shell exports `RALLY_SESSION_ID` once. Its child commands
+share `sess:parent:<id>#live`, which supports claims and exact referenced
+handoffs without claiming a live terminal. `rally session ensure` creates the
+same parent identity and exports the close token needed by `session close`.
+Inside a managed child, ensuring its existing raw ID intentionally reuses the
+managed identity; evaluate all returned environment fields, including the mode.
+
+`rally run` also exports `RALLY_MANAGED_SESSION_MODE=task|persistent`; this
+launch marker keeps its children in `sess:managed:<id>#live`. A managed name is
+still not proof of delivery: referenced handoffs require the matching live
+runner, and injection requires an actual registered backend. Do not copy that
+marker into unrelated GUI sessions. When adopting an existing terminal agent,
+use the session ID returned by `rally adopt` and set the managed mode in that
+agent's parent environment; adoption cannot change an already running process's
+environment for you.
+
+Upgrade boundary: previous versions mapped every `RALLY_SESSION_ID` to the
+managed namespace. Finish or release those old claims with the old binary and
+old environment before starting a fresh parent lease with the new version.
+Re-enter, acknowledge the room, and route new work to the new exact identity.
+If only the new binary remains, restore the old namespace for cleanup only by
+setting `RALLY_MANAGED_SESSION_MODE=persistent` with the exact old raw ID and
+releasing your own claims (or closing with the original close token). Then
+unset the marker and start a fresh parent lease. This does not register a
+runner or make an old managed handoff routable.
+Old ledger facts remain unchanged; pending handoffs to old identities require
+explicit rerouting. Registered managed children already carrying the launch
+marker retain their identities. Do not mix binary versions within one lease.
+
+An editor chat panel is not a tmux pane. For Cursor or Antigravity, first
+identify whether the target is a terminal agent, structured CLI process, or
+GUI conversation. `commands=[]` with `delivery_path=ledger_only` means this
+command did not call a synchronous terminal backend. A later receiver ACK can
+prove queue consumption, but cannot establish which unobserved transport ran.
+
 ## 1. Launching a managed agent
 
 `rally run <claude|codex|opencode|gemini> [--name <label>] [--task <prompt>] [--resource task:<work-context>] [--backend tmux|cmux] [--dry-run] [--json]`
@@ -222,3 +259,5 @@ Rally deconflicts **file ownership, not git branch/checkout state**. Multiple ag
 ## 8. Standing down cleanly
 
 After handing off: `rally stop <your-session>` (releases claims) or just let the takeover own the room. Leave the handoff doc committed and the canonical branch green.
+
+See the [identity and transport investigation](research/2026-09-08-identity-and-transport.md) for measured host boundaries and adapter acceptance gates.

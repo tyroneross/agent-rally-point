@@ -128,7 +128,7 @@ impl ChannelSandbox {
 
         let path = self.root.join(format!("tmux-unverified-{managed_name}.sh"));
         let body = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  list-panes) printf '%s\\n%s\\n%s\\n' 'rally-claude-{managed_name}' '@1' '%1' ;;\n  display-message) printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '%1' '101' '202' '/tmp/rally-test.sock' '0' '0' ;;\n  capture-pane) printf '%s\\n' 'unrelated pane content' ;;\nesac\nexit 0\n"
+            "#!/bin/sh\ncase \"$1\" in\n  list-panes) printf '%s\\n%s\\n%s\\n' 'rally-claude-{managed_name}' '@1' '%1' ;;\n  display-message) printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '%1' '101' '202' '/tmp/rally-test.sock' '0' '0' '0' '0' ;;\n  capture-pane) printf '%s\\n' 'unrelated pane content' ;;\nesac\nexit 0\n"
         );
         fs::write(&path, body).expect("write unverified tmux stub");
         let mut permissions = fs::metadata(&path)

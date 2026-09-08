@@ -615,12 +615,36 @@ fn ptyd_binary() -> Option<PathBuf> {
         && !explicit.is_empty()
     {
         let p = PathBuf::from(&explicit);
-        return p.exists().then_some(p);
+        return is_executable_file(&p).then_some(p);
     }
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|dir| dir.join("ptyd"))
-        .find(|cand| cand.is_file())
+        .find(|cand| is_executable_file(cand))
+}
+
+/// Whether an owned ptyd daemon can be autostarted if no live socket exists.
+/// This is an availability probe only: it never starts a process. Callers may
+/// advertise ptyd as a fallback only when the endpoint is live or this returns
+/// true; a merely resolved socket path is not runnable evidence.
+pub(crate) fn ptyd_autostart_available() -> bool {
+    ptyd_binary().is_some()
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
 }
 
 /// Pull a human-readable message out of a JSON-RPC `error` body
@@ -698,6 +722,24 @@ mod tests {
         ));
         // Unix socket paths are length-limited; keep it short.
         format!("{}.sock", dir.display())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ptyd_autostart_probe_requires_an_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path =
+            std::env::temp_dir().join(format!("rally-ptyd-not-executable-{}", std::process::id()));
+        std::fs::write(&path, "not an executable").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            !is_executable_file(&path),
+            "a path that merely exists cannot make ptyd an available fallback"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_executable_file(&path));
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

@@ -106,6 +106,8 @@ pub(crate) struct EndpointInputs {
     pub tmux_pane: Option<String>,
     /// Rally-managed session id (a `rally run` backend session).
     pub managed_session_id: Option<String>,
+    /// Stable parent-exported identity without a managed transport claim.
+    pub parent_session_id: Option<String>,
     /// Cloud provider (e.g. `github-actions`, `fly`, `modal`).
     pub cloud_provider: Option<String>,
     /// Cloud job/run id.
@@ -132,6 +134,7 @@ pub(crate) struct EndpointResolution {
 pub(crate) enum EndpointSource {
     Cloud,
     Managed,
+    Parent,
     Tmux,
     Terminal,
     Process,
@@ -249,7 +252,7 @@ pub(crate) struct SessionLease {
 ///
 /// Precedence (a higher-fidelity signal always wins so the same physical place
 /// maps to the same id regardless of which weaker signals are also present):
-/// cloud job → managed pane → tmux pane → terminal session/tty → local process.
+/// cloud job → managed pane → parent lease → tmux pane → terminal session/tty → local process.
 /// Falls back to `host:` (ambiguous) and finally `unknown` (ambiguous).
 ///
 /// Pure: no env, no clock, no filesystem.
@@ -267,6 +270,13 @@ pub(crate) fn derive_endpoint(inputs: &EndpointInputs) -> EndpointResolution {
         return EndpointResolution {
             endpoint_id: format!("managed:{managed}"),
             source: EndpointSource::Managed,
+            ambiguous: false,
+        };
+    }
+    if let Some(parent) = seg(&inputs.parent_session_id) {
+        return EndpointResolution {
+            endpoint_id: format!("parent:{parent}"),
+            source: EndpointSource::Parent,
             ambiguous: false,
         };
     }
@@ -428,6 +438,22 @@ impl ProtocolSessionIdentity {
         Self::mint(&endpoint, tool_type, "live", actor, None)
     }
 
+    /// Resolve a parent lease consistently with child CLI invocations. Only
+    /// the explicit managed launch marker selects the managed namespace.
+    pub(crate) fn from_parent_lease(raw_session_id: &str, tool: &str) -> Self {
+        let mut inputs = EndpointInputs::default();
+        if managed_mode_for_lease(raw_session_id).is_some() {
+            inputs.managed_session_id = Some(raw_session_id.to_string());
+        } else {
+            inputs.parent_session_id = Some(raw_session_id.to_string());
+        }
+        let endpoint = derive_endpoint(&inputs);
+        let (kind, actor) = tool
+            .split_once(':')
+            .map_or((tool, None), |(kind, actor)| (kind, Some(actor)));
+        Self::mint(&endpoint, kind, "live", actor, None)
+    }
+
     /// True when this identity was back-filled from a legacy `tool`-only event.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_legacy(&self) -> bool {
@@ -467,6 +493,7 @@ fn legible_name(tool_type: &str, actor_id: Option<&str>, endpoint: &EndpointReso
     };
     let place = match endpoint.source {
         EndpointSource::Tmux | EndpointSource::Terminal => format!("in {}", endpoint.endpoint_id),
+        EndpointSource::Parent => format!("in parent session {}", endpoint.endpoint_id),
         EndpointSource::Managed => format!("in managed {}", endpoint.endpoint_id),
         EndpointSource::Cloud => format!("on {}", endpoint.endpoint_id),
         EndpointSource::Process => format!("as {}", endpoint.endpoint_id),
@@ -479,6 +506,14 @@ fn legible_name(tool_type: &str, actor_id: Option<&str>, endpoint: &EndpointReso
     }
 }
 
+/// Keep lifecycle exports and runtime derivation on the same launch marker.
+pub(crate) fn managed_mode_for_lease(raw_session_id: &str) -> Option<String> {
+    let mode = std::env::var("RALLY_MANAGED_SESSION_MODE").ok()?;
+    (matches!(mode.as_str(), "task" | "persistent")
+        && std::env::var("RALLY_SESSION_ID").as_deref() == Ok(raw_session_id))
+    .then_some(mode)
+}
+
 impl EndpointInputs {
     /// Boundary constructor: read env + process metadata once. This is the only
     /// impure surface; the derivation it feeds is pure. Kept out of unit tests.
@@ -486,6 +521,14 @@ impl EndpointInputs {
     pub(crate) fn from_env() -> Self {
         use std::env;
         let nonempty = |v: Result<String, env::VarError>| v.ok().filter(|s| !s.is_empty());
+        let raw_session = nonempty(env::var("RALLY_SESSION_ID"));
+        // `session ensure` and ordinary onboarding also export RALLY_SESSION_ID.
+        // Identity is not proof that a terminal runner exists. Older managed
+        // children already carry this marker; unknown modes remain external.
+        let managed = raw_session
+            .as_deref()
+            .and_then(managed_mode_for_lease)
+            .is_some();
         Self {
             host: nonempty(env::var("HOSTNAME")).or_else(|| {
                 std::process::Command::new("hostname")
@@ -503,7 +546,8 @@ impl EndpointInputs {
             tmux_session: None,
             tmux_window: None,
             tmux_pane: nonempty(env::var("TMUX_PANE")),
-            managed_session_id: nonempty(env::var("RALLY_SESSION_ID")),
+            managed_session_id: raw_session.clone().filter(|_| managed),
+            parent_session_id: raw_session.filter(|_| !managed),
             cloud_provider: if env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
                 Some("github-actions".to_string())
             } else {
@@ -517,6 +561,27 @@ impl EndpointInputs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent_lease_is_stable_but_distinct_from_managed_runner() {
+        let parent = EndpointInputs {
+            parent_session_id: Some("gui-a".into()),
+            pid: Some(100),
+            ..Default::default()
+        };
+        let next_child = EndpointInputs {
+            pid: Some(200),
+            ..parent.clone()
+        };
+        assert_eq!(derive_endpoint(&parent), derive_endpoint(&next_child));
+        assert_eq!(derive_endpoint(&parent).endpoint_id, "parent:gui-a");
+        let managed = EndpointInputs {
+            managed_session_id: Some("gui-a".into()),
+            ..parent
+        };
+        assert_eq!(derive_endpoint(&managed).endpoint_id, "managed:gui-a");
+        assert_ne!(derive_endpoint(&managed), derive_endpoint(&next_child));
+    }
 
     fn proc_inputs(host: &str, pid: u32, start: &str) -> EndpointInputs {
         EndpointInputs {

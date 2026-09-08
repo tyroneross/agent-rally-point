@@ -822,29 +822,6 @@ pub(crate) struct BackendRunner {
     bulk_buffer: String,
 }
 
-/// Legacy tmux/cmux landing-verify tuning (P1a). A few short retries tolerate
-/// app render latency without wedging the inject path.
-const LEGACY_VERIFY_ATTEMPTS: usize = 3;
-const LEGACY_VERIFY_BACKOFF_MS: u64 = 120;
-const LEGACY_VERIFY_CAPTURE_LINES: usize = 40;
-/// Shortest payload token worth searching for in the pane after inject. Below
-/// this, false-positive substring matches (and unverifiable short payloads) make
-/// screen confirmation unreliable, so we skip verification rather than downgrade.
-const LEGACY_VERIFY_MIN_NEEDLE: usize = 6;
-
-/// Pick a stable needle to confirm on the pane after a legacy inject: the
-/// longest whitespace-delimited, control-free token in the sanitized payload,
-/// of length >= [`LEGACY_VERIFY_MIN_NEEDLE`]. Returns `None` when no such token
-/// exists (payload too short / all-whitespace), signalling "cannot verify".
-fn verify_needle(sanitized: &str) -> Option<String> {
-    sanitized
-        .split_whitespace()
-        .filter(|tok| !tok.chars().any(|c| c.is_control()))
-        .max_by_key(|tok| tok.chars().count())
-        .filter(|tok| tok.chars().count() >= LEGACY_VERIFY_MIN_NEEDLE)
-        .map(str::to_string)
-}
-
 impl BackendRunner {
     pub(crate) fn new(backend: Backend, bins: BackendBins) -> Self {
         // PROVENANCE: the BackendBins struct previously carried `herdr_bin` and
@@ -977,7 +954,13 @@ impl BackendRunner {
     fn usable_alternatives(&self) -> Vec<&'static str> {
         let path = std::env::var_os("PATH");
         let mut out = Vec::new();
-        if !self.backend.is_ptyd() && self.ptyd_socket.is_some() {
+        if !self.backend.is_ptyd()
+            && (self
+                .ptyd_socket
+                .as_deref()
+                .is_some_and(crate::daemon_client::socket_is_live)
+                || crate::daemon_client::ptyd_autostart_available())
+        {
             out.push("ptyd");
         }
         if self.backend != Backend::Tmux
@@ -1077,21 +1060,22 @@ impl BackendRunner {
             "-p",
             "-t",
             target,
-            "#{pane_id}\t#{pane_pid}\t#{pid}\t#{socket_path}\t#{pane_dead}\t#{pane_in_mode}"
+            "#{pane_id}\t#{pane_pid}\t#{pid}\t#{socket_path}\t#{pane_dead}\t#{pane_in_mode}\t#{pane_input_off}\t#{synchronize-panes}"
         ];
         let output = run_command_output(&command)?;
         let fields: Vec<_> = output.trim().split('\t').collect();
-        if fields.len() != 6
+        if fields.len() != 8
             || !fields[0].starts_with('%')
             || fields[1].parse::<u32>().is_err()
             || fields[2].parse::<u32>().is_err()
             || fields[3].is_empty()
             || fields[4] != "0"
             || fields[5] != "0"
+            || fields[6] != "0"
+            || fields[7] != "0"
         {
             return Err(RallyError::Command(
-                "tmux pane identity unavailable, dead or in copy mode; handoff remains pending"
-                    .into(),
+                "tmux pane identity unavailable, dead, in copy mode, input-disabled, or synchronized; handoff remains pending".into(),
             ));
         }
         Ok(TmuxBinding {
@@ -1186,6 +1170,14 @@ impl BackendRunner {
     }
 
     pub(crate) fn inject(&self, target: &str, text: &str) -> Result<()> {
+        // Recheck immediately before the tmux write. `live_target` validates
+        // the registered pane generation earlier in the inject flow, but pane
+        // mode, input enablement, and window synchronization can change before
+        // bytes reach tmux. This closes the normal check/write interval; a
+        // change after this probe is still transport-unknown, never delivery.
+        if self.backend == Backend::Tmux {
+            self.tmux_identity(target)?;
+        }
         let payload = self.deliverable(text);
         if self.backend == Backend::Tmux && payload.len() > 8192 {
             // Large frames exceed OS argv limits with one hex argument per
@@ -1227,34 +1219,16 @@ impl BackendRunner {
         run_commands(&self.inject_commands(target, text))
     }
 
-    /// tmux/cmux legacy inject WITH best-effort landing verification (P1a).
-    /// A bare `send-keys` exit 0 only proves the keystrokes were queued, not
-    /// that the pane's app consumed them — so `delivered=true` on that alone is
-    /// fire-and-forget. Here we send, then capture the pane and confirm a stable
-    /// payload needle actually appeared, catching the "live pane but app not
-    /// consuming" false positive. Agent-neutral (no tool-id coupling); the
-    /// daemon/ptyd path keeps its own Receipt+F4 verification and does not use
-    /// this method.
-    ///   `Ok(true)`  = sent AND payload confirmed on the pane (verified delivery)
-    ///   `Ok(false)` = sent (send-keys succeeded) but landing NOT confirmed
+    /// Legacy tmux/cmux inject with conservative transport truth.
+    ///
+    /// A pane capture can contain a stale copy of the payload before this write,
+    /// so it cannot establish that this injection reached the current receiver.
+    /// The caller records a successful write as `sent_unverified`; only a
+    /// receiver-authored Rally ACK may upgrade that state.
+    ///   `Ok(false)` = sent but receiver arrival remains unverified
     ///   `Err(_)`    = the send itself failed
     pub(crate) fn inject_and_verify(&self, target: &str, text: &str) -> Result<bool> {
         self.inject(target, text)?;
-        // Missing evidence is unknown, even if the transport returned success.
-        let needle = match verify_needle(&strip_inject_rally_marks(&sanitize_inject_text(text))) {
-            Some(n) => n,
-            None => return Ok(false),
-        };
-        for attempt in 0..LEGACY_VERIFY_ATTEMPTS {
-            if attempt > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(LEGACY_VERIFY_BACKOFF_MS));
-            }
-            if let Ok(screen) = self.capture(target, LEGACY_VERIFY_CAPTURE_LINES)
-                && screen.contains(&needle)
-            {
-                return Ok(true);
-            }
-        }
         Ok(false)
     }
 
@@ -2689,7 +2663,7 @@ mod tests {
     };
     // Plan F functional core (Chunk 3): herdr_command, parse_herdr_agents_tab,
     // and resolve_agent_pane_from_list removed with the Backend::Herdr arm.
-    use super::{Backend, BackendRunner, verify_needle};
+    use super::{Backend, BackendRunner};
     use super::{
         CR, INJECT_LABEL_MARK, INJECT_LABEL_REMOVED, INJECT_SENDER_NONE_STATED,
         MESSAGE_FRAME_FIELDS, PASTE_END, PASTE_START, RECEIVER_RULE_MARK,
@@ -2876,37 +2850,20 @@ mod tests {
         }
     }
 
-    // ---- P1a: legacy tmux/cmux inject landing-verify -----------------------
+    // ---- legacy tmux/cmux transport truth ----------------------------------
 
-    #[test]
-    fn verify_needle_picks_longest_stable_token_or_none() {
-        assert_eq!(
-            verify_needle("rally-verify-token-ABC123 hello"),
-            Some("rally-verify-token-ABC123".to_string()),
-            "longest control-free token, >= MIN chars"
-        );
-        assert_eq!(verify_needle("hi"), None, "too short to verify reliably");
-        assert_eq!(
-            verify_needle("a b c d"),
-            None,
-            "no token reaches MIN length"
-        );
-        assert_eq!(
-            verify_needle("   \t  "),
-            None,
-            "whitespace-only has no needle"
-        );
-        assert_eq!(verify_needle(""), None, "empty payload has no needle");
+    /// Write an executable stub `tmux` that reports a safe binding and exits
+    /// with `send_rc` for `send-keys`.
+    fn stub_tmux(tag: &str, send_rc: u8) -> String {
+        stub_tmux_with_state(tag, "%1\t1\t1\t/socket\t0\t0\t0\t0", send_rc)
     }
 
-    /// Write an executable stub `tmux` that exits 0 for `send-keys` and prints
-    /// `capture_out` for `capture-pane` (agent-neutral — no tool id involved).
-    fn stub_tmux(tag: &str, capture_out: &str, send_rc: u8) -> String {
+    fn stub_tmux_with_state(tag: &str, state: &str, send_rc: u8) -> String {
         use std::os::unix::fs::PermissionsExt;
         let path =
             std::env::temp_dir().join(format!("rally-p1a-{}-{}.sh", tag, std::process::id()));
         let body = format!(
-            "#!/bin/sh\nfor a in \"$@\"; do\n  [ \"$a\" = \"capture-pane\" ] && {{ printf '%s\\n' '{capture_out}'; exit 0; }}\n  [ \"$a\" = \"send-keys\" ] && exit {send_rc}\ndone\nexit 0\n"
+            "#!/bin/sh\nfor a in \"$@\"; do\n  [ \"$a\" = \"display-message\" ] && {{ printf '%s\\n' '{state}'; exit 0; }}\n  [ \"$a\" = \"send-keys\" ] && exit {send_rc}\ndone\nexit 0\n"
         );
         std::fs::write(&path, body).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2956,28 +2913,28 @@ mod tests {
     }
 
     #[test]
-    fn inject_and_verify_confirms_when_payload_lands_on_pane() {
-        let bin = stub_tmux("pos", "user@host:~$ rally-verify-token-ABC123 hello", 0);
+    fn inject_and_verify_never_promotes_screen_echo_to_receiver_arrival() {
+        let bin = stub_tmux("stale-echo", 0);
         let r = tmux_runner(&bin);
         assert!(
-            iv_retry(&r, "rally-verify-token-ABC123 hello").unwrap(),
-            "capture-pane shows the payload needle => verified delivery"
+            !iv_retry(&r, "rally-verify-token-ABC123 hello").unwrap(),
+            "a successful tmux write remains sent-unverified without a receiver ACK"
         );
     }
 
     #[test]
-    fn inject_and_verify_reports_unverified_when_payload_absent() {
-        let bin = stub_tmux("neg", "nothing relevant on screen here", 0);
+    fn inject_and_verify_reports_unverified_without_capture() {
+        let bin = stub_tmux("no-capture", 0);
         let r = tmux_runner(&bin);
         assert!(
             !iv_retry(&r, "rally-verify-token-ABC123 hello").unwrap(),
-            "send-keys ok but payload never appears => sent-but-unverified, not a false 'delivered'"
+            "capture output is not consulted to establish receiver arrival"
         );
     }
 
     #[test]
     fn inject_and_verify_errors_when_send_fails() {
-        let bin = stub_tmux("fail", "irrelevant", 1);
+        let bin = stub_tmux("fail", 1);
         let r = tmux_runner(&bin);
         assert!(
             iv_retry(&r, "rally-verify-token-ABC123 hello").is_err(),
@@ -2986,16 +2943,21 @@ mod tests {
     }
 
     #[test]
-    fn inject_and_verify_is_unverified_when_capture_is_empty() {
-        // `/usr/bin/true`-style stub: send-keys ok, capture-pane returns nothing.
-        // Empty capture supplies no landing evidence. Transport success remains
-        // distinguishable from failure, without inventing observed delivery.
-        let bin = stub_tmux("empty", "", 0);
-        let r = tmux_runner(&bin);
-        assert!(
-            !iv_retry(&r, "rally-verify-token-ABC123 hello").unwrap(),
-            "empty/unavailable capture is unverifiable, not a failed landing"
-        );
+    fn tmux_inject_refuses_input_disabled_or_synchronized_pane_at_write_boundary() {
+        for (tag, state) in [
+            ("input-off", "%1\t1\t1\t/socket\t0\t0\t1\t0"),
+            ("synchronized", "%1\t1\t1\t/socket\t0\t0\t0\t1"),
+        ] {
+            let bin = stub_tmux_with_state(tag, state, 0);
+            let error = tmux_runner(&bin)
+                .inject_and_verify("sess", "rally-write-guard-token")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("input-disabled") || error.contains("synchronized"),
+                "unsafe tmux state must refuse before write: {error}"
+            );
+        }
     }
 
     // ---- backend availability probe ---------------------------------------

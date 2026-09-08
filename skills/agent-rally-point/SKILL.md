@@ -33,6 +33,15 @@ rally enter --tool "$TOOL" --session-id "$RALLY_SESSION_ID" --json
 rally next --tool "$TOOL" --json
 ```
 
+`RALLY_SESSION_ID` is a stable parent lease, not transport registration. Ordinary
+sessions resolve to `sess:parent:<id>#live`. Only children launched with
+`RALLY_MANAGED_SESSION_MODE=task|persistent` use the managed namespace; do not
+set that marker for an unrelated GUI chat. When upgrading from a version that
+mapped every exported ID to `managed:`, release the old lease's claims with the
+old binary first, then enter and acknowledge a fresh parent lease. Pending old
+handoffs need explicit rerouting; never silently transfer another lease's claims.
+
+
 Keep this export in the parent shell for the whole Rally lifecycle. Every
 separate `rally` process inherits the same session identity, so a claim created
 by this terminal is visible to strict `before-complete` and releasable by this

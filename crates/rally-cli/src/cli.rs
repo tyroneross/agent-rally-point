@@ -9,6 +9,8 @@ use rally_protocol::{MessageIntent, WorkResponsibility};
 #[allow(clippy::large_enum_variant)] // short-lived dispatch enum; boxing adds indirection for no runtime benefit
 pub(crate) enum CliCommand {
     Init(InitArgs),
+    Setup(crate::runtime_setup::SetupArgs),
+    Routes(crate::runtime_routes::RoutesArgs),
     Hooks(HooksArgs),
     Enter(EnterArgs),
     Say(SayArgs),
@@ -971,6 +973,8 @@ pub(crate) const COMMANDS: &[&str] = &[
     "watch",
     "migrate-legacy",
     "doctor",
+    "setup",
+    "routes",
     "version",
     // Work surface commands (appended — do not reorder above)
     "backlog",
@@ -1068,6 +1072,15 @@ fn parse_failure_message(failure: ParseFailure) -> String {
 }
 
 fn cli_parser() -> OptionParser<CliCommand> {
+    let setup = crate::runtime_setup::parser()
+        .to_options()
+        .command("setup")
+        .map(CliCommand::Setup);
+    let routes = crate::runtime_routes::parser()
+        .to_options()
+        .command("routes")
+        .map(CliCommand::Routes);
+
     let init = init_parser()
         .to_options()
         .command("init")
@@ -1333,6 +1346,8 @@ fn cli_parser() -> OptionParser<CliCommand> {
 
     construct!([
         init,
+        setup,
+        routes,
         hooks,
         enter,
         say,

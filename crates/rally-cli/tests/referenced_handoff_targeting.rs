@@ -68,6 +68,7 @@ impl Room {
             .env_remove("GITHUB_ACTIONS")
             .env_remove("GITHUB_RUN_ID")
             .env_remove("RALLY_SESSION_ID")
+            .env_remove("RALLY_MANAGED_SESSION_MODE")
             .env("TERM_SESSION_ID", session)
             .env("PATH", format!("{}:{inherited}", self.bin.display()))
             .args(args)
@@ -84,10 +85,26 @@ impl Room {
             .env_remove("GITHUB_ACTIONS")
             .env_remove("GITHUB_RUN_ID")
             .env("RALLY_SESSION_ID", session)
+            .env("RALLY_MANAGED_SESSION_MODE", "persistent")
             .env("PATH", format!("{}:{inherited}", self.bin.display()))
             .args(args)
             .output()
             .unwrap()
+    }
+
+    fn json_parent(&self, session: &str, args: &[&str]) -> Value {
+        let out = rally_command()
+            .current_dir(&self.cwd)
+            .env("HOME", &self.home)
+            .env("RALLY_HOOKS", "off")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID")
+            .env_remove("RALLY_MANAGED_SESSION_MODE")
+            .env("RALLY_SESSION_ID", session)
+            .args(args)
+            .output()
+            .unwrap();
+        Self::parse(args, out)
     }
 
     fn json(&self, session: &str, args: &[&str]) -> Value {
@@ -1270,5 +1287,153 @@ fn documented_receiver_ack_executes_against_bound_handoff() {
     assert_ne!(
         retry["data"]["inject"]["verified_received"], true,
         "withdrawal is not completion: {retry}"
+    );
+}
+
+#[test]
+fn ordinary_parent_lease_can_receive_referenced_handoff_without_managed_runner() {
+    let room = Room::new();
+    let who = room.json_parent("gui-author", &["whoami", "--tool", "cursor:a", "--json"]);
+    assert_eq!(
+        who["data"]["whoami"]["session_identity"]["session_id"],
+        "sess:parent:gui-author#live"
+    );
+    let artifact = room.json_parent(
+        "gui-author",
+        &[
+            "say",
+            "artifact",
+            "--tool",
+            "cursor:a",
+            "--subject",
+            "ready",
+            "--json",
+        ],
+    );
+    assert_eq!(artifact["ok"], true, "{artifact}");
+    assert_eq!(
+        artifact["data"]["say"]["fact"]["from_session_id"],
+        who["data"]["whoami"]["session_identity"]["session_id"]
+    );
+    let id = artifact["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .unwrap();
+    let handoff = room.json_parent(
+        "gui-reviewer",
+        &[
+            "say",
+            "handoff",
+            "--tool",
+            "antigravity:r",
+            "--ref",
+            id,
+            "--subject",
+            "reviewed",
+            "--json",
+        ],
+    );
+    assert_eq!(handoff["ok"], true, "{handoff}");
+    let delivery = room.json_parent(
+        "gui-reviewer",
+        &[
+            "inject",
+            "cursor:a",
+            "--tool",
+            "antigravity:r",
+            "--intent",
+            "inform",
+            "--text",
+            "read your handoff",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        delivery["data"]["inject"]["commands"],
+        serde_json::json!([])
+    );
+    assert_eq!(delivery["data"]["inject"]["delivery_path"], "ledger_only");
+    assert_eq!(delivery["data"]["inject"]["delivered"], false);
+    let handoff_id = handoff["data"]["say"]["fact"]["event_id"].as_str().unwrap();
+    let ack = room.json_parent(
+        "gui-author",
+        &[
+            "say",
+            "handoff",
+            "--tool",
+            "cursor:a",
+            "--ref",
+            handoff_id,
+            "--handoff-state",
+            "acked",
+            "--subject",
+            "received",
+            "--json",
+        ],
+    );
+    assert_eq!(ack["ok"], true, "{ack}");
+    assert_eq!(
+        ack["data"]["say"]["fact"]["from_session_id"],
+        "sess:parent:gui-author#live"
+    );
+    let sessions = room.json_parent("gui-author", &["sessions", "--json"]);
+    assert_eq!(sessions["ok"], true, "{sessions}");
+}
+
+#[test]
+fn fresh_parent_lifecycle_exports_clear_an_inherited_managed_marker() {
+    let room = Room::new();
+    let opened = room.json_managed(
+        "old-runner",
+        &[
+            "session",
+            "ensure",
+            "--tool",
+            "cursor:new",
+            "--session-id",
+            "new-parent",
+            "--resource",
+            "task:parent-test",
+            "--json",
+        ],
+    );
+    assert_eq!(opened["ok"], true, "{opened}");
+    let environment = opened["data"]["session"]["environment"]
+        .as_object()
+        .unwrap();
+    assert_eq!(environment["RALLY_MANAGED_SESSION_MODE"], "");
+    let run = |args: &[&str]| {
+        let out = rally_command()
+            .current_dir(&room.cwd)
+            .env("HOME", &room.home)
+            .env("RALLY_HOOKS", "off")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID")
+            .envs(
+                environment
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str().unwrap())),
+            )
+            .args(args)
+            .output()
+            .unwrap();
+        Room::parse(args, out)
+    };
+    let who = run(&["whoami", "--tool", "cursor:new", "--json"]);
+    assert_eq!(
+        who["data"]["whoami"]["session_identity"]["session_id"],
+        "sess:parent:new-parent#live"
+    );
+    let closed = run(&["session", "close", "--tool", "cursor:new", "--json"]);
+    assert_eq!(closed["ok"], true, "{closed}");
+    assert_eq!(
+        closed["data"]["session"]["session_id"],
+        "sess:parent:new-parent#live"
+    );
+    assert_eq!(
+        closed["data"]["session"]["released_claim_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
     );
 }

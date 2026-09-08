@@ -137,7 +137,7 @@ struct Workspace {
 impl Workspace {
     fn observable_tmux_stub(&self) -> String {
         let path = self.home.join("observable-tmux");
-        fs::write(&path, "#!/bin/sh\ncase \"$1\" in\n display-message) printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '%1' '101' '202' '/tmp/rally-test.sock' '0' '0' ;;\nesac\nexit 0\n").unwrap();
+        fs::write(&path, "#!/bin/sh\ncase \"$1\" in\n display-message) printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '%1' '101' '202' '/tmp/rally-test.sock' '0' '0' '0' '0' ;;\nesac\nexit 0\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path.to_string_lossy().into_owned()
     }

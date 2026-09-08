@@ -9,6 +9,15 @@ not. A tool can participate in the room as soon as it can run the `rally` CLI;
 managed stdin injection only works when the session is launched or adopted by a
 Rally-aware runtime.
 
+## Discover available connections
+
+Run `rally setup --json` to discover missing runtimes and `rally routes --json`
+to inspect current tested routes. Request the user's approval before applying
+an installation plan. A transport connection is not agent acknowledgement;
+only a fresh correlated receiver proof enables a `ready` live route. See
+[Setup and tested agent routes](SETUP-AND-ROUTING.md) for consent, probes,
+persistence and delivery limitations.
+
 ## Contract
 
 Every host must establish one lease in the long-lived parent process before it
@@ -36,7 +45,9 @@ each guarantee as `enforced`, `advisory`, or `unmanaged`. In particular, Codex
 write blocking remains `advisory` because its current hook output cannot deny a
 tool call; visibility and atomic claim acquisition remain separate guarantees.
 When a second fresh lease appears, `session ensure` starts the per-repo
-single-writer daemon idempotently and reports the result under `daemon`.
+single-writer daemon only after approval through `rally setup --component
+coordinator --apply`, and reports the result under `daemon`. Without approval
+it reports `permission_required` and continues without automatic activation.
 Set `RALLY_DAEMON_AUTOSTART=0` in the parent only when the host deliberately
 owns daemon lifecycle itself.
 

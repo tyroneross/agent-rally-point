@@ -116,6 +116,7 @@ PY
       rally_assert_disposable_repo "$repo" "$tmp" "$SOURCE_ROOT" || exit 70
       export HOME="$tmp/home"
       export RALLY_SESSION_ID="scale-$i"
+      unset RALLY_MANAGED_SESSION_MODE
       capture "$i" enter enter --tool "$tool" --json --timeout-ms 60000
       capture "$i" next next --tool "$tool" --json --timeout-ms 60000
       capture "$i" check check before-write --tool "$tool" --path "$path" --strict --json --timeout-ms 60000
@@ -127,14 +128,27 @@ PY
   }
 
   local pids=() start end
-  start="$(python3 -c 'import time; print(time.monotonic())')"
+  # Python <3.10 on macOS gives monotonic() a process-local origin.
+  # Both timestamps must use the same kernel clock across Python processes.
+  start="$(python3 -c 'import time; print(time.clock_gettime(time.CLOCK_MONOTONIC))')"
   for ((i=0; i<n; i++)); do agent "$i" & pids+=("$!"); done
   for pid in "${pids[@]}"; do wait "$pid" || true; done
-  end="$(python3 -c 'import time; print(time.monotonic())')"
+  end="$(python3 -c 'import time; print(time.clock_gettime(time.CLOCK_MONOTONIC))')"
 
   if [[ "$INTERNAL_MUTANT" == "op-failure" ]]; then
     printf '%s\n' '{"ok":false,"error":{"code":"forced-mutant"}}' >"$results/0.artifact.json"
     printf '%s\n' '9' >"$results/0.artifact.rc"
+  elif [[ "$INTERNAL_MUTANT" == "managed-identity" ]]; then
+    python3 - "$results/0.enter.json" <<'PY_MUTANT'
+import json,sys
+path=sys.argv[1]
+with open(path) as source: data=json.load(source)
+for row in data.get("data",{}).get("append_outcomes",[]):
+    fact=row.get("fact",{})
+    if fact.get("kind")=="presence":
+        fact["from_session_id"]="sess:managed:scale-0#live"
+with open(path,"w") as dest: json.dump(data,dest)
+PY_MUTANT
   elif [[ "$INTERNAL_MUTANT" == "silent-loss" ]]; then
     python3 - "$repo" "scale-$mode-$n-artifact-0" <<'PY'
 import glob,json,os,sys
@@ -156,7 +170,7 @@ PY
   fi
 
   python3 - "$mode" "$n" "$repo" "$results" "$start" "$end" "$INTERNAL_MUTANT" "$MAX_WALL_S" <<'PY'
-import glob,json,os,sqlite3,sys
+import glob,json,math,os,sqlite3,sys
 mode,n,repo,res,start,end,mutant,max_wall_s=sys.argv[1],int(sys.argv[2]),sys.argv[3],sys.argv[4],float(sys.argv[5]),float(sys.argv[6]),sys.argv[7],float(sys.argv[8])
 failures=[]
 docs={}
@@ -197,8 +211,8 @@ for i in range(n):
         return matches[0] if len(matches)==1 else None
     entered=fact_session("enter","presence")
     artifact=fact_session("artifact","artifact")
-    if not entered or not entered.startswith("sess:managed:"):
-        failures.append(f"agent {i} did not use managed local identity: {entered}")
+    if entered != f"sess:parent:scale-{i}#live":
+        failures.append(f"agent {i} did not use its exact parent identity: {entered}")
     elif artifact != entered:
         failures.append(f"agent {i} identity changed between turns: enter={entered} artifact={artifact}")
     session_ids.append(entered)
@@ -240,7 +254,9 @@ try:
     if check != "ok": failures.append(f"integrity failure: {check}")
 except Exception as exc: failures.append(f"integrity check failed: {exc}")
 
-wall_s=end-start
+wall_s=-1 if mutant == "invalid-clock" else end-start
+if not math.isfinite(wall_s) or wall_s <= 0:
+    failures.append("invalid elapsed time from shared monotonic clock")
 if max_wall_s and wall_s > max_wall_s:
     failures.append(f"wall time {wall_s:.2f}s exceeded {max_wall_s:.2f}s")
 summary={"mode":mode,"scale":n,"wall_s":round(wall_s,2),"max_wall_s":max_wall_s or None,"shared_claim_winner":shared_success,"failures":failures}
@@ -257,10 +273,18 @@ PY
 }
 
 run_self_test() {
-  local failures=0 rc threshold_output
+  local failures=0 rc threshold_output clock_output
   set +e
   RALLY_SCALE_MUTANT=op-failure RALLY_BIN="$RALLY" "$0" --mode direct --scales 2 >/dev/null 2>&1
   rc=$?; [[ $rc -ne 0 ]] || { echo "SELF_TEST_FAIL forced operation failure passed" >&2; failures=$((failures+1)); }
+  RALLY_SCALE_MUTANT=managed-identity RALLY_BIN="$RALLY" "$0" --mode direct --scales 2 >/dev/null 2>&1
+  rc=$?; [[ $rc -ne 0 ]] || { echo "SELF_TEST_FAIL managed namespace accepted for parent fixture" >&2; failures=$((failures+1)); }
+  clock_output=$(RALLY_SCALE_MUTANT=invalid-clock RALLY_BIN="$RALLY" "$0" --mode direct --scales 2 2>&1)
+  rc=$?
+  if [[ $rc -eq 0 || "$clock_output" != *"invalid elapsed time from shared monotonic clock"* ]]; then
+    echo "SELF_TEST_FAIL invalid elapsed time did not fail for the expected reason" >&2
+    failures=$((failures+1))
+  fi
   RALLY_SCALE_MUTANT=silent-loss RALLY_BIN="$RALLY" "$0" --mode direct --scales 2 >/dev/null 2>&1
   rc=$?; [[ $rc -ne 0 ]] || { echo "SELF_TEST_FAIL forced silent loss passed" >&2; failures=$((failures+1)); }
   threshold_output=$(RALLY_BIN="$RALLY" "$0" --mode direct --scales 2 --max-wall-s 0.000001 2>&1)
@@ -275,7 +299,7 @@ run_self_test() {
   rc=$?; [[ $rc -ne 0 ]] || { echo "SELF_TEST_FAIL wrong binary passed" >&2; failures=$((failures+1)); }
   set -e
   if [[ $failures -eq 0 ]]; then
-    echo '{"self_test":"pass","mutants_rejected":["operation-failure","silent-loss","wall-threshold","missing-binary","wrong-binary"]}'
+    echo '{"self_test":"pass","mutants_rejected":["operation-failure","managed-identity","silent-loss","invalid-clock","wall-threshold","missing-binary","wrong-binary"]}'
     return 0
   fi
   return 1

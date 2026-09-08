@@ -56,6 +56,7 @@ pub(crate) const ACTIVE_ENGAGEMENT_FILENAME: &str = "active-engagement";
 /// Cross-process guard for critical sections that must keep `facts.db` and the
 /// canonical JSONL segments in lock-step.
 const ROOM_MUTATION_LOCK_FILENAME: &str = "mutation.lock";
+const CURSOR_TEMP_ATTEMPTS: usize = 32;
 
 /// Finite fallback for callers without a command/request deadline (principally
 /// in-process use and tests). Real direct commands use the shorter watchdog
@@ -295,6 +296,11 @@ use std::hash::{Hash, Hasher};
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+
+/// Differentiates same-clock cursor-cache staging files. The create-new open
+/// below remains the authority: this counter only makes a collision unlikely
+/// before the filesystem rejects one.
+static CURSOR_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// Deterministic O26 fault sites. Test controls are keyed by the exact `.rally`
 /// path, so parallel stores cannot affect one another. Production builds retain
@@ -9387,30 +9393,66 @@ pub(crate) fn read_cursors_at(path: &Path) -> Result<BTreeMap<String, i64>> {
         .collect())
 }
 
-/// Write-through update of `cursors.json` at `path`: read-modify-write via a
-/// temp-file-then-rename swap (atomic on the same filesystem). Factored out
-/// of [`DirectRoomStore`] for the same reason as [`read_cursors_at`].
+/// Write-through update of `cursors.json` at `path`: a room-locked
+/// read-modify-write followed by a temp-file-then-rename swap. The lock keeps
+/// routed clients from losing each other's cache entries after their daemon
+/// requests complete. Factored out of [`DirectRoomStore`] for the same reason
+/// as [`read_cursors_at`].
 pub(crate) fn write_cursor_at(path: &Path, tool: &str, seq: i64) -> Result<()> {
+    let room_dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let _guard = acquire_room_mutation_lock(room_dir)?;
     let mut cursors = read_cursors_at(path)?;
     cursors.insert(tool.to_string(), seq);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(RallyError::io(format!("create {}", parent.display())))?;
-    }
     let content = serde_json::to_string_pretty(&json!({
         "updated_at": now_string(),
         "cursors": cursors
     }))
     .map_err(RallyError::json("render cursors"))?;
-    let temp_path = path.with_extension(format!("json.tmp-{}", short_id()));
-    fs::write(&temp_path, content)
-        .map_err(RallyError::io(format!("write {}", temp_path.display())))?;
-    fs::rename(&temp_path, path).map_err(|err| {
-        let _ = fs::remove_file(&temp_path);
-        RallyError::Io {
-            context: format!("replace {} with {}", path.display(), temp_path.display()),
-            source: err,
+    for _ in 0..CURSOR_TEMP_ATTEMPTS {
+        let nonce = CURSOR_TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let temp_path = path.with_extension(format!("json.tmp-{}-{nonce:x}", short_id()));
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
+        let mut temp = match options.open(&temp_path) {
+            Ok(temp) => temp,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(RallyError::Io {
+                    context: format!("create {}", temp_path.display()),
+                    source: error,
+                });
+            }
+        };
+        if let Err(error) = temp.write_all(content.as_bytes()) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(RallyError::Io {
+                context: format!("write {}", temp_path.display()),
+                source: error,
+            });
+        }
+        drop(temp);
+        return fs::rename(&temp_path, path).map_err(|err| {
+            let _ = fs::remove_file(&temp_path);
+            RallyError::Io {
+                context: format!("replace {} with {}", path.display(), temp_path.display()),
+                source: err,
+            }
+        });
+    }
+    Err(RallyError::Io {
+        context: format!("create unique cursor staging file for {}", path.display()),
+        source: io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "cursor staging names exhausted",
+        ),
     })
 }
 
@@ -17924,6 +17966,56 @@ mod ledger_tests {
         assert_eq!(
             read_count, 1,
             "5 no-advance polls with content_max_seq must produce only 1 read-checkpoint (anti-loop guard)"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cursor_cache_concurrent_writers_preserve_each_tool_and_clean_staging_files() {
+        let root = unique_root("cursor-cache-concurrent-writers");
+        let cursor_path = root.join(".rally").join("cursors.json");
+        let writers = 12usize;
+        let barrier = Arc::new(std::sync::Barrier::new(writers));
+        let mut joins = Vec::with_capacity(writers);
+
+        for index in 0..writers {
+            let cursor_path = cursor_path.clone();
+            let barrier = Arc::clone(&barrier);
+            joins.push(thread::spawn(move || {
+                barrier.wait();
+                write_cursor_at(&cursor_path, &format!("tool-{index}"), index as i64 + 1)
+            }));
+        }
+        for join in joins {
+            join.join().expect("cursor writer thread panicked").unwrap();
+        }
+
+        let cursors = read_cursors_at(&cursor_path).unwrap();
+        assert_eq!(
+            cursors.len(),
+            writers,
+            "each concurrent routed client must retain its cursor entry"
+        );
+        for index in 0..writers {
+            assert_eq!(
+                cursors.get(&format!("tool-{index}")),
+                Some(&(index as i64 + 1))
+            );
+        }
+        let staging = fs::read_dir(cursor_path.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("cursors.json.tmp-")
+            })
+            .count();
+        assert_eq!(
+            staging, 0,
+            "successful cursor writes must clean staging files"
         );
 
         fs::remove_dir_all(&root).ok();

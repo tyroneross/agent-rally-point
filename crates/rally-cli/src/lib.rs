@@ -151,6 +151,8 @@ mod ripple;
 mod rotate;
 mod route_findings;
 mod run_worktree;
+mod runtime_routes;
+mod runtime_setup;
 mod session_identity;
 mod source_grounding;
 mod store;
@@ -958,7 +960,7 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
     // the daemon's entire lifetime. Strip watchdog-only flags first so a
     // stray `--timeout-ms`/`--fail-open` on the invocation can't reach the
     // `daemon` subcommand parser (which doesn't know about them).
-    if first_two_positionals_are_daemon_serve(&args) {
+    if first_two_positionals_are_daemon_serve(&args) || args.first().is_some_and(|a| a == "setup") {
         return run_inline(strip_timeout_flag(args));
     }
 
@@ -973,7 +975,11 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
     // Resolve the budget from the *raw* args, then strip the watchdog-only
     // `--timeout-ms` flag so it never reaches a subcommand parser (which would
     // reject it as unknown). The env var path needs no stripping.
-    let timeout = resolve_watchdog_timeout(&args);
+    let timeout = if args.first().is_some_and(|a| a == "routes") {
+        runtime_routes::watchdog_budget(&args)
+    } else {
+        resolve_watchdog_timeout(&args)
+    };
     // Watchdog-level flag detection happens BEFORE stripping so we honor
     // `--fail-open` / `--fail-closed` even though those tokens are removed
     // before the subcommand parser sees them.
@@ -1599,6 +1605,8 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
 
     match command {
         CliCommand::Init(args) => command_init(args),
+        CliCommand::Setup(args) => runtime_setup::command(args),
+        CliCommand::Routes(args) => runtime_routes::command(args),
         CliCommand::Hooks(args) => command_hooks(args),
         CliCommand::Enter(args) => command_enter(args),
         CliCommand::Say(args) => command_say(args),
@@ -5464,6 +5472,7 @@ fn current_protocol_session(tool: Option<&str>) -> session_identity::ProtocolSes
     // renewal on one lease across CLI invocations. Higher-fidelity managed,
     // tmux, and terminal identities retain their normal precedence.
     if inputs.managed_session_id.is_none()
+        && inputs.parent_session_id.is_none()
         && inputs.tmux_pane.is_none()
         && inputs.term_session_id.is_none()
         && inputs.tty.is_none()
@@ -7501,6 +7510,22 @@ fn canonical_admission_resources(resources: Vec<String>) -> Result<Vec<String>> 
     Ok(canonical)
 }
 
+fn admission_protocol_identity(
+    session: &ManagedSession,
+) -> session_identity::ProtocolSessionIdentity {
+    if session.backend == "external" {
+        session_identity::ProtocolSessionIdentity::from_parent_lease(
+            &session.session_id,
+            &session.tool,
+        )
+    } else {
+        session_identity::ProtocolSessionIdentity::from_managed_lease(
+            &session.session_id,
+            &session.tool,
+        )
+    }
+}
+
 fn acquire_session_admission(
     room: &RoomStore,
     session: &ManagedSession,
@@ -7510,12 +7535,9 @@ fn acquire_session_admission(
     if resources.is_empty() {
         return Ok(None);
     }
-    let owner_session = session_identity::ProtocolSessionIdentity::from_managed_lease(
-        &session.session_id,
-        &session.tool,
-    )
-    .from_session_id()
-    .to_string();
+    let owner_session = admission_protocol_identity(session)
+        .from_session_id()
+        .to_string();
     let facts = room.facts()?;
     let snapshot = room.snapshot()?;
     if let Some(existing) = snapshot.active_claims.iter().find(|claim| {
@@ -7626,12 +7648,9 @@ impl AdmissionRollback<'_> {
 impl Drop for AdmissionRollback<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let owner_session = session_identity::ProtocolSessionIdentity::from_managed_lease(
-                &self.session.session_id,
-                &self.session.tool,
-            )
-            .from_session_id()
-            .to_string();
+            let owner_session = admission_protocol_identity(&self.session)
+                .from_session_id()
+                .to_string();
             let operation_material = format!("{}:{}", self.session.session_id, self.claim_id);
             let release = Fact {
                 from_session_id: Some(owner_session),
@@ -10667,6 +10686,11 @@ fn maybe_activate_session_daemon(fresh_sessions: usize) -> SessionDaemonStatus {
             Some("RALLY_DAEMON_AUTOSTART=0".to_string()),
         );
     }
+    if !repo_root().is_ok_and(|root| runtime_setup::coordinator_approved(&root)) {
+        return daemon_status_without_activation(
+            "permission_required", Some("Enable the background coordinator with rally setup --component coordinator --apply".to_string()),
+        );
+    }
     match command_daemon_start(
         true,
         cli::DaemonStartArgs {
@@ -10746,7 +10770,7 @@ fn command_session_ensure(json: bool, args: SessionEnsureArgs) -> Result<Output>
         args.live_delivery,
     );
     let identity =
-        session_identity::ProtocolSessionIdentity::from_managed_lease(&raw_session_id, &args.tool);
+        session_identity::ProtocolSessionIdentity::from_parent_lease(&raw_session_id, &args.tool);
     let room = RoomStore::open()?;
     let facts = room.facts()?;
     if facts.iter().any(|fact| {
@@ -10861,7 +10885,13 @@ fn command_session_ensure(json: bool, args: SessionEnsureArgs) -> Result<Output>
         reused,
         capabilities,
     };
+    let managed_mode =
+        session_identity::managed_mode_for_lease(&raw_session_id).unwrap_or_default();
     let environment = BTreeMap::from([
+        (
+            "RALLY_MANAGED_SESSION_MODE".to_string(),
+            managed_mode.clone(),
+        ),
         ("RALLY_SESSION_ID".to_string(), raw_session_id.clone()),
         ("RALLY_AGENT_ID".to_string(), raw_session_id.clone()),
         ("RALLY_TOOL_ID".to_string(), args.tool.clone()),
@@ -10870,7 +10900,8 @@ fn command_session_ensure(json: bool, args: SessionEnsureArgs) -> Result<Output>
             close_token.clone(),
         ),
     ]);
-    let shell_export = session_shell_export(&raw_session_id, &args.tool, &close_token);
+    let shell_export =
+        session_shell_export(&raw_session_id, &args.tool, &close_token, &managed_mode);
     let body = envelope(
         "session",
         SCHEMA_SESSION,
@@ -11014,7 +11045,7 @@ fn command_session_close(json: bool, args: SessionCloseArgs) -> Result<Output> {
             ))
         })?;
     let identity =
-        session_identity::ProtocolSessionIdentity::from_managed_lease(&raw_session_id, &args.tool);
+        session_identity::ProtocolSessionIdentity::from_parent_lease(&raw_session_id, &args.tool);
     let session_id = identity.from_session_id().to_string();
     let room = RoomStore::open()?;
     let engagement_facts = room.facts()?;
@@ -12712,14 +12743,20 @@ pub(crate) fn shell_quote(value: &str) -> String {
         .into_owned()
 }
 
-fn session_shell_export(raw_session_id: &str, tool: &str, close_token: &str) -> String {
+fn session_shell_export(
+    raw_session_id: &str,
+    tool: &str,
+    close_token: &str,
+    managed_mode: &str,
+) -> String {
     format!(
-        "export RALLY_SESSION_ID={} RALLY_AGENT_ID={} RALLY_TOOL_ID={} {}={}",
+        "export RALLY_SESSION_ID={} RALLY_AGENT_ID={} RALLY_TOOL_ID={} {}={} RALLY_MANAGED_SESSION_MODE={}",
         shell_quote(raw_session_id),
         shell_quote(raw_session_id),
         shell_quote(tool),
         session_identity::SESSION_CLOSE_TOKEN_ENV,
         shell_quote(close_token),
+        shell_quote(managed_mode),
     )
 }
 
@@ -14450,7 +14487,7 @@ mod tests {
         let session_id = "lease 'quoted' $(touch should-not-run); $HOME";
         let tool = "generic shell:01; echo should-not-run";
         let close_token = "close 'quoted' $(touch should-not-run); $HOME";
-        let export = session_shell_export(session_id, tool, close_token);
+        let export = session_shell_export(session_id, tool, close_token, "");
         assert_eq!(
             shlex::split(&export).unwrap(),
             vec![
@@ -14459,6 +14496,7 @@ mod tests {
                 format!("RALLY_AGENT_ID={session_id}"),
                 format!("RALLY_TOOL_ID={tool}"),
                 format!("RALLY_SESSION_CLOSE_TOKEN={close_token}"),
+                "RALLY_MANAGED_SESSION_MODE=".to_string(),
             ]
         );
     }
@@ -19844,26 +19882,38 @@ struct Envelope<T> {
 }
 
 fn envelope<T: Serialize>(command: &str, schema: &str, data: T) -> Result<Value> {
-    serde_json::to_value(Envelope {
+    let mut value = serde_json::to_value(Envelope {
         ok: true,
         product: "rally",
         command: command.to_string(),
         schema: schema.to_string(),
         data,
     })
-    .map_err(RallyError::json("render command envelope"))
+    .map_err(RallyError::json("render command envelope"))?;
+    add_capability_discovery(command, &mut value);
+    Ok(value)
+}
+
+fn add_capability_discovery(command: &str, value: &mut Value) {
+    if value["data"].is_object()
+        && matches!(command, "whoami" | "next" | "room" | "enter" | "bootstrap")
+    {
+        value["data"]["capability_discovery"] = json!({
+            "routes": "rally routes --json", "setup": "rally setup --json",
+            "probe": "rally routes --probe <exact-actor> --tool <sender> --json",
+            "policy": "Use the shared route projection; presence or queued delivery does not establish live prompt receipt. Installation requires explicit user approval."
+        });
+    }
 }
 
 /// Like `envelope`, but accepts a pre-serialized `Value` for data.
 /// Used for commands whose outcome types don't implement `JsonSchema`.
 fn envelope_value(command: &str, schema: &str, data: Value) -> Result<Value> {
-    Ok(json!({
-        "ok": true,
-        "product": "rally",
-        "command": command,
-        "schema": schema,
-        "data": data,
-    }))
+    let mut value = json!({
+        "ok": true, "product": "rally", "command": command, "schema": schema, "data": data,
+    });
+    add_capability_discovery(command, &mut value);
+    Ok(value)
 }
 
 pub(crate) fn repo_root() -> Result<PathBuf> {
@@ -20821,7 +20871,7 @@ fn help_text() -> String {
         "  rally run <claude|codex|opencode|gemini> [--task <prompt>] [--name <name>] [--backend <auto|tmux|cmux|ptyd|ptyd-strict>] [--dry-run] [--json]",
         "    managed run ids auto-number active agents, e.g. claude-01 / claude_code:01",
         "  rally task-worker --session-id <id>  # internal lifecycle wrapper started by run --task",
-        "  rally sessions [--reap] [--json] [--tmux-bin <path>] [--cmux-bin <path>]",
+        "  rally setup [--component tmux|coordinator|ptyd] [--apply] [--json]\n  rally routes [--probe <tool> --tool <sender>] [--json]\n  rally sessions [--reap] [--json] [--tmux-bin <path>] [--cmux-bin <path>]",
         "  rally session ensure --tool <tool> [--session-id <id>] [--adapter <host>] [--strict] [--native-hook] [--lifecycle-close] [--live-delivery] [--json]",
         "    mint or reuse one parent-exported lease and report each adapter guarantee as enforced, advisory, or unmanaged",
         "  rally session close --tool <tool> [--session-id <id>] [--json]",

@@ -123,7 +123,7 @@ fn recording_tmux_stub(
     let bin = sandbox.root().join("tmux-sec009-spy.sh");
     let log = sandbox.root().join("tmux-sec009-spy.log");
     let body = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\n  list-panes) printf '%s\\n%s\\n%s\\n' 'rally-claude-{managed_name}' '@1' '%1' ;;\n  capture-pane) printf '%s\\n' 'unrelated pane content' ;;\nesac\nexit 0\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\n  list-panes) printf '%s\\n%s\\n%s\\n' 'rally-claude-{managed_name}' '@1' '%1' ;;\n  display-message) printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '%1' '101' '202' '/tmp/rally-test.sock' '0' '0' '0' '0' ;;\n  capture-pane) printf '%s\\n' 'unrelated pane content' ;;\nesac\nexit 0\n",
         log.display()
     );
     fs::write(&bin, body).expect("write SEC-009 tmux spy");
