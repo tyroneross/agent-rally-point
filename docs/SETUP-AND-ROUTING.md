@@ -87,6 +87,13 @@ unique nonce, current role and lead epoch. It never automatically resends.
 
 A ready route requires both a recorded transport send and a receiver-authored
 artifact/receipt bound to the request, exact session, nonce, role and lead epoch.
+The receiver must also echo a separate `RALLY_ROUTE_DELIVERY_` challenge from
+the live prompt. Only its SHA-256 digest is stored in the handoff; the raw
+challenge is added to the actual backend write, never to sender-authored
+directives, wake commands or content facts. Ordinary ledger polling therefore
+cannot prove the live injection path. Older probes without this digest remain
+unverified. Ordinary `inject --text` remains ledgered and cannot substitute for
+this internal connection-check path.
 Terminal echo, old screen text, sender transport receipts, blockers and unrelated
 responses cannot substitute for that receiver proof. Proof expires after five
 minutes. Changed registrations, roles, lead epochs, withdrawn evidence and newer
@@ -103,6 +110,19 @@ retains an explicitly probed target. Onboarding outputs (`whoami`, `enter`,
 access to an editor's separate native GUI conversation. Cursor, Antigravity and
 other hosts need their own authorized end-to-end trials before claiming support.
 The protocol does not depend on the model provider.
+
+Run the transport regression against the exact candidate binary with installed
+stock tmux:
+
+```sh
+python3 tests/runtime/test_route_probe_transport.py --binary /absolute/path/to/rally --output /tmp/route-transport.json
+```
+
+The consuming receiver must pass; polling-only, missing-ACK, wrong-token and
+wrong-session receivers must fail route verification. The test also checks that
+the challenge stays out of the sender's ledger before a response. Missing tmux
+or a failed receiver control fails the test; it never counts as a passing
+negative. These controlled receivers do not establish live model/provider support.
 
 ## Current tmux protections
 

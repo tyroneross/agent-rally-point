@@ -97,7 +97,8 @@ if [ "$n_begin" -eq 2 ]; then
     # satisfied this check — a mutation that survived the first draft of this
     # test. The sanitizer would have been gone with every assertion green.
     for fn in "function ident(" "function prose(" "function line("; do
-      printf '%s' "$body" | grep -qF "$fn" || missing="$missing block$((i + 1)):${fn};"
+      # Drain the producer: grep -q can cause printf to SIGPIPE under pipefail.
+      printf '%s' "$body" | grep -F "$fn" >/dev/null || missing="$missing block$((i + 1)):${fn};"
     done
   done
   if [ -z "$missing" ]; then ok "$T"; else bad "$T" "missing: $missing"; fi

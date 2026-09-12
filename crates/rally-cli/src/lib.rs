@@ -9241,6 +9241,21 @@ fn opportunistic_orphan_sweep_on_enter(room: &RoomStore) {
 }
 
 fn command_inject(args: InjectArgs) -> Result<Output> {
+    command_inject_inner(args, None)
+}
+
+/// A connection challenge must travel only over the selected live transport.
+/// Ordinary --text is deliberately ledgered, so it cannot prove that path.
+fn command_inject_probe(args: InjectArgs, challenge: String) -> Result<Output> {
+    if args.dry_run || args.text.is_some() || args.handoff.is_none() {
+        return Err(RallyError::Usage(
+            "A route challenge requires a live referenced handoff without --text".into(),
+        ));
+    }
+    command_inject_inner(args, Some(challenge))
+}
+
+fn command_inject_inner(args: InjectArgs, transport_challenge: Option<String>) -> Result<Output> {
     let dry_run = args.dry_run;
     let target = args.target;
     let sender_tool = args.tool;
@@ -9326,7 +9341,13 @@ fn command_inject(args: InjectArgs) -> Result<Output> {
             args.require_ack,
             args.timeout_seconds,
             args.bins,
+            transport_challenge.as_deref(),
         ),
+        InjectTarget::LedgerAgent(_) if transport_challenge.is_some() => {
+            Err(RallyError::NotStarted(
+                "A transport-only challenge requires an exact managed endpoint".into(),
+            ))
+        }
         InjectTarget::LedgerAgent(agent_id) => command_inject_ledger(
             args.json,
             dry_run,
@@ -9751,6 +9772,7 @@ fn command_inject_managed(
     require_ack: bool,
     timeout_seconds: i64,
     bins: BackendBins,
+    transport_challenge: Option<&str>,
 ) -> Result<Output> {
     if session.task_scoped {
         return Err(RallyError::Usage(format!(
@@ -9775,6 +9797,15 @@ fn command_inject_managed(
     }
     let effective_require_ack = require_ack || handoff.is_some();
     let timeout = timeout_seconds as u64;
+    // Keep text and command plans suitable for the durable ledger. Only the
+    // actual backend write receives this token; wakes, directives and content
+    // facts must never reveal it to a receiver that merely polls the queue.
+    let wire_text = match transport_challenge {
+        Some(token) => format!(
+            "{text}\nConnection probe delivery token: {token}. Include --evidence {token} in your receipt for this handoff, in addition to its requested nonce, epoch and role."
+        ),
+        None => text.clone(),
+    };
 
     // Open the room once for all appends in this command.
     let mut room = if !dry_run {
@@ -9924,7 +9955,7 @@ fn command_inject_managed(
         PtydDelivery::PolicyRejectedUrgentAddition
     } else {
         let expect_pane = session.daemon_pane.clone().unwrap_or_default();
-        match backend_runner.ptyd_inject(&session.tool, &text, &expect_pane) {
+        match backend_runner.ptyd_inject(&session.tool, &wire_text, &expect_pane) {
             Ok(state) => PtydDelivery::Sent { state },
             Err(e) => {
                 let msg = e.to_string();
@@ -9979,7 +10010,7 @@ fn command_inject_managed(
         // Addition is delivered by NO backend.
         false
     } else {
-        match live_target.and_then(|target| backend_runner.inject_and_verify(&target, &text)) {
+        match live_target.and_then(|target| backend_runner.inject_and_verify(&target, &wire_text)) {
             Ok(true) => true,
             Ok(false) => {
                 legacy_sent_unverified = true;

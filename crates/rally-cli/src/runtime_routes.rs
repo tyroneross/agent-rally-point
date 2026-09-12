@@ -66,6 +66,7 @@ pub(crate) fn watchdog_budget(args: &[String]) -> std::time::Duration {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Probe {
     nonce: String,
+    delivery_digest: String,
     endpoint: String,
     lead_epoch: Option<i64>,
     role: Option<String>,
@@ -192,6 +193,10 @@ fn proof<'a>(
             && matches!(f.kind, FactKind::Artifact | FactKind::Receipt)
             && crate::receiver_response_matches(request, f, &view.session.tool)
             && f.evidence.iter().any(|s| s == &probe.nonce)
+            && f.evidence.iter().any(|s| {
+                s.starts_with("RALLY_ROUTE_DELIVERY_")
+                    && crate::runtime_setup::digest(s.as_bytes()) == probe.delivery_digest
+            })
             && f.evidence.iter().any(|s| s == &epoch)
             && (role.is_none() || f.role.as_deref() == role)
     })?;
@@ -285,8 +290,10 @@ fn run_probe(args: &RoutesArgs, room: &RoomStore, views: &[SessionView]) -> Resu
     let snapshot = room.snapshot()?;
     let role = role_for(&room.facts()?, target, snapshot.lead.as_deref());
     let nonce = format!("RALLY_CONNECTION_{}", uuid::Uuid::new_v4().simple());
+    let delivery_token = format!("RALLY_ROUTE_DELIVERY_{}", uuid::Uuid::new_v4().simple());
     let probe = Probe {
         nonce: nonce.clone(),
+        delivery_digest: crate::runtime_setup::digest(delivery_token.as_bytes()),
         endpoint: endpoint(view),
         lead_epoch: snapshot.lead_epoch,
         role: role.clone(),
@@ -300,7 +307,7 @@ fn run_probe(args: &RoutesArgs, room: &RoomStore, views: &[SessionView]) -> Resu
             .unwrap_or_else(|| "none".into())
     );
     let instructions = format!(
-        "Connection check only. Do not edit files or start other work. Read this handoff, then post an artifact referencing this handoff with --evidence {nonce} --evidence {epoch}{} and your exact --tool {target}. This proves receipt only, not task completion.",
+        "Connection check only. Do not edit files or start other work. Post an artifact referencing this handoff with --evidence {nonce} --evidence {epoch}{} and your exact --tool {target}. Also echo the RALLY_ROUTE_DELIVERY_ token from the live injected prompt via --evidence. If you only polled this handoff and have no delivery token, do not claim live delivery. This proves receipt only, not task completion.",
         role.as_ref()
             .map(|r| format!(" --role {}", crate::shell_quote(r)))
             .unwrap_or_default()
@@ -341,7 +348,7 @@ fn run_probe(args: &RoutesArgs, room: &RoomStore, views: &[SessionView]) -> Resu
     ];
     let output = match crate::cli::parse_cli(&invoke)? {
         CliParse::Command(c) => match *c {
-            CliCommand::Inject(a) => crate::command_inject(a)?,
+            CliCommand::Inject(a) => crate::command_inject_probe(a, delivery_token)?,
             _ => unreachable!(),
         },
         _ => unreachable!(),
@@ -460,6 +467,7 @@ mod tests {
             crate::managed_protocol_session_id(&view.session.session_id, &view.session.tool);
         let p = Probe {
             nonce: "unique-probe".into(),
+            delivery_digest: crate::runtime_setup::digest(b"RALLY_ROUTE_DELIVERY_fixture"),
             endpoint: endpoint(&view),
             lead_epoch: Some(7),
             role: Some("worker".into()),
@@ -495,7 +503,11 @@ mod tests {
             from_session_id: Some(bound),
             role: Some("worker".into()),
             ref_id: Some(request.event_id.clone()),
-            evidence: vec![p.nonce, "lead-epoch:7".into()],
+            evidence: vec![
+                p.nonce,
+                "lead-epoch:7".into(),
+                "RALLY_ROUTE_DELIVERY_fixture".into(),
+            ],
             ..Default::default()
         };
         let sent = Fact {
@@ -524,6 +536,8 @@ mod tests {
             "actor",
             "session",
             "nonce",
+            "delivery_token",
+            "ledger_only",
             "epoch",
             "reference",
             "role",
@@ -536,6 +550,10 @@ mod tests {
                 "actor" => bad[1].tool = Some("impostor".into()),
                 "session" => bad[1].from_session_id = Some("different-generation".into()),
                 "nonce" => bad[1].evidence[0] = "stale-nonce".into(),
+                "delivery_token" => bad[1].evidence[2] = "RALLY_ROUTE_DELIVERY_wrong".into(),
+                "ledger_only" => {
+                    bad[1].evidence.pop();
+                }
                 "epoch" => bad[1].evidence[1] = "lead-epoch:6".into(),
                 "reference" => bad[1].ref_id = Some("another-request".into()),
                 "role" => bad[1].role = Some("lead".into()),

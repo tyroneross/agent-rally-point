@@ -187,13 +187,26 @@ impl Workspace {
     }
 
     fn json_with_session(&self, session_id: &str, args: &[&str]) -> Value {
+        self.json_with_session_mode(session_id, None, args)
+    }
+
+    fn json_with_session_mode(
+        &self,
+        session_id: &str,
+        managed_mode: Option<&str>,
+        args: &[&str],
+    ) -> Value {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_rally"));
         cmd.current_dir(&self.cwd)
             .env("HOME", &self.home)
             .env_remove("GITHUB_ACTIONS")
             .env_remove("GITHUB_RUN_ID")
             .env("RALLY_DAEMON_AUTOSTART", "0")
+            .env_remove("RALLY_MANAGED_SESSION_MODE")
             .env("RALLY_SESSION_ID", session_id);
+        if let Some(mode) = managed_mode {
+            cmd.env("RALLY_MANAGED_SESSION_MODE", mode);
+        }
         if self.global_index {
             cmd.env("RALLY_GLOBAL_INDEX", "1");
         }
@@ -1854,8 +1867,9 @@ fn rally_stop_tombstones_session_when_backend_stop_fails() {
         .as_str()
         .unwrap();
     let tool = run["data"]["run"]["session"]["tool"].as_str().unwrap();
-    let claim = workspace.json_with_session(
+    let claim = workspace.json_with_session_mode(
         session_id,
+        Some("persistent"),
         &[
             "say",
             "claim",
@@ -1867,6 +1881,10 @@ fn rally_stop_tombstones_session_when_backend_stop_fails() {
             "--path",
             "src/managed.rs",
         ],
+    );
+    assert_eq!(
+        claim["data"]["say"]["fact"]["from_session_id"],
+        format!("sess:managed:{session_id}#live")
     );
     let claim_id = claim["data"]["say"]["fact"]["event_id"].as_str().unwrap();
     let stop = workspace.json(&["stop", session_id, "--json", "--tmux-bin", "/usr/bin/false"]);
@@ -5058,6 +5076,23 @@ fn second_fresh_session_activates_rallyd_and_current_view_has_direct_daemon_pari
     let direct = workspace.json(&["session", "current", "--json"]);
     assert_eq!(direct["data"]["session"]["total"], 1);
 
+    // Autostart requires explicit consent. Stop the approved coordinator so
+    // the second lease proves automatic restart rather than reuse of setup's process.
+    let plan = workspace.json(&["setup", "--component", "coordinator", "--json"]);
+    let plan_id = plan["data"]["setup"]["plan"]["plan_id"].as_str().unwrap();
+    let approved = workspace.json(&[
+        "setup",
+        "--component",
+        "coordinator",
+        "--apply",
+        "--approve-plan",
+        plan_id,
+        "--json",
+    ]);
+    assert_eq!(approved["data"]["setup"]["state"], "ready");
+    let stopped = workspace.json(&["daemon", "stop", "--json"]);
+    assert_eq!(stopped["data"]["daemon"]["live"], false);
+
     let second = ensure("parent-b", "claude_code:b");
     assert_eq!(second["data"]["session"]["daemon"]["live"], true);
     assert!(matches!(
@@ -6814,8 +6849,9 @@ printf 'completed after release\n' > "$result"
     let target_a = run_a["data"]["run"]["session"]["target"].as_str().unwrap();
     let target_b = run_b["data"]["run"]["session"]["target"].as_str().unwrap();
 
-    let claim_a = workspace.json_with_session(
+    let claim_a = workspace.json_with_session_mode(
         session_a,
+        Some("task"),
         &[
             "say",
             "claim",
@@ -6828,8 +6864,9 @@ printf 'completed after release\n' > "$result"
             "src/task-a.rs",
         ],
     );
-    let claim_b = workspace.json_with_session(
+    let claim_b = workspace.json_with_session_mode(
         session_b,
+        Some("task"),
         &[
             "say",
             "claim",
@@ -6841,6 +6878,14 @@ printf 'completed after release\n' > "$result"
             "--path",
             "src/task-b.rs",
         ],
+    );
+    assert_eq!(
+        claim_a["data"]["say"]["fact"]["from_session_id"],
+        format!("sess:managed:{session_a}#live")
+    );
+    assert_eq!(
+        claim_b["data"]["say"]["fact"]["from_session_id"],
+        format!("sess:managed:{session_b}#live")
     );
     let claim_a_id = claim_a["data"]["say"]["fact"]["event_id"].as_str().unwrap();
     let claim_b_id = claim_b["data"]["say"]["fact"]["event_id"].as_str().unwrap();
