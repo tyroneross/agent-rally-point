@@ -17,9 +17,11 @@ them unread for over an hour before a human noticed and re-posted it by hand.
 
 `rally say handoff --to <tool>` now checks the target's presence against its
 liveness window before returning. When the target is not live it still commits
-the handoff to that exact target, ALSO copies it to the base-tool inbox a fresh
-session polls (`codex` for `codex:*`, `claude_code` for `claude_code:*`), records
-a `wake` fact against the target, and prints a warning naming the last-seen time
+the handoff to that exact target, ALSO copies it to the base-tool inbox
+(`codex` for `codex:*`, `claude_code` for `claude_code:*`) — a separately-polled
+identity, though reaching it takes an actual `rally inbox --tool codex`, since
+inbox reads match the tool string exactly — records a `wake` fact against the
+target, and prints a warning naming the last-seen time
 and where the copy went. `--json` carries `data.delivery {target_live, last_seen,
 last_seen_age_secs, fallback_inbox, reason}`; `fallback_inbox` reports the inbox
 that RECEIVED a copy, never one that was merely planned. `--target-policy exact`
@@ -46,10 +48,12 @@ whether a message was read.
 
 Presence deliberately does not count as consumption — `ensure_presence` writes it
 on every rally call and the coordination hook writes it on the agent's behalf, so
-it proves a process touched the room, not that anyone opened the inbox. Only
-`read`, `resolve`, `receipt`, `decision`, `handoff`, and `artifact` by the target
-after the handoff's sequence, or an explicit non-system reply citing it, discharge
-one.
+it proves a process touched the room, not that anyone opened the inbox. Nor does
+a `read` checkpoint on position alone: it is a room-wide READ CURSOR, so a live
+target polling busily about other work would otherwise discharge every handoff
+pending against it. The cursor must have REACHED the handoff (`read_seq >= seq`).
+A fallback copy gets no row of its own — it is a second address for a handoff the
+list already carries, reported through that row's `fallback_inbox`.
 
 Configure the send-time window with `coordination.handoff_liveness_window_secs`
 or `RALLY_HANDOFF_LIVENESS_WINDOW_SECS`; unset keeps the adaptive per-session

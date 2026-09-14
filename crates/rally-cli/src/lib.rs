@@ -3368,7 +3368,7 @@ fn command_say(args: SayArgs) -> Result<Output> {
         evidence.push(format!("protocol:idempotency_key={retry_key}"));
     } else if target_policy
         .as_deref()
-        .is_some_and(|p| p != TARGET_POLICY_EXACT)
+        .is_some_and(|p| p != TARGET_POLICY_EXACT || kind != FactKind::Handoff)
         || requested_handoff_state.is_some()
         || requested_idempotency_key.is_some()
     {

@@ -177,8 +177,12 @@ these happen and none of them is optional:
 - The handoff still commits to the target you asked for, unchanged. A returning
   session finds its own mail.
 - A **copy also goes to the base-tool inbox** — `codex` for any `codex:*`
-  target, `claude_code` for any `claude_code:*` — which is the inbox a FRESH
-  session of that host polls on start. Acking either one is enough.
+  target, `claude_code` for any `claude_code:*`. That is a real, separately-polled
+  identity, not a broadcast: on the measured room the bare `codex` and
+  `claude_code` tools had authored 196 and 963 facts including 30 and 508 read
+  checkpoints. It is NOT automatic fan-in, though — inbox reads match the tool
+  string exactly, so a session entered as `codex:<uuid>` sees the copy only if it
+  also runs `rally inbox --tool codex`. Acking either copy is enough.
 - A `wake` fact records the attempt against the target, so `rally next --tool
   <target>` surfaces it whenever that identity comes back.
 - The command prints a warning naming the target's last-seen time and where the
@@ -213,6 +217,11 @@ rally handoffs                          # full census: delivered and not
 A copy in a second inbox is one more chance to be read. It is not proof anyone
 read it — only a target-authored ACK is that, and `--undelivered` keeps saying
 so until one arrives.
+
+**Two inboxes now hold the same request, and nothing serializes them.** A
+base-inbox reader and a returning target could both pick it up. Expect at most
+one to act, and use `--target-policy exact` when duplicate work would actually
+cost something.
 
 ### Ownership transfer before launch
 

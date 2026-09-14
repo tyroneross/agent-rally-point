@@ -190,9 +190,10 @@ unread forever with nobody told.
 `rally say handoff --to <tool>` therefore checks the target's presence first.
 When the target is not live it still commits the handoff to that target, ALSO
 copies it to the base-tool inbox (`codex` for `codex:*`, `claude_code` for
-`claude_code:*`) that a fresh session of that host polls on start, records a
-`wake` fact against the target, and prints a warning naming the target's
-last-seen time and where the copy went. `--json` carries the same under
+`claude_code:*`) — a real, separately-polled identity, though reaching it takes
+an actual `rally inbox --tool codex`, since inbox reads match the tool string
+exactly. It also records a `wake` fact against the target and prints a warning
+naming the target's last-seen time and where the copy went. `--json` carries the same under
 `data.delivery`. Pass `--target-policy exact` when the handoff must reach one
 receiver or nobody — it suppresses the copy and still warns.
 
@@ -205,7 +206,8 @@ rally handoffs --undelivered --json
 That lists every targeted handoff whose target never read, acked, or resolved
 it — scanning the whole ledger, so a handoff that expired out of `rally room`
 still shows up. **A fallback copy is one more chance to be read, not proof
-anyone read it.** Only a target-authored ACK is that.
+anyone read it.** Only a target-authored ACK is that. Two inboxes hold the same
+request and nothing serializes them, so expect at most one reader to act.
 
 ## Sending a Handoff Document
 

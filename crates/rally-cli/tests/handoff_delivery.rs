@@ -13,11 +13,15 @@
 //! ones the real agents wrote. It carries three targeted handoffs whose
 //! outcomes differ, which is what makes it a test rather than a demo:
 //!
-//! | original | from → to | outcome |
-//! |---|---|---|
-//! | `fact_2b7b_18d5033b70b1b380` | `codex:sol-v6` → `codex:motion-review` | **never picked up** |
-//! | `fact_cf5_18d4fddfc16b98b0` | `codex:clarity-v5` → `claude:clarity-review` | delivered |
-//! | (two replies) | `claude:clarity-review` → `codex:clarity-v5` | delivered |
+//! | fixture seq | event id | from → to | outcome |
+//! |---|---|---|---|
+//! | 55 | `fact_2b7b_18d5033b70b1b380` | `codex:sol-v6` → `codex:motion-review` | **never picked up** |
+//! | 8 | `fact_12117_18d4fd9e64231f48` | `codex:clarity-v5` → `claude:clarity-review` | delivered |
+//! | 27 | `fact_4a22_18d4feacdf7b4f80` | `claude:clarity-review` → `codex:clarity-v5` | delivered |
+//! | 30 | `fact_789d_18d4feb8bf759fe0` | `claude:clarity-review` → `codex:clarity-v5` | delivered |
+//!
+//! (Fixture seq 21 is an untargeted broadcast handoff and has no addressee
+//! whose silence could be measured.)
 //!
 //! The undelivered one is the incident: its target registered at 22:20:01Z,
 //! wrote its last fact at 22:20:40Z, and the handoff arrived at 22:53:00Z. It
@@ -45,8 +49,13 @@ use support::rally_cmd::rally_command;
 const UNDELIVERED_EVENT_ID: &str = "fact_2b7b_18d5033b70b1b380";
 /// Its target — registered once, then silent.
 const DEAD_TARGET: &str = "codex:motion-review";
-/// A handoff from the same fixture whose target DID act afterwards.
-const DELIVERED_EVENT_ID: &str = "fact_cf5_18d4fddfc16b98b0";
+/// A handoff from the same fixture whose target DID act afterwards: fixture
+/// seq 8, discharged by `codex:clarity-v5`'s own later receipt and release.
+const DELIVERED_EVENT_ID: &str = "fact_12117_18d4fd9e64231f48";
+/// Two more delivered handoffs, addressed the other way. These are the rows the
+/// consumption index actually decides, so they are the ones a broken filter
+/// would leak.
+const DELIVERED_REPLY_IDS: [&str; 2] = ["fact_4a22_18d4feacdf7b4f80", "fact_789d_18d4feb8bf759fe0"];
 
 static NONCE: AtomicUsize = AtomicUsize::new(0);
 
@@ -183,10 +192,19 @@ fn must_not_list_a_handoff_the_target_answered() {
         !ids.iter().any(|id| id == DELIVERED_EVENT_ID),
         "{DELIVERED_EVENT_ID}'s target acted after it; it is delivered, not undelivered. got {ids:?}"
     );
-    assert!(
-        ids.len() < 5,
-        "the fixture holds 5 handoffs, 3 of them targeted and answered; \
-         listing nearly all of them means the filter is not filtering. got {ids:?}"
+    for delivered in DELIVERED_REPLY_IDS {
+        assert!(
+            !ids.iter().any(|id| id == delivered),
+            "{delivered} was answered by its target; it must not be listed. got {ids:?}"
+        );
+    }
+    // The fixture holds four TARGETED handoffs and exactly one is unread. An
+    // implementation that returned every handoff would satisfy the recall test
+    // and fail here.
+    assert_eq!(
+        ids,
+        vec![UNDELIVERED_EVENT_ID.to_string()],
+        "exactly one of the fixture's four targeted handoffs is unread"
     );
 }
 
@@ -433,6 +451,42 @@ fn the_reply_binding_policies_still_require_a_ref() {
     assert!(
         emitted.contains("handoff_target_policy_requires_ref"),
         "the refusal must keep its typed code; got {emitted}"
+    );
+}
+
+/// `exact` answers "may this send fan out", which only a handoff can do.
+/// Accepting it on another kind would turn a typed refusal into a silent no-op.
+#[test]
+fn target_policy_exact_is_still_refused_on_a_non_handoff_kind() {
+    let room = Room::new("policy-exact-scope");
+    let out = room
+        .command(&[
+            "say",
+            "artifact",
+            "--tool",
+            "claude_code:sender",
+            "--to",
+            DEAD_TARGET,
+            "--target-policy",
+            "exact",
+            "--subject",
+            "artifacts do not fan out",
+            "--json",
+        ])
+        .output()
+        .expect("spawn rally");
+    assert!(
+        !out.status.success(),
+        "a flag that cannot affect the command must be refused, not accepted"
+    );
+    let emitted = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        emitted.contains("handoff_target_policy_requires_ref"),
+        "got {emitted}"
     );
 }
 

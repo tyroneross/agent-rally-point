@@ -21,9 +21,12 @@
 //!
 //! 1. **The warning was the only effect.** The fact went to exactly one inbox —
 //!    the dead one. [`delivery_plan`] additionally routes a copy to the base
-//!    tool (`codex` for `codex:*`), which is the inbox a *fresh* Codex session
-//!    actually polls, and emits a `wake` fact so the target's own wake queue
-//!    records the attempt.
+//!    tool (`codex` for `codex:*`), a separately-polled identity that on the
+//!    measured room had authored 196 facts including 30 read checkpoints, and
+//!    emits a `wake` fact so the target's own wake queue records the attempt.
+//!    Note the copy is not FANNED IN automatically: `obligations::build_inbox`
+//!    matches the target string exactly, so the copy is retrieved by an actual
+//!    `rally inbox --tool codex`, not by a `codex:<uuid>` session's own poll.
 //! 2. **Nothing said so afterwards.** A warning is a line on one terminal at one
 //!    moment. [`project_handoffs`] makes the same condition queryable at any
 //!    later time, over the whole ledger, regardless of lease expiry.
@@ -50,6 +53,9 @@ use crate::store::{FRESHNESS_FRESH, Fact, FactKind, RoomSnapshot, is_system_auth
 /// read the handoff. On the measured ledger, counting presence as delivery
 /// hides `fact_ad0d_18d3f4e4e8c9b3f0` (seq 6243), whose target posted 1,659
 /// later events and still never acknowledged the request addressed to it.
+///
+/// `Read` is present but does NOT qualify on position alone — see
+/// [`read_cursor_reached`].
 const CONSUMPTION_KINDS: &[FactKind] = &[
     FactKind::Read,
     FactKind::Resolve,
@@ -58,6 +64,26 @@ const CONSUMPTION_KINDS: &[FactKind] = &[
     FactKind::Handoff,
     FactKind::Artifact,
 ];
+
+/// A `read` fact is a room-wide READ CURSOR, not a per-fact acknowledgement:
+/// `rally next` appends one whenever the tool's read position advances, and its
+/// `summary` carries that position as `read_seq:<N>` (`store.rs`, `FactKind::Read`).
+///
+/// So "the target wrote a read AFTER this handoff's sequence" is the wrong
+/// question — a target polling busily about other work writes those constantly,
+/// and treating them as consumption would discharge every handoff pending
+/// against a live-but-ignoring session. The right question is whether the cursor
+/// REACHED this handoff.
+///
+/// A checkpoint whose `read_seq` cannot be parsed is not counted: an
+/// unreadable position is not evidence of any position.
+fn read_cursor_reached(fact: &Fact, handoff_seq: i64) -> bool {
+    fact.summary
+        .as_deref()
+        .and_then(|summary| summary.strip_prefix("read_seq:"))
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .is_some_and(|read_seq| read_seq >= handoff_seq)
+}
 
 /// The base-tool inbox for a suffixed session id: `codex:motion-review` →
 /// `codex`, `claude_code:1380685e-…` → `claude_code`.
@@ -245,6 +271,7 @@ pub(crate) fn project_handoffs(
     // One pass to index consumption, so the scan stays O(n) rather than
     // O(handoffs × facts). Rooms reach six figures of events.
     let mut consumed_by: Vec<(&str, i64)> = Vec::new();
+    let mut read_cursors: Vec<(&str, &Fact)> = Vec::new();
     let mut answered: BTreeSet<&str> = BTreeSet::new();
     let mut last_presence: std::collections::BTreeMap<&str, &str> =
         std::collections::BTreeMap::new();
@@ -255,7 +282,9 @@ pub(crate) fn project_handoffs(
             if fact.kind == FactKind::Presence {
                 last_presence.insert(tool, fact.created_at.as_str());
             }
-            if CONSUMPTION_KINDS.contains(&fact.kind) {
+            if fact.kind == FactKind::Read {
+                read_cursors.push((tool, fact));
+            } else if CONSUMPTION_KINDS.contains(&fact.kind) {
                 consumed_by.push((tool, fact.seq));
             }
         }
@@ -290,10 +319,25 @@ pub(crate) fn project_handoffs(
         if retracted.contains(&fact.event_id) {
             continue;
         }
+        // A fallback copy is a second ADDRESS for a handoff this list already
+        // carries, not a second obligation. Emitting its own row double-counts
+        // `undelivered_total` and prints "this handoff reached nobody" about the
+        // very fact that was the extra reach. The original row reports it
+        // through `fallback_inbox` instead.
+        if fact
+            .evidence
+            .iter()
+            .any(|marker| marker.starts_with(FALLBACK_OF_MARKER))
+        {
+            continue;
+        }
         let undelivered = !answered.contains(fact.event_id.as_str())
             && !consumed_by
                 .iter()
-                .any(|(tool, seq)| *tool == target && *seq > fact.seq);
+                .any(|(tool, seq)| *tool == target && *seq > fact.seq)
+            && !read_cursors
+                .iter()
+                .any(|(tool, read)| *tool == target && read_cursor_reached(read, fact.seq));
         if undelivered_only && !undelivered {
             continue;
         }
@@ -379,6 +423,14 @@ mod tests {
             subject: format!("handoff {seq}"),
             created_at: "2026-09-13T22:53:00Z".to_string(),
             ..Fact::default()
+        }
+    }
+
+    /// A `read` checkpoint whose cursor sits at `read_seq`.
+    fn read_cursor(seq: i64, tool: &str, read_seq: i64) -> Fact {
+        Fact {
+            summary: Some(format!("read_seq:{read_seq}")),
+            ..act(seq, FactKind::Read, tool)
         }
     }
 
@@ -506,16 +558,76 @@ mod tests {
         assert_eq!(rows[0].age_secs, Some(7_200));
     }
 
+    /// A read checkpoint whose cursor REACHED the handoff is consumption.
     #[test]
     fn a_handoff_the_target_read_afterwards_is_delivered() {
         let facts = vec![
             handoff(10, "fact_ok", "codex:sol-v6", Some("codex:motion-review")),
-            act(11, FactKind::Read, "codex:motion-review"),
+            read_cursor(11, "codex:motion-review", 12),
         ];
         assert!(project_handoffs(&facts, NOW, true).is_empty());
         let all = project_handoffs(&facts, NOW, false);
         assert_eq!(all.len(), 1);
         assert!(!all[0].undelivered);
+    }
+
+    /// The recall hole a position-blind read check would open: a target that is
+    /// ALIVE and polling busily about other work writes read checkpoints
+    /// constantly. Counting those would discharge every handoff pending against
+    /// a live-but-ignoring session — the common case, not the rare one.
+    #[test]
+    fn a_read_cursor_that_never_reached_the_handoff_is_not_consumption() {
+        let facts = vec![
+            handoff(
+                10,
+                "fact_ignored",
+                "codex:sol-v6",
+                Some("codex:motion-review"),
+            ),
+            // Later in time, but the cursor is still behind the handoff.
+            read_cursor(11, "codex:motion-review", 9),
+            read_cursor(12, "codex:motion-review", 9),
+        ];
+        let rows = project_handoffs(&facts, NOW, true);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].undelivered);
+    }
+
+    /// An unreadable cursor position is not evidence of any position.
+    #[test]
+    fn a_read_checkpoint_with_no_parseable_position_is_not_consumption() {
+        let mut malformed = act(11, FactKind::Read, "codex:motion-review");
+        malformed.summary = Some("read_seq:not-a-number".to_string());
+        let mut absent = act(12, FactKind::Read, "codex:motion-review");
+        absent.summary = None;
+        let facts = vec![
+            handoff(
+                10,
+                "fact_ignored",
+                "codex:sol-v6",
+                Some("codex:motion-review"),
+            ),
+            malformed,
+            absent,
+        ];
+        assert_eq!(project_handoffs(&facts, NOW, true).len(), 1);
+    }
+
+    /// A fallback copy is a second ADDRESS for a handoff already in the list,
+    /// not a second obligation. Its own row would double-count the total and
+    /// print "reached nobody" about the fact that WAS the extra reach.
+    #[test]
+    fn a_fallback_copy_does_not_get_its_own_row() {
+        let mut copy = handoff(11, "fact_copy", "codex:sol-v6", Some("codex"));
+        copy.evidence = vec![format!("{FALLBACK_OF_MARKER}fact_dead")];
+        let facts = vec![
+            handoff(10, "fact_dead", "codex:sol-v6", Some("codex:motion-review")),
+            copy,
+        ];
+        let rows = project_handoffs(&facts, NOW, false);
+        assert_eq!(rows.len(), 1, "one send must produce one row");
+        assert_eq!(rows[0].event_id, "fact_dead");
+        assert_eq!(rows[0].fallback_inbox.as_deref(), Some("codex"));
     }
 
     /// Presence proves a process touched the room, not that anyone read the
