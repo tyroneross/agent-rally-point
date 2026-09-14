@@ -1,27 +1,21 @@
 # Agent Rally Point
 
-**Rally Point solves multi-agent coordination in local repos. Every agent shares who it is, what it is working on, and its status on one shared ledger per repo, so agents using any coding harness can exchange durable coordination facts in that repo.**
+**Rally gives coding agents a shared record of who owns each task, what changed, and which handoffs were received.** Run agents from different LLMs in one project without relaying every status update yourself.
 
-Rally Point works across terminals and LLMs, so multiple Claude and Codex agents can work independently in one repo and coordinate access to the same file. Claims serialize conflicting writes; Rally does not make simultaneous edits to one file safe. The ledger and protocol work with any coding harness that can invoke the CLI, including local models, Cursor, Herdr, and Ghostty.
+The `rally` CLI stores coordination facts in a local, append-only ledger. Any harness that can run shell commands can use that protocol: Codex, Claude Code, Gemini, Cursor, RossLabs Agent Harness, or a custom agent. Automatic hooks and direct prompt delivery depend on the host and backend; CLI access alone does not prove either integration works.
 
 ## The problem
 
-Working with more than one coding agent means moving between them by hand. A shared memory store and handoff docs help, but the process stays manual and the work stays sequential: Claude works, then you hand off to Codex.
-
-Run them at the same time instead and they overwrite each other's uncommitted work, so you go back to taking turns.
+When several agents work on one project, they need to know who owns a file, where another agent stopped, and whether a requested review reached its recipient. Without a shared record, the operator has to reconstruct that state across conversations.
 
 ## How it works
 
-Every terminal session gets a unique ID and writes to the rally when it starts working, naming the file, the task, and its state. An agent that joins later sees what is already being worked on, and claims the files it will edit. An agent that wants a claimed file can ask the owner to release it, or message that agent directly.
+- **Identify the session.** Each agent joins with a distinct identity, reads the current lead and mission, and acknowledges the room's rules. Resolve roles from live state; the lead coordinates assignments and decisions, while each agent reports its own work.
+- **Claim before editing.** Rally refuses overlapping exclusive claims. Configured host hooks check file claims before edits and warn by default. Agents must honor refusals; Rally does not lock files against arbitrary writes or make simultaneous edits safe.
+- **Record the result.** Agents publish artifacts and verification evidence, then release their claims. Claims expire when their leases are not renewed; managed launches use separate worktrees by default.
+- **Verify the handoff.** A receiver-authored receipt proves acknowledgement of the referenced request. Completed work needs a separate result and verification evidence. A successful transport send proves neither.
 
-Each rally also has a lead, usually the first frontier agent to join. The lead resolves conflicts between the others.
-
-- **A claim covers more than a file.** It can name the dev database, a port, a branch, or a task.
-- **The check runs automatically before an edit.** It warns by default; three opt-in switches make it block instead.
-- **The ledger is append-only and repo-local.** A project can deliberately commit it, but Rally's own release repo keeps live coordination history local so fresh clones begin with an empty room.
-- **Agents that leave don't hold the repo hostage.** Claims decay on a lease, and leftover work is isolated in its own worktree.
-
-Agents also hand work to each other, and a handoff is complete only when the receiving agent writes its own acknowledgement.
+For example, assign one agent to implement a feature and another to review a separate part of the repo. Each reads the same claims and task results, even if the agents use different model providers.
 
 ### The turn loop
 
@@ -31,7 +25,7 @@ For exact command behavior, jump to the [command-level turn-loop reference](#tur
 
 Solid arrows write durable coordination facts; dashed arrows read the shared record. The host owns the edit and verification steps.
 
-## What people use it for
+## Tasks Rally can coordinate
 
 - Run Claude on the UI and Codex on the database at the same time, with more agents reviewing the work and fixing bugs behind them.
 - Dispatch a Claude agent from a Codex terminal, or the reverse.
@@ -57,6 +51,8 @@ only in the target repo, enable only a documented host integration, and verify w
 rally doctor --json, rally hooks status, and rally whoami using a unique tool ID.
 Report every file changed, every remaining manual step, and any failed validation.
 ```
+
+Installing the CLI does not enable host hooks or background services. Ask before installing or enabling an optional runtime; explain the feature it enables.
 
 The agent should read the [trust model](docs/security/TRUST-MODEL.md) and [host integration guide](docs/AUTO-COORDINATION-HOOKS.md) before enabling hooks. The CLI protocol works across LLMs; automatic edit interception works only where the host exposes and loads a supported hook interface.
 
@@ -115,7 +111,7 @@ RALLY_SOURCE="$(pwd)"
 
 The installer checks a SHA256 and a build-provenance attestation before it makes the
 downloaded file executable, and refuses rather than falling back to an unverified download.
-To build it yourself instead, run `cargo install --path crates/rally-cli` (needs Rust 1.89+).
+The release matrix targets macOS and Linux (GNU), each on ARM64 and x86_64. The verified download path requires `gh`; a failed checksum or attestation stops installation. To build the checked-out source instead, run `cargo install --path crates/rally-cli` (source requires Rust 1.89+; this checkout pins Rust 1.95.0).
 
 **2. Turn it on in the repo your agents share.**
 
@@ -124,8 +120,7 @@ cd your-repo
 rally init
 ```
 
-That creates `.rally/` and writes a pointer into your `CLAUDE.md` and `AGENTS.md`, so any
-agent that opens the repo knows how to join.
+That creates `.rally/` and writes instructions into `CLAUDE.md` and `AGENTS.md`. Agents that read those files can discover how to join; other harnesses need the [any-agent onboarding instructions](docs/ANY-AGENT-ONBOARDING.md).
 
 **3. Optionally wire a host for automatic hooks.**
 
@@ -165,6 +160,49 @@ Use a distinct `--tool` value for every concurrent session, such as `codex:parse
 
 </details>
 
+## Verify a first result
+
+After installing `rally`, run this in a **new disposable Git repository**. The two `pilot:` names simulate competing agents; this check needs no LLM or daemon. Each simulated agent keeps its own session ID so it can later release its claim.
+
+```bash
+mkdir rally-pilot
+cd rally-pilot
+git init
+rally init
+RALLY_PILOT_ID="pilot-$(date +%s)-$$"
+RALLY_SESSION_ID="$RALLY_PILOT_ID-writer" rally say claim --tool pilot:writer --path README.md --subject "Review README" --json
+# Expected refusal: this second identity requests the same file.
+RALLY_SESSION_ID="$RALLY_PILOT_ID-reviewer" rally say claim --tool pilot:reviewer --path README.md --subject "Competing review" --json
+RALLY_SESSION_ID="$RALLY_PILOT_ID-reviewer" rally check before-write --tool pilot:reviewer --path README.md --strict --json
+rally claims --json
+```
+
+The first claim succeeds and returns its `event_id`. The competing claim exits nonzero and reports a claim conflict. The strict check exits **4** and reports `data.check.allow: false`. `rally claims` shows the writer's active claim. No README edit occurs. To release it, run `RALLY_SESSION_ID="$RALLY_PILOT_ID-writer" rally say release --tool pilot:writer --ref <claim-event-id> --subject "Pilot complete" --json`, replacing the placeholder with the first claim's ID.
+
+This proves CLI claim enforcement. To verify an installed host integration, also run `rally doctor --json`, `rally hooks status`, and `rally whoami --tool <unique-session-id> --json` in the target repo. Resolve any ambiguous host identity before proceeding. Then exercise a competing edit through that host: advisory mode should surface a warning; strict mode should refuse it. Configuration files and a successful CLI check alone do not prove that the host loaded its hooks. See the [host integration guide](docs/AUTO-COORDINATION-HOOKS.md) for setup and limits.
+
+## Set up optional runtimes and test routes
+
+**Current source feature:** `rally setup` and `rally routes` are on `main`; the published v0.2.7 binary predates them. Build this checkout to use these commands until a newer release includes them.
+
+```bash
+rally setup --component tmux --json  # inspect the installation/check plan
+rally setup --component tmux --apply
+rally routes --json
+```
+
+When tmux is missing, interactive setup asks permission before running its installation plan. An agent should ask: **“Request permission to install tmux to enable background terminal agents.”** After approval, it can apply the exact returned plan ID. An existing supported tmux is reused. Enabling Rally's optional background coordinator also requires approval; setup does not install a login service. tmux sessions do not survive a reboot. There is no automatic ptyd installer in this release path.
+
+`rally routes` distinguishes `polling_only`, `blocked`, `testing_required`, and `ready`. A lead or another authorized sender can test an exact managed recipient:
+
+```bash
+rally routes --probe <exact-managed-actor> --tool <sender> --timeout-seconds 20 --json
+```
+
+A route becomes `ready` only after current endpoint checks and a matching receiver-authored proof of the live prompt challenge. Ordinary ledger polling, terminal echo and a successful send cannot provide that proof. Proof expires after five minutes and is invalidated by relevant session or role changes. A ready route proves a connection check; verify each task's receipt and result separately.
+
+The stock tmux adapter checks its bound target, copy mode, disabled input and synchronized panes. No customized tmux build ships here. Native Cursor and Antigravity GUI injection still needs host-specific end-to-end validation. See [setup, permissions, process lifetime and route proof](docs/SETUP-AND-ROUTING.md).
+
 ## Direct agent-to-agent communication
 
 Rally can launch and message managed coding-agent sessions across supported hosts:
@@ -172,7 +210,7 @@ Rally can launch and message managed coding-agent sessions across supported host
 - **`rally run`** launches Claude, Codex, OpenCode, or Gemini through a managed backend. It assigns a unique Rally identity and creates a dedicated linked worktree by default, so the session can be listed, captured, attached to, and stopped predictably.
 - **`--resource task:<work-context>`** makes Rally acquire exclusive ownership before `rally run` starts the harness. Host adapters for any other harness can use the same gate with `rally session ensure --resource task:<work-context>` before opening or resuming that context. A conflict fails at the Rally boundary instead of reaching the host's native "open in another app / Retry" state.
 - **`rally run codex --task "<prompt>"`** launches bounded Codex work through `codex exec`; Rally feeds the long-lived child over stdin, preserves the final response under `.rally/task-results/`, and automatically closes the session when the task completes. Result files are private local artifacts (mode `0600`) that persist until the operator archives or deletes them; Rally does not apply an automatic retention window. It removes a clean worktree or retains a dirty one with a recovery path. Plain `rally run codex` remains interactive and persistent. The invoking shell may retain the `--task` command in its history.
-- **`rally inject`** queues a prompt or recorded handoff for an existing managed session. It does not target arbitrary terminals. A successful inject means the message was enqueued; the receiving agent's own acknowledgement proves receipt.
+- **`rally inject`** queues a prompt or recorded handoff for an existing managed session. It does not target arbitrary terminals. A successful inject may only record queued work. Inspect `delivery_reason`, `reached_target` and `queued` to distinguish queuing from a transport send. A correlated acknowledgement from the receiving agent proves receipt; it does not prove task completion.
 
 Inspect the launch plan before starting the session:
 
@@ -280,7 +318,7 @@ The implementation lives in [`dynamic-workflows/`](dynamic-workflows/README.md).
 
 ## Security and host hooks
 
-This repo commits hook registrations for four hosts: `.claude/settings.json`, `.codex/hooks.json`, `.cursor/hooks.json`, and `hooks/hooks.json`. **Opening the repo in one of those hosts and trusting it loads those hooks.** That is the intended design and the reason coordination needs no setup step. It is also a trust decision, so here is what runs.
+This repo includes Claude Code, Codex and Cursor hook configurations, plus a plugin hook manifest. A compatible host must load the relevant configuration before automatic checks can run. Adopting repositories need the setup described above; `rally init` alone does not enable hooks. Trusting a host configuration permits its hook code to run.
 
 | Event | What the hook does |
 |-------|--------------------|
@@ -311,7 +349,7 @@ A claim scope is `type:identifier` with an optional access prefix. Eleven resour
 rally say claim --tool claude_code --subject "resetting dev db" --scope service:postgres-dev --json
 ```
 
-While that claim is live, another agent's overlapping claim is refused at write time — the append fails with exit 2:
+While that claim is live, another agent's overlapping claim is refused at write time — the command exits nonzero:
 
 ```text
 claim conflict: claude_code holds service:postgres-dev (claim fact_...), which overlaps the scope you requested
@@ -340,26 +378,21 @@ rally run claude --resource task:<work-context>   # admission before launch
 rally inject <session|name|tool> --handoff <event-id> --json
 ```
 
-### Five-minute two-agent pilot
+### Try two managed agents
 
-From an initialized target repository, inspect the launch plan first. `rally run` gives each managed agent a unique tool id and a dedicated linked worktree by default.
-
-```bash
-rally run claude --name ui-review --dry-run --json
-rally run codex  --name parser --task "Review the parser and report findings." --dry-run --json
-```
-
-Check `data.run.session.tool` and `worktree_path` in each response, then launch only the agents you intend to use:
+Use an initialized repo with an initial Git commit and the required harnesses installed and signed in. Inspect each launch with `--dry-run --json` first. Check the generated identity and worktree path, then run:
 
 ```bash
-rally run claude --name ui-review
-rally run codex  --name parser --task "Review the parser and report findings."
+rally run claude --name readme-review
+rally run codex --name test-review --task "Read CONTRIBUTING.md and the test configuration. Report the documented verification commands and any mismatch. Do not edit files."
 rally sessions --json
 ```
 
-Use `--shared` or `--no-worktree` only when you deliberately want a shared checkout. Agents still claim and check files before editing, and a receiver's own ACK—not a successful `rally inject` exit code—proves a handoff was received.
+Give the interactive Claude session this task: “Read README.md. Report up to three unclear installation steps with line references. Do not edit files.” Use equivalent repository documents if these files are absent.
 
-**`rally inject` returns `ok: true` when a message is enqueued, which is not the same as delivered.** Treat the target's own ACK as proof, not the inject's exit code.
+The sessions listing proves registration. Read both agents' final reports to verify the requested work; the bounded Codex task also records its final response under `.rally/task-results/`. To test a cross-agent handoff, resolve the recipient from live state and follow the [handoff receipt procedure](docs/HANDOFFS-AND-LAUNCHING-AGENTS.md). Do not treat launch success, terminal text or `inject` success as evidence that an agent accepted the task.
+
+Use `--shared` or `--no-worktree` only when you intend a shared checkout. Agents still claim and check files before editing.
 
 ## Where the record lives
 
@@ -370,12 +403,12 @@ Use `--shared` or `--no-worktree` only when you deliberately want a shared check
 
 ## Design tradeoffs
 
-Three decisions shape everything above, and each cost something. [`docs/DESIGN-TRADEOFFS.md`](docs/DESIGN-TRADEOFFS.md) records what was tried, what broke, and what was chosen:
+These choices set the coordination boundary. [`docs/DESIGN-TRADEOFFS.md`](docs/DESIGN-TRADEOFFS.md) records what was tried, what broke, and what was chosen:
 
-- **Hooks beat a hookless CLI.** Instructing agents to run the commands produced inconsistent compliance that failed silently, because a missed check looks identical to a repo where nobody else is working. Hooks made compliance near-universal and made the repo more intrusive.
+- **Hooks reduce reliance on agents remembering each check.** A configured host calls Rally at defined events. That adds executable code to the host; it does not establish a measured compliance rate across all agents.
 - **Agents self-manage; a manager agent was rejected.** A manager would turn the substrate into a scheduler and a single point of failure. Rally fixed the observability that made silence ambiguous instead — mandated check-ins, worktree isolation for no-shows, lease expiry on claims.
 - **Rally gates ownership but does not choose the next harness.** An explicit `--resource` request is an atomic admission check. The host still decides what to launch, whether to wait, and where to redirect after Rally grants ownership.
-- **Push where available, pull as the floor.** Direct pane delivery arrives now and lets two agents argue a design question in real time. The ledger is what the protocol guarantees.
+- **Use live delivery where tested, and polling where it is unavailable.** The ledger retains the handoff; a route check establishes whether a managed recipient can receive a live prompt.
 
 ## Security and maturity
 
@@ -385,12 +418,13 @@ If a second contributor can land commits in your repo, read the trust model firs
 
 The [trust model](docs/security/TRUST-MODEL.md) documents the concrete boundary: Rally coordinates trusted local processes and does not turn same-UID agents into mutually isolated principals. Security-sensitive behavior is covered by executable tests in the repository so contributors can inspect and extend the controls.
 
-**Maturity, stated plainly:** Rally runs daily on a small number of fresh macOS installs driven by one operator. It is not proven on Linux beyond CI, on hosts other than the four wired here, or with more than one human. Expect edge cases outside that envelope.
+**Maturity, stated plainly:** Rally runs daily on a small number of fresh macOS installs driven by one operator. It is not proven on Linux beyond CI, across every harness or editor GUI, or with more than one human. Expect edge cases outside that envelope.
 
 ## Start here
 
 - [`RALLY.md`](RALLY.md) — the 60-second operating guide. Read this first.
 - [`docs/RALLY_ARCHITECTURE.md`](docs/RALLY_ARCHITECTURE.md) — per-repo segmentation contract and product boundary.
+- [`docs/SETUP-AND-ROUTING.md`](docs/SETUP-AND-ROUTING.md) — runtime permission, process lifetime and connection checks.
 - [`docs/COMMAND-SEMANTICS.md`](docs/COMMAND-SEMANTICS.md) — read/write behavior per command.
 - [`docs/AUTO-COORDINATION-HOOKS.md`](docs/AUTO-COORDINATION-HOOKS.md) — how the host hook wiring works.
 - [`dynamic-workflows/PROTOCOL.md`](dynamic-workflows/PROTOCOL.md) — the workstream descriptor for fanning several agents out on one objective.
@@ -405,6 +439,8 @@ python3 scripts/generate_host_surfaces.py --check
 python3 scripts/sync_host_integrations.py --json          # read-only diagnosis
 python3 scripts/sync_host_integrations.py --apply --json  # reconcile installed hosts
 ```
+
+The reconciler manages installed plugin providers; it does not maintain hook scripts manually copied into adopting repositories. Review and merge those project-local copies when upgrading, preserve unrelated settings, and repeat the host activation check.
 
 The reconciler requires exactly one enabled provider per host. It removes stale duplicates, updates from the canonical marketplace, and reports when Claude Code or Codex must restart to load new content. It changes nothing without `--apply`.
 
