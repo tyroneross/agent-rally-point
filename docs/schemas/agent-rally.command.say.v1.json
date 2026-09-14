@@ -3,28 +3,96 @@
   "$id": "urn:agent-rally:command:say:v1",
   "title": "Rally Say Command",
   "type": "object",
-  "required": ["ok", "product", "command", "schema", "data"],
+  "required": [
+    "ok",
+    "product",
+    "command",
+    "schema",
+    "data"
+  ],
   "properties": {
-    "ok": { "const": true },
-    "product": { "const": "rally" },
-    "command": { "const": "say" },
-    "schema": { "const": "agent-rally.command.say.v1" },
+    "ok": {
+      "const": true
+    },
+    "product": {
+      "const": "rally"
+    },
+    "command": {
+      "const": "say"
+    },
+    "schema": {
+      "const": "agent-rally.command.say.v1"
+    },
     "data": {
       "type": "object",
-      "required": ["say", "room", "verified"],
+      "required": [
+        "say",
+        "room",
+        "verified"
+      ],
       "properties": {
         "say": {
           "type": "object",
-          "required": ["fact"],
+          "required": [
+            "fact"
+          ],
           "properties": {
             "fact": {
               "type": "object",
-              "required": ["schema", "event_id", "thread_id", "created_at", "tool", "kind", "subject", "scope", "evidence"]
+              "required": [
+                "schema",
+                "event_id",
+                "thread_id",
+                "created_at",
+                "tool",
+                "kind",
+                "subject",
+                "scope",
+                "evidence"
+              ]
             }
           }
         },
-        "room": { "type": "object" },
-        "verified": { "type": "object" }
+        "room": {
+          "type": "object"
+        },
+        "verified": {
+          "type": "object"
+        },
+        "delivery": {
+          "type": "object",
+          "description": "Where a targeted handoff actually went. Present only on `say handoff` with a real (non-broadcast) target; absent on every other fact kind, so a reader can tell 'delivery did not apply' from 'delivery failed'. `fallback_inbox` names the inbox that RECEIVED a copy, not the one that was planned.",
+          "required": [
+            "target_live",
+            "reason"
+          ],
+          "properties": {
+            "target_live": {
+              "type": "boolean",
+              "description": "Target's presence is inside its liveness window. Rally delivery is pull-only, so a false here means the target will not see the handoff until it returns."
+            },
+            "last_seen": {
+              "type": "string",
+              "description": "RFC3339 stamp of the target's last activity; omitted when it has never been seen in this room."
+            },
+            "last_seen_age_secs": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "fallback_inbox": {
+              "type": "string",
+              "description": "Base-tool inbox that also received a copy (`codex` for `codex:*`). Omitted when no copy was sent or the copy failed to write."
+            },
+            "reason": {
+              "enum": [
+                "target_live",
+                "policy_forbids_fallback",
+                "no_base_inbox",
+                "fallback_delivered"
+              ]
+            }
+          }
+        }
       }
     }
   }

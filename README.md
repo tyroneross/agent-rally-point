@@ -182,7 +182,9 @@ rally run codex --name parser --task "Review the parser and report findings." --
 # Use plain run + inject only when the session must remain open for later steering.
 ```
 
-Longer handoffs should remain durable in the Rally ledger or a committed handoff document; injection is the focused delivery path. See [Handoffs and Launching Agents](docs/HANDOFFS-AND-LAUNCHING-AGENTS.md) for backend and acknowledgement details.
+Longer handoffs should remain durable in the Rally ledger or a committed handoff document; injection is the focused delivery path.
+
+Ledger delivery is **pull-only** — a handoff arrives when the target runs `rally next` or `rally inbox`. A session that has exited never pulls, so `rally say handoff --to <tool>` checks the target's presence first: if it is not live, the handoff still commits to that target, a copy also goes to the base-tool inbox a fresh session polls (`codex` for `codex:*`), a `wake` fact records the attempt, and the command says so on screen and in `data.delivery`. Use `--target-policy exact` to forbid the copy. Audit later with `rally handoffs --undelivered`, which scans the whole ledger rather than the lease-ranked room projection. See [Handoffs and Launching Agents](docs/HANDOFFS-AND-LAUNCHING-AGENTS.md) for backend and acknowledgement details.
 
 ## Optional tools
 

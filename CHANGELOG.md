@@ -7,6 +7,54 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Fixed — a handoff to a session that has gone silent no longer vanishes
+
+Rally delivery is pull-only: a handoff arrives when the target runs `rally next`
+or `rally inbox`. A session that has already exited never pulls, so a handoff
+addressed to it sat in that inbox forever with nobody told. Measured on one
+15,139-event room, **8 of 27 targeted handoffs were never picked up** — one of
+them unread for over an hour before a human noticed and re-posted it by hand.
+
+`rally say handoff --to <tool>` now checks the target's presence against its
+liveness window before returning. When the target is not live it still commits
+the handoff to that exact target, ALSO copies it to the base-tool inbox a fresh
+session polls (`codex` for `codex:*`, `claude_code` for `claude_code:*`), records
+a `wake` fact against the target, and prints a warning naming the last-seen time
+and where the copy went. `--json` carries `data.delivery {target_live, last_seen,
+last_seen_age_secs, fallback_inbox, reason}`; `fallback_inbox` reports the inbox
+that RECEIVED a copy, never one that was merely planned. `--target-policy exact`
+— now accepted without `--ref` — forbids the copy and still warns, as does any
+`--ref`-bound reply, which protocol binds to one receiver.
+
+A prior `stale-target` advisory already warned on exactly this send and was not
+enough: it was the only effect, it named no other inbox, and nothing said so
+afterwards. Targeted handoffs now carry the stronger `handoff-target-not-live`
+code; every other targeted kind keeps `stale-target` unchanged.
+
+The delivery wake shares its identity with the one `rally next` mints for the
+same handoff, so a returning target sees one wake rather than two.
+
+### Added — `rally handoffs [--undelivered]`
+
+Lists every non-retracted targeted handoff with its age, its target's last-seen
+time, whether a fallback copy exists, and whether anyone ever read it. It scans
+the whole ledger rather than `room.open_handoffs`, because that projection ranks
+by lease freshness: on the measured room it was EMPTY while eight handoffs sat
+unconsumed, and on a smaller fixture it lists handoffs the target already
+answered. Lease expiry describes a claim's grip on a file; it says nothing about
+whether a message was read.
+
+Presence deliberately does not count as consumption — `ensure_presence` writes it
+on every rally call and the coordination hook writes it on the agent's behalf, so
+it proves a process touched the room, not that anyone opened the inbox. Only
+`read`, `resolve`, `receipt`, `decision`, `handoff`, and `artifact` by the target
+after the handoff's sequence, or an explicit non-system reply citing it, discharge
+one.
+
+Configure the send-time window with `coordination.handoff_liveness_window_secs`
+or `RALLY_HANDOFF_LIVENESS_WINDOW_SECS`; unset keeps the adaptive per-session
+window the squad projection already computes.
+
 ### Fixed — bounded Codex workers release the synced-task writer lease
 
 `rally run codex --task "<prompt>"` now launches the prompt through `codex exec`

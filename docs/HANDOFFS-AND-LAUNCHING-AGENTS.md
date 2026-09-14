@@ -162,6 +162,58 @@ Default communication order:
 2. Use `rally inject` to deliver the first instruction or urgent steering into a `rally run`-managed session.
 3. Use a committed handoff doc only when the payload is too long or durable enough to review outside the ledger.
 
+### The delivery rule
+
+**Rally delivery is pull-only.** A handoff is delivered when the target runs
+`rally next` or `rally inbox` and finds it. Nothing pushes. A session that has
+already exited never pulls, so a handoff addressed to it would once sit in its
+inbox forever with nobody told — measured on one room, **8 of 27 targeted
+handoffs were never picked up.**
+
+So `rally say handoff --to <tool>` now checks the target's presence against its
+liveness window before it returns. When the target is not live, all four of
+these happen and none of them is optional:
+
+- The handoff still commits to the target you asked for, unchanged. A returning
+  session finds its own mail.
+- A **copy also goes to the base-tool inbox** — `codex` for any `codex:*`
+  target, `claude_code` for any `claude_code:*` — which is the inbox a FRESH
+  session of that host polls on start. Acking either one is enough.
+- A `wake` fact records the attempt against the target, so `rally next --tool
+  <target>` surfaces it whenever that identity comes back.
+- The command prints a warning naming the target's last-seen time and where the
+  copy went. `--json` carries the same as
+  `data.delivery {target_live, last_seen, last_seen_age_secs, fallback_inbox, reason}`.
+  `fallback_inbox` names the inbox that RECEIVED a copy, not the one that was
+  planned — if the copy failed to write, the field is absent and a second
+  warning says so.
+
+Two cases send no copy, and both say so rather than going quiet:
+`--target-policy exact` (and any `--ref`-bound reply, which protocol binds to
+one receiver) refuses the fan-out; a target that is already a base inbox has
+nowhere broader to go.
+
+The window defaults to the same adaptive per-session window `rally room`
+publishes, so a send and a room read never disagree about who is alive. Pin a
+flat one across every peer with `coordination.handoff_liveness_window_secs` or
+`RALLY_HANDOFF_LIVENESS_WINDOW_SECS`.
+
+**Audit it later.** `rally handoffs --undelivered` lists every non-retracted
+targeted handoff whose target never read, acked, or resolved it, with its age,
+the target's last-seen time, and any fallback copy. It scans the whole ledger
+rather than `room.open_handoffs`, because that projection ranks by lease
+freshness: it drops an unanswered handoff exactly when it has been pending
+longest, and still lists ones the target already answered.
+
+```bash
+rally handoffs --undelivered --json     # the audit
+rally handoffs                          # full census: delivered and not
+```
+
+A copy in a second inbox is one more chance to be read. It is not proof anyone
+read it — only a target-authored ACK is that, and `--undelivered` keeps saying
+so until one arrives.
+
 ### Ownership transfer before launch
 
 Handoff delivery and launch admission are separate gates:

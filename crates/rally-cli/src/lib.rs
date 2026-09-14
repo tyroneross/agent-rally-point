@@ -131,6 +131,7 @@ mod discovery;
 mod doctor;
 mod error;
 mod event_envelope;
+mod handoffs;
 mod hook_runtime;
 mod hooks_config;
 mod init;
@@ -208,6 +209,7 @@ const SCHEMA_RISKS: &str = "agent-rally.command.risks.v1";
 const SCHEMA_DECISIONS: &str = "agent-rally.command.decisions.v1";
 const SCHEMA_ARTIFACTS: &str = "agent-rally.command.artifacts.v1";
 const SCHEMA_CLAIMS: &str = "agent-rally.command.claims.v1";
+const SCHEMA_HANDOFFS: &str = "agent-rally.command.handoffs.v1";
 const SCHEMA_ROUTE_FINDINGS: &str = "agent-rally.command.route-findings.v1";
 // B13
 const SCHEMA_CHECK_CI: &str = "agent-rally.command.check-ci.v1";
@@ -1637,6 +1639,7 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
         CliCommand::Decisions(args) => command_kind_read(args, KindRead::Decisions),
         CliCommand::Artifacts(args) => command_kind_read(args, KindRead::Artifacts),
         CliCommand::Claims(args) => command_kind_read(args, KindRead::Claims),
+        CliCommand::Handoffs(args) => command_handoffs(args),
         CliCommand::RouteFindings(args) => command_route_findings(args),
         // B13
         CliCommand::CheckCi(args) => command_check_ci(args),
@@ -3363,14 +3366,27 @@ fn command_say(args: SayArgs) -> Result<Output> {
             ));
         }
         evidence.push(format!("protocol:idempotency_key={retry_key}"));
-    } else if target_policy.is_some()
+    } else if target_policy
+        .as_deref()
+        .is_some_and(|p| p != TARGET_POLICY_EXACT)
         || requested_handoff_state.is_some()
         || requested_idempotency_key.is_some()
     {
+        // `exact` is exempt on purpose: `ref-author`/`third-party` answer "who
+        // may reply to the referenced fact", which is meaningless without a
+        // ref. `exact` answers "may this send fan out", which is meaningful on
+        // any handoff — and is the ONLY way to forbid the fallback copy.
         return Err(RallyError::Usage(
-            "handoff_target_policy_requires_ref: --target-policy, --handoff-state, and --idempotency-key require `say handoff --ref <event-id>`".to_string(),
+            "handoff_target_policy_requires_ref: --target-policy ref-author|third-party, --handoff-state, and --idempotency-key require `say handoff --ref <event-id>`. `--target-policy exact` is accepted without --ref and suppresses the base-inbox fallback copy.".to_string(),
         ));
     }
+
+    // Fan-out verdict, decided once. A `--ref`-bound handoff is bound by
+    // protocol to exactly one receiver ("that exact receiver must reply"), so
+    // copying it to a shared base inbox would invite the very third-party reply
+    // `handoff_third_party_reply_forbidden` rejects.
+    let fallback_forbidden = target_policy.as_deref() == Some(TARGET_POLICY_EXACT)
+        || (kind == FactKind::Handoff && ref_id.is_some());
 
     // Register presence only after all fail-closed handoff validation. A
     // rejected target must not create any durable side effect.
@@ -3609,13 +3625,54 @@ fn command_say(args: SayArgs) -> Result<Output> {
             RoomSnapshot::default()
         }
     };
-    // Stale-target advisory. The fact is already committed — this ranks and
-    // warns, it never gates: a stale peer may be exactly who the sender means
-    // (a returning session, a scheduled agent). It names the freshest peers so
-    // the sender can re-target with one command if it did not mean the ghost.
-    if let Some(warning) = stale_target_warning(&snapshot, &args.tool, fact.target.as_deref()) {
-        say_warnings.push(warning);
-    }
+    // Handoff delivery. A targeted handoff is the one fact kind whose whole
+    // purpose is to reach somebody, so it gets the delivery treatment rather
+    // than the bare stale-target advisory: liveness check, fallback copy to the
+    // base inbox, wake fact, and a warning that names both. Every other
+    // targeted kind keeps the advisory unchanged.
+    let delivery = if fact.kind == FactKind::Handoff
+        && let Some(target) = fact.target.clone()
+        && target != "all"
+    {
+        let plan = handoffs::delivery_plan(
+            &snapshot,
+            &target,
+            hooks_config::resolve_coordination(room.repo_root())
+                .unwrap_or_default()
+                .handoff_liveness_window_secs,
+            fallback_forbidden,
+        );
+        let fallback_inbox = if plan.target_live {
+            None
+        } else {
+            deliver_handoff_fallback(
+                &room,
+                &args.tool,
+                &fact,
+                &target,
+                &plan,
+                &snapshot,
+                &mut say_warnings,
+            )
+        };
+        Some(SayDelivery {
+            target_live: plan.target_live,
+            last_seen: plan.last_seen.clone(),
+            last_seen_age_secs: plan.last_seen_age_secs,
+            // What LANDED, not what was planned.
+            fallback_inbox,
+            reason: plan.reason.as_str().to_string(),
+        })
+    } else {
+        // Stale-target advisory. The fact is already committed — this ranks and
+        // warns, it never gates: a stale peer may be exactly who the sender means
+        // (a returning session, a scheduled agent). It names the freshest peers so
+        // the sender can re-target with one command if it did not mean the ghost.
+        if let Some(warning) = stale_target_warning(&snapshot, &args.tool, fact.target.as_deref()) {
+            say_warnings.push(warning);
+        }
+        None
+    };
     // R9-readback: capture verified {room, seq} from the confirmed fact.
     let verified = SayVerified {
         room: room.room_id().to_string(),
@@ -3633,6 +3690,7 @@ fn command_say(args: SayArgs) -> Result<Output> {
             },
             room: RoomSummary::from(&snapshot),
             warnings: say_warnings,
+            delivery,
             verified,
         },
     )?;
@@ -4267,6 +4325,9 @@ fn command_release_by_path(
             },
             room: RoomSummary::from(&snapshot_after),
             warnings,
+            // `command_release_by_path` never posts a handoff, so there is no
+            // delivery decision to report.
+            delivery: None,
             verified,
         },
     )?;
@@ -19258,6 +19319,187 @@ struct AckPayload {
     fact: Fact,
 }
 
+/// The `rally next` action for an unanswered targeted handoff. Shared by
+/// `append_next_wake_intent` and the send-time delivery wake so both mint ONE
+/// wake identity per handoff rather than two spellings of the same fact.
+pub(crate) const NEXT_ACTION_RESPOND_TO_HANDOFF: &str = "respond_to_handoff";
+
+/// `--target-policy exact` — deliver to precisely this target and fan out to
+/// nothing. The only `--target-policy` value accepted WITHOUT `--ref`, because
+/// it is the one that says something about delivery rather than about which
+/// author may reply to a referenced fact.
+pub(crate) const TARGET_POLICY_EXACT: &str = "exact";
+
+/// Advisory code on `rally say handoff --to <peer>` when that peer is past its
+/// liveness window. The handoff still commits to the requested target; this
+/// names where the extra copy went so the sender does not have to guess.
+const SAY_WARNING_HANDOFF_NOT_LIVE: &str = "handoff-target-not-live";
+
+/// Commit the fallback copy and the wake fact for a handoff whose target is not
+/// live, and push the advisory that names both.
+///
+/// Returns the inbox that ACTUALLY received a copy — `None` when none was
+/// attempted or when the append failed. The caller reports that return value,
+/// never the plan: a `delivery.fallback_inbox` naming an inbox that does not
+/// hold the handoff is the same silent-loss defect this module exists to close,
+/// one layer up.
+///
+/// Secondary writes, deliberately non-fatal: the sender's handoff is already
+/// durable, and failing the whole command because a best-effort copy could not
+/// be appended would trade a delivered handoff for an error. Each failure is
+/// reported as its own warning rather than swallowed.
+#[allow(clippy::too_many_arguments)]
+fn deliver_handoff_fallback(
+    room: &RoomStore,
+    sender: &str,
+    original: &Fact,
+    target: &str,
+    plan: &handoffs::DeliveryPlan,
+    snapshot: &RoomSnapshot,
+    say_warnings: &mut Vec<SayWarning>,
+) -> Option<String> {
+    let mut delivered_to: Option<String> = None;
+    let seen = match (&plan.last_seen, plan.last_seen_age_secs) {
+        (Some(ts), Some(age)) => format!("last seen {} ago ({ts})", format_age_short(age)),
+        (Some(ts), None) => format!("last seen {ts}"),
+        (None, _) => "NEVER seen in this room".to_string(),
+    };
+
+    if let Some(base) = plan.fallback_inbox.as_deref() {
+        let mut copy = original.clone();
+        copy.event_id = new_id("fact");
+        copy.seq = 0;
+        copy.created_at = now_string();
+        copy.target = Some(base.to_string());
+        // NOT `ref_id`. A handoff carrying `ref` is a protocol REPLY, and the
+        // store then demands the full `protocol:*` marker set and a live
+        // managed target (`handoff_protocol_marker_missing`, measured on the
+        // first real run of this path). This copy is a duplicate delivery of an
+        // original request, so the link travels as an evidence marker instead.
+        copy.subject = format!("[fallback from {target}] {}", original.subject);
+        // Markers, not a schema bump: `rally handoffs` reads `fallback_of` to
+        // pair the copy with its original, and an older binary replays both
+        // strings untouched.
+        copy.evidence.push(format!(
+            "{}{}",
+            handoffs::FALLBACK_OF_MARKER,
+            original.event_id
+        ));
+        copy.evidence.push(format!(
+            "{}{}",
+            handoffs::FALLBACK_REASON_MARKER,
+            plan.reason.as_str()
+        ));
+        match room.append_fact(&copy) {
+            Ok(outcome) => {
+                outcome.into_fact_reporting();
+                delivered_to = Some(base.to_string());
+            }
+            Err(error) => say_warnings.push(SayWarning {
+                code: "handoff-fallback-write-failed".to_string(),
+                message: format!(
+                    "target {target} is not live ({seen}) and the fallback copy to inbox {base} \
+                     could NOT be written: {error}. The original handoff is committed; nothing \
+                     else has it. Deliver it by hand or re-target a live peer."
+                ),
+            }),
+        }
+    }
+
+    // The target's own wake queue records the attempt even though no transport
+    // exists — `rally next --tool <target>` is where a RETURNING session finds
+    // it. QueuedAwaitingPoll is the honest disposition: nothing was pushed.
+    //
+    // The subject and ref deliberately MATCH what `append_next_wake_intent`
+    // mints for the same handoff. Both facts say "this target has work"; minting
+    // a second spelling would stack two pending wakes per handoff and break the
+    // D6 coalescing invariant (`routed_next_coalesces_wake_intents`). Sharing
+    // the identity means the send pre-mints the wake, and the target's own later
+    // `next` dedupes onto it instead of adding another.
+    let wake_subject = format!("wake intent for {target}: {NEXT_ACTION_RESPOND_TO_HANDOFF}");
+    let already_pending = snapshot.pending_wakes.iter().any(|wake| {
+        wake.target.as_deref() == Some(target)
+            && wake.subject == wake_subject
+            && wake.ref_id.as_deref() == Some(original.event_id.as_str())
+    });
+    if !already_pending {
+        let wake = wake_fact(
+            &SystemActor::for_tool(sender),
+            target,
+            &wake_subject,
+            Vec::new(),
+            Some(format!(
+                "handoff {} from {sender} is waiting and {target} is not live ({seen})",
+                original.event_id
+            )),
+            vec!["rally next --tool <tool> --json".to_string()],
+            Some(original.event_id.clone()),
+            WakeDelivery {
+                status: Some("pending".to_string()),
+                disposition: backends::DeliveryDisposition::QueuedAwaitingPoll,
+            },
+        );
+        if let Err(error) = room.append_fact(&wake) {
+            say_warnings.push(SayWarning {
+                code: "handoff-wake-write-failed".to_string(),
+                message: format!("could not record a wake intent for {target}: {error}"),
+            });
+        }
+    }
+
+    let alternatives: Vec<String> = snapshot
+        .ranked_peers(Some(sender))
+        .into_iter()
+        .filter(|sq| sq.freshness == store::FRESHNESS_FRESH)
+        .take(STALE_TARGET_ALTERNATIVES)
+        .map(|sq| {
+            format!(
+                "{} (seen {} ago)",
+                sq.tool,
+                sq.age_secs
+                    .map(format_age_short)
+                    .unwrap_or_else(|| "?".to_string())
+            )
+        })
+        .collect();
+    let alt_text = if alternatives.is_empty() {
+        "no fresh peer is visible right now".to_string()
+    } else {
+        format!("fresher peers: {}", alternatives.join(", "))
+    };
+    // Reads `delivered_to` (what landed), never `plan.fallback_inbox` (what was
+    // intended). The write above can fail.
+    let routing = match (&delivered_to, plan.reason) {
+        (Some(base), _) => format!(
+            "A copy was ALSO delivered to inbox {base}, which a fresh {base} session polls on \
+             start. Ack either one."
+        ),
+        (None, handoffs::FallbackReason::PolicyForbids) => {
+            "No fallback copy was sent: --target-policy exact (or a --ref-bound reply) binds this \
+             handoff to one receiver."
+                .to_string()
+        }
+        (None, handoffs::FallbackReason::NoBaseInbox) => format!(
+            "{target} IS a base inbox, so there is no broader one to copy to. NOBODY else has \
+             this handoff."
+        ),
+        // The fallback was intended and did not land; the preceding
+        // `handoff-fallback-write-failed` warning carries the cause.
+        (None, _) => "NO fallback copy landed — see handoff-fallback-write-failed above. NOBODY \
+             else has this handoff."
+            .to_string(),
+    };
+    say_warnings.push(SayWarning {
+        code: SAY_WARNING_HANDOFF_NOT_LIVE.to_string(),
+        message: format!(
+            "handoff target {target} is not live — {seen}. Rally delivery is PULL-only, so a \
+             session that has exited will never see this. {routing} {alt_text}. Audit later with \
+             `rally handoffs --undelivered`."
+        ),
+    });
+    delivered_to
+}
+
 /// Advisory code on `rally say --target <peer>` when that peer's presence is
 /// past its adaptive window. The say still commits and still targets the peer.
 const SAY_WARNING_STALE_TARGET: &str = "stale-target";
@@ -19464,6 +19706,26 @@ struct SayPayload {
     projection_warnings: Vec<store::ProjectionWarning>,
 }
 
+/// Where a targeted handoff actually went. Present only on `say handoff` with
+/// a real target — absent on broadcasts and on every other fact kind, so a
+/// reader can distinguish "delivery did not apply" from "delivery failed".
+#[derive(JsonSchema, Serialize)]
+struct SayDelivery {
+    /// Target's presence is inside its liveness window.
+    target_live: bool,
+    /// Target's last presence stamp; `None` when it has never been seen here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_seen: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_seen_age_secs: Option<i64>,
+    /// Base inbox that also received a copy; `None` when no copy was sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback_inbox: Option<String>,
+    /// `target_live` | `policy_forbids_fallback` | `no_base_inbox` |
+    /// `fallback_delivered`.
+    reason: String,
+}
+
 /// Envelope for `say`: primary result at `data.say`, shared fields as siblings.
 #[derive(JsonSchema, Serialize)]
 struct SayData {
@@ -19473,6 +19735,9 @@ struct SayData {
     /// Non-blocking advisories (omitted from JSON when empty).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<SayWarning>,
+    /// Where a targeted handoff went. Absent on every other kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivery: Option<SayDelivery>,
     /// R9-readback: verified room id (engagement label) and sequence number.
     verified: SayVerified,
 }
@@ -20233,6 +20498,115 @@ fn command_kind_read(args: KindReadArgs, kind: KindRead) -> Result<Output> {
     Ok(Output::new(args.json, text, body))
 }
 
+/// Envelope for `handoffs`: result under `data.handoffs`.
+#[derive(JsonSchema, Serialize)]
+struct HandoffsData {
+    handoffs: HandoffsPayload,
+}
+
+#[derive(JsonSchema, Serialize)]
+struct HandoffsPayload {
+    /// Rows returned after `--undelivered` filtering and `--limit` truncation.
+    count: usize,
+    /// Undelivered handoffs in the WHOLE ledger, before `--limit`. A reader
+    /// must be able to tell "3 rows because there are 3" from "3 rows because
+    /// you asked for 3".
+    undelivered_total: usize,
+    /// Every non-retracted targeted handoff, whatever its delivery state.
+    targeted_total: usize,
+    undelivered_only: bool,
+    rows: Vec<handoffs::HandoffRow>,
+}
+
+/// `rally handoffs [--undelivered]` — the after-the-fact half of handoff
+/// delivery.
+///
+/// Read-only. Scans `room.facts()` rather than a snapshot projection: see
+/// `handoffs::project_handoffs` for why lease freshness is the wrong lens for
+/// "did anyone read this".
+fn command_handoffs(args: HandoffsArgs) -> Result<Output> {
+    let room = RoomStore::open()?;
+    let facts = room.facts()?;
+    let now = now_string();
+    let all = handoffs::project_handoffs(&facts, &now, false);
+    let targeted_total = all.len();
+    let undelivered_total = all.iter().filter(|row| row.undelivered).count();
+    let mut rows: Vec<handoffs::HandoffRow> = if args.undelivered {
+        all.into_iter().filter(|row| row.undelivered).collect()
+    } else {
+        all
+    };
+    rows.truncate(args.limit);
+
+    let text = render_handoffs_text(&rows, undelivered_total, targeted_total, args.undelivered);
+    let body = envelope(
+        "handoffs",
+        SCHEMA_HANDOFFS,
+        HandoffsData {
+            handoffs: HandoffsPayload {
+                count: rows.len(),
+                undelivered_total,
+                targeted_total,
+                undelivered_only: args.undelivered,
+                rows,
+            },
+        },
+    )?;
+    Ok(Output::new(args.json, text, body))
+}
+
+/// Human rendering. Each row names the target's last-seen time and where a
+/// fallback copy went, because those are the two facts that decide what the
+/// reader does next: re-target, or go wake the session.
+fn render_handoffs_text(
+    rows: &[handoffs::HandoffRow],
+    undelivered_total: usize,
+    targeted_total: usize,
+    undelivered_only: bool,
+) -> String {
+    let mut out = if undelivered_only {
+        format!("handoffs undelivered={undelivered_total} of {targeted_total} targeted")
+    } else {
+        format!("handoffs {targeted_total} targeted ({undelivered_total} undelivered)")
+    };
+    if rows.is_empty() {
+        out.push_str("\n  none");
+        return out;
+    }
+    for row in rows {
+        let age = row
+            .age_secs
+            .map(format_age_short)
+            .unwrap_or_else(|| "?".to_string());
+        let seen = match (&row.target_last_seen, row.target_last_seen_age_secs) {
+            (Some(ts), Some(age)) => format!("last seen {} ago ({ts})", format_age_short(age)),
+            (Some(ts), None) => format!("last seen {ts}"),
+            (None, _) if row.target_ever_seen => "never posted presence".to_string(),
+            (None, _) => "NEVER appeared in this room".to_string(),
+        };
+        let state = if row.undelivered {
+            "UNDELIVERED"
+        } else {
+            "delivered"
+        };
+        out.push_str(&format!(
+            "\n  {} [{state}] age={age} from={} -> {}\n    {}\n    target {seen}",
+            row.event_id,
+            row.from.as_deref().unwrap_or("unknown"),
+            row.target,
+            row.subject,
+        ));
+        match &row.fallback_inbox {
+            Some(inbox) => out.push_str(&format!("\n    fallback copy in inbox {inbox}")),
+            None if row.undelivered => {
+                out.push_str("\n    no fallback copy — this handoff reached nobody")
+            }
+            None => {}
+        }
+    }
+    out
+}
+
 /// Envelope for `route-findings`: result under `data["route-findings"]`.
 #[derive(JsonSchema, Serialize)]
 struct RouteFindingsData {
@@ -20891,6 +21265,9 @@ fn help_text() -> String {
         "  rally risks [--json]       # active coordination risks",
         "  rally decisions [--json]   # current decisions",
         "  rally artifacts [--json]   # recent artifacts",
+        "",
+        "  rally handoffs [--undelivered] [--limit N] [--json]  # targeted handoffs and whether each reached its target;",
+        "    --undelivered lists the ones whose target never read, acked, or resolved them, regardless of lease expiry",
         "",
         "  rally lead show|handoff|assign|relinquish [--json]  # lead title; the seat gates room-wide claims, the room freeze, and its own transfer",
         "  rally doctor [--canonical-paths] [--prune-rooms] [--reap-stale] [--sweep-corrupt] [--apply] [--json]",

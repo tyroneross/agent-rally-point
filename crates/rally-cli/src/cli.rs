@@ -46,6 +46,7 @@ pub(crate) enum CliCommand {
     Decisions(KindReadArgs),
     Artifacts(KindReadArgs),
     Claims(KindReadArgs),
+    Handoffs(HandoffsArgs),
     RouteFindings(RouteFindingsArgs),
     /// B13: CI gate — read-only health check of the room state.
     CheckCi(CheckCiArgs),
@@ -886,6 +887,20 @@ pub(crate) struct KindReadArgs {
     pub(crate) json: bool,
 }
 
+/// `rally handoffs` — targeted-handoff delivery projection.
+///
+/// Deliberately NOT a `KindReadArgs` sibling. The other per-kind reads project
+/// `RoomSnapshot`, which ranks by lease freshness; this one must scan the whole
+/// ledger, because a handoff nobody answered expires out of the snapshot
+/// exactly when it has been pending longest.
+#[derive(Clone, Debug)]
+pub(crate) struct HandoffsArgs {
+    pub(crate) json: bool,
+    /// Show only handoffs with no consumption signal after their sequence.
+    pub(crate) undelivered: bool,
+    pub(crate) limit: usize,
+}
+
 /// Rank-11: `rally mission` args.
 ///
 /// Three modes (mutually exclusive by flag presence):
@@ -984,6 +999,8 @@ pub(crate) const COMMANDS: &[&str] = &[
     "decisions",
     "artifacts",
     "claims",
+    // Targeted-handoff delivery projection (read-only, whole-ledger)
+    "handoffs",
     "route-findings",
     // B13: CI gate
     "check-ci",
@@ -1279,6 +1296,11 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .descr("Read-only: active claims (room.active_claims).")
         .command("claims")
         .map(CliCommand::Claims);
+    let handoffs = handoffs_parser()
+        .to_options()
+        .descr("Read-only: targeted handoffs and whether each one reached its target. `--undelivered` lists the ones nobody read, regardless of lease expiry.")
+        .command("handoffs")
+        .map(CliCommand::Handoffs);
     let route_findings = route_findings_parser()
         .to_options()
         .descr("Route findings from a JSON file to active claim owners; unowned → risk facts.")
@@ -1379,6 +1401,7 @@ fn cli_parser() -> OptionParser<CliCommand> {
         decisions,
         artifacts,
         claims,
+        handoffs,
         route_findings,
         check_ci,
         dag,
@@ -2698,6 +2721,23 @@ fn board_parser() -> impl Parser<BoardArgs> {
 fn kind_read_parser() -> impl Parser<KindReadArgs> {
     let json = json_flag();
     construct!(KindReadArgs { json })
+}
+
+fn handoffs_parser() -> impl Parser<HandoffsArgs> {
+    let json = json_flag();
+    let undelivered = long("undelivered")
+        .help("Only handoffs whose target never read, acked, or resolved them")
+        .switch();
+    let limit = long("limit")
+        .help("Maximum rows to return (default 50)")
+        .argument::<usize>("N")
+        .guard(|n| (1..=500).contains(n), "limit must be 1..=500")
+        .fallback(50);
+    construct!(HandoffsArgs {
+        json,
+        undelivered,
+        limit
+    })
 }
 
 fn route_findings_parser() -> impl Parser<RouteFindingsArgs> {

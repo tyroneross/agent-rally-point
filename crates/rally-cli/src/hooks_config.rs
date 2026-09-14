@@ -387,6 +387,15 @@ pub(crate) struct CoordinationConfig {
     /// `rally enter`. `0` disables auto-reap, leaving
     /// `rally doctor --reap-stale --apply` as the only caller.
     pub(crate) auto_reap_interval_secs: i64,
+    /// `say handoff`: FLAT window, in seconds, for deciding whether a handoff
+    /// target is live enough to pull its own inbox.
+    ///
+    /// `None` (the default) keeps the per-session ADAPTIVE window the squad
+    /// projection already computes from each session's declared heartbeat
+    /// cadence, so a send and a `rally room` read never disagree about who is
+    /// alive. Set an integer only to pin one window across every peer — e.g. a
+    /// fleet of one-shot agents where the adaptive window is too generous.
+    pub(crate) handoff_liveness_window_secs: Option<i64>,
 }
 
 impl Default for CoordinationConfig {
@@ -405,6 +414,7 @@ impl Default for CoordinationConfig {
             stale_wait_secs: crate::next::DEFAULT_STALE_WAIT_SECS,
             handoff_expiry_secs: crate::reaper::DEFAULT_HANDOFF_EXPIRY_SECS,
             auto_reap_interval_secs: crate::reaper::DEFAULT_AUTO_REAP_INTERVAL_SECS,
+            handoff_liveness_window_secs: None,
         }
     }
 }
@@ -475,6 +485,13 @@ fn coordination_from_value(value: &Value, into: &mut CoordinationConfig) {
         && v > 0
     {
         into.stale_wait_secs = v;
+    }
+    if let Some(v) = coord
+        .get("handoff_liveness_window_secs")
+        .and_then(Value::as_i64)
+        && v > 0
+    {
+        into.handoff_liveness_window_secs = Some(v);
     }
     // Zero is meaningful here: it turns handoff expiry off.
     if let Some(v) = coord.get("handoff_expiry_secs").and_then(Value::as_i64)
@@ -578,6 +595,12 @@ pub(crate) fn resolve_coordination(repo_root: &Path) -> Result<CoordinationConfi
         &mut cfg.consumer_context_bytes,
     );
     coord_env_i64("RALLY_STALE_WAIT_SECS", &mut cfg.stale_wait_secs);
+    if let Ok(raw) = std::env::var("RALLY_HANDOFF_LIVENESS_WINDOW_SECS")
+        && let Ok(v) = raw.trim().parse::<i64>()
+        && v > 0
+    {
+        cfg.handoff_liveness_window_secs = Some(v);
+    }
     coord_env_i64_allow_zero("RALLY_HANDOFF_EXPIRY_SECS", &mut cfg.handoff_expiry_secs);
     coord_env_i64_allow_zero(
         "RALLY_AUTO_REAP_INTERVAL_SECS",

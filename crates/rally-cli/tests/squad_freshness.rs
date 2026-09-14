@@ -17,7 +17,9 @@
 //! * the `room` human line reports `squads=N fresh=X stale=Y`;
 //! * `next.peer_targets` ranks visible peers freshest-first, self excluded;
 //! * `say --target <stale peer>` commits, delivers, AND attaches a
-//!   `stale-target` warning naming fresher peers; a fresh target gets none.
+//!   warning naming fresher peers; a fresh target gets none. A targeted
+//!   HANDOFF gets the stronger `handoff-target-not-live` delivery advisory;
+//!   every other targeted kind gets the plain `stale-target` one.
 //!
 //! Assertions are made on CLI output only, so a refactor that stops wiring the
 //! fields through the real command path fails here.
@@ -270,6 +272,13 @@ fn next_ranks_peer_targets_freshest_first_and_excludes_self() {
     );
 }
 
+/// Two advisories, one boundary. A targeted HANDOFF to a stale peer gets the
+/// delivery advisory (`handoff-target-not-live`), which additionally routes a
+/// fallback copy and records a wake. Every OTHER targeted kind keeps the plain
+/// `stale-target` ranking advisory — there is nothing to deliver, so there is
+/// nothing to fall back to.
+///
+/// Both still commit to the requested target and neither ever re-targets.
 #[test]
 fn say_to_stale_target_warns_and_still_delivers_but_fresh_target_does_not() {
     let room = Room::new("say");
@@ -296,17 +305,20 @@ fn say_to_stale_target_warns_and_still_delivers_but_fresh_target_does_not() {
         .unwrap_or_default();
     let stale_warning = warnings
         .iter()
-        .find(|w| w["code"] == "stale-target")
-        .unwrap_or_else(|| panic!("expected a stale-target warning; got {warnings:?}"));
+        .find(|w| w["code"] == "handoff-target-not-live")
+        .unwrap_or_else(|| panic!("expected a handoff-target-not-live warning; got {warnings:?}"));
     let msg = stale_warning["message"].as_str().unwrap();
-    assert!(msg.contains("target ghost was last seen"), "{msg}");
+    assert!(msg.contains("handoff target ghost is not live"), "{msg}");
+    assert!(msg.contains("last seen"), "{msg}");
     assert!(msg.contains("fresher peers:"), "{msg}");
     assert!(msg.contains("live-a") && msg.contains("live-b"), "{msg}");
     assert!(
         !msg.contains("me ("),
         "sender is not its own alternative: {msg}"
     );
-    assert!(msg.contains("Delivered anyway"), "{msg}");
+    // `ghost` has no `:` suffix, so it IS a base inbox — the warning must say
+    // plainly that nothing else received a copy rather than implying one.
+    assert!(msg.contains("NOBODY else has this handoff"), "{msg}");
 
     // The handoff really is on the ledger, addressed to the ghost.
     let open = room.json(&["room", "--json"])["data"]["room"]["open_handoffs"]
@@ -334,9 +346,34 @@ fn say_to_stale_target_warns_and_still_delivers_but_fresh_target_does_not() {
         .cloned()
         .unwrap_or_default();
     assert!(
-        warnings.iter().all(|w| w["code"] != "stale-target"),
+        warnings
+            .iter()
+            .all(|w| w["code"] != "stale-target" && w["code"] != "handoff-target-not-live"),
         "fresh target must not warn: {warnings:?}"
     );
+
+    // A NON-handoff targeted say keeps the original ranking advisory: there is
+    // no delivery obligation to fall back on, only a better peer to suggest.
+    let artifact_to_ghost = room.say_ok(&[
+        "artifact",
+        "--tool",
+        "me",
+        "--target",
+        "ghost",
+        "--subject",
+        "fyi for the ghost",
+    ]);
+    let warnings = artifact_to_ghost["data"]["warnings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let plain = warnings
+        .iter()
+        .find(|w| w["code"] == "stale-target")
+        .unwrap_or_else(|| panic!("expected a stale-target warning; got {warnings:?}"));
+    let msg = plain["message"].as_str().unwrap();
+    assert!(msg.contains("target ghost was last seen"), "{msg}");
+    assert!(msg.contains("Delivered anyway"), "{msg}");
 
     // Broadcast: no stale-target warning either.
     let all = room.say_ok(&[
@@ -353,7 +390,9 @@ fn say_to_stale_target_warns_and_still_delivers_but_fresh_target_does_not() {
         .cloned()
         .unwrap_or_default();
     assert!(
-        warnings.iter().all(|w| w["code"] != "stale-target"),
+        warnings
+            .iter()
+            .all(|w| w["code"] != "stale-target" && w["code"] != "handoff-target-not-live"),
         "broadcast must not warn: {warnings:?}"
     );
 }

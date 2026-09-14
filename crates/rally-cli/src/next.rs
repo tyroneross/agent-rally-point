@@ -263,7 +263,7 @@ pub(crate) fn build_entry(
                 .is_none_or(|target| target == tool || target == "all")
         })
         .take(MAX_ENTER_ROWS)
-        .map(|f| entry_item("respond_to_handoff", f))
+        .map(|f| entry_item(crate::NEXT_ACTION_RESPOND_TO_HANDOFF, f))
         .collect::<Vec<_>>();
     let mut do_items = respond_to.clone();
     do_items.extend(
@@ -540,7 +540,7 @@ fn next_candidates(
             && stale_targeted_handoff(handoff, tool, stale_wait_secs);
         if assigned_to_tool(handoff, tool) && !aged_out {
             candidates.push(NextCandidate::from_fact(
-                "respond_to_handoff",
+                crate::NEXT_ACTION_RESPOND_TO_HANDOFF,
                 "open_handoff_targeted_to_this_tool",
                 boost_score(100, handoff, role, paths),
                 handoff,

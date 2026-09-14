@@ -180,6 +180,33 @@ do not create a second task or repeatedly inject the same instruction. If the
 primary channel is unavailable at dispatch time, use the backup immediately
 and state why.
 
+## Handoff Delivery — Pull-Only, and What Rally Does About It
+
+Rally delivery is **pull-only**: a handoff is delivered when the target runs
+`rally next` or `rally inbox` and finds it. Nothing pushes it. A session that has
+already exited never pulls, so a handoff addressed to a dead session would sit
+unread forever with nobody told.
+
+`rally say handoff --to <tool>` therefore checks the target's presence first.
+When the target is not live it still commits the handoff to that target, ALSO
+copies it to the base-tool inbox (`codex` for `codex:*`, `claude_code` for
+`claude_code:*`) that a fresh session of that host polls on start, records a
+`wake` fact against the target, and prints a warning naming the target's
+last-seen time and where the copy went. `--json` carries the same under
+`data.delivery`. Pass `--target-policy exact` when the handoff must reach one
+receiver or nobody — it suppresses the copy and still warns.
+
+Audit any time with:
+
+```bash
+rally handoffs --undelivered --json
+```
+
+That lists every targeted handoff whose target never read, acked, or resolved
+it — scanning the whole ledger, so a handoff that expired out of `rally room`
+still shows up. **A fallback copy is one more chance to be read, not proof
+anyone read it.** Only a target-authored ACK is that.
+
 ## Sending a Handoff Document
 
 When the work produces a handoff **document** rather than a task packet, the document's
@@ -294,6 +321,11 @@ A stale peer is still a legal target: `rally say ... --target <stale-peer>`
 commits and delivers, and attaches a `stale-target` entry in `warnings[]` naming
 the freshest alternatives. Rally advises and ranks; the choice stays with you —
 a returning session or a scheduled agent may be exactly who you mean.
+
+A targeted **handoff** to a stale peer gets the stronger
+`handoff-target-not-live` entry instead, because a handoff has a delivery
+obligation an artifact does not: it also copies to the base-tool inbox, records
+a wake, and reports all of it in `data.delivery`. See "Handoff Delivery" above.
 
 Target the session that is actually working the paths in question — an active
 claim on the file under discussion is stronger evidence of the right peer than
