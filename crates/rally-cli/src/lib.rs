@@ -11373,9 +11373,7 @@ fn managed_session_injectability(
                     .daemon_socket
                     .clone()
                     .or_else(daemon_client::rally_owned_socket);
-                let live = socket
-                    .as_deref()
-                    .is_some_and(daemon_client::socket_is_live);
+                let live = socket.as_deref().is_some_and(daemon_client::socket_is_live);
                 if live {
                     (
                         true,
@@ -11383,11 +11381,7 @@ fn managed_session_injectability(
                         inject_via,
                     )
                 } else {
-                    (
-                        false,
-                        "daemon_socket_not_live".to_string(),
-                        inject_via,
-                    )
+                    (false, "daemon_socket_not_live".to_string(), inject_via)
                 }
             } else {
                 // Unknown without a live probe is not a delivery guarantee.
@@ -14175,7 +14169,10 @@ mod tests {
         );
 
         assert!(hr.actionable, "one stale socket file remains actionable");
-        assert!(hr.sockets_live.is_empty(), "empty files are not live daemons");
+        assert!(
+            hr.sockets_live.is_empty(),
+            "empty files are not live daemons"
+        );
 
         // Add a second stale CLI socket file. Existence alone is not ambiguity.
         let cli_sock = cfg_dir.join("ptyd.sock");
@@ -14208,7 +14205,10 @@ mod tests {
         let session = liveness_session("dead-daemon", "claude_code:probe");
         let (injectable, status, via) =
             managed_session_injectability(&session, SessionLiveness::Unknown);
-        assert!(!injectable, "unknown without a live probe must not look injectable");
+        assert!(
+            !injectable,
+            "unknown without a live probe must not look injectable"
+        );
         assert_eq!(status, "managed_session_liveness_unknown");
         assert_eq!(via, "tmux");
 
@@ -14217,7 +14217,10 @@ mod tests {
         daemon.daemon_socket = Some("/tmp/rally-definitely-not-a-live-ptyd.sock".into());
         let (injectable, status, via) =
             managed_session_injectability(&daemon, SessionLiveness::Unknown);
-        assert!(!injectable, "a registered but dead daemon socket is not injectable");
+        assert!(
+            !injectable,
+            "a registered but dead daemon socket is not injectable"
+        );
         assert_eq!(status, "daemon_socket_not_live");
         assert_eq!(via, "daemon");
     }
