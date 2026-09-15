@@ -2553,7 +2553,53 @@ pub(crate) fn run_ledger_health() -> Result<LedgerHealthReport> {
     let root = repo_root()?;
     let mut report = ledger_health_in_dir(&root.join(".rally"));
     report.findings.extend(install_surface_findings(&root));
+    // Do not open the store: default doctor must still answer on a corrupt
+    // facts.db. Skew uses git + BUILD_ID only.
+    let parsed = parse_build_id(crate::BUILD_ID);
+    let facts = collect_skew_facts(&root, parsed.commit.as_deref());
+    let skew = classify_binary_skew(&root, crate::BUILD_ID, &facts);
+    report.findings.extend(binary_skew_findings(&skew));
     Ok(report)
+}
+
+/// Default-doctor rows for a PATH binary that does not match this checkout.
+/// `in_sync` and `version_only_match` stay silent so a current install is quiet.
+fn binary_skew_findings(skew: &BinarySkewReport) -> Vec<LedgerFinding> {
+    let (code, severity, remedy) = match skew.verdict {
+        SkewVerdict::BinaryBehindHead => (
+            "binary_behind_head",
+            "warn",
+            Some(
+                "scripts/install-rally.sh --source --yes   # or: cargo install --path crates/rally-cli --root \"$HOME/.local\""
+                    .to_string(),
+            ),
+        ),
+        SkewVerdict::Diverged => (
+            "binary_diverged_from_head",
+            "info",
+            Some(
+                "scripts/install-rally.sh --source --yes   # rebuild from this checkout if this branch is the intended binary"
+                    .to_string(),
+            ),
+        ),
+        SkewVerdict::VersionMismatch => (
+            "binary_version_mismatch",
+            "warn",
+            Some(
+                "scripts/install-rally.sh --source --yes   # or: cargo install --path crates/rally-cli --root \"$HOME/.local\""
+                    .to_string(),
+            ),
+        ),
+        SkewVerdict::InSync | SkewVerdict::VersionOnlyMatch | SkewVerdict::Unknown => {
+            return Vec::new();
+        }
+    };
+    vec![LedgerFinding {
+        code: code.to_string(),
+        severity: severity.to_string(),
+        message: skew.detail.clone(),
+        remedy,
+    }]
 }
 
 /// Fresh-install gaps that look like a healthy ledger: Rally is initialized
@@ -3573,6 +3619,28 @@ mod binary_skew_tests {
             "a behind verdict must say what to do; got: {}",
             r.detail
         );
+        let findings = binary_skew_findings(&r);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].code, "binary_behind_head");
+        assert_eq!(findings[0].severity, "warn");
+        assert!(
+            findings[0]
+                .remedy
+                .as_deref()
+                .is_some_and(|s| s.contains("install-rally.sh")),
+            "behind must name the installer; got {:?}",
+            findings[0].remedy
+        );
+    }
+
+    #[test]
+    fn in_sync_binary_is_silent_on_default_doctor() {
+        let r = classify_binary_skew(
+            Path::new("/repo"),
+            "0.1.7+6e20ee8",
+            &facts("6e20ee8", true, true, Some(0)),
+        );
+        assert!(binary_skew_findings(&r).is_empty());
     }
 
     #[test]
