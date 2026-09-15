@@ -2550,7 +2550,44 @@ pub(crate) fn ledger_health_in_dir(rally_dir: &Path) -> LedgerHealthReport {
 }
 
 pub(crate) fn run_ledger_health() -> Result<LedgerHealthReport> {
-    Ok(ledger_health_in_dir(&repo_root()?.join(".rally")))
+    let root = repo_root()?;
+    let mut report = ledger_health_in_dir(&root.join(".rally"));
+    report.findings.extend(install_surface_findings(&root));
+    Ok(report)
+}
+
+/// Fresh-install gaps that look like a healthy ledger: Rally is initialized
+/// but no host actually wired the coordination hook.
+fn install_surface_findings(repo_root: &Path) -> Vec<LedgerFinding> {
+    let mut findings = Vec::new();
+    if !repo_root.join(".rally/manifest.json").is_file() {
+        return findings;
+    }
+    let surfaces = [
+        ".cursor/hooks.json",
+        ".claude/settings.json",
+        ".codex/hooks.json",
+    ];
+    let wired = surfaces.iter().any(|rel| {
+        fs::read_to_string(repo_root.join(rel))
+            .ok()
+            .is_some_and(|text| text.contains("rally-coordination-hook"))
+    });
+    if !wired {
+        findings.push(LedgerFinding {
+            code: "missing_host_hooks".to_string(),
+            severity: "info".to_string(),
+            message: format!(
+                "{} has a Rally room but no host hook file mentions rally-coordination-hook — `rally init` does not copy hooks",
+                repo_root.display()
+            ),
+            remedy: Some(
+                "copy hooks/rally-coordination-hook.sh and merge generated .cursor/hooks.json / .claude/settings.json / .codex/hooks.json from agent-rally-point"
+                    .to_string(),
+            ),
+        });
+    }
+    findings
 }
 
 // =============================================================================
@@ -4003,6 +4040,38 @@ mod ledger_health_tests {
         let report = ledger_health_in_dir(&dir);
         assert!(!report.rally_dir_exists);
         assert!(report.findings.iter().any(|f| f.code == "no_rally_dir"));
+    }
+
+    #[test]
+    fn missing_host_hooks_are_an_info_finding_not_an_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "rally-install-surface-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(dir.join(".rally")).unwrap();
+        fs::write(dir.join(".rally/manifest.json"), "{}").unwrap();
+        let findings = install_surface_findings(&dir);
+        assert!(
+            findings.iter().any(|f| f.code == "missing_host_hooks"),
+            "{findings:?}"
+        );
+        assert!(findings.iter().all(|f| f.severity == "info"));
+        fs::create_dir_all(dir.join(".claude")).unwrap();
+        fs::write(
+            dir.join(".claude/settings.json"),
+            r#"{"hooks":{"SessionStart":[{"command":"hooks/rally-coordination-hook.sh"}]}}"#,
+        )
+        .unwrap();
+        let wired = install_surface_findings(&dir);
+        assert!(
+            wired.iter().all(|f| f.code != "missing_host_hooks"),
+            "{wired:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

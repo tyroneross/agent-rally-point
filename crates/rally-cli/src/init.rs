@@ -215,7 +215,7 @@ fn pointer_block(docs: &ManifestDocs) -> String {
         "This repo coordinates parallel coding agents via **agent-rally-point** \
          (per-repo, no external service).\n\n",
     );
-    s.push_str("- **Self-locate FIRST:** `rally whoami --tool <you> --json` — host runtime, room, lead, mission, ack status. If `host_runtime.ambiguous` is true, STOP and resolve which host before acting (never guess).\n");
+    s.push_str("- **Self-locate FIRST:** `rally whoami --tool <you> --json` — host runtime, room, lead, mission, ack status. Stop only if `host_runtime.actionable` is false (live ptyd sockets conflict and this process has no pin); never guess. Stale socket files alone are not a stop.\n");
     s.push_str("- **Enter + acknowledge:** `rally enter --tool <host-llm-role-number> --json` (e.g. `claude_code:01`), then `rally ack --tool <you>` to confirm you ingested the rules/guardrails/lead/mission.\n");
     s.push_str("- **Resolve targets from live state:** Treat lead/tool ids as runtime data, not constants. Use `whoami`, `lead show`, `room`, `next`, and explicit handoff targets; do not copy ids from examples, old logs, or another repo.\n");
     s.push_str("- **What to do next:** `rally next --tool <you> --json`\n");
@@ -707,6 +707,10 @@ mod tests {
                 "exactly one end marker in {filename}"
             );
             assert!(doc.contains("rally enter"));
+            assert!(
+                doc.contains("host_runtime.actionable"),
+                "{filename}: pointer must stop on actionable=false, not stale socket ambiguity"
+            );
             assert!(doc.contains("RALLY.md"));
             // ARP-R-07 (D1): the untrusted-data caveat must ride with the
             // `rally room --json` pointer itself, not live somewhere else in

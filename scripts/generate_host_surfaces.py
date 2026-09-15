@@ -341,9 +341,10 @@ def render_hook_surfaces(config: dict[str, Any]) -> dict[Path, str]:
         "mutations receive path-scoped checks. See docs/AUTO-COORDINATION-HOOKS.md."
     )
     cursor_comment = (
-        "GENERATED from config/host-integrations.json. Cursor schema v1 has no "
-        "UserPromptSubmit equivalent; sessionStart/stop run side effects and "
-        "preToolUse can inject agent_message. See docs/AUTO-COORDINATION-HOOKS.md."
+        "GENERATED from config/host-integrations.json. sessionStart injects "
+        "additional_context; beforeSubmitPrompt runs idle side effects with no "
+        "model channel; preToolUse matches Write|StrReplace|Delete|EditNotebook "
+        "and can inject agent_message. See docs/AUTO-COORDINATION-HOOKS.md."
     )
     return {
         Path("hooks/hooks.json"): json_text(

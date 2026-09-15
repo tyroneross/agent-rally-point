@@ -1,5 +1,5 @@
 {
-  "$comment": "GENERATED from config/host-integrations.json. Cursor schema v1 has no UserPromptSubmit equivalent; sessionStart/stop run side effects and preToolUse can inject agent_message. See docs/AUTO-COORDINATION-HOOKS.md.",
+  "$comment": "GENERATED from config/host-integrations.json. sessionStart injects additional_context; beforeSubmitPrompt runs idle side effects with no model channel; preToolUse matches Write|StrReplace|Delete|EditNotebook and can inject agent_message. See docs/AUTO-COORDINATION-HOOKS.md.",
   "version": 1,
   "hooks": {
     "sessionStart": [
@@ -8,11 +8,17 @@
         "timeout": 5
       }
     ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "RALLY_HOOK_SOURCE=project bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/hooks/rally-coordination-hook.sh\" idle cursor",
+        "timeout": 5
+      }
+    ],
     "preToolUse": [
       {
         "command": "RALLY_HOOK_SOURCE=project bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/hooks/rally-coordination-hook.sh\" before-write cursor",
         "timeout": 10,
-        "matcher": "Write|Edit"
+        "matcher": "Write|Edit|StrReplace|Delete|EditNotebook"
       }
     ],
     "stop": [

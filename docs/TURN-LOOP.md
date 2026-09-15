@@ -19,7 +19,7 @@ from a read or from work that Rally deliberately leaves to the host.
 
 | Step | Command shape | Durable coordination effect |
 |------|---------------|-----------------------------|
-| Self-locate | `rally whoami --tool <unique-tool> --json` | Reads local room/host state; does not append a durable fact. Stop if `host_runtime.ambiguous` is true. |
+| Self-locate | `rally whoami --tool <unique-tool> --json` | Reads local room/host state; does not append a durable fact. Stop only if `host_runtime.actionable` is false. |
 | Join | `rally enter --tool <unique-tool> --json` | Writes presence for the session. |
 | Acknowledge | `rally ack --tool <unique-tool>` | Writes acknowledgement of the room's rules, lead, and mission. |
 | Ask | `rally next --tool <unique-tool> --json` | Reads the current room and records the wake intent for the check. Treat its result as a recommendation, not an execution order. |

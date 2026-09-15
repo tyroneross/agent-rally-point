@@ -46,7 +46,7 @@ pub(crate) const PURE_READ_TOOLS: &[&str] = &["view_image","Read","Glob","Grep",
 #[rustfmt::skip]
 pub(crate) const OPAQUE_SHELL_TOOLS: &[&str] = &["exec_command","write_stdin","Bash","Shell","run_terminal_cmd"];
 #[rustfmt::skip]
-pub(crate) const MUTATION_TOOLS: &[&str] = &["apply_patch","Write","Edit","MultiEdit","NotebookEdit","write_file","edit_file","delete_file","move_file","create_file","search_replace"];
+pub(crate) const MUTATION_TOOLS: &[&str] = &["apply_patch","Write","Edit","MultiEdit","NotebookEdit","EditNotebook","StrReplace","write_file","edit_file","delete_file","Delete","move_file","create_file","search_replace"];
 
 pub(crate) const MAX_TARGETS: usize = 16;
 pub(crate) const HOOK_CONTRACT_VERSION: u32 = 1;
@@ -106,6 +106,14 @@ impl HostFamily {
         }
     }
 
+    /// Cursor loads Claude project hooks (third-party compatibility). The
+    /// envelope then carries `cursor_version` while argv still says
+    /// `claude_code`, which dual-enters the same conversation as two host
+    /// families. Force the Cursor family when the envelope proves the host.
+    pub(crate) fn from_tool_and_stdin(tool: &str, stdin: &str) -> Self {
+        Self::from_tool(&remap_claude_tool_to_cursor(tool, stdin))
+    }
+
     /// `nativeEvent(tool, phase)` at `hook.sh:1912-1923`.
     pub(crate) fn event_name(self, phase: &str) -> &'static str {
         match self {
@@ -132,6 +140,22 @@ impl HostFamily {
             },
         }
     }
+}
+
+/// When Cursor fires Claude-shaped hooks, rewrite the argv family so claims
+/// and envelopes stay on `cursor:<session>` instead of minting a twin
+/// `claude_code:` identity for the same conversation.
+pub(crate) fn remap_claude_tool_to_cursor(tool: &str, stdin: &str) -> String {
+    if !stdin.contains("\"cursor_version\"") {
+        return tool.to_string();
+    }
+    if tool == "claude_code" {
+        return "cursor".to_string();
+    }
+    if let Some(rest) = tool.strip_prefix("claude_code:") {
+        return format!("cursor:{rest}");
+    }
+    tool.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1607,7 +1631,8 @@ pub(crate) struct HookRequest {
 pub(crate) fn run_before_write(req: HookRequest) -> Value {
     let mut trace = Trace::start();
     let deadline = Deadline::from_watchdog(DEFAULT_TIMEOUT_MS);
-    let host = HostFamily::from_tool(&req.tool_arg);
+    let tool_arg = remap_claude_tool_to_cursor(&req.tool_arg, &req.stdin);
+    let host = HostFamily::from_tool_and_stdin(&req.tool_arg, &req.stdin);
 
     let parsed = parse_input(&req.stdin);
     trace.mark("parse");
@@ -1674,13 +1699,13 @@ pub(crate) fn run_before_write(req: HookRequest) -> Value {
     let unscoped = classification.raw_paths.is_empty();
 
     let identity = resolve_identity(
-        &req.tool_arg,
+        &tool_arg,
         req.session_arg.as_deref(),
         &classification.session,
         &|key| std::env::var(key).ok(),
         parent_pid(),
     );
-    let tool = identity.tool;
+    let tool = remap_claude_tool_to_cursor(&identity.tool, &req.stdin);
     let session = identity.session;
 
     let paths = if unscoped {
@@ -2474,6 +2499,24 @@ mod tests {
         );
         assert_eq!(HostFamily::Gemini.event_name("before-write"), "BeforeTool");
         assert_eq!(HostFamily::Cursor.event_name("before-write"), "preToolUse");
+        assert_eq!(
+            remap_claude_tool_to_cursor(
+                "claude_code:95a42897",
+                r#"{"cursor_version":"1.7.2","session_id":"95a42897"}"#
+            ),
+            "cursor:95a42897"
+        );
+        assert_eq!(
+            HostFamily::from_tool_and_stdin(
+                "claude_code:95a42897",
+                r#"{"cursor_version":"1.7.2"}"#
+            ),
+            HostFamily::Cursor
+        );
+        assert_eq!(
+            remap_claude_tool_to_cursor("claude_code:95a42897", r#"{"session_id":"x"}"#),
+            "claude_code:95a42897"
+        );
     }
 
     #[test]

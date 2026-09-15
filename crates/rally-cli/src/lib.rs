@@ -8439,8 +8439,9 @@ fn try_register_session_with_daemon(
     session: &mut ManagedSession,
 ) -> Result<()> {
     let runtime = detect_host_runtime();
-    // Never guess which daemon to bind when multiple sockets are resolvable.
-    let Some(socket) = daemon_client::resolve_unambiguous_socket(&runtime.sockets_found) else {
+    // Bind only when exactly one *live* daemon answers. Stale socket files
+    // in sockets_found must not freeze registration (same rule as whoami).
+    let Some(socket) = daemon_client::resolve_unambiguous_socket(&runtime.sockets_live) else {
         return Ok(());
     };
     match daemon_client::register_agent(&socket, &session.tool, &session.target) {
@@ -11366,11 +11367,37 @@ fn managed_session_injectability(
     };
     match liveness {
         SessionLiveness::Live => (true, "live_managed_session".to_string(), inject_via),
-        SessionLiveness::Unknown => (
-            true,
-            "managed_session_liveness_unknown".to_string(),
-            inject_via,
-        ),
+        SessionLiveness::Unknown => {
+            if session.daemon_registered {
+                let socket = session
+                    .daemon_socket
+                    .clone()
+                    .or_else(daemon_client::rally_owned_socket);
+                let live = socket
+                    .as_deref()
+                    .is_some_and(daemon_client::socket_is_live);
+                if live {
+                    (
+                        true,
+                        "managed_session_liveness_unknown".to_string(),
+                        inject_via,
+                    )
+                } else {
+                    (
+                        false,
+                        "daemon_socket_not_live".to_string(),
+                        inject_via,
+                    )
+                }
+            } else {
+                // Unknown without a live probe is not a delivery guarantee.
+                (
+                    false,
+                    "managed_session_liveness_unknown".to_string(),
+                    inject_via,
+                )
+            }
+        }
         SessionLiveness::Stale => (false, "stale_managed_session".to_string(), inject_via),
     }
 }
@@ -14065,12 +14092,13 @@ mod tests {
     #[test]
     fn detect_host_runtime_finds_easy_terminal_ptyd_socket() {
         // SL-2: when …/EasyTerminal/ptyd.sock exists, detect_host_runtime
-        // reports under_ptyd=true with that path in sockets_found. When a
-        // second ptyd.sock exists (e.g. ~/.config/ptyd/ptyd.sock), ambiguous=true.
+        // reports under_ptyd=true with that path in sockets_found. Empty
+        // socket *files* are not live daemons: a second stale file must not
+        // set ambiguous (that freeze made managed `rally run` workers STOP).
         //
         // Test runs in an isolated HOME so we don't depend on / pollute the
-        // real user filesystem. PTYD_SOCKET_PATH is cleared so only on-disk
-        // resolution drives the decision.
+        // real user filesystem. PTYD_SOCKET_PATH and RALLY_MANAGED_SESSION_MODE
+        // are cleared so only on-disk resolution drives the decision.
         //
         // Env mutation is process-wide and Rust 2024 marks it unsafe. We
         // serialize HOME/PTYD/XDG mutations via the crate-wide PROCESS_ENV_LOCK
@@ -14092,6 +14120,7 @@ mod tests {
             home: Option<String>,
             ptyd: Option<String>,
             xdg: Option<String>,
+            managed: Option<String>,
         }
         impl Drop for EnvGuard {
             fn drop(&mut self) {
@@ -14108,6 +14137,10 @@ mod tests {
                         Some(v) => env::set_var("XDG_RUNTIME_DIR", v),
                         None => env::remove_var("XDG_RUNTIME_DIR"),
                     }
+                    match &self.managed {
+                        Some(v) => env::set_var("RALLY_MANAGED_SESSION_MODE", v),
+                        None => env::remove_var("RALLY_MANAGED_SESSION_MODE"),
+                    }
                 }
             }
         }
@@ -14115,11 +14148,13 @@ mod tests {
             home: env::var("HOME").ok(),
             ptyd: env::var("PTYD_SOCKET_PATH").ok(),
             xdg: env::var("XDG_RUNTIME_DIR").ok(),
+            managed: env::var("RALLY_MANAGED_SESSION_MODE").ok(),
         };
         unsafe {
             env::set_var("HOME", &home);
             env::remove_var("PTYD_SOCKET_PATH");
             env::remove_var("XDG_RUNTIME_DIR");
+            env::remove_var("RALLY_MANAGED_SESSION_MODE");
         }
 
         // Only the Easy Terminal socket exists.
@@ -14139,16 +14174,52 @@ mod tests {
             hr.sockets_found
         );
 
-        // Add the CLI socket → ambiguous.
+        assert!(hr.actionable, "one stale socket file remains actionable");
+        assert!(hr.sockets_live.is_empty(), "empty files are not live daemons");
+
+        // Add a second stale CLI socket file. Existence alone is not ambiguity.
         let cli_sock = cfg_dir.join("ptyd.sock");
         std::fs::write(&cli_sock, b"").unwrap();
         let hr2 = detect_host_runtime();
         assert!(hr2.under_ptyd);
+        assert_eq!(hr2.sockets_found.len(), 2, "both files still listed");
         assert!(
-            hr2.ambiguous,
-            "two ptyd sockets on disk -> ambiguous=true (got sockets_found={:?})",
-            hr2.sockets_found
+            !hr2.ambiguous,
+            "stale socket files must not set ambiguous (got sockets_found={:?} sockets_live={:?})",
+            hr2.sockets_found, hr2.sockets_live
         );
+        assert!(
+            hr2.actionable,
+            "managed/unmanaged agents must keep working when every on-disk socket is dead"
+        );
+
+        unsafe {
+            env::set_var("RALLY_MANAGED_SESSION_MODE", "task");
+        }
+        let hr3 = detect_host_runtime();
+        assert!(
+            hr3.actionable,
+            "RALLY_MANAGED_SESSION_MODE pins the session even if live sockets later conflict"
+        );
+    }
+
+    #[test]
+    fn unknown_liveness_is_not_injectable_without_a_live_daemon() {
+        let session = liveness_session("dead-daemon", "claude_code:probe");
+        let (injectable, status, via) =
+            managed_session_injectability(&session, SessionLiveness::Unknown);
+        assert!(!injectable, "unknown without a live probe must not look injectable");
+        assert_eq!(status, "managed_session_liveness_unknown");
+        assert_eq!(via, "tmux");
+
+        let mut daemon = session.clone();
+        daemon.daemon_registered = true;
+        daemon.daemon_socket = Some("/tmp/rally-definitely-not-a-live-ptyd.sock".into());
+        let (injectable, status, via) =
+            managed_session_injectability(&daemon, SessionLiveness::Unknown);
+        assert!(!injectable, "a registered but dead daemon socket is not injectable");
+        assert_eq!(status, "daemon_socket_not_live");
+        assert_eq!(via, "daemon");
     }
 
     #[test]
@@ -19550,8 +19621,9 @@ struct WhoamiPayload {
     branch: Option<String>,
     build_id: String,
     cwd: String,
-    /// Self-location: which host runtime (ptyd) this process is bound to, and
-    /// whether more than one is resolvable (ambiguous → agents must not guess).
+    /// Self-location: which host runtime (ptyd) this process is bound to.
+    /// Stop only when `host_runtime.actionable` is false — stale socket files
+    /// can make `sockets_found` noisy without being a live conflict.
     host_runtime: HostRuntime,
     /// Coordination context — resolves "who's lead / what's the goal" in one call.
     lead: Option<String>,
@@ -19569,15 +19641,23 @@ struct WhoamiPayload {
 
 /// Self-location of the host runtime (Easy Terminal / ptyd). `bound_socket` is
 /// the socket THIS process is pinned to (`PTYD_SOCKET_PATH`); `sockets_found`
-/// is every resolvable ptyd socket on disk; `ambiguous` is true when
-/// more than one exists — the exact condition that made an agent guess which
-/// ptyd it was on. Fail-loud on ambiguity instead of silently defaulting.
+/// is every resolvable ptyd socket on disk; `sockets_live` is the subset that
+/// answer a cheap daemon probe. `ambiguous` is true only when more than one
+/// *live* unbound socket exists. Stale socket files must not freeze agents.
+/// `actionable` is true when the agent already has a bound socket, a Rally
+/// managed-session identity, or at most one live socket — so a `rally run`
+/// worker can continue without guessing.
 #[derive(JsonSchema, Serialize)]
 struct HostRuntime {
     under_ptyd: bool,
     bound_socket: Option<String>,
     sockets_found: Vec<String>,
+    sockets_live: Vec<String>,
     ambiguous: bool,
+    /// False only when live ptyd sockets conflict and this process has no pin
+    /// and is not a Rally-managed session. Agents should stop on false, not on
+    /// `ambiguous` alone.
+    actionable: bool,
 }
 
 /// Pure: keep the candidate paths that exist on disk, de-duplicated, order-stable.
@@ -19592,10 +19672,9 @@ fn existing_unique_paths(candidates: &[String]) -> Vec<String> {
     found
 }
 
-/// Detect resolvable ptyd sockets. Probes the Easy Terminal app-daemon socket
-/// (`…/EasyTerminal/ptyd.sock`) and the ptyd CLI socket
-/// (`~/.config/ptyd/ptyd.sock`), plus XDG_RUNTIME_DIR. Reads env + filesystem
-/// existence only.
+/// Detect resolvable ptyd sockets. Lists every on-disk candidate, then probes
+/// which of those files actually answer (`socket_is_live`). Ambiguity is a
+/// live-daemon conflict, not "two socket files exist".
 fn detect_host_runtime() -> HostRuntime {
     let bound = env::var("PTYD_SOCKET_PATH").ok().filter(|s| !s.is_empty());
     let home = env::var("HOME").unwrap_or_default();
@@ -19615,10 +19694,23 @@ fn detect_host_runtime() -> HostRuntime {
         candidates.push(b.clone());
     }
     let found = existing_unique_paths(&candidates);
+    let live: Vec<String> = found
+        .iter()
+        .filter(|socket| daemon_client::socket_is_live(socket))
+        .cloned()
+        .collect();
+    let managed = env::var("RALLY_MANAGED_SESSION_MODE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .is_some();
+    let ambiguous = live.len() > 1 && bound.is_none();
+    let actionable = bound.is_some() || managed || !ambiguous;
     HostRuntime {
         under_ptyd: bound.is_some() || !found.is_empty(),
         bound_socket: bound,
-        ambiguous: found.len() > 1,
+        sockets_live: live,
+        ambiguous,
+        actionable,
         sockets_found: found,
     }
 }

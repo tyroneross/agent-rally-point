@@ -43,7 +43,9 @@
 #   Gemini -- github.com/google-gemini/gemini-cli docs/hooks/reference.md
 #     systemMessage       "Displayed immediately to the user in the terminal."
 #     additionalContext   read on SessionStart, BeforeAgent, AfterTool.
-#   Cursor -- cursor.com/docs/hooks (schema v1)
+#   Cursor -- cursor.com/docs/hooks
+#     sessionStart        additional_context (+ env)
+#     beforeSubmitPrompt  continue/user_message only — no model inject
 #     agent_message       "Message fed back to the agent when the action is
 #                          denied" -- so on an ALLOW advisory it reaches nobody.
 #     no systemMessage field exists.
@@ -144,6 +146,7 @@ try { env = JSON.parse(process.env.ENV_JSON || "{}"); } catch (e) {
 }
 const sinks = {
   "additionalContext": env?.hookSpecificOutput?.additionalContext,
+  "additional_context": env?.additional_context,
   "permissionDecisionReason": env?.hookSpecificOutput?.permissionDecisionReason,
   "systemMessage": env?.systemMessage,
   "agent_message": env?.agent_message,
@@ -198,7 +201,7 @@ for row in \
   "gemini:start:additionalContext:model" \
   "gemini:idle:additionalContext:model" \
   "gemini:after-write:systemMessage:human" \
-  "cursor:start:none:none" \
+  "cursor:start:additional_context:model" \
   "cursor:idle:none:none" \
   "cursor:after-write:none:none" \
 ; do

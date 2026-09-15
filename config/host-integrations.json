@@ -134,15 +134,18 @@
         "Shell",
         "run_terminal_cmd"
       ],
-      "mutation": [
+        "mutation": [
         "apply_patch",
         "Write",
         "Edit",
         "MultiEdit",
         "NotebookEdit",
+        "EditNotebook",
+        "StrReplace",
         "write_file",
         "edit_file",
         "delete_file",
+        "Delete",
         "move_file",
         "create_file",
         "search_replace"
@@ -163,7 +166,8 @@
         "timeout_ms": 5000,
         "events": {
           "claude_code": "UserPromptSubmit",
-          "codex": "UserPromptSubmit"
+          "codex": "UserPromptSubmit",
+          "cursor": "beforeSubmitPrompt"
         }
       },
       {
@@ -177,7 +181,7 @@
         "matchers": {
           "claude_code": "Edit|Write|MultiEdit|NotebookEdit",
           "codex": null,
-          "cursor": "Write|Edit"
+          "cursor": "Write|Edit|StrReplace|Delete|EditNotebook"
         }
       },
       {

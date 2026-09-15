@@ -106,12 +106,15 @@ and release jobs.
 >
 > **Cursor:** delivered as the project hook `.cursor/hooks.json` (Cursor has no
 > plugin marketplace, so it is not a plugin install like Claude Code / Codex).
-> Cursor's hook schema cannot inject context at `sessionStart`, so the
-> session-start awareness/offer does not surface there; the safety-critical
-> `preToolUse` before-write deconfliction does (`agent_message`). The
-> `preToolUse` input envelope shape is matched against Cursor's tool input but is
-> not yet validated against a live Cursor session — treat path-specific claims as
-> best-effort until confirmed.
+> `sessionStart` returns `{additional_context}` ([Cursor hooks](https://cursor.com/docs/hooks)).
+> `beforeSubmitPrompt` (idle) has no model-inject field — it still posts presence and returns `{}`. `preToolUse`
+> matcher is `Write|Edit|StrReplace|Delete|EditNotebook`; `agent_message` is
+> documented as deny-path, so advisory before-write remains a known gap. Cursor
+> third-party Claude hooks that carry `cursor_version` are remapped to the
+> `cursor:` family so one conversation is not dual-entered as `claude_code:`.
+> The wrapper remaps `--tool` **before** native `rally hook before-write` exec,
+> so an older installed binary still receives `cursor:` instead of minting a
+> `claude_code:` claim from the same conversation.
 >
 > **Other hosts:** Gemini, Qwen, Gemma, Aider, IDE plugins, and custom CLIs do not get
 > automatic hooks from this file today. Give them the any-agent bootstrap prompt,

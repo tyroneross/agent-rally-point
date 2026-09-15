@@ -352,7 +352,7 @@ _rally_native_capable() {  # $1=root $2=absolute resolved binary path
 # config/host-integrations.json (generator tests pin that relationship).
 _RALLY_NATIVE_PURE_READ_TOOLS='["view_image","Read","Glob","Grep","WebFetch","WebSearch","read_file","list_dir","list_directory","codebase_search","grep_search"]'
 _RALLY_NATIVE_OPAQUE_SHELL_TOOLS='["exec_command","write_stdin","Bash","Shell","run_terminal_cmd"]'
-_RALLY_NATIVE_MUTATION_TOOLS='["apply_patch","Write","Edit","MultiEdit","NotebookEdit","write_file","edit_file","delete_file","move_file","create_file","search_replace"]'
+_RALLY_NATIVE_MUTATION_TOOLS='["apply_patch","Write","Edit","MultiEdit","NotebookEdit","EditNotebook","StrReplace","write_file","edit_file","delete_file","Delete","move_file","create_file","search_replace"]'
 _RALLY_NATIVE_MAX_TARGETS=16
 
 phase="${1:-idle}"
@@ -364,10 +364,45 @@ case "$(printf '%s' "${RALLY_HOOKS:-}" | tr '[:upper:]' '[:lower:]')" in
   0|off|false|no|disabled) exit 0 ;;
 esac
 
-# Native execution branch. Must run BEFORE stdin is consumed below — the
-# binary reads the host envelope itself. A `case`, not a `tr` spawn: this
-# runs on every before-write fire, so the opt-out check itself must not add
-# a process.
+# Read the host envelope once. Native before-write used to exec before this
+# so the binary could read stdin itself — that skipped Cursor dual-id remap
+# and minted claude_code:<uuid> claims from Cursor third-party Claude hooks.
+# Read first, remap, then pipe the same bytes into the native binary.
+input=""
+if [ ! -t 0 ]; then
+  input="$(cat || true)"
+fi
+
+# Cursor loads Claude project hooks (third-party compatibility). The envelope
+# then carries cursor_version while argv still says claude_code, which
+# dual-enters the same conversation as two host families. Force family cursor
+# before native exec AND before session expansion so claims stay on
+# cursor:<session> even when the installed rally binary is older than the
+# rust remap.
+if printf '%s' "$input" | grep -q '"cursor_version"'; then
+  case "$tool" in
+    claude_code)
+      tool="cursor"
+      ;;
+    claude_code:*)
+      tool="cursor:${tool#*:}"
+      ;;
+  esac
+  if [ -n "${RALLY_TOOL_ID:-}" ]; then
+    case "$RALLY_TOOL_ID" in
+      claude_code)
+        RALLY_TOOL_ID="cursor"
+        ;;
+      claude_code:*)
+        RALLY_TOOL_ID="cursor:${RALLY_TOOL_ID#*:}"
+        ;;
+    esac
+    export RALLY_TOOL_ID
+  fi
+fi
+
+# Native execution branch. A `case`, not a `tr` spawn: this runs on every
+# before-write fire, so the opt-out check itself must not add a process.
 #
 # KNOWN BEHAVIOUR CHANGE: because this runs ahead of envelope classification,
 # a pure-read tool call and a repo with hooks disabled via .rally/config.json
@@ -399,23 +434,16 @@ if [ "$phase" = "before-write" ] && [ "$_rally_native_hook_disabled" = "0" ]; th
       fi
     fi
     if [ -n "$_rally_native_resolved_bin" ] && _rally_native_capable "$_rally_native_root" "$_rally_native_resolved_bin"; then
-      # stdin is untouched: the binary reads the host envelope itself.
+      # Same envelope bytes the wrapper just classified for dual-id remap.
       # RALLY_OBSERVER_PID is already exported above. No --fail-open: hook
       # advises, so a deadline miss must stay fail-loud, never fail-silent.
-      exec "$_rally_native_resolved_bin" hook before-write --tool "$tool" \
+      printf '%s' "$input" | exec "$_rally_native_resolved_bin" hook before-write --tool "$tool" \
         --repo-root "$_rally_native_root" \
         --timeout-ms "${RALLY_HOOK_TIMEOUT_MS:-3000}"
     fi
   fi
 fi
 
-# Read the native envelope once. Classification happens before walking the repo
-# or resolving/running the Rally binary, so a known read pays only JSON parsing
-# and returns the host's exact empty-object response.
-input=""
-if [ ! -t 0 ]; then
-  input="$(cat || true)"
-fi
 have_node=0
 if command -v node >/dev/null 2>&1; then have_node=1; fi
 
@@ -2328,11 +2356,11 @@ const briefMode = roomDetail !== "verbose" && phase !== "before-write";
 // model-directed prose printed there is text no reader can act on.
 function audienceOf(t, ph) {
   if (t === "cursor" || (t + "").startsWith("cursor")) {
-    // Cursor emits {} on sessionStart/beforeSubmitPrompt/stop, and on
-    // preToolUse its agent_message is documented as reaching the agent only
-    // when the action is DENIED. Rally advises rather than denies, so nothing
-    // Cursor receives today is model-visible. Recorded, not papered over.
-    return "human";
+    // sessionStart injects additional_context (cursor.com/docs/hooks).
+    // beforeSubmitPrompt has no model channel (continue/user_message only).
+    // preToolUse agent_message is documented as reaching the agent only when
+    // the action is DENIED. stop.followup_message restarts the turn.
+    return ph === "start" ? "model" : "human";
   }
   return ph === "after-write" ? "human" : "model";
 }
@@ -3247,16 +3275,17 @@ if (tool === "gemini" || tool.startsWith("gemini")) {
     output({systemMessage: message});
   }
 } else if (tool === "cursor" || tool.startsWith("cursor")) {
-  // Cursor hook contract (schema v1, from the Cursor "create-hook" skill Event
-  // Output Cheat Sheet): only preToolUse injects an agent-visible message
-  // (agent_message) plus a permission gate. sessionStart / stop /
-  // beforeSubmitPrompt have NO documented context-injection output, so they run
-  // their rally side-effects (enter on start, next on idle) and return an empty
-  // object. Advisory by default (permission "allow"); strict mode emits "deny".
+  // Cursor hook contract (cursor.com/docs/hooks):
+  // sessionStart → additional_context (+ optional env)
+  // beforeSubmitPrompt → continue/user_message only (no model inject)
+  // preToolUse → permission + agent_message (agent_message is deny-path)
+  // stop → followup_message would restart the turn; emit {}
   if (event === "preToolUse") {
     output(stop
       ? {permission: "deny", agent_message: message}
       : {permission: "allow", agent_message: message});
+  } else if (event === "sessionStart") {
+    output({additional_context: message});
   } else {
     output({});
   }

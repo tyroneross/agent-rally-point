@@ -52,6 +52,10 @@ export RALLY_HOOK_MS_BUDGET_SCALE
 RALLY_NATIVE_HOOK="${RALLY_NATIVE_HOOK:-off}"
 export RALLY_NATIVE_HOOK
 
+# Host sessionStart env (or a parent agent) can leak these into the suite and
+# override every test's intended --tool. Isolate.
+unset RALLY_TOOL_ID RALLY_SESSION_ID RALLY_AGENT_ID
+
 PASS=0
 FAIL=0
 FAILS=()
@@ -1940,6 +1944,58 @@ T="codex schema: before-write conflict → systemMessage, no permissionDecision"
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
 
 # ----------------------------------------------------------------------
+# Cursor sessionStart injects additional_context (documented model channel).
+# Cursor idle stays empty. Claude-shaped argv + cursor_version remaps to the
+# cursor family so one conversation is not dual-entered.
+# ----------------------------------------------------------------------
+T="cursor schema: sessionStart → additional_context"
+cursor_life="$tmpdir/rally_cursor_life"
+cat > "$cursor_life" <<'EOF'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "hooks status") printf '%s\n' '{"data":{"hooks":{"enabled":true,"prompt":"once"}}}'; exit 0 ;;
+  "status read")  printf '%s\n' '{}'; exit 0 ;;
+esac
+case "$1" in
+  room) printf '%s\n' '{"data":{"room":{"squads":[],"active_claims":[],"open_handoffs":[]}}}' ;;
+  next) printf '%s\n' '{"data":{"next":{"actionable":true,"action":"respond_to_handoff","requires_human":false,"fact":{"event_id":"fact_cursor_start","tool":"codex:01","subject":"review requested"}}}}' ;;
+  *)    printf '%s\n' '{}' ;;
+esac
+exit 0
+EOF
+install_stub "$cursor_life"
+(
+  repo="$tmpdir/cursor-start-repo"
+  mkdir -p "$repo/.rally"
+  cd "$repo"
+  out=$(RALLY_BIN="$cursor_life" RALLY_SESSION_ID="sess-cursor" "$HOOK" start cursor <<<'{"session_id":"sess-cursor","cursor_version":"1.7.2"}' 2>/dev/null)
+  rc=$?
+  if [ "$rc" != "0" ]; then printf 'rc=%s out=[%s]\n' "$rc" "$out" >&2; exit 1; fi
+  printf '%s' "$out" | grep -q '"additional_context"' || { printf 'missing additional_context: %s\n' "$out" >&2; exit 1; }
+  if printf '%s' "$out" | grep -qE '"additionalContext"|"permissionDecision"'; then
+    printf 'cursor start leaked Claude-only keys: %s\n' "$out" >&2; exit 1
+  fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+T="cursor dual-id: claude_code argv + cursor_version renders cursor start envelope"
+(
+  repo="$tmpdir/cursor-dual-repo"
+  mkdir -p "$repo/.rally"
+  cd "$repo"
+  out=$(RALLY_BIN="$cursor_life" RALLY_SESSION_ID="sess-dual" "$HOOK" start claude_code <<<'{"session_id":"sess-dual","cursor_version":"1.7.2"}' 2>/dev/null)
+  rc=$?
+  if [ "$rc" != "0" ]; then printf 'rc=%s out=[%s]\n' "$rc" "$out" >&2; exit 1; fi
+  printf '%s' "$out" | grep -q '"additional_context"' || { printf 'expected cursor start shape: %s\n' "$out" >&2; exit 1; }
+  if printf '%s' "$out" | grep -q 'additionalContext'; then
+    printf 'dual-id still rendered Claude envelope: %s\n' "$out" >&2; exit 1
+  fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+# ----------------------------------------------------------------------
 # Test 7: low-severity warn → additionalContext (no deny) in both modes
 # ----------------------------------------------------------------------
 T="low-severity warn: never deny (even strict)"
@@ -3191,6 +3247,43 @@ EOF
   fi
   exit 0
 ); then ok "$T"; else bad "$T" "the native exec branch (production default) has no falsifier without this case"; fi
+
+T="native branch: claude_code argv + cursor_version remaps --tool before exec"
+(
+  repo="$tmpdir/native-dual-repo"
+  mkdir -p "$repo/.rally"
+  cd "$repo" || exit 1
+  native_bin="$tmpdir/rally_native_dual"
+  native_calls="$tmpdir/rally_native_dual.calls"
+  : > "$native_calls"
+  cat > "$native_bin" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${CALLS:?}"
+if [ "$1" = "hook" ] && [ "$2" = "capabilities" ]; then
+  printf '%s\n' '{"data":{"hook":{"phases":["before-write"]}}}'
+  exit 0
+fi
+printf '%s\n' '{}'
+exit 0
+EOF
+  install_stub "$native_bin"
+  out=$(CALLS="$native_calls" RALLY_NATIVE_HOOK=on RALLY_BIN="$native_bin" \
+    "$HOOK" before-write claude_code \
+    <<<'{"cursor_version":"1.7.2","session_id":"sess-native-dual","tool_name":"Write","tool_input":{"file_path":"src/a.rs"}}' 2>/dev/null)
+  rc=$?
+  if [ "$rc" != "0" ]; then printf 'rc=%s out=[%s]\n' "$rc" "$out" >&2; exit 1; fi
+  bw="$(grep '^hook before-write' "$native_calls" | head -n1)"
+  printf '%s' "$bw" | grep -q -- '--tool cursor' || {
+    printf 'native exec kept claude_code after cursor_version remap: [%s]\n' "$bw" >&2
+    exit 1
+  }
+  printf '%s' "$bw" | grep -q -- '--tool claude_code' && {
+    printf 'native exec still passed claude_code: [%s]\n' "$bw" >&2
+    exit 1
+  }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
 
 # Summary
 # ----------------------------------------------------------------------
