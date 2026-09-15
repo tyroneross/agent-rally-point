@@ -437,9 +437,15 @@ if [ "$phase" = "before-write" ] && [ "$_rally_native_hook_disabled" = "0" ]; th
       # Same envelope bytes the wrapper just classified for dual-id remap.
       # RALLY_OBSERVER_PID is already exported above. No --fail-open: hook
       # advises, so a deadline miss must stay fail-loud, never fail-silent.
-      printf '%s' "$input" | exec "$_rally_native_resolved_bin" hook before-write --tool "$tool" \
+      #
+      # Do not `exec` on the right-hand side of a pipe. Bash applies that
+      # exec to the pipeline element only, so this script kept running and
+      # the node renderer printed a second JSON envelope (`{}\n{}` /
+      # doubled PreToolUse objects). native_hook.rs requires one value.
+      printf '%s' "$input" | "$_rally_native_resolved_bin" hook before-write --tool "$tool" \
         --repo-root "$_rally_native_root" \
         --timeout-ms "${RALLY_HOOK_TIMEOUT_MS:-3000}"
+      exit $?
     fi
   fi
 fi

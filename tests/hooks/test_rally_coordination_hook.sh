@@ -3272,6 +3272,10 @@ EOF
     <<<'{"cursor_version":"1.7.2","session_id":"sess-native-dual","tool_name":"Write","tool_input":{"file_path":"src/a.rs"}}' 2>/dev/null)
   rc=$?
   if [ "$rc" != "0" ]; then printf 'rc=%s out=[%s]\n' "$rc" "$out" >&2; exit 1; fi
+  if [ "$out" != "{}" ]; then
+    printf 'native Write fire must print one JSON object (pipe+exec used to fall through and double-print): [%s]\n' "$out" >&2
+    exit 1
+  fi
   bw="$(grep '^hook before-write' "$native_calls" | head -n1)"
   printf '%s' "$bw" | grep -q -- '--tool cursor' || {
     printf 'native exec kept claude_code after cursor_version remap: [%s]\n' "$bw" >&2
