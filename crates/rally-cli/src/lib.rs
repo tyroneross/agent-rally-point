@@ -11201,7 +11201,10 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
     let action = args.action;
     let dry_run = args.dry_run;
     let target = args.target;
-    let session = find_session(&target, &args.bins)?;
+    // A stale session is exactly what `rally stop` exists to tombstone, so
+    // Stop must not be refused by the stale-session guard that protects
+    // attach/capture (whose error message itself tells you to run stop).
+    let session = find_session(&target, &args.bins, matches!(action, SessionAction::Stop))?;
     // Capture the tmux bin before `args.bins` is moved into the runner — the
     // session-end self-kill (below) needs it.
     let tmux_bin_for_self_kill = args.bins.tmux_bin.clone();
@@ -12274,7 +12277,7 @@ fn build_risk_fact(
     }
 }
 
-fn find_session(target: &str, bins: &BackendBins) -> Result<ManagedSession> {
+fn find_session(target: &str, bins: &BackendBins, allow_stale: bool) -> Result<ManagedSession> {
     let room = RoomStore::open()?;
     let Some(view) = read_session_views(&room, bins.clone())?
         .into_iter()
@@ -12288,7 +12291,9 @@ fn find_session(target: &str, bins: &BackendBins) -> Result<ManagedSession> {
             "unknown managed session {target}"
         )));
     };
-    reject_stale_session(target, &view)?;
+    if !allow_stale {
+        reject_stale_session(target, &view)?;
+    }
     Ok(view.session)
 }
 

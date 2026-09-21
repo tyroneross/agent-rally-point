@@ -7666,3 +7666,104 @@ fn self_exit_check_still_reaches_an_empty_cycle_with_an_ancient_handoff() {
 
     workspace.cleanup();
 }
+
+#[test]
+fn stop_tombstones_a_stale_managed_session() {
+    let _run_guard = serialize_rally_run();
+    let workspace = Workspace::new("rally-stop-stale-session");
+    let fake_tmux = workspace.cwd.join("fake-tmux-stop-stale.sh");
+    write_executable(
+        &fake_tmux,
+        r#"#!/bin/sh
+case "$1" in
+  new-session) exit 0 ;;
+  list-panes) echo "no server running on /tmp/rally-test" >&2; exit 1 ;;
+  kill-session) echo "can't find session: $3" >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+"#,
+    );
+    let fake_tmux = fake_tmux.to_string_lossy().to_string();
+    let run = workspace.json(&[
+        "run",
+        "claude",
+        "--json",
+        "--name",
+        "gone",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        &fake_tmux,
+    ]);
+    let session_id = run["data"]["run"]["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let sessions = workspace.json(&["sessions", "--json", "--tmux-bin", &fake_tmux]);
+    assert_eq!(
+        sessions["data"]["sessions"]["sessions"][0]["liveness"],
+        "stale"
+    );
+
+    // Regression: stop used to refuse a stale session with an error telling
+    // the caller to run `rally stop` — the very command that failed.
+    let stop = workspace.json(&["stop", &session_id, "--json", "--tmux-bin", &fake_tmux]);
+    assert_eq!(stop["ok"], true, "{stop:#}");
+    let after = workspace.json(&["sessions", "--json", "--tmux-bin", &fake_tmux]);
+    assert_eq!(
+        after["data"]["sessions"]["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "stop must tombstone a stale session: {after:#}"
+    );
+    workspace.cleanup();
+}
+
+#[test]
+fn run_worktree_failure_in_commitless_repo_leaves_no_active_session() {
+    let _run_guard = serialize_rally_run();
+    let cwd = temp_path("rally-run-no-commits-cwd");
+    let home = temp_path("rally-run-no-commits-home");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let init = Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .current_dir(&cwd)
+        .status()
+        .unwrap();
+    assert!(init.success());
+    let workspace = Workspace {
+        cwd,
+        home,
+        global_index: false,
+        suppress_worktree: false,
+    };
+    let run = workspace.output(&[
+        "run",
+        "custom",
+        "--command-json",
+        r#"["true"]"#,
+        "--json",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        "/usr/bin/true",
+    ]);
+    assert!(
+        !run.status.success(),
+        "worktree add must fail with no commits"
+    );
+    let sessions = workspace.json(&["sessions", "--json", "--tmux-bin", "/usr/bin/true"]);
+    assert_eq!(
+        sessions["data"]["sessions"]["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "a run whose worktree provisioning failed must not leave an active session: {sessions:#}"
+    );
+    workspace.cleanup();
+}
