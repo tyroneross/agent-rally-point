@@ -875,6 +875,21 @@ fn resolve_watchdog_timeout(args: &[String]) -> Duration {
         return Duration::from_millis(ms);
     }
 
+    // (2a) `say handoff` injects into the target's pane by default, which runs
+    // the same backend write as `inject`; give it inject's default budget so
+    // the durable record plus the inject never race the hook-sized watchdog.
+    if matches!(first_positionals(args), (Some("say"), Some("handoff")))
+        && !args
+            .windows(2)
+            .any(|w| w[0] == "--deliver" && w[1] == "record")
+        && !args.iter().any(|a| a == "--deliver=record")
+    {
+        let ms = 10_000u64
+            .saturating_add(INJECT_WATCHDOG_HEADROOM_MS)
+            .clamp(MIN_WATCHDOG_TIMEOUT_MS, INJECT_MAX_WATCHDOG_TIMEOUT_MS);
+        return Duration::from_millis(ms);
+    }
+
     // (2b) `daemon start` (D1) — elevated fixed budget so it isn't pre-empted
     // by a cold-reconcile wait-for-ready poll sized against the store
     // router's 30s corridor (R3). `daemon serve` never reaches here at all —
@@ -3155,6 +3170,13 @@ fn command_say(args: SayArgs) -> Result<Output> {
         )));
     }
     let kind = args.kind;
+    let handoff_delivery_mode = parse_handoff_delivery_flags(
+        &kind,
+        args.target.is_some() || args.ref_id.is_some(),
+        args.deliver.as_deref(),
+        args.ack_within.as_deref(),
+    )?;
+    let say_bins = args.bins.clone();
     let subject = args
         .subject
         .unwrap_or_else(|| default_subject(kind.as_str()));
@@ -3370,6 +3392,19 @@ fn command_say(args: SayArgs) -> Result<Output> {
         return Err(RallyError::Usage(
             "handoff_target_policy_requires_ref: --target-policy, --handoff-state, and --idempotency-key require `say handoff --ref <event-id>`".to_string(),
         ));
+    }
+
+    // The ACK deadline is a wall-clock marker, deliberately appended AFTER the
+    // referenced-handoff idempotency key: a retry minutes later must not mint a
+    // second retry identity just because its deadline moved.
+    let ack_by = handoff_delivery_mode
+        .and_then(|(_, secs)| secs)
+        .map(|secs| {
+            (Utc::now() + chrono::Duration::seconds(secs))
+                .to_rfc3339_opts(SecondsFormat::Secs, true)
+        });
+    if let Some(ref deadline) = ack_by {
+        evidence.push(format!("{ACK_BY_MARKER}{deadline}"));
     }
 
     // Register presence only after all fail-closed handoff validation. A
@@ -3616,11 +3651,30 @@ fn command_say(args: SayArgs) -> Result<Output> {
     if let Some(warning) = stale_target_warning(&snapshot, &args.tool, fact.target.as_deref()) {
         say_warnings.push(warning);
     }
+    // Handoff delivery runs strictly AFTER the durable commit: the ledger copy
+    // is the obligation; the pane inject is only the focused notification. Any
+    // delivery failure degrades to record-only and says why — never an error,
+    // because the handoff already landed and the receiver can still pull it.
+    let delivery = match (handoff_delivery_mode, fact.target.as_deref()) {
+        (Some((mode, _)), Some(target_tool)) => Some(deliver_handoff(
+            mode,
+            &args.tool,
+            target_tool,
+            &fact.event_id,
+            ack_by.clone(),
+            say_bins,
+        )),
+        _ => None,
+    };
     // R9-readback: capture verified {room, seq} from the confirmed fact.
     let verified = SayVerified {
         room: room.room_id().to_string(),
         seq: fact.seq,
     };
+    let delivery_text = delivery
+        .as_ref()
+        .map(|d| format!(" delivery={} ({})", d.status, d.detail))
+        .unwrap_or_default();
     let body = envelope(
         "say",
         SCHEMA_SAY,
@@ -3634,10 +3688,11 @@ fn command_say(args: SayArgs) -> Result<Output> {
             room: RoomSummary::from(&snapshot),
             warnings: say_warnings,
             verified,
+            delivery,
         },
     )?;
     let text = format!(
-        "said {} {} room={} seq={}",
+        "said {} {} room={} seq={}{delivery_text}",
         fact.kind.as_str(),
         fact.event_id,
         room.room_id(),
@@ -4273,6 +4328,7 @@ fn command_release_by_path(
             },
             room: RoomSummary::from(&snapshot_after),
             warnings,
+            delivery: None,
             verified,
         },
     )?;
@@ -4467,7 +4523,25 @@ fn command_next(args: NextArgs) -> Result<Output> {
         );
     }
     let lead_context = build_lead_context(&snapshot, Some(&tool), role.as_deref());
+    let overdue_handoffs = escalate_overdue_handoffs(&room, &snapshot, &tool, !audit)?;
     let (peers_fresh, peers_stale) = (next.peer_targets.fresh, next.peer_targets.stale);
+    let overdue_text = if overdue_handoffs.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " overdue_handoffs={} ({})",
+            overdue_handoffs.len(),
+            overdue_handoffs
+                .iter()
+                .map(|h| format!(
+                    "{} -> {}",
+                    obligations::single_line(&h.event_id),
+                    obligations::single_line(&h.target)
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     let body = envelope(
         "next",
         SCHEMA_NEXT,
@@ -4479,10 +4553,11 @@ fn command_next(args: NextArgs) -> Result<Output> {
             wake_intent,
             room: RoomSummary::from(&snapshot),
             lead_context,
+            overdue_handoffs,
         },
     )?;
     let text = format!(
-        "next action={action} target={target_event_id} peers_fresh={} peers_stale={}",
+        "next action={action} target={target_event_id} peers_fresh={} peers_stale={}{overdue_text}",
         peers_fresh, peers_stale
     );
     Ok(Output::new(args.json, text, body))
@@ -5337,6 +5412,9 @@ fn claim_say_args(tool: &str, lane: &str, path: &str, json: bool) -> SayArgs {
         reason: None,
         wake_after: None,
         ref_standby: None,
+        deliver: None,
+        ack_within: None,
+        bins: BackendBins::default(),
     }
 }
 
@@ -13696,8 +13774,18 @@ mod tests {
         // `inject` only matches as the FIRST positional, never as an argument
         // value to another command.
         assert_eq!(
-            resolve_watchdog_timeout(&argv(&["say", "handoff", "--subject", "inject"])),
+            resolve_watchdog_timeout(&argv(&["say", "risk", "--subject", "inject"])),
             Duration::from_millis(DEFAULT_WATCHDOG_TIMEOUT_MS)
+        );
+        // `say handoff --deliver record` never injects, so it keeps the default.
+        assert_eq!(
+            resolve_watchdog_timeout(&argv(&["say", "handoff", "--deliver", "record"])),
+            Duration::from_millis(DEFAULT_WATCHDOG_TIMEOUT_MS)
+        );
+        // Default `say handoff` injects, so it gets inject's default budget.
+        assert!(
+            resolve_watchdog_timeout(&argv(&["say", "handoff", "--subject", "x"]))
+                > Duration::from_millis(DEFAULT_WATCHDOG_TIMEOUT_MS)
         );
     }
 
@@ -18624,6 +18712,9 @@ mod tests {
             reason: None,
             wake_after: None,
             ref_standby: None,
+            deliver: None,
+            ack_within: None,
+            bins: BackendBins::default(),
         }
     }
 
@@ -19560,6 +19651,9 @@ struct SayData {
     warnings: Vec<SayWarning>,
     /// R9-readback: verified room id (engagement label) and sequence number.
     verified: SayVerified,
+    /// Targeted-handoff delivery outcome (omitted for every other fact).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivery: Option<HandoffDelivery>,
 }
 
 /// R9-readback confirmation surfaced in every successful `rally say` response.
@@ -19776,6 +19870,10 @@ struct NextData {
     room: RoomSummary,
     /// Live lead/self-role metadata for the acting tool.
     lead_context: LeadContext,
+    /// Handoffs this tool sent whose `--ack-within` deadline passed with no
+    /// receiver ack. Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    overdue_handoffs: Vec<OverdueHandoff>,
 }
 
 fn scopes_from(raw_scopes: Vec<String>, resources: Vec<String>, paths: Vec<String>) -> Vec<String> {
@@ -21053,4 +21151,257 @@ fn help_text() -> String {
         "  Lineage flags (on any `say` kind): --run <id> --step <id> --parent-step <id>",
     ]
     .join("\n")
+}
+
+// =============================================================================
+// Handoff delivery + no-response escalation
+// =============================================================================
+
+/// Evidence marker carrying a handoff's ACK deadline (RFC 3339, UTC).
+const ACK_BY_MARKER: &str = "ack-by:";
+/// Subject prefix of the one risk fact written per overdue handoff.
+const NO_RESPONSE_SUBJECT_PREFIX: &str = "no-response:";
+const MAX_ACK_WITHIN_SECS: i64 = 7 * 24 * 3600;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandoffDeliveryMode {
+    Inject,
+    Record,
+}
+
+/// Validate `--deliver` / `--ack-within`. Returns `None` for non-handoff or
+/// untargeted facts (the flags are rejected there if given).
+fn parse_handoff_delivery_flags(
+    kind: &FactKind,
+    targeted: bool,
+    deliver: Option<&str>,
+    ack_within: Option<&str>,
+) -> Result<Option<(HandoffDeliveryMode, Option<i64>)>> {
+    if *kind != FactKind::Handoff || !targeted {
+        if deliver.is_some() || ack_within.is_some() {
+            return Err(RallyError::Usage(
+                "--deliver and --ack-within apply only to a targeted `say handoff` (--target or --ref)"
+                    .to_string(),
+            ));
+        }
+        return Ok(None);
+    }
+    let mode = match deliver.unwrap_or("inject") {
+        "inject" | "auto" => HandoffDeliveryMode::Inject,
+        "record" => HandoffDeliveryMode::Record,
+        other => {
+            return Err(RallyError::Usage(format!(
+                "--deliver must be inject or record; got {other}"
+            )));
+        }
+    };
+    let secs = ack_within.map(parse_ack_within).transpose()?;
+    Ok(Some((mode, secs)))
+}
+
+fn parse_ack_within(raw: &str) -> Result<i64> {
+    let raw = raw.trim();
+    let (digits, unit) = match raw.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+        Some((idx, _)) => raw.split_at(idx),
+        None => (raw, "s"),
+    };
+    let multiplier = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        _ => 0,
+    };
+    let secs = digits
+        .parse::<i64>()
+        .ok()
+        .and_then(|n| n.checked_mul(multiplier))
+        .filter(|secs| (1..=MAX_ACK_WITHIN_SECS).contains(secs));
+    secs.ok_or_else(|| {
+        RallyError::Usage(format!(
+            "--ack-within must be a duration like 90s, 10m, or 2h (1s..7d); got {raw}"
+        ))
+    })
+}
+
+/// What happened to a targeted handoff beyond the durable record.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+struct HandoffDelivery {
+    /// `inject` or `record` — what the sender asked for.
+    mode: String,
+    /// `injected` (pane write attempted through `rally inject --handoff`) or
+    /// `record_only` (ledger copy only; the receiver must pull it).
+    status: String,
+    /// Why, in one line: the inject delivery reason, or the fallback cause.
+    detail: String,
+    /// ACK deadline when `--ack-within` was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ack_by: Option<String>,
+}
+
+fn deliver_handoff(
+    mode: HandoffDeliveryMode,
+    sender_tool: &str,
+    target_tool: &str,
+    handoff_id: &str,
+    ack_by: Option<String>,
+    bins: BackendBins,
+) -> HandoffDelivery {
+    let record_only = |detail: String| HandoffDelivery {
+        mode: match mode {
+            HandoffDeliveryMode::Inject => "inject",
+            HandoffDeliveryMode::Record => "record",
+        }
+        .to_string(),
+        status: "record_only".to_string(),
+        detail,
+        ack_by: ack_by.clone(),
+    };
+    if mode == HandoffDeliveryMode::Record {
+        return record_only("--deliver record: not injected".to_string());
+    }
+    // Only a LIVE rally-managed session is a pane we may type into. A bare
+    // ledger agent id, a human pane, or a stale/gone session is never injected;
+    // `resolve_inject_target` already refuses stale and renumbered sessions.
+    match resolve_inject_target(target_tool, &bins) {
+        Ok(InjectTarget::Managed(_)) => {}
+        Ok(InjectTarget::LedgerAgent(_)) => {
+            return record_only(format!(
+                "{target_tool} is not a live rally-managed session; recorded for pull via `rally next`/`rally inbox`"
+            ));
+        }
+        Err(error) => return record_only(format!("not injectable: {error}")),
+    }
+    let args = InjectArgs {
+        json: true,
+        dry_run: false,
+        target: target_tool.to_string(),
+        text: None,
+        handoff: Some(handoff_id.to_string()),
+        require_ack: false,
+        timeout_seconds: 10,
+        bins,
+        tool: sender_tool.to_string(),
+        intent: MessageIntent::Directive,
+        responsibility: rally_protocol::WorkResponsibility::Unspecified,
+        urgent: false,
+    };
+    // Sender verification and lead/consent authorization run inside
+    // `command_inject_inner`; a refusal lands here as record-only.
+    match command_inject_inner(args, None) {
+        Ok(output) if output.exit_code == 0 => HandoffDelivery {
+            mode: "inject".to_string(),
+            status: "injected".to_string(),
+            detail: output.body["data"]["inject"]["delivery_reason"]
+                .as_str()
+                .unwrap_or("sent")
+                .to_string(),
+            ack_by,
+        },
+        Ok(output) => record_only(format!(
+            "inject failed: {}",
+            obligations::single_line(&output.text)
+        )),
+        Err(error) => record_only(format!("inject refused: {error}")),
+    }
+}
+
+/// One handoff the caller sent whose ACK deadline passed unanswered.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+struct OverdueHandoff {
+    event_id: String,
+    target: String,
+    subject: String,
+    ack_by: String,
+    overdue_secs: i64,
+    /// The durable no-response risk fact, when one is recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    risk_event_id: Option<String>,
+}
+
+/// Open handoffs authored by `tool` whose `ack-by:` deadline is before `now`.
+/// A receiver ack closes the handoff, which removes it from `open_handoffs`
+/// and therefore from this list — that is the only thing that clears it.
+fn overdue_handoffs_at(
+    snapshot: &RoomSnapshot,
+    tool: &str,
+    now: chrono::DateTime<Utc>,
+) -> Vec<OverdueHandoff> {
+    snapshot
+        .open_handoffs
+        .iter()
+        .filter(|fact| fact.tool.as_deref() == Some(tool))
+        .filter_map(|fact| {
+            let target = fact.target.clone()?;
+            let deadline_raw = fact
+                .evidence
+                .iter()
+                .find_map(|e| e.strip_prefix(ACK_BY_MARKER))?;
+            let deadline = chrono::DateTime::parse_from_rfc3339(deadline_raw).ok()?;
+            let overdue_secs = (now - deadline.with_timezone(&Utc)).num_seconds();
+            (overdue_secs >= 0).then(|| OverdueHandoff {
+                event_id: fact.event_id.clone(),
+                target,
+                subject: fact.subject.clone(),
+                ack_by: deadline_raw.to_string(),
+                overdue_secs,
+                risk_event_id: snapshot
+                    .current_risks
+                    .iter()
+                    .find(|risk| is_no_response_risk_for(risk, &fact.event_id))
+                    .map(|risk| risk.event_id.clone()),
+            })
+        })
+        .collect()
+}
+
+fn is_no_response_risk_for(risk: &Fact, handoff_id: &str) -> bool {
+    risk.kind == FactKind::Risk
+        && risk.ref_id.as_deref() == Some(handoff_id)
+        && risk.subject.starts_with(NO_RESPONSE_SUBJECT_PREFIX)
+}
+
+/// Compute the caller's overdue handoffs and, when `write` is set, record one
+/// durable `risk` fact per handoff that has none yet. Authored by the sender:
+/// the escalation is the sender's own log of a peer that did not answer.
+fn escalate_overdue_handoffs(
+    room: &RoomStore,
+    snapshot: &RoomSnapshot,
+    tool: &str,
+    write: bool,
+) -> Result<Vec<OverdueHandoff>> {
+    let mut overdue = overdue_handoffs_at(snapshot, tool, Utc::now());
+    if !write {
+        return Ok(overdue);
+    }
+    for item in overdue.iter_mut().filter(|i| i.risk_event_id.is_none()) {
+        let mut risk = build_risk_fact(
+            tool,
+            format!(
+                "{NO_RESPONSE_SUBJECT_PREFIX} {} did not ack handoff {} by {}",
+                item.target, item.event_id, item.ack_by
+            ),
+            format!(
+                "no response from {} to handoff {} ({}) — ack deadline {} passed {}s ago. \
+                 Escalate: re-inject (`rally inject {} --handoff {} --tool {tool}`), post a \
+                 backup locator, or reroute. Clears when {} acks (`rally say receipt --ref {}`).",
+                item.target,
+                item.event_id,
+                obligations::single_line(&item.subject),
+                item.ack_by,
+                item.overdue_secs,
+                item.target,
+                item.event_id,
+                item.target,
+                item.event_id,
+            ),
+            Vec::new(),
+            "warn",
+            vec![format!("no-response-to:{}", item.event_id)],
+            Some(item.event_id.clone()),
+        );
+        risk.target = Some(tool.to_string());
+        let appended = room.append_fact(&risk)?.into_fact_reporting();
+        item.risk_event_id = Some(appended.event_id);
+    }
+    Ok(overdue)
 }

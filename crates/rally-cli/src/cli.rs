@@ -232,6 +232,14 @@ pub(crate) struct SayArgs {
     // B1 wake-specific args (only meaningful when kind == wake)
     /// Wake: event-id of the standby fact being acknowledged. Stored in ref_id.
     pub(crate) ref_standby: Option<String>,
+    /// Handoff delivery mode: `inject` (default) also injects the handoff into
+    /// the target's live managed pane; `record` only records it.
+    pub(crate) deliver: Option<String>,
+    /// Handoff ACK deadline (`90s`, `10m`, `2h`). Stored as an `ack-by:<iso>`
+    /// evidence marker; the sender's `rally next` escalates once it passes.
+    pub(crate) ack_within: Option<String>,
+    /// Backend binaries used to probe/inject the handoff target's pane.
+    pub(crate) bins: BackendBins,
 }
 
 #[derive(Clone, Debug)]
@@ -1574,6 +1582,15 @@ fn say_parser() -> impl Parser<SayArgs> {
     let reason = optional_string_arg("reason", "REASON");
     let wake_after = optional_string_arg("wake-after", "OFFSET_OR_ISO");
     let ref_standby = optional_string_arg("ref-standby", "EVENT_ID");
+    let deliver = long("deliver")
+        .help("handoff only: `inject` (default) records the handoff AND injects it into the target's live rally-managed pane; falls back to record-only (with a reported reason) when the target is not a live managed session or inject is refused. `record` never injects.")
+        .argument::<String>("MODE")
+        .optional();
+    let ack_within = long("ack-within")
+        .help("handoff only: ACK deadline such as 90s, 10m, 2h. After it passes with no receiver ack, the sender's `rally next` records one `risk` fact (no-response) and lists the handoff under overdue_handoffs until the receiver acks.")
+        .argument::<String>("DURATION")
+        .optional();
+    let bins = backend_bins_parser();
     // KIND is a closed set, so `--help` has to name it. Discovering the set by
     // trial costs a junk fact in a live room per guess.
     let kind_help = format!(
@@ -1610,6 +1627,9 @@ fn say_parser() -> impl Parser<SayArgs> {
         reason,
         wake_after,
         ref_standby,
+        deliver,
+        ack_within,
+        bins,
         kind
     )
     .map(
@@ -1640,6 +1660,9 @@ fn say_parser() -> impl Parser<SayArgs> {
             reason,
             wake_after,
             ref_standby,
+            deliver,
+            ack_within,
+            bins,
             kind,
         )| SayArgs {
             json,
@@ -1669,6 +1692,9 @@ fn say_parser() -> impl Parser<SayArgs> {
             reason,
             wake_after,
             ref_standby,
+            deliver,
+            ack_within,
+            bins,
         },
     )
 }

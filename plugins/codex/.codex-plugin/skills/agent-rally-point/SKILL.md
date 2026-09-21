@@ -137,7 +137,7 @@ rally say artifact --tool "$TOOL" --subject "implemented change" --uri <path> --
 4. **Record coordination facts**:
 
 ```bash
-rally say handoff --tool "$TOOL" --target <other-tool> --subject "review this" --summary "<context>" --json
+rally say handoff --tool "$TOOL" --target <other-tool> --subject "review this" --summary "<context>" --ack-within 10m --json
 rally say blocker --tool "$TOOL" --subject "need decision" --severity high --json
 rally say resolve --tool "$TOOL" --ref <blocker-id> --subject "resolved" --json
 rally say decision --tool "$TOOL" --subject "binding decision" --status binding --json
@@ -160,6 +160,22 @@ recipient. Record five fields before dispatch: **recipient**, **primary
 channel**, **backup channel**, **ACK deadline**, and **fallback action**. Include
 the result date/time zone, original context, current status, and evidence or
 verification gaps in the returned payload.
+
+**Handoffs that need action: inject first, watch for the reply, escalate on
+silence.** `rally say handoff --target <tool>` records the handoff and, by
+default (`--deliver inject`), injects it into the target's pane when the target
+is a live `rally run`-managed session. Read `data.delivery.status`: `injected`
+means the pane write was attempted (not proof of receipt); `record_only` names
+why it could not inject (unmanaged/stale target, or inject authorization
+refused) — the receiver must then pull it, so use the backup channel now. Add
+`--ack-within 10m` for any handoff you are waiting on. Keep polling
+`rally next --tool "$TOOL" --json`; once the deadline passes with no receiver
+ack, `next` writes ONE durable `risk` fact (`no-response: <tool> did not ack
+handoff <id>`) and lists the handoff under `data.overdue_handoffs`. Then run the
+declared backup once (re-inject with `rally inject <tool> --handoff <id>`, post a
+backup locator, or reroute/tell the user). The entry clears only when the
+receiver acks (`rally say receipt|resolve --ref <id>`). `--deliver record`
+opts out of the inject.
 
 Use two delivery paths with different failure modes:
 
