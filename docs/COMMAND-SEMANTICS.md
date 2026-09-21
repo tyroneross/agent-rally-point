@@ -71,6 +71,10 @@ it appends presence or the handoff:
   This compatibility policy cannot reply to an existing handoff; only its exact
   bound receiver can do so. A reroute cites the original artifact/request in a
   new handoff.
+  A legacy directive with no `protocol:to_session_id` is bound by its first
+  status reply (`--ref <directive> --handoff-state acked|accepted|rejected`):
+  that reply's tool and session become the receiver, only the directive's
+  named `--target` tool may make it, and the author cannot answer its own.
 
 Fact v1 persists the routing bridge in Rally-owned evidence keys:
 `protocol:bridge_version=fact-v1`, `protocol:event_kind`,

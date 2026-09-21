@@ -1328,6 +1328,47 @@ fn same_handoff_semantics(existing: &Fact, proposed: &Fact) -> bool {
         && existing.from_session_id == proposed.from_session_id
 }
 
+/// Who may reply to a referenced handoff ("directive").
+///
+/// A strict handoff carries `target` + `protocol:to_session_id`, so its
+/// receiver is fixed. A legacy/unbound directive (no `--ref`, so no
+/// `to_session_id`) is bound by its FIRST status reply: that reply's author
+/// tool+session become the receiver, and every later reply must match them.
+/// Until then, only the directive's named `target` tool (if any) may reply.
+pub(crate) enum UnboundDirectiveReceiver<'a> {
+    Bound { tool: &'a str, session: &'a str },
+    Open { tool: Option<&'a str> },
+}
+
+pub(crate) fn unbound_directive_receiver<'a>(
+    referenced: &'a Fact,
+    facts: &'a [Fact],
+) -> UnboundDirectiveReceiver<'a> {
+    if let (Some(tool), Some(session)) = (
+        referenced.target.as_deref(),
+        protocol_marker(referenced, "to_session_id"),
+    ) {
+        return UnboundDirectiveReceiver::Bound { tool, session };
+    }
+    let first_reply = facts
+        .iter()
+        .filter(|candidate| {
+            candidate.kind == FactKind::Handoff
+                && candidate.ref_id.as_deref() == Some(referenced.event_id.as_str())
+                && protocol_marker(candidate, "event_kind").is_some()
+        })
+        .min_by_key(|candidate| candidate.seq);
+    if let Some(reply) = first_reply
+        && let (Some(tool), Some(session)) =
+            (reply.tool.as_deref(), reply.from_session_id.as_deref())
+    {
+        return UnboundDirectiveReceiver::Bound { tool, session };
+    }
+    UnboundDirectiveReceiver::Open {
+        tool: referenced.target.as_deref(),
+    }
+}
+
 fn validate_referenced_handoff(fact: &Fact, facts: &[Fact]) -> Result<()> {
     if fact.kind != FactKind::Handoff {
         return Ok(());
@@ -1502,9 +1543,22 @@ fn validate_referenced_handoff(fact: &Fact, facts: &[Fact]) -> Result<()> {
         )));
     }
     if referenced.kind == FactKind::Handoff {
-        let expected_reply_tool = referenced.target.as_deref().unwrap_or_default();
-        let expected_reply_session =
-            protocol_marker(referenced, "to_session_id").unwrap_or_default();
+        let (expected_reply_tool, expected_reply_session) =
+            match unbound_directive_receiver(referenced, facts) {
+                UnboundDirectiveReceiver::Bound { tool, session } => (tool, session),
+                UnboundDirectiveReceiver::Open { tool } => (
+                    tool.or(fact.tool.as_deref()).unwrap_or_default(),
+                    fact.from_session_id.as_deref().unwrap_or_default(),
+                ),
+            };
+        if referenced.from_session_id.is_some()
+            && fact.from_session_id == referenced.from_session_id
+            && protocol_marker(referenced, "to_session_id").is_none()
+        {
+            return Err(RallyError::Usage(format!(
+                "handoff_reply_author_mismatch: ref {ref_id} is your own directive; its receiver must reply"
+            )));
+        }
         if fact.tool.as_deref() != Some(expected_reply_tool)
             || fact.from_session_id.as_deref() != Some(expected_reply_session)
             || fact.target != referenced.tool

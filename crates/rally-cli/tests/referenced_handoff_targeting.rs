@@ -1437,3 +1437,102 @@ fn fresh_parent_lifecycle_exports_clear_an_inherited_managed_marker() {
         1
     );
 }
+
+#[test]
+fn status_reply_binds_an_unbound_legacy_directive() {
+    let room = Room::new();
+    // A legacy directive: a handoff with no `--ref`, so it carries no exact
+    // `protocol:to_session_id` binding.
+    let sent = room.json(
+        "session-author",
+        &[
+            "say",
+            "handoff",
+            "--tool",
+            "author:a",
+            "--target",
+            "reviewer:r",
+            "--subject",
+            "please review",
+            "--json",
+        ],
+    );
+    assert_eq!(sent["ok"], true, "{sent}");
+    let directive = sent["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A different tool still cannot answer a directive aimed at reviewer:r.
+    let wrong = room.run(
+        "session-other",
+        &[
+            "say",
+            "handoff",
+            "--tool",
+            "other:o",
+            "--ref",
+            &directive,
+            "--handoff-state",
+            "acked",
+            "--subject",
+            "ack",
+            "--json",
+        ],
+    );
+    assert!(!wrong.status.success());
+    assert!(
+        String::from_utf8_lossy(&wrong.stderr).contains("handoff_reply_author_mismatch"),
+        "{}",
+        String::from_utf8_lossy(&wrong.stderr)
+    );
+
+    // Regression: the named receiver's status reply used to be refused with
+    // handoff_reply_unbound_legacy. It now binds the directive it answers.
+    let ack = room.json(
+        "session-reviewer",
+        &[
+            "say",
+            "handoff",
+            "--tool",
+            "reviewer:r",
+            "--ref",
+            &directive,
+            "--handoff-state",
+            "acked",
+            "--subject",
+            "ack",
+            "--json",
+        ],
+    );
+    assert_eq!(ack["ok"], true, "{ack}");
+    let evidence = ack["data"]["say"]["fact"]["evidence"].as_array().unwrap();
+    assert!(
+        evidence
+            .iter()
+            .any(|v| v == "protocol:event_kind=handoff.acked")
+    );
+    // Once bound, another session of the same tool cannot take it over.
+    let hijack = room.run(
+        "session-reviewer-2",
+        &[
+            "say",
+            "handoff",
+            "--tool",
+            "reviewer:r",
+            "--ref",
+            &directive,
+            "--handoff-state",
+            "accepted",
+            "--subject",
+            "mine",
+            "--json",
+        ],
+    );
+    assert!(!hijack.status.success());
+    assert!(
+        String::from_utf8_lossy(&hijack.stderr).contains("handoff_reply_author_mismatch"),
+        "{}",
+        String::from_utf8_lossy(&hijack.stderr)
+    );
+}

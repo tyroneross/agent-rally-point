@@ -3795,16 +3795,22 @@ fn resolve_referenced_handoff_binding(
             ref_id.to_string(),
         )
     } else if referenced.kind == FactKind::Handoff {
-        let expected_tool = referenced.target.as_deref().ok_or_else(|| {
-            RallyError::Usage(format!(
-                "handoff_reply_unbound_legacy: handoff {ref_id} has no target; use --target-policy third-party with one exact managed session"
-            ))
-        })?;
-        let expected_session = protocol_evidence(referenced, "to_session_id").ok_or_else(|| {
-            RallyError::Usage(format!(
-                "handoff_reply_unbound_legacy: handoff {ref_id} has no exact to_session_id; use --target-policy third-party with one exact managed session"
-            ))
-        })?;
+        // A legacy directive has no exact receiver binding; its first status
+        // reply binds it (see `store::unbound_directive_receiver`). All the
+        // author/receiver checks below still apply to the bound pair.
+        let (expected_tool, expected_session) = match store::unbound_directive_receiver(
+            referenced, &facts,
+        ) {
+            store::UnboundDirectiveReceiver::Bound { tool, session } => (tool, session),
+            store::UnboundDirectiveReceiver::Open { tool: named } => {
+                if referenced.from_session_id.as_deref() == Some(caller_session) {
+                    return Err(RallyError::Usage(format!(
+                        "handoff_reply_author_mismatch: ref {ref_id} is your own directive; its receiver must reply"
+                    )));
+                }
+                (named.unwrap_or(tool), caller_session)
+            }
+        };
         if tool != expected_tool || caller_session != expected_session {
             return Err(RallyError::Usage(format!(
                 "handoff_reply_author_mismatch: ref {ref_id} is bound to {expected_tool}/{expected_session}; caller is {tool}/{caller_session}. The bound receiver must author the reply."
