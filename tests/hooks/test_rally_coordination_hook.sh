@@ -1995,6 +1995,23 @@ T="cursor dual-id: claude_code argv + cursor_version renders cursor start envelo
 )
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
 
+T="cursor dual-id: claude_code argv + conversation_id (no cursor_version) remaps to cursor start"
+(
+  repo="$tmpdir/cursor-dual-convid-repo"
+  mkdir -p "$repo/.rally"
+  cd "$repo" || exit 1
+  out=$(RALLY_BIN="$cursor_life" "$HOOK" start claude_code \
+    <<<'{"conversation_id":"sess-convid","session_id":"sess-convid","hook_event_name":"sessionStart"}' 2>/dev/null)
+  rc=$?
+  if [ "$rc" != "0" ]; then printf 'rc=%s out=[%s]\n' "$rc" "$out" >&2; exit 1; fi
+  printf '%s' "$out" | grep -q '"additional_context"' || { printf 'expected cursor start shape: %s\n' "$out" >&2; exit 1; }
+  if printf '%s' "$out" | grep -q 'additionalContext'; then
+    printf 'conversation_id dual-id still rendered Claude envelope: %s\n' "$out" >&2; exit 1
+  fi
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
 # ----------------------------------------------------------------------
 # Test 7: low-severity warn → additionalContext (no deny) in both modes
 # ----------------------------------------------------------------------
@@ -3283,6 +3300,39 @@ EOF
   }
   printf '%s' "$bw" | grep -q -- '--tool claude_code' && {
     printf 'native exec still passed claude_code: [%s]\n' "$bw" >&2
+    exit 1
+  }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+T="native branch: claude_code argv + conversation_id remaps --tool before exec"
+(
+  repo="$tmpdir/native-convid-repo"
+  mkdir -p "$repo/.rally"
+  cd "$repo" || exit 1
+  native_bin="$tmpdir/rally_native_convid"
+  native_calls="$tmpdir/rally_native_convid.calls"
+  : > "$native_calls"
+  cat > "$native_bin" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${CALLS:?}"
+if [ "$1" = "hook" ] && [ "$2" = "capabilities" ]; then
+  printf '%s\n' '{"data":{"hook":{"phases":["before-write"]}}}'
+  exit 0
+fi
+printf '%s\n' '{}'
+exit 0
+EOF
+  install_stub "$native_bin"
+  out=$(CALLS="$native_calls" RALLY_NATIVE_HOOK=on RALLY_BIN="$native_bin" \
+    "$HOOK" before-write claude_code \
+    <<<'{"conversation_id":"sess-native-convid","session_id":"sess-native-convid","hook_event_name":"preToolUse","tool_name":"Write","tool_input":{"file_path":"src/a.rs"}}' 2>/dev/null)
+  rc=$?
+  if [ "$rc" != "0" ]; then printf 'rc=%s out=[%s]\n' "$rc" "$out" >&2; exit 1; fi
+  bw="$(grep '^hook before-write' "$native_calls" | head -n1)"
+  printf '%s' "$bw" | grep -q -- '--tool cursor' || {
+    printf 'native exec kept claude_code after conversation_id remap: [%s]\n' "$bw" >&2
     exit 1
   }
   exit 0

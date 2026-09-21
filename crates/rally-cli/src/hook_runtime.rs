@@ -107,7 +107,7 @@ impl HostFamily {
     }
 
     /// Cursor loads Claude project hooks (third-party compatibility). The
-    /// envelope then carries `cursor_version` while argv still says
+    /// envelope then carries Cursor common fields while argv still says
     /// `claude_code`, which dual-enters the same conversation as two host
     /// families. Force the Cursor family when the envelope proves the host.
     pub(crate) fn from_tool_and_stdin(tool: &str, stdin: &str) -> Self {
@@ -142,11 +142,40 @@ impl HostFamily {
     }
 }
 
+/// Cursor's common hook payload always includes `conversation_id` and
+/// `cursor_version` ([hooks docs](https://cursor.com/docs/hooks)). Claude-compat
+/// third-party mapping can omit `cursor_version` while still sending Cursor
+/// field names. Any of these is enough to prove the host is Cursor.
+pub(crate) fn stdin_signals_cursor_host(stdin: &str) -> bool {
+    if stdin.contains("\"cursor_version\"") || stdin.contains("\"cursorVersion\"") {
+        return true;
+    }
+    if stdin.contains("\"conversation_id\"") || stdin.contains("\"parent_conversation_id\"") {
+        return true;
+    }
+    // Cursor event names are camelCase; Claude Code's are PascalCase.
+    const CURSOR_EVENTS: &[&str] = &[
+        "sessionStart",
+        "preToolUse",
+        "beforeSubmitPrompt",
+        "sessionEnd",
+        "subagentStart",
+        "subagentStop",
+        "preCompact",
+        "stop",
+    ];
+    CURSOR_EVENTS.iter().any(|event| {
+        let needle = format!("\"hook_event_name\":\"{event}\"");
+        let spaced = format!("\"hook_event_name\": \"{event}\"");
+        stdin.contains(&needle) || stdin.contains(&spaced)
+    })
+}
+
 /// When Cursor fires Claude-shaped hooks, rewrite the argv family so claims
 /// and envelopes stay on `cursor:<session>` instead of minting a twin
 /// `claude_code:` identity for the same conversation.
 pub(crate) fn remap_claude_tool_to_cursor(tool: &str, stdin: &str) -> String {
-    if !stdin.contains("\"cursor_version\"") {
+    if !stdin_signals_cursor_host(stdin) {
         return tool.to_string();
     }
     if tool == "claude_code" {
@@ -230,11 +259,18 @@ pub(crate) fn parse_input(raw: &str) -> std::result::Result<ParsedEnvelope, Stri
         return Err("hook envelope is not an object".to_string());
     };
 
-    let session = ["session_id", "sessionId"]
-        .iter()
-        .find_map(|key| obj.get(*key).filter(|v| js_truthy(v)))
-        .map(js_to_string)
-        .unwrap_or_default();
+    // Nested Cursor Task agents mint a new conversation_id; bind them to the
+    // parent Composer thread so one operator chat is one Rally squad.
+    let session = [
+        "parent_conversation_id",
+        "conversation_id",
+        "session_id",
+        "sessionId",
+    ]
+    .iter()
+    .find_map(|key| obj.get(*key).filter(|v| js_truthy(v)))
+    .map(js_to_string)
+    .unwrap_or_default();
 
     let has_tool_name = obj.contains_key("tool_name") || obj.contains_key("toolName");
     let tool_name = if obj.contains_key("tool_name") {
@@ -2515,7 +2551,31 @@ mod tests {
         );
         assert_eq!(
             remap_claude_tool_to_cursor("claude_code:95a42897", r#"{"session_id":"x"}"#),
-            "claude_code:95a42897"
+            "claude_code:95a42897",
+            "a Claude-only envelope must not remap"
+        );
+        assert_eq!(
+            remap_claude_tool_to_cursor(
+                "claude_code:95a42897",
+                r#"{"conversation_id":"95a42897-0473-4e6e-8ace-ebabd4f937fc","session_id":"95a42897-0473-4e6e-8ace-ebabd4f937fc"}"#
+            ),
+            "cursor:95a42897",
+            "Cursor common payload without cursor_version still remaps"
+        );
+        assert_eq!(
+            remap_claude_tool_to_cursor(
+                "claude_code:95a42897",
+                r#"{"hook_event_name":"sessionStart","session_id":"95a42897"}"#
+            ),
+            "cursor:95a42897"
+        );
+        let nested = parse_input(
+            r#"{"conversation_id":"child-uuid","parent_conversation_id":"e31d06b9-85a6-4ba9-8138-0ad1a0b0d086","session_id":"child-uuid"}"#,
+        )
+        .expect("nested envelope");
+        assert_eq!(
+            nested.session, "e31d06b9-85a6-4ba9-8138-0ad1a0b0d086",
+            "nested Task agents bind to the parent Composer id"
         );
     }
 

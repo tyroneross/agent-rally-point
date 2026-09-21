@@ -112,9 +112,10 @@ and release jobs.
 > `beforeSubmitPrompt` (idle) has no model-inject field — it still posts presence and returns `{}`. `preToolUse`
 > matcher is `Write|Edit|StrReplace|Delete|EditNotebook`; `agent_message` is
 > documented as deny-path, so advisory before-write remains a known gap. Cursor
-> third-party Claude hooks that carry `cursor_version` are remapped to the
+> third-party Claude hooks that carry Cursor-shaped envelopes (`conversation_id`,
+> `parent_conversation_id`, camelCase `hook_event_name`, or `cursor_version`) are remapped to the
 > `cursor:` family so one conversation is not dual-entered as `claude_code:`.
-> The wrapper remaps `--tool` **before** native `rally hook before-write` exec,
+> Nested Task agents bind to `parent_conversation_id`. The wrapper remaps `--tool` **before** native `rally hook before-write` exec,
 > so an older installed binary still receives `cursor:` instead of minting a
 > `claude_code:` claim from the same conversation.
 >

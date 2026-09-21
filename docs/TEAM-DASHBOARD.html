@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Team Coordination — Findings Dashboard (2026-09-20)</title>
+<style>
+  :root { color-scheme: light; }
+  body { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; line-height: 1.5; max-width: 960px; margin: 0 auto; padding: 24px 20px 64px; color: #1a1a1a; background: #fff; }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  h2 { font-size: 17px; margin: 32px 0 8px; padding-bottom: 4px; border-bottom: 1px solid #ddd; }
+  h3 { font-size: 14px; margin: 16px 0 4px; }
+  p, li { font-size: 14px; }
+  .meta { font-size: 12px; color: #555; margin-bottom: 16px; }
+  .status-ok { color: #0a6b2d; font-weight: 600; }
+  .status-warn { color: #8a5200; font-weight: 600; }
+  .status-fail { color: #a12020; font-weight: 600; }
+  table { border-collapse: collapse; width: 100%; margin: 8px 0 16px; font-size: 13px; }
+  th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; vertical-align: top; }
+  th { background: #f2f2f2; font-weight: 600; }
+  ol.flow { counter-reset: step; list-style: none; padding: 0; }
+  ol.flow > li { counter-increment: step; margin: 0 0 12px; padding: 10px 12px 10px 48px; position: relative; border: 1px solid #ddd; }
+  ol.flow > li::before { content: counter(step); position: absolute; left: 12px; top: 10px; width: 24px; height: 24px; line-height: 24px; text-align: center; font-size: 13px; font-weight: 700; background: #1a1a1a; color: #fff; }
+  code { font-size: 12.5px; background: #f4f4f4; padding: 1px 4px; }
+  details { font-size: 13px; margin: 4px 0; }
+  summary { cursor: pointer; font-weight: 600; }
+  footer { margin-top: 40px; font-size: 12px; color: #555; border-top: 1px solid #ddd; padding-top: 12px; }
+</style>
+</head>
+<body>
+
+<h1>Team coordination — findings dashboard</h1>
+<p class="meta">2026-09-20 · Muse Code 1.3.0 · repo: <code>agent-rally-point</code> · scope: recall canary, workflow research, charter/roles, notifications</p>
+
+<h2>Headline</h2>
+<p>File-based shared context works for simple ordered recall: <span class="status-ok">2/2 fresh agents verbatim</span>. The durable-memory and role-visibility gaps found by research are addressed by five new repo artifacts (charter, modes, retests, simulator + tests, notification schema).</p>
+
+<h2>1 · What was found</h2>
+<ul>
+  <li>No <code>TEAM.md</code> / <code>CHARTER.md</code> / <code>GOAL.md</code> existed at root or <code>~/dev</code> depth 2 (16k-file search) — this change adds the first team contract.</li>
+  <li>Canonical durable record is per-repo <code>.rally/log/*.jsonl</code>; <code>facts.db</code>, <code>snapshot.cache.json</code>, claim-index and cursors are disposable. Active engagement pointer lives outside the repo.</li>
+  <li>Rally already records a lead seat (first frontier join or user-designated), ack gate, exclusive file-scope claims with lease expiry, and merge-gate doctrine. It records and exposes; it does not force agents.</li>
+  <li>Stored sessions carry <code>role:null</code> — roles must be derived from live state (<code>rally room</code> / <code>lead show</code>), not persisted as identity.</li>
+  <li>Build-loop durable goals are <code>backlog.md</code> + <code>milestones.jsonl</code> + <code>CURRENT.md</code> (no <code>goal.md</code> API); persona-lab runs plan-only with blind lanes and file:line-verified encounters.</li>
+  <li>Notification precedents exist: <code>monitor.py</code> deltas (<code>last_seq</code> + surfaced keys), per-tool file sinks (<code>consumers.toml</code>), <code>agent-rally.fact.v1</code> envelope, bookmark trails (<code>trails/files.md</code>, <code>LATEST.md</code>, <code>cost-ledger.jsonl</code>).</li>
+</ul>
+
+<h2>2 · Actions of each agent</h2>
+<table>
+  <tr><th>Agent</th><th>Task</th><th>Actions taken</th><th>Result</th></tr>
+  <tr>
+    <td>Lead (parent session)</td>
+    <td>Orchestrate, canary, land artifacts</td>
+    <td>Authored <code>/tmp/team-recall-canary.md</code> (4 ordered items + checksum); spawned A/B; compared verbatim; wrote charter, modes, retests, simulator, tests, notifications; ran pytest.</td>
+    <td><span class="status-ok">Done — 4/4 pytest pass</span></td>
+  </tr>
+  <tr>
+    <td>RECALL-A (fresh subagent)</td>
+    <td>R1 verbatim recall</td>
+    <td>Read canary file, reported 4 items + checksum line.</td>
+    <td><span class="status-ok">Pass — verbatim</span></td>
+  </tr>
+  <tr>
+    <td>RECALL-B (fresh subagent)</td>
+    <td>R1 verbatim recall</td>
+    <td>Read canary file, reported 4 items + checksum line.</td>
+    <td><span class="status-ok">Pass — verbatim</span></td>
+  </tr>
+  <tr>
+    <td>Workflow slot-0 (rally)</td>
+    <td>Rally integration discovery · 13 tool calls</td>
+    <td>Inspected <code>.rally</code> stores, manifest, NORTH_STAR invariants, claim scopes.</td>
+    <td><span class="status-ok">Evidence delivered</span></td>
+  </tr>
+  <tr>
+    <td>Workflow slot-1 (personas/build-loop)</td>
+    <td>Persona + build-loop discovery · 11 tool calls</td>
+    <td>Inspected persona-lab runs/rosters, build-loop phases, <code>blm context --mode</code>.</td>
+    <td><span class="status-ok">Evidence delivered</span></td>
+  </tr>
+  <tr>
+    <td>Workflow slot-2 (retest design)</td>
+    <td>Recall retest design · 0 tool calls</td>
+    <td>No tool calls; returned no usable evidence.</td>
+    <td><span class="status-fail">Empty — parent authored retests instead</span></td>
+  </tr>
+  <tr>
+    <td>Workflow slot-3 (options)</td>
+    <td>Charter/roles options · 16 tool calls</td>
+    <td>Searched 16k files for TEAM_GOALS, constitution precedents, handoff failures, MEMORY lanes.</td>
+    <td><span class="status-ok">Evidence delivered</span></td>
+  </tr>
+  <tr>
+    <td>Workflow slot-4 (notifications)</td>
+    <td>Notification surfaces · 10 tool calls</td>
+    <td>Inspected monitor deltas, consumers.toml, fact envelope, bookmark trails, hooks gap.</td>
+    <td><span class="status-ok">Evidence delivered</span></td>
+  </tr>
+  <tr>
+    <td>Workflow synthesis</td>
+    <td>Merge 5 slots</td>
+    <td>Composed findings; marked 6 unresolved items explicitly.</td>
+    <td><span class="status-ok">Complete with noted gaps</span></td>
+  </tr>
+</table>
+
+<h2>3 · Flow of work and comms between agents</h2>
+<ol class="flow">
+  <li><strong>Lead authors shared context.</strong> Lead writes mission + ordered task list with <code>context_version</code> (canary: <code>/tmp/team-recall-canary.md</code>, checksum <code>ALPHA-BRAVO-CHARLIE-DELTA-7</code>).</li>
+  <li><strong>Lead spawns members.</strong> <code>subagent_spawn</code> with a narrow objective ("read the file, report verbatim starting with RECALL-A/B"); shared workspace, no isolation needed for read-only recall.</li>
+  <li><strong>Members read, never guess.</strong> Each member opens the same file body and quotes it back; no member-to-member channel is used — the file is the single source of truth.</li>
+  <li><strong>Lead verifies.</strong> <code>subagent_wait</code> collects each result; lead diffs order + checksum. Mismatch = fail, not retry-by-editing the check.</li>
+  <li><strong>Research fans out, then merges.</strong> Five workflow children inspect different surfaces (rally store, personas/build-loop, retests, options, notifications) in parallel; a synthesis agent merges compact evidence + unresolved list into one terminal summary.</li>
+  <li><strong>Steady-state comms use the ledger.</strong> <code>rally say artifact</code> → <code>.rally/log/</code> (status heartbeats every ~10 min, silence &gt;15 min is a coordination bug); <code>team.event.v1</code> adds role + <code>ack_seq</code> so staleness is detectable; <code>rally room</code> projects lead, mode, and last event per agent.</li>
+  <li><strong>Change = new version + re-ack.</strong> Any mutation to mission or order bumps <code>context_version</code>; members re-ack and re-quote (R3) before merge. Stale-version work fails the merge gate, never the keystroke.</li>
+</ol>
+<h3>Channels used / deliberately not used</h3>
+<ul>
+  <li>Used: <code>subagent_spawn</code>/<code>subagent_wait</code> (task refs), Workflow parallel + synthesis, shared files, <code>.rally/log</code> facts.</li>
+  <li>Present but unused: <code>session-message list/send</code> (2 live peer sessions reachable) — not messaged to avoid interrupting real work; canary used fresh subagents instead.</li>
+</ul>
+
+<h2>4 · Issues and lessons learned</h2>
+<table>
+  <tr><th>Issue</th><th>Impact</th><th>Lesson / disposition</th></tr>
+  <tr><td>Slot-2 child returned zero evidence (0 tool calls)</td><td>Retest design had no research input</td><td>Check per-slot evidence before synthesizing; parent authored R1–R3 + simulator directly. <span class="status-warn">Recovered</span></td></tr>
+  <tr><td><code>role:null</code> in stored sessions</td><td>Cannot read roles from history</td><td>Derive roles at read time from live <code>room</code>/<code>lead show</code>; recorded in charter + event schema.</td></tr>
+  <tr><td>Config precedence (<code>~/.rally</code> vs <code>~/dev/.rally</code> vs per-repo) unverified</td><td>Ambiguous source of truth</td><td>Treat per-repo log as canonical until code verifies otherwise; noted open in notifications doc.</td></tr>
+  <tr><td>No durable goals API; semantic recall unavailable</td><td>Goals composed from files; JSONL is the working path</td><td>Charter cites <code>backlog.md</code>/<code>milestones.jsonl</code>/<code>CURRENT.md</code> by id + version instead of assuming an API.</td></tr>
+  <tr><td>lead/worker/reviewer vocabulary is new (code shows orchestrator/implementer/judge)</td><td>Term mismatch with implementation</td><td>Adopt in charter + events first, then CLI projections; flagged as follow-up.</td></tr>
+  <tr><td>Pre-existing dirty tree (<code>hook_runtime.rs</code>, coordination hook)</td><td>Risk of collateral edits</td><td>Left untouched; the five new files are untracked and reviewable in isolation.</td></tr>
+</table>
+
+<h2>5 · Artifacts landed (reviewable, untracked)</h2>
+<ul>
+  <li><code>docs/TEAM-CHARTER.md</code> — goal, roles, shared-memory protocol, personas/build-loop rules, modes.</li>
+  <li><code>config/team-modes.json</code> — standard (default) / strict / lightweight, user-selectable via <code>TEAM_MODE</code>.</li>
+  <li><code>docs/TEAM-RECALL-RETESTS.md</code> — R1 verbatim, R2 instruction, R3 mutation recall.</li>
+  <li><code>scripts/team_recall_retest.py</code> + <code>tests/test_team_recall.py</code> — offline replay, 4 passed.</li>
+  <li><code>docs/TEAM-NOTIFICATIONS.md</code> — <code>team.event.v1</code> schema over existing <code>.rally/log</code> + file sinks.</li>
+</ul>
+
+<footer>Canary file <code>/tmp/team-recall-canary.md</code> preserved for re-runs. Live peer sessions were never messaged. Workflow synthesis: complete with 6 explicitly carried unresolved items.</footer>
+
+<!-- Agent-readable payload: an LLM reading this file as text takes the LAST match of STACK-DATA-BEGIN ... STACK-DATA-END and parses it as JSON (last match wins). -->
+<!--STACK-DATA-BEGIN-->
+{"title": "Team coordination findings dashboard", "date": "2026-09-20", "canary": {"file": "/tmp/team-recall-canary.md", "checksum": "ALPHA-BRAVO-CHARLIE-DELTA-7", "recall_a": "pass-verbatim", "recall_b": "pass-verbatim"}, "tests": {"suite": "tests/test_team_recall.py", "passed": 4, "failed": 0}, "artifacts": ["docs/TEAM-CHARTER.md", "config/team-modes.json", "docs/TEAM-RECALL-RETESTS.md", "scripts/team_recall_retest.py", "tests/test_team_recall.py", "docs/TEAM-NOTIFICATIONS.md", "docs/TEAM-DASHBOARD.html"], "open_items": ["config-precedence-unverified", "no-durable-goals-api", "role-null-derive-at-read", "vocab-lead-worker-reviewer-new", "no-live-rally-binary-read", "semantic-recall-unavailable"]}
+<!--STACK-DATA-END-->
+<script type="application/json" id="stack-data">
+/*STACK-DATA-BEGIN
+{
+  "title": "Team coordination findings dashboard",
+  "date": "2026-09-20",
+  "canary": {"file": "/tmp/team-recall-canary.md", "checksum": "ALPHA-BRAVO-CHARLIE-DELTA-7", "recall_a": "pass-verbatim", "recall_b": "pass-verbatim"},
+  "agents": [
+    {"id": "lead-parent", "calls": null, "result": "done"},
+    {"id": "recall-a", "calls": 0, "result": "pass-verbatim"},
+    {"id": "recall-b", "calls": 0, "result": "pass-verbatim"},
+    {"id": "wf-slot-0-rally", "calls": 13, "result": "evidence"},
+    {"id": "wf-slot-1-personas-buildloop", "calls": 11, "result": "evidence"},
+    {"id": "wf-slot-2-retests", "calls": 0, "result": "empty"},
+    {"id": "wf-slot-3-options", "calls": 16, "result": "evidence"},
+    {"id": "wf-slot-4-notifications", "calls": 10, "result": "evidence"},
+    {"id": "wf-synthesis", "calls": 0, "result": "complete-with-gaps"}
+  ],
+  "tests": {"suite": "tests/test_team_recall.py", "passed": 4, "failed": 0},
+  "artifacts": ["docs/TEAM-CHARTER.md", "config/team-modes.json", "docs/TEAM-RECALL-RETESTS.md", "scripts/team_recall_retest.py", "tests/test_team_recall.py", "docs/TEAM-NOTIFICATIONS.md", "docs/TEAM-DASHBOARD.html"],
+  "open_items": ["config-precedence-unverified", "no-durable-goals-api", "role-null-derive-at-read", "vocab-lead-worker-reviewer-new", "no-live-rally-binary-read", "semantic-recall-unavailable"]
+}
+STACK-DATA-END*/
+</script>
+
+</body>
+</html>

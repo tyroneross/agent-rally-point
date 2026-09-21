@@ -45,3 +45,16 @@ payload_match = { verdict = "BLOCKED" }
 [consumers.urgent_notify.sink]
 type = "notify"
 title = "Rally Watcher — blocker"
+
+
+# Team interaction board: roles + ack/performance for the operator.
+# Copy this block into ~/.agent-rally-watcher/consumers.toml, then:
+#   agent-rally-watcher reload
+# Body is payload.summary when present; otherwise the record kind.
+[consumers.team_status.filter]
+kinds = ["handoff", "presence", "decision", "feedback"]
+
+[consumers.team_status.sink]
+type = "notify"
+title = "Rally team"
+body_field = "summary"

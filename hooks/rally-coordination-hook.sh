@@ -379,7 +379,9 @@ fi
 # before native exec AND before session expansion so claims stay on
 # cursor:<session> even when the installed rally binary is older than the
 # rust remap.
-if printf '%s' "$input" | grep -q '"cursor_version"'; then
+# Cursor common payload (docs): conversation_id + cursor_version + camelCase
+# hook_event_name. Claude-compat third-party mapping can omit cursor_version.
+if printf '%s' "$input" | grep -qE '"cursor_version"|"cursorVersion"|"conversation_id"|"parent_conversation_id"|"hook_event_name"[[:space:]]*:[[:space:]]*"(sessionStart|preToolUse|beforeSubmitPrompt|sessionEnd|subagentStart|subagentStop|preCompact|stop)"'; then
   case "$tool" in
     claude_code)
       tool="cursor"
@@ -515,7 +517,7 @@ catch (_) { finish(14, {effect:"malformed", tool:"unknown", session:"", diagnost
 if (!value || typeof value !== "object" || Array.isArray(value)) {
   finish(14, {effect:"malformed", tool:"unknown", session:"", diagnostic:"hook envelope is not an object"});
 }
-const session = String(value.session_id || value.sessionId || "");
+const session = String(value.parent_conversation_id || value.conversation_id || value.session_id || value.sessionId || "");
 const hasToolName = Object.prototype.hasOwnProperty.call(value, "tool_name") || Object.prototype.hasOwnProperty.call(value, "toolName");
 const rawTool = Object.prototype.hasOwnProperty.call(value, "tool_name") ? value.tool_name : value.toolName;
 const cwd = typeof value.cwd === "string"
@@ -1395,7 +1397,7 @@ if [ "$have_node" = "1" ] && [ -n "$input" ]; then
 const fs=require("fs");
 try {
   const value=JSON.parse(fs.readFileSync(0,"utf8")||"{}");
-  process.stdout.write(String(value.session_id || value.sessionId || ""));
+  process.stdout.write(String(value.parent_conversation_id || value.conversation_id || value.session_id || value.sessionId || ""));
 } catch (_) {}
 ' ; } 2>/dev/null)"
   fi

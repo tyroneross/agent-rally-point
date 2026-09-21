@@ -1,0 +1,5 @@
+TEAM-CTX-1
+1. ALPHA: Stabilize shared-memory write protocol
+2. BRAVO: Add TEAM_CHARTER.md with roles
+3. CHARLIE: Wire rally native event notifications
+Checksum: ALPHA-BRAVO-CHARLIE-1

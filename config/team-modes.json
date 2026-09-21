@@ -1,0 +1,21 @@
+{
+  "$schema": "https://agent-rally-point.invalid/schemas/team-modes.json",
+  "default": "standard",
+  "modes": {
+    "standard": {
+      "recall_gate": ["R1"],
+      "status_cadence": "10min",
+      "use_when": "normal parallel work"
+    },
+    "strict": {
+      "recall_gate": ["R1", "R3"],
+      "status_cadence": "5min",
+      "use_when": "merge-heavy or flaky-recall squads"
+    },
+    "lightweight": {
+      "recall_gate": ["checksum-only"],
+      "status_cadence": "final-only",
+      "use_when": "solo or 2-agent spikes"
+    }
+  }
+}

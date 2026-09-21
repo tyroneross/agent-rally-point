@@ -1,0 +1,79 @@
+{
+  "schema": "agent-rally.team-task-board.v1",
+  "context_version": "TEAM-CTX-1",
+  "commander_intent": "Reliable agent-to-agent communication: same mission, same ordered task list, same context version.",
+  "higher_echelon": {
+    "id": "user:operator",
+    "callsign": "HHQ",
+    "kind": "hhq",
+    "receive": ["rally room", "rally say artifact", "team.event.v1"]
+  },
+  "constraints": [
+    "TEAM-CHARTER.md",
+    "team mode standard (R1 before start)",
+    "claim before edit; never block keystrokes",
+    "personas = voice only; facts from this board + rally"
+  ],
+  "companies": [
+    {
+      "session": "claude_code:muse-lead",
+      "callsign": "Lead Co",
+      "kind": "gm",
+      "host": "claude_code",
+      "reports_to": "user:operator",
+      "resources": ["rally", "build-loop", "persona-lab", "muse-spark subagents"]
+    },
+    {
+      "session": "cursor:5be1cf8a-6687-468e-8f0e-e1e9e8ab3818",
+      "callsign": "Native Co",
+      "kind": "gm",
+      "host": "cursor",
+      "reports_to": "claude_code:muse-lead",
+      "resources": ["rally CLI", "build-loop hooks", "agent-rally-watcher"]
+    },
+    {
+      "session": "muse_spark:capability-probe-01",
+      "callsign": "Muse Co",
+      "kind": "gm",
+      "host": "muse-spark",
+      "reports_to": "claude_code:muse-lead",
+      "resources": ["claude CLI via muse-spark wrapper", "rally (blocked until Shell hook reloads)"],
+      "notes": "recall_ready only as of 2026-09-20"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "ALPHA",
+      "intent": "Stabilize shared-memory write protocol",
+      "session": "claude_code:muse-lead",
+      "status": "in_progress",
+      "depends_on": [],
+      "resources": ["rally mission", "context_version"]
+    },
+    {
+      "id": "BRAVO",
+      "intent": "Add TEAM_CHARTER.md with roles",
+      "session": "claude_code:muse-lead",
+      "status": "done",
+      "depends_on": [],
+      "resources": ["docs/TEAM-CHARTER.md", "config/team-modes.json"]
+    },
+    {
+      "id": "CHARLIE",
+      "intent": "Wire rally native event notifications",
+      "session": "cursor:5be1cf8a-6687-468e-8f0e-e1e9e8ab3818",
+      "status": "in_progress",
+      "depends_on": ["BRAVO"],
+      "resources": ["build-loop hooks", "TEAM-NOTIFICATIONS.md", "agent-rally-watcher"]
+    },
+    {
+      "id": "DELTA",
+      "intent": "Admit Muse / new sessions to room_ready and keep this board current",
+      "session": "muse_spark:capability-probe-01",
+      "status": "blocked",
+      "depends_on": ["CHARLIE"],
+      "resources": ["MUSE_SPARK_API_KEY", "rally enter/ack"],
+      "notes": "blocked on Cursor Shell hook JSON"
+    }
+  ]
+}
