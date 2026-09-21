@@ -40,6 +40,16 @@ its absolute path as `RALLY_FLOW_CORE`:
 
 The linter, fan-out resolver, limiter, and packet generator below all use that same absolute path.
 
+## Joining a team
+
+When your launch instructions name a shared team memory directory, you are a team member (any agent, any provider):
+
+1. Read `team-memory.json` there first. If it is missing, its `digest` differs from the digest in your instructions, or a file it lists is missing, write an `abstain` receipt and do not start work. Never fill a gap by guessing.
+2. Otherwise read `CHARTER.md` (if listed) and `project.md`, then write your receipt JSON to the exact `receipts/<token>.json` path you were given, using the capability ids listed in the instructions. You get team tasks only after the coordinator scores that receipt as an exact match.
+3. Clear every rally obligation addressed to you with your own `rally say receipt --tool <you> --ref <event>`; nobody else can clear it for you.
+4. Report status on a directive with `rally say handoff --tool <you> --ref <directive> --handoff-state acked|accepted|rejected`. Your first reply binds an unbound directive to your session; after that only you can reply to it. For new work, send a NEW `rally say handoff --to <coordinator> --evidence directive:<event>`. Escalate blockers with `rally say blocker --to <coordinator> --severity high`.
+5. On rally 0.2.7 or older a `--ref` reply to an unbound directive fails with `handoff_reply_unbound_legacy`; use the NEW-handoff form from step 4 instead.
+
 ## 1 · Decompose — author the descriptor
 
 Write a JSON workstream descriptor per `../../dynamic-workflows/PROTOCOL.md` (§1). Required
