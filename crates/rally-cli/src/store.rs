@@ -5461,16 +5461,15 @@ impl DirectRoomStore {
                 return Err(RallyError::Usage(refusal));
             }
             if let Some(conflict) = claim_authority::detect_conflict(&facts, &fact) {
-                return Err(RallyError::Usage(format!(
-                    "claim conflict: {} holds {} (claim {}), which overlaps the scope you \
-                     requested, {}",
-                    conflict
-                        .existing_owner
-                        .as_deref()
-                        .unwrap_or("unknown owner"),
-                    conflict.existing_scope,
-                    conflict.existing_claim_id,
-                    conflict.scope
+                // HARD CONSTRAINT: the "claim conflict:" prefix and the owner's
+                // position as the FIRST whitespace-delimited token after it are
+                // byte-stable. `ClaimConflictEntry` in lib.rs parses the owner
+                // by splitting exactly there; RC-037 already broke that field
+                // once with a prose edit. Anything new goes AFTER the existing
+                // sentence, never before the owner. Pinned by
+                // `claim_conflict_message_keeps_owner_parseable`.
+                return Err(RallyError::Usage(claim_authority::conflict_message(
+                    &conflict,
                 )));
             }
         }

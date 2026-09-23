@@ -463,10 +463,27 @@ fn claude_peer_claim_is_high_severity_advisory() {
         body["hookSpecificOutput"]["permissionDecisionReason"].is_null(),
         "allow-path permissionDecisionReason is user-only dead weight: {body:#}"
     );
-    assert!(reason.contains("HIGH-SEVERITY"), "{reason}");
+    // OPTIONS FIRST. The advisory used to open with a severity banner and the
+    // words "advisory - not blocking; rally never enforces", which read as
+    // permission to ignore the rest. It now opens with what the agent can do,
+    // names the holder and the contested path, and offers commands that exist.
+    // The edit still proceeds: `permissionDecision` above is "allow".
     assert!(
-        reason.contains("advisory \u{2014} not blocking"),
+        reason.contains("here's what you can do right now"),
         "{reason}"
+    );
+    assert!(
+        !reason.contains("HIGH-SEVERITY") && !reason.contains("never enforces"),
+        "the advisory banner must not return: {reason}"
+    );
+    assert!(reason.contains("codex:peer"), "must name the holder: {reason}");
+    assert!(
+        reason.contains("src/shared.rs"),
+        "must name the contested path: {reason}"
+    );
+    assert!(
+        reason.contains("rally say handoff --to codex:peer"),
+        "must offer the handoff: {reason}"
     );
     assert!(
         reason.starts_with("UNTRUSTED LEDGER DATA FOLLOWS"),
@@ -596,10 +613,14 @@ fn codex_conflict_never_carries_permission_decision() {
             );
         }
         let msg = body["systemMessage"].as_str().unwrap_or("");
-        assert!(
-            msg.contains("HIGH-SEVERITY"),
-            "codex strict={strict}: {msg}"
-        );
+        // Strict keeps the BLOCKING banner (it really does deny); the advisory
+        // path leads with the options instead.
+        let wanted = if strict {
+            "HIGH-SEVERITY"
+        } else {
+            "here's what you can do right now"
+        };
+        assert!(msg.contains(wanted), "codex strict={strict}: {msg}");
     }
 
     // Cursor: {permission, agent_message} in both modes; only the value flips.

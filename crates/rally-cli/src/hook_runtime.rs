@@ -897,6 +897,12 @@ impl Deadline {
 pub(crate) struct Visible {
     pub(crate) severity: String,
     pub(crate) message: String,
+    /// Holder and path of the finding that stopped the write, carried from
+    /// `build_check`'s findings so the renderer can name them without a new
+    /// lookup. `None` whenever the check produced no holder (e.g. a non-claim
+    /// blocker), and the renderer degrades rather than inventing one.
+    pub(crate) owner: Option<String>,
+    pub(crate) path: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -966,7 +972,21 @@ pub(crate) fn aggregate_checks(judgments: Vec<PathJudgment>) -> AggregateCheck {
             })
             .collect::<Vec<_>>()
             .join(" | ");
-        Some(Visible { severity, message })
+        // First named holder wins: a multi-path mutation can collide with more
+        // than one peer, and the options block speaks to one of them. The rest
+        // stay in `message`, which concatenates every target.
+        let owner = visible
+            .iter()
+            .find_map(|target| target.agent_visible.as_ref()?.owner.clone());
+        let path = visible
+            .iter()
+            .find_map(|target| target.agent_visible.as_ref()?.path.clone());
+        Some(Visible {
+            severity,
+            message,
+            owner,
+            path,
+        })
     };
     AggregateCheck {
         allow,
@@ -1383,11 +1403,37 @@ pub(crate) fn render_before_write(
     };
 
     let next_tool = if tool.is_empty() { "<you>" } else { tool };
-    let joined = format!(
-        "{}\n  Next: rally next --tool {}",
-        visible.message,
-        ident(next_tool, 60)
-    );
+    let next_cmd = format!("rally next --tool {}", ident(next_tool, 60));
+    // OPTIONS FIRST. The old body led with a severity banner and a restatement
+    // of the collision, and ended with one command; a colliding agent read it
+    // as "noted" and wrote anyway, or spent turns working out who held the
+    // file. Leading with the three things it can actually do — hand off, take
+    // another task, work outside the claimed scope — is the whole change. It
+    // does NOT gate anything: the edit proceeds exactly as before.
+    //
+    // Every command named here is verified to exist in the CLI. `claim
+    // --queue` and `rally say ask` do not exist. `rally say release --path X
+    // --tool <lead>` is deliberately absent: identity is self-asserted, so
+    // handing that to the refused caller instructs it to act as the lead
+    // (ARP-R-01, `claim_authority.rs`).
+    let joined = match (visible.owner.as_deref(), visible.path.as_deref()) {
+        (Some(owner), Some(path)) => {
+            let owner = ident(owner, 60);
+            let path = ident(path, 200);
+            format!(
+                "Rally — here's what you can do right now. \
+                 1) Hand it off (recommended): {owner} holds {path} and can fold your change in — \
+                 `rally say handoff --to {owner} --subject \"<change>\"`. \
+                 2) Work in parallel: take your next task — `{next_cmd}`. \
+                 3) Work here: files outside {path} are open to you. \
+                 {owner} is editing {path} right now."
+            )
+        }
+        // No holder named (a non-claim blocker, or a claim with no tool id):
+        // degrade to the fact plus the one command, rather than inventing an
+        // owner to address.
+        _ => format!("{} Next: {next_cmd}", visible.message),
+    };
     let mut raw_message = line(&joined, 4000);
     if raw_message.is_empty() {
         raw_message = "Rally has a pending coordination obligation.".to_string();
@@ -1408,9 +1454,13 @@ pub(crate) fn render_before_write(
                 "\u{26a0}\u{fe0f} HIGH-SEVERITY coordination signal (STRICT MODE \u{2014} BLOCKING): {raw_message}"
             )
         } else {
-            format!(
-                "\u{26a0}\u{fe0f} HIGH-SEVERITY coordination signal (advisory \u{2014} not blocking; rally never enforces): {raw_message}"
-            )
+            // The advisory banner used to read "(advisory — not blocking;
+            // rally never enforces)", which the reader took as permission to
+            // ignore the rest of the sentence. The body now leads with the
+            // options, so the banner is dropped here. Nothing about whether
+            // the edit proceeds changes: `stop` is still the only thing that
+            // blocks, and it is still strict-mode only.
+            raw_message
         }
     } else {
         raw_message
@@ -2003,6 +2053,14 @@ fn judge_path(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        owner: visible
+            .and_then(|value| value.get("owner"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        path: visible
+            .and_then(|value| value.get("path"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
     });
     Ok(PathJudgment {
         path: path.unwrap_or_default().to_string(),
@@ -2425,7 +2483,12 @@ mod tests {
             false,
         );
         let expected = format!(
-            "{UNTRUSTED_PREAMBLE}\u{26a0}\u{fe0f} HIGH-SEVERITY coordination signal (advisory \u{2014} not blocking; rally never enforces): target 1: Rally check found room facts that should stop or redirect this write. Next: rally next --tool claude_code:c1"
+            "{UNTRUSTED_PREAMBLE}Rally \u{2014} here's what you can do right now. \
+             1) Hand it off (recommended): claude_code:c2 holds \u{ab}src/shared.rs\u{bb} and can \
+             fold your change in \u{2014} `rally say handoff --to claude_code:c2 --subject \"<change>\"`. \
+             2) Work in parallel: take your next task \u{2014} `rally next --tool claude_code:c1`. \
+             3) Work here: files outside \u{ab}src/shared.rs\u{bb} are open to you. \
+             claude_code:c2 is editing \u{ab}src/shared.rs\u{bb} right now."
         );
         assert_eq!(
             rendered["hookSpecificOutput"]["permissionDecision"],
@@ -2593,6 +2656,8 @@ mod tests {
                 agent_visible: Some(Visible {
                     severity: "stop".to_string(),
                     message: "blocked".to_string(),
+                    owner: None,
+                    path: None,
                 }),
             },
             PathJudgment {
@@ -2601,6 +2666,8 @@ mod tests {
                 agent_visible: Some(Visible {
                     severity: "warn".to_string(),
                     message: "careful".to_string(),
+                    owner: None,
+                    path: None,
                 }),
             },
         ]);
@@ -2815,8 +2882,9 @@ mod tests {
             allow: false,
             agent_visible: Some(Visible {
                 severity: "stop".to_string(),
-                message: "Rally check found room facts that should stop or redirect this write."
-                    .to_string(),
+                message: "claude_code:c2 holds src/shared.rs (claim fact_c0ffee)".to_string(),
+                owner: Some("claude_code:c2".to_string()),
+                path: Some("src/shared.rs".to_string()),
             }),
         }])
     }

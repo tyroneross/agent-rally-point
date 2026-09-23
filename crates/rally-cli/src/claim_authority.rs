@@ -42,6 +42,38 @@ pub(crate) struct ClaimConflict {
     pub(crate) existing_scope: String,
 }
 
+/// The refusal a colliding claim reads.
+///
+/// Lives beside [`ClaimConflict`] rather than inline at the append site so the
+/// regression test that pins its parseable shape grades the SAME string the
+/// store emits. The prefix `claim conflict: ` and the owner's position as the
+/// first whitespace-delimited token after it are a machine contract
+/// (`ClaimConflictEntry`, `lib.rs`); everything else is prose and may change.
+pub(crate) fn conflict_message(conflict: &ClaimConflict) -> String {
+    let owner = conflict
+        .existing_owner
+        .as_deref()
+        .unwrap_or("unknown-owner");
+    format!(
+        "claim conflict: {owner} holds {} (claim {}), which overlaps the scope you requested, {}. \
+         Next: hand the change to {owner} with `rally say handoff --to {owner} \
+         --subject \"<change>\"`, take another task with `rally next --tool <you>`, or claim a \
+         narrower scope outside {}",
+        conflict.existing_scope, conflict.existing_claim_id, conflict.scope, conflict.existing_scope,
+    )
+}
+
+/// The owner field of a `claim conflict:` refusal, parsed the one way the
+/// message guarantees. Shared by the manifest-refresh envelope builder and the
+/// test that pins the contract, so the parse cannot drift from the producer.
+pub(crate) fn conflict_owner_from_message(msg: &str) -> Option<String> {
+    msg.split("claim conflict:")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
 /// Stamp a `lease_expires_at:` evidence marker with an EXPLICIT lease window
 /// (seconds). Used so a claim's lease window can be SIZE-SCALED (a single-file
 /// claim gets the small window, a coarse claim the large one) — see
@@ -681,6 +713,47 @@ mod tests {
         let conflict = detect_conflict(&[existing], &incoming).unwrap();
         assert_eq!(conflict.existing_claim_id, "claim-a");
         assert_eq!(conflict.scope, "file:src/lib.rs");
+    }
+
+    /// The `claim conflict:` prefix and the owner's position as the first
+    /// whitespace token after it are a MACHINE contract, not prose:
+    /// `ClaimConflictEntry` (lib.rs) parses the owner by splitting exactly
+    /// there. RC-037 already broke that field once with a wording change, and
+    /// the envelope silently carried a whole sentence where a tool id belongs.
+    /// Any future edit to this message must keep this test green.
+    #[test]
+    fn claim_conflict_message_keeps_owner_parseable() {
+        let conflict = ClaimConflict {
+            existing_claim_id: "claim-a".to_string(),
+            existing_owner: Some("codex:07".to_string()),
+            scope: "file:src/lib.rs".to_string(),
+            existing_scope: "dir:src".to_string(),
+        };
+        let msg = conflict_message(&conflict);
+        assert!(
+            msg.starts_with("claim conflict: "),
+            "prefix is parsed for, not read: {msg}"
+        );
+        assert_eq!(
+            conflict_owner_from_message(&msg).as_deref(),
+            Some("codex:07"),
+            "owner must stay the first whitespace token after the prefix: {msg}"
+        );
+        // The added guidance must live AFTER the existing sentence, so the
+        // owner is never displaced.
+        let next = msg.find("Next:").expect("a Next: line must be offered");
+        let owner_at = msg.find("codex:07").expect("owner present");
+        assert!(owner_at < next, "guidance must follow the owner: {msg}");
+
+        // Unknown owner still yields ONE token, never a sentence.
+        let anonymous = ClaimConflict {
+            existing_owner: None,
+            ..conflict
+        };
+        assert_eq!(
+            conflict_owner_from_message(&conflict_message(&anonymous)).as_deref(),
+            Some("unknown-owner"),
+        );
     }
 
     #[test]

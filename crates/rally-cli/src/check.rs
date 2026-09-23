@@ -26,7 +26,18 @@ struct CheckResult {
 struct AgentVisible {
     present: bool,
     severity: &'static str,
-    message: &'static str,
+    /// The first blocking finding's own text, not a generic stand-in: the
+    /// agent-visible channel is where a colliding writer decides what to do
+    /// next, and a sentence that names no holder and no path cannot support
+    /// that decision.
+    message: String,
+    /// Carried so the hook renderer can compose an options-first block without
+    /// re-deriving the holder from prose (or taking any new lookup). Both come
+    /// straight from the finding that stopped the write.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -68,7 +79,14 @@ pub(crate) fn build_check(
             )));
         }
     }
-    let stop = findings.iter().any(|finding| finding.severity == "stop");
+    let blocker = findings.iter().find(|finding| finding.severity == "stop");
+    let stop = blocker.is_some();
+    let visible_message = match blocker {
+        Some(finding) => finding.message.clone(),
+        None => "Rally check passed.".to_string(),
+    };
+    let visible_owner = blocker.and_then(|finding| finding.owner.clone());
+    let visible_path = blocker.and_then(|finding| finding.path.clone());
     let allow = !stop;
     let exit_code = if strict && stop { 4 } else { 0 };
     let finding_count = findings.len();
@@ -84,11 +102,9 @@ pub(crate) fn build_check(
                 agent_visible: AgentVisible {
                     present: stop,
                     severity: if stop { "stop" } else { "info" },
-                    message: if stop {
-                        "Rally check found room facts that should stop or redirect this write."
-                    } else {
-                        "Rally check passed."
-                    },
+                    message: visible_message,
+                    owner: visible_owner,
+                    path: visible_path,
                 },
             },
         },
@@ -136,6 +152,7 @@ fn check_before_write(
                 .as_deref()
                 .map(|o| stale_owners.contains(o))
                 .unwrap_or(false);
+            let owner = claim.tool.as_deref().unwrap_or("unknown owner");
 
             if exact_or_dir && is_different_tool && owner_is_stale {
                 // Squatting claim: reclaimable, not a hard block.
@@ -143,12 +160,19 @@ fn check_before_write(
                     code: "stale-owner-claim",
                     severity: "warn",
                     message: format!(
-                        "path claimed by {} whose presence is idle (>15m) — not a hard \
-                         block; proceed with coordination awareness. If the owner is \
-                         truly gone (idle >2h), a lead can reclaim it with \
-                         `rally say release --path {} --tool <lead>`",
-                        claim.tool.as_deref().unwrap_or("unknown"),
+                        "{} holds {} and has been idle >15m — not a hard block. \
+                         Your options: proceed with coordination awareness, hand the \
+                         change over with `rally say handoff --to {} --subject \
+                         \"<change>\"`, or take another task with `rally next --tool {}`. \
+                         Only {} can release the claim, with \
+                         `rally say release --path {} --tool {}`",
+                        owner,
                         path,
+                        owner,
+                        tool,
+                        owner,
+                        path,
+                        owner,
                     ),
                     fact_id: Some(claim.event_id.clone()),
                     owner: claim.tool.clone(),
@@ -159,7 +183,17 @@ fn check_before_write(
                 findings.push(CheckFinding {
                     code: "claimed-path",
                     severity: "stop",
-                    message: "another agent has claimed this path".to_string(),
+                    // Names the holder, the path, and the claim id. The bare
+                    // "another agent has claimed this path" was the single most
+                    // frequent collision message in the room and identified
+                    // none of the three, so the reader spent turns working out
+                    // who to talk to. Same shape as `stale-owner-claim` above.
+                    message: format!(
+                        "{} holds {} (claim {}) — hand the change over with \
+                         `rally say handoff --to {} --subject \"<change>\"`, or take \
+                         another task with `rally next --tool {}`",
+                        owner, path, claim.event_id, owner, tool,
+                    ),
                     fact_id: Some(claim.event_id.clone()),
                     owner: claim.tool.clone(),
                     path: Some(path.to_string()),
@@ -586,6 +620,143 @@ mod tests {
         assert!(
             !findings.iter().any(|f| f.code == "claimed-path"),
             "a stale-owner conflict must NOT also emit a hard claimed-path stop"
+        );
+    }
+
+    /// Commands the CLI actually accepts, verified against `rally say --help`
+    /// (kinds `handoff` / `release`; flags `--to`, `--path`, `--tool`,
+    /// `--subject`) and `rally next --help` (`--tool`).
+    const ALLOWED_COMMANDS: [&str; 3] = [
+        "rally say handoff --to ",
+        "rally next --tool ",
+        "rally say release --path ",
+    ];
+
+    /// Suggestions that must never reach an agent.
+    ///
+    /// `claim --queue` and `rally say ask` do not exist at all. `rally say
+    /// release --path X --tool <lead>` exists but instructs the caller that was
+    /// just refused to post as the LEAD — identity here is self-asserted and
+    /// unsigned, so the refusal would be coaching the reader around itself.
+    /// ARP-R-01 removed that shape once already (`claim_authority.rs`).
+    const BANNED_SUGGESTIONS: [&str; 3] = ["claim --queue", "rally say ask", "--tool <lead>"];
+
+    /// A collision message is only useful if the reader can act on it alone:
+    /// it names WHO holds the contested thing, names WHAT is contested, and
+    /// every command it offers exists.
+    fn assert_actionable(label: &str, msg: &str, holder: &str, contested: &str) {
+        assert!(
+            msg.contains(holder),
+            "{label} must name the holder ({holder}): {msg}"
+        );
+        assert!(
+            msg.contains(contested),
+            "{label} must name the contested path/scope ({contested}): {msg}"
+        );
+        for banned in BANNED_SUGGESTIONS {
+            assert!(
+                !msg.contains(banned),
+                "{label} suggests {banned}, which must never be offered: {msg}"
+            );
+        }
+        let mut commands = 0usize;
+        for span in msg.split('`').skip(1).step_by(2) {
+            if !span.starts_with("rally ") {
+                continue;
+            }
+            commands += 1;
+            assert!(
+                ALLOWED_COMMANDS.iter().any(|ok| span.starts_with(ok)),
+                "{label} offers `{span}`, which is not a verified rally command"
+            );
+        }
+        assert!(
+            commands > 0,
+            "{label} offers the reader no command at all: {msg}"
+        );
+    }
+
+    #[test]
+    fn every_collision_message_names_the_holder_the_path_and_a_real_command() {
+        let snapshot = RoomSnapshot {
+            active_claims: vec![claim_by("alpha", "src/foo.rs")],
+            squads: vec![squad("alpha", "active")],
+            ..Default::default()
+        };
+        let mut findings = Vec::new();
+        check_before_write(&snapshot, "beta", Some("src/foo.rs"), &mut findings);
+        let live = findings
+            .iter()
+            .find(|f| f.code == "claimed-path")
+            .expect("live-owner collision finding");
+        assert_actionable("claimed-path", &live.message, "alpha", "src/foo.rs");
+        assert!(
+            live.message.contains("fact_alpha"),
+            "claimed-path must name the claim id: {}",
+            live.message
+        );
+
+        let stale_snapshot = RoomSnapshot {
+            active_claims: vec![claim_by("dead-owner", "src/foo.rs")],
+            squads: vec![squad("dead-owner", "idle")],
+            ..Default::default()
+        };
+        let mut stale_findings = Vec::new();
+        check_before_write(
+            &stale_snapshot,
+            "beta",
+            Some("src/foo.rs"),
+            &mut stale_findings,
+        );
+        let stale = stale_findings
+            .iter()
+            .find(|f| f.code == "stale-owner-claim")
+            .expect("stale-owner collision finding");
+        assert_actionable(
+            "stale-owner-claim",
+            &stale.message,
+            "dead-owner",
+            "src/foo.rs",
+        );
+
+        let conflict = crate::claim_authority::conflict_message(
+            &crate::claim_authority::ClaimConflict {
+                existing_claim_id: "fact_alpha".to_string(),
+                existing_owner: Some("alpha".to_string()),
+                scope: "file:src/foo.rs".to_string(),
+                existing_scope: "dir:src".to_string(),
+            },
+        );
+        assert_actionable("claim conflict", &conflict, "alpha", "dir:src");
+    }
+
+    /// The agent-visible channel is what the hook renders from; it must carry
+    /// the blocking finding's own text plus the structured holder/path, not a
+    /// generic sentence the renderer would have to parse back out of prose.
+    #[test]
+    fn agent_visible_carries_the_blocking_finding_and_its_holder() {
+        let snapshot = RoomSnapshot {
+            active_claims: vec![claim_by("alpha", "src/foo.rs")],
+            squads: vec![squad("alpha", "active")],
+            ..Default::default()
+        };
+        let outcome = build_check(
+            "before-write".to_string(),
+            "beta".to_string(),
+            None,
+            Some("src/foo.rs".to_string()),
+            false,
+            &snapshot,
+        )
+        .expect("check builds");
+        let visible = &outcome.data.check.agent_visible;
+        assert!(visible.present);
+        assert_eq!(visible.owner.as_deref(), Some("alpha"));
+        assert_eq!(visible.path.as_deref(), Some("src/foo.rs"));
+        assert!(
+            visible.message.contains("alpha") && visible.message.contains("src/foo.rs"),
+            "agent_visible message must name holder and path: {}",
+            visible.message
         );
     }
 }

@@ -5449,12 +5449,11 @@ fn command_claims_refresh(args: ClaimsRefreshArgs) -> Result<Output> {
                 // grading it. Splitting on whitespace depends only on the
                 // owner being the first thing named, which both the old and new
                 // wording guarantee.
-                let owner = msg
-                    .split("claim conflict:")
-                    .nth(1)
-                    .and_then(|rest| rest.split_whitespace().next())
-                    .map(str::to_string)
-                    .filter(|s| !s.is_empty())
+                //
+                // The parse now lives beside the producer
+                // (`claim_authority::conflict_message`) so a prose edit and the
+                // field that depends on it cannot drift apart unnoticed.
+                let owner = claim_authority::conflict_owner_from_message(&msg)
                     .unwrap_or_else(|| "unknown".to_string());
                 conflicts.push(ClaimConflictEntry {
                     path: path.clone(),
