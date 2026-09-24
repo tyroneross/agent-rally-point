@@ -179,12 +179,39 @@ fn plans_every_branch_and_worktree_without_writing_state() {
     fs::write(fixture.repo.join("uncommitted.txt"), "keep this work").unwrap();
     let dirty = fixture.plan();
     assert_eq!(dirty["data"]["worktree_plan"]["base_status"], "dirty");
+    assert_eq!(branch(&dirty, "main")["next_action"], "none");
+    assert!(
+        branch(&dirty, "main")["blockers"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(branch(&dirty, "feature")["next_action"], "resolve_blockers");
     assert!(
         branch(&dirty, "feature")["blockers"]
             .as_array()
             .unwrap()
             .contains(&Value::from("base_worktree_not_clean"))
+    );
+
+    let sync = fixture.root.join("sync");
+    fixture_git(
+        &fixture.repo,
+        &["worktree", "add", sync.to_str().unwrap(), "unattached"],
+    );
+    fs::write(sync.join("uncommitted.txt"), "keep this too").unwrap();
+    let dirty_sync = fixture.plan();
+    assert_eq!(branch(&dirty_sync, "unattached")["relation"], "in_sync");
+    assert_eq!(
+        branch(&dirty_sync, "unattached")["worktree_status"],
+        "dirty"
+    );
+    assert_eq!(branch(&dirty_sync, "unattached")["next_action"], "none");
+    assert!(
+        branch(&dirty_sync, "unattached")["blockers"]
+            .as_array()
+            .unwrap()
+            .is_empty()
     );
 
     fixture_git(&fixture.repo, &["add", "uncommitted.txt"]);

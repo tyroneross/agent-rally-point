@@ -689,6 +689,9 @@ const INJECT_MAX_WATCHDOG_TIMEOUT_MS: u64 = 605_000;
 /// this is returned directly rather than clamped through the generic
 /// override path.
 const DAEMON_START_WATCHDOG_TIMEOUT_MS: u64 = 45_000;
+/// `worktree plan` scans every local branch and registered checkout on demand.
+/// Give it room for a busy host without extending the 3s hook-command budget.
+const WORKTREE_PLAN_WATCHDOG_TIMEOUT_MS: u64 = 15_000;
 
 /// True when the resolved subcommand is `inject`. `inject` is the one
 /// deliberately-LONG interactive coordination verb: with `--handoff` /
@@ -841,7 +844,8 @@ fn inject_timeout_seconds(args: &[String]) -> Option<u64> {
 ///     its `--timeout-seconds` ACK wait + headroom, bypassing the 60s hook cap.
 ///     This is what lets `inject --handoff --timeout-seconds 75` actually wait
 ///     75s for an ACK instead of being killed at 3s.
-///  3. Otherwise the clamped default (`DEFAULT_WATCHDOG_TIMEOUT_MS`).
+///  3. `worktree plan` gets 15s for its on-demand Git scan.
+///  4. Otherwise the clamped default (`DEFAULT_WATCHDOG_TIMEOUT_MS`).
 ///
 /// Out-of-range / unparseable inputs fall through rather than erroring — the
 /// watchdog must never be the thing that fails a command.
@@ -900,6 +904,10 @@ fn resolve_watchdog_timeout(args: &[String]) -> Duration {
         || first_two_positionals_are_session_ensure(args)
     {
         return Duration::from_millis(DAEMON_START_WATCHDOG_TIMEOUT_MS);
+    }
+
+    if matches!(first_positionals(args), (Some("worktree"), Some("plan"))) {
+        return Duration::from_millis(WORKTREE_PLAN_WATCHDOG_TIMEOUT_MS);
     }
 
     // (3) Everything else: the hook-safe default.
@@ -13104,6 +13112,22 @@ mod tests {
         );
         assert_eq!(
             resolve_watchdog_timeout(&argv(&["session", "current", "--json"])),
+            Duration::from_millis(DEFAULT_WATCHDOG_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn worktree_plan_watchdog_is_bounded_and_does_not_change_hook_budget() {
+        assert_eq!(
+            resolve_watchdog_timeout(&argv(&["worktree", "plan", "--json"])),
+            Duration::from_millis(WORKTREE_PLAN_WATCHDOG_TIMEOUT_MS)
+        );
+        assert_eq!(
+            resolve_watchdog_timeout(&argv(&["worktree", "plan", "--timeout-ms", "5000"])),
+            Duration::from_millis(5000)
+        );
+        assert_eq!(
+            resolve_watchdog_timeout(&argv(&["hook", "before-write", "--json"])),
             Duration::from_millis(DEFAULT_WATCHDOG_TIMEOUT_MS)
         );
     }

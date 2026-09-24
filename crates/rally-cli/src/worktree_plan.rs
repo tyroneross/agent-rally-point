@@ -128,7 +128,9 @@ pub(crate) fn build(repo: &Path, requested_base: Option<&str>) -> Result<Plan, S
             ahead_of_upstream,
         );
         let mut blockers = Vec::new();
-        if tree.is_some_and(|wt| wt.status != "clean") {
+        // A dirty checkout is inventory, not a blocker, when no base-relative
+        // update or merge is being recommended.
+        if !matches!(relation, "base" | "in_sync") && tree.is_some_and(|wt| wt.status != "clean") {
             blockers.push("source_worktree_not_clean");
         }
         if matches!(
