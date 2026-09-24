@@ -59,7 +59,10 @@ pub(crate) fn conflict_message(conflict: &ClaimConflict) -> String {
          Next: hand the change to {owner} with `rally say handoff --to {owner} \
          --subject \"<change>\"`, take another task with `rally next --tool <you>`, or claim a \
          narrower scope outside {}",
-        conflict.existing_scope, conflict.existing_claim_id, conflict.scope, conflict.existing_scope,
+        conflict.existing_scope,
+        conflict.existing_claim_id,
+        conflict.scope,
+        conflict.existing_scope,
     )
 }
 

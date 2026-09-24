@@ -166,13 +166,7 @@ fn check_before_write(
                          \"<change>\"`, or take another task with `rally next --tool {}`. \
                          Only {} can release the claim, with \
                          `rally say release --path {} --tool {}`",
-                        owner,
-                        path,
-                        owner,
-                        tool,
-                        owner,
-                        path,
-                        owner,
+                        owner, path, owner, tool, owner, path, owner,
                     ),
                     fact_id: Some(claim.event_id.clone()),
                     owner: claim.tool.clone(),
@@ -719,14 +713,13 @@ mod tests {
             "src/foo.rs",
         );
 
-        let conflict = crate::claim_authority::conflict_message(
-            &crate::claim_authority::ClaimConflict {
+        let conflict =
+            crate::claim_authority::conflict_message(&crate::claim_authority::ClaimConflict {
                 existing_claim_id: "fact_alpha".to_string(),
                 existing_owner: Some("alpha".to_string()),
                 scope: "file:src/foo.rs".to_string(),
                 existing_scope: "dir:src".to_string(),
-            },
-        );
+            });
         assert_actionable("claim conflict", &conflict, "alpha", "dir:src");
     }
 

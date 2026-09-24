@@ -476,7 +476,10 @@ fn claude_peer_claim_is_high_severity_advisory() {
         !reason.contains("HIGH-SEVERITY") && !reason.contains("never enforces"),
         "the advisory banner must not return: {reason}"
     );
-    assert!(reason.contains("codex:peer"), "must name the holder: {reason}");
+    assert!(
+        reason.contains("codex:peer"),
+        "must name the holder: {reason}"
+    );
     assert!(
         reason.contains("src/shared.rs"),
         "must name the contested path: {reason}"
