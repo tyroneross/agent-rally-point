@@ -162,6 +162,7 @@ mod test_git_fixture;
 mod tier_fit;
 pub mod worktree_gc;
 mod worktree_guard;
+mod worktree_plan;
 mod write_authority;
 
 use backends::*;
@@ -1669,6 +1670,7 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
         CliCommand::Adopt(args) => command_adopt(args),
         // Sweep-reaper: GC leftover per-agent worktrees
         CliCommand::WorktreeGc(args) => command_worktree_gc(args),
+        CliCommand::WorktreePlan(args) => command_worktree_plan(args),
         // Layer 1: completion-scoped self-exit re-check
         CliCommand::SelfExitCheck(args) => command_self_exit_check(args),
         // BACKLOG S-P3, Chunk C: rallyd store daemon lifecycle
@@ -2205,6 +2207,49 @@ fn command_daemon_status(json: bool) -> Result<Output> {
 // =============================================================================
 
 const SCHEMA_WORKTREE_GC: &str = "agent-rally.command.worktree-gc.v1";
+const SCHEMA_WORKTREE_PLAN: &str = "agent-rally.command.worktree-plan.v1";
+
+fn command_worktree_plan(args: WorktreePlanArgs) -> Result<Output> {
+    let plan =
+        worktree_plan::build(&repo_root()?, args.base.as_deref()).map_err(RallyError::Message)?;
+    let mut lines = vec![format!(
+        "rally worktree plan: base={} worktrees={} local_branches={} remote_branches={} (local refs; no fetch)",
+        plan.base,
+        plan.worktrees.len(),
+        plan.branches.len(),
+        plan.remote_branches.len()
+    )];
+    for branch in &plan.branches {
+        lines.push(format!(
+            "{}: {} (ahead {} behind {}); base={} upstream={}{}",
+            branch.name,
+            branch.relation,
+            branch.ahead_of_base,
+            branch.behind_base,
+            branch.next_action,
+            branch.upstream_action,
+            if branch.blockers.is_empty() {
+                String::new()
+            } else {
+                format!("; blockers={}", branch.blockers.join(","))
+            }
+        ));
+    }
+    for worktree in &plan.worktrees {
+        if worktree.branch.is_none() {
+            lines.push(format!(
+                "detached worktree: {} ({})",
+                worktree.path, worktree.status
+            ));
+        }
+    }
+    let body = envelope_value(
+        "worktree_plan",
+        SCHEMA_WORKTREE_PLAN,
+        json!({ "worktree_plan": plan }),
+    )?;
+    Ok(Output::new(args.json, lines.join("\n"), body))
+}
 
 fn command_worktree_gc(args: WorktreeGcArgs) -> Result<Output> {
     let repo = repo_root()?;

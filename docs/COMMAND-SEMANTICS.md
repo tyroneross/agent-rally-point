@@ -133,6 +133,31 @@ therefore receive distinct operation identities.
 | `rally watch` | no | yes | optional | conditional | `--once`/projection-only use is audit-friendly; `--on-activity` executes an external command. |
 | `rally route-findings` | yes | yes | no | no | Converts verified findings into risks or handoffs. |
 | `rally worktree gc` | optional | yes | yes | no | Dry-run is inspection; apply removes worktrees/branches after its safety checks. |
+| `rally worktree plan` | no | no | no | yes | Reads Git's registered worktrees, local branches, and locally stored remote refs; never fetches, merges, updates, or writes a Rally fact. |
+
+### Worktree merge/update plan
+
+`rally worktree plan --json` reports every registered worktree, local branch,
+and locally stored remote branch. `--base BRANCH` selects a local integration
+branch. Without it, Rally uses a matching local branch for `origin/HEAD`, then
+`main`, `master`, or `trunk`; it fails if none exists. Rows are sorted by ref
+name or path and contain no wall-clock field, so an unchanged Git state produces
+the same plan. The command uses `GIT_OPTIONAL_LOCKS=0`, disables fsmonitor, and
+does not fetch.
+
+Each local branch includes its relation to the base, ahead/behind counts, an
+upstream relation and kind (local or remote tracking) when a configured upstream
+ref still exists, and suggested base and upstream actions. Checked-out worktrees
+include clean, dirty, unavailable, and
+unknown status; detached worktrees appear separately. Worktree locks remain
+visible as inventory and do not block Git merges. A dirty or unavailable
+source worktree blocks a base-relative update recommendation. A dirty or
+unavailable base worktree blocks a base-relative merge recommendation.
+`unique_patch_commits` is advisory:
+zero can indicate equivalent patches, but merge commits may still carry
+important topology or conflict choices. Recommendations do not attest to live
+agent ownership or predict merge conflicts. Verify both before executing a
+merge or removing a worktree.
 
 ## Simplification Direction
 

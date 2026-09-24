@@ -66,6 +66,8 @@ pub(crate) enum CliCommand {
     Adopt(AdoptArgs),
     /// Sweep-reap leftover rally per-agent worktrees and branches.
     WorktreeGc(WorktreeGcArgs),
+    /// Read-only merge/update plan for every registered worktree and local branch.
+    WorktreePlan(WorktreePlanArgs),
     /// Layer 1: completion-scoped self-exit re-check for a task-scoped session.
     SelfExitCheck(SelfExitCheckArgs),
     /// BACKLOG S-P3: `rally daemon serve|start|stop|status` — the rallyd
@@ -876,6 +878,12 @@ pub(crate) struct WorktreeGcArgs {
     pub(crate) ttl_secs: u64,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct WorktreePlanArgs {
+    pub(crate) json: bool,
+    pub(crate) base: Option<String>,
+}
+
 /// B13: arguments for `rally check ci`.
 #[derive(Clone, Debug)]
 pub(crate) struct CheckCiArgs {
@@ -1333,9 +1341,15 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .to_options()
         .descr("Sweep-reap leftover rally per-agent worktrees and branches. Default = dry-run (list candidates only). Use --apply to execute cleanup.")
         .command("gc")
-        .map(CliCommand::WorktreeGc)
+        .map(CliCommand::WorktreeGc);
+    let worktree_plan = worktree_plan_parser()
         .to_options()
-        .descr("Worktree management: gc — sweep-reap leftover per-agent worktrees.")
+        .descr("Read-only Git snapshot of every worktree and local branch, with merge and update recommendations. Does not fetch or change Git state.")
+        .command("plan")
+        .map(CliCommand::WorktreePlan);
+    let worktree = construct!([worktree_gc, worktree_plan])
+        .to_options()
+        .descr("Worktree management: plan — inspect merge/update state; gc — sweep-reap managed worktrees.")
         .command("worktree")
         .map(|c| c);
 
@@ -1397,7 +1411,7 @@ fn cli_parser() -> OptionParser<CliCommand> {
         lead,
         ack,
         adopt,
-        worktree_gc,
+        worktree,
         self_exit_check,
         daemon,
         claims_refresh,
@@ -2835,6 +2849,12 @@ fn worktree_gc_parser() -> impl Parser<WorktreeGcArgs> {
         apply,
         ttl_secs,
     })
+}
+
+fn worktree_plan_parser() -> impl Parser<WorktreePlanArgs> {
+    let json = json_flag();
+    let base = optional_string_arg("base", "BRANCH");
+    construct!(json, base).map(|(json, base)| WorktreePlanArgs { json, base })
 }
 
 fn parse_u64_arg(name: &str, value: String) -> Result<u64> {

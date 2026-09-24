@@ -309,6 +309,17 @@ that tool posts a status update. This is the lightweight Rally bus for plan,
 owner, ETA, and status; do not rely on chat paste as the only coordination
 surface.
 
+## Plan Branch Merges And Updates
+
+Run `rally worktree plan --json` to inspect every Git-registered worktree,
+local branch, and locally stored remote branch. The plan compares branches to
+the local integration base and their configured upstreams, and names dirty or
+unavailable worktrees that need attention before a merge. Use `--base BRANCH`
+when the integration target is not the detected default. The command is
+read-only and does not fetch; refresh remote refs separately before relying on
+upstream comparisons. Recommendations are advisory and do not establish agent
+ownership or merge-conflict safety.
+
 ## Where State Lives
 
 ```text
