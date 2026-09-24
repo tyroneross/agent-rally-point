@@ -63,9 +63,18 @@ struct RefRow {
     upstream: Option<String>,
 }
 
+type RefRows = BTreeMap<String, RefRow>;
+
+struct BranchMetrics {
+    behind_base: u64,
+    ahead_of_base: u64,
+    unique_patch_commits: Option<u64>,
+    behind_upstream: Option<u64>,
+    ahead_of_upstream: Option<u64>,
+}
+
 pub(crate) fn build(repo: &Path, requested_base: Option<&str>) -> Result<Plan, String> {
-    let local = refs(repo, "refs/heads")?;
-    let remote = refs(repo, "refs/remotes")?;
+    let (local, remote) = refs(repo)?;
     let base = select_base(repo, requested_base, &local)?;
     let base_ref = format!("refs/heads/{base}");
     let base_head = local[&base_ref].head.clone();
@@ -80,22 +89,46 @@ pub(crate) fn build(repo: &Path, requested_base: Option<&str>) -> Result<Plan, S
     let base_worktree = base_tree.map(|wt| wt.path.clone());
 
     let existing_refs: BTreeSet<_> = local.keys().chain(remote.keys()).cloned().collect();
-    let mut branches = Vec::with_capacity(local.len());
-    for (full_ref, row) in &local {
-        let name = full_ref.trim_start_matches("refs/heads/").to_string();
-        let tree = by_branch.get(full_ref).copied();
-        let (behind_base, ahead_of_base) = if full_ref == &base_ref {
+    let local_rows: Vec<_> = local.iter().collect();
+    let metrics = parallel_git_reads(&local_rows, |(full_ref, row)| {
+        let (behind_base, ahead_of_base) = if *full_ref == &base_ref {
             (0, 0)
         } else {
-            counts(repo, &base_ref, full_ref)?
+            counts(repo, &base_head, &row.head)?
         };
         // Patch equivalence is advisory: merge commits can still carry topology
         // or conflict decisions that a patch count does not capture.
         let unique_patch_commits = if ahead_of_base > 0 {
-            Some(count_unique_patches(repo, &base_ref, full_ref)?)
+            Some(count_unique_patches(repo, &base_head, &row.head)?)
         } else {
             None
         };
+        let (behind_upstream, ahead_of_upstream) = row
+            .upstream
+            .as_deref()
+            .and_then(|name| local.get(name).or_else(|| remote.get(name)))
+            .map(|upstream| counts(repo, &upstream.head, &row.head))
+            .transpose()?
+            .map_or((None, None), |(behind, ahead)| (Some(behind), Some(ahead)));
+        Ok(BranchMetrics {
+            behind_base,
+            ahead_of_base,
+            unique_patch_commits,
+            behind_upstream,
+            ahead_of_upstream,
+        })
+    })?;
+    let mut branches = Vec::with_capacity(local.len());
+    for ((full_ref, row), metrics) in local_rows.into_iter().zip(metrics) {
+        let name = full_ref.trim_start_matches("refs/heads/").to_string();
+        let tree = by_branch.get(full_ref).copied();
+        let BranchMetrics {
+            behind_base,
+            ahead_of_base,
+            unique_patch_commits,
+            behind_upstream,
+            ahead_of_upstream,
+        } = metrics;
         let relation = relation(
             full_ref == &base_ref,
             behind_base,
@@ -113,13 +146,6 @@ pub(crate) fn build(repo: &Path, requested_base: Option<&str>) -> Result<Plan, S
             None => "none",
             Some(value) if existing_refs.contains(value) => "present",
             Some(_) => "gone",
-        };
-        let (behind_upstream, ahead_of_upstream) = match upstream.as_deref() {
-            Some(value) if upstream_state == "present" => {
-                let (behind, ahead) = counts(repo, value, full_ref)?;
-                (Some(behind), Some(ahead))
-            }
-            _ => (None, None),
         };
         let upstream_action = upstream_action(
             upstream_state,
@@ -260,23 +286,30 @@ fn select_base(
     Err("cannot determine a local base branch; pass --base BRANCH".into())
 }
 
-fn refs(repo: &Path, prefix: &str) -> Result<BTreeMap<String, RefRow>, String> {
+fn refs(repo: &Path) -> Result<(RefRows, RefRows), String> {
     let bytes = git(
         repo,
         &[
             "for-each-ref",
             "--format=%(refname)%00%(objectname)%00%(upstream)",
-            prefix,
+            "refs/heads",
+            "refs/remotes",
         ],
     )?;
     let text = String::from_utf8(bytes).map_err(|e| format!("non-UTF-8 Git ref output: {e}"))?;
-    let mut result = BTreeMap::new();
+    let mut local = BTreeMap::new();
+    let mut remote = BTreeMap::new();
     for line in text.lines() {
         let fields: Vec<_> = line.split('\0').collect();
         if fields.len() != 3 || fields[0].is_empty() || fields[1].is_empty() {
             return Err("malformed Git for-each-ref output".into());
         }
-        result.insert(
+        let destination = if fields[0].starts_with("refs/heads/") {
+            &mut local
+        } else {
+            &mut remote
+        };
+        destination.insert(
             fields[0].to_string(),
             RefRow {
                 head: fields[1].to_string(),
@@ -284,7 +317,7 @@ fn refs(repo: &Path, prefix: &str) -> Result<BTreeMap<String, RefRow>, String> {
             },
         );
     }
-    Ok(result)
+    Ok((local, remote))
 }
 
 fn list_worktrees(repo: &Path) -> Result<Vec<Worktree>, String> {
@@ -305,23 +338,11 @@ fn list_worktrees(repo: &Path) -> Result<Vec<Worktree>, String> {
                 let head = head
                     .take()
                     .ok_or("malformed Git worktree entry: missing HEAD")?;
-                let status = if !Path::new(&path).exists() {
-                    "unavailable".to_string()
-                } else {
-                    match git(
-                        Path::new(&path),
-                        &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
-                    ) {
-                        Ok(bytes) if bytes.is_empty() => "clean".to_string(),
-                        Ok(_) => "dirty".to_string(),
-                        Err(_) => "unknown".to_string(),
-                    }
-                };
                 result.push(Worktree {
                     path,
                     head,
                     branch: branch.take(),
-                    status,
+                    status: String::new(),
                     locked,
                     prunable,
                 });
@@ -342,7 +363,54 @@ fn list_worktrees(repo: &Path) -> Result<Vec<Worktree>, String> {
             prunable = true;
         }
     }
+    let statuses = parallel_git_reads(&result, |wt| Ok(worktree_status(&wt.path)))?;
+    for (worktree, status) in result.iter_mut().zip(statuses) {
+        worktree.status = status;
+    }
     Ok(result)
+}
+
+fn worktree_status(path: &str) -> String {
+    if !Path::new(path).exists() {
+        return "unavailable".to_string();
+    }
+    match git(
+        Path::new(path),
+        &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
+    ) {
+        Ok(bytes) if bytes.is_empty() => "clean".to_string(),
+        Ok(_) => "dirty".to_string(),
+        Err(_) => "unknown".to_string(),
+    }
+}
+
+fn parallel_git_reads<T, U, F>(items: &[T], read: F) -> Result<Vec<U>, String>
+where
+    T: Sync,
+    U: Send,
+    F: Fn(&T) -> Result<U, String> + Sync,
+{
+    let parallelism = std::thread::available_parallelism()
+        .map_or(1, |cores| cores.get())
+        .min(4);
+    let mut values = Vec::with_capacity(items.len());
+    for batch in items.chunks(parallelism) {
+        if batch.len() == 1 {
+            values.push(read(&batch[0])?);
+            continue;
+        }
+        std::thread::scope(|scope| -> Result<(), String> {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|item| scope.spawn(|| read(item)))
+                .collect();
+            for handle in handles {
+                values.push(handle.join().map_err(|_| "Git read worker panicked")??);
+            }
+            Ok(())
+        })?;
+    }
+    Ok(values)
 }
 
 fn counts(repo: &Path, left: &str, right: &str) -> Result<(u64, u64), String> {
