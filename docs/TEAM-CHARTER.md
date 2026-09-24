@@ -67,4 +67,3 @@ or subagent under the charter. Every company **reports to higher echelon**
 (operator HHQ and/or the lead session); it does not invent a parallel mission.
 Durable assignment is still
 `rally backlog add --id <id> --intent "…" --target <session>`.
-
