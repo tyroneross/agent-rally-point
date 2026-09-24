@@ -78,6 +78,9 @@ jobs:
       - name: CI and release workflow contract
         run: python3 tests/scripts/test_release_workflow_contract.py
 
+      - name: Docs-vs-CI claims lint
+        run: python3 tests/scripts/test_docs_ci_claims.py
+
       # Advisory: the lint exits 0 whatever it finds, so this step cannot fail
       # the build. `--strict` stays off until precision is measured
       # out-of-sample. Its own tests run here too, because a detector whose

@@ -11,7 +11,7 @@ When several agents work on one project, they need to know who owns a file, wher
 ## How it works
 
 - **Identify the session.** Each agent joins with a distinct identity, reads the current lead and mission, and acknowledges the room's rules. Resolve roles from live state; the lead coordinates assignments and decisions, while each agent reports its own work.
-- **Claim before editing.** Rally refuses overlapping exclusive claims. Configured host hooks check file claims before edits and warn by default. Agents must honor refusals; Rally does not lock files against arbitrary writes or make simultaneous edits safe.
+- **Claim before editing.** Rally refuses overlapping exclusive claims. Configured host hooks check file claims before edits. The edit-time check is advisory by default: `rally check before-write` allows the edit with a warning and exits 0; `--strict` makes it exit 4 on a stop finding. Agents must honor refusals; Rally does not lock files against arbitrary writes or make simultaneous edits safe.
 - **Record the result.** Agents publish artifacts and verification evidence, then release their claims. Claims expire when their leases are not renewed; managed launches use separate worktrees by default.
 - **Verify the handoff.** A receiver-authored receipt proves acknowledgement of the referenced request. Completed work needs a separate result and verification evidence. A successful transport send proves neither.
 

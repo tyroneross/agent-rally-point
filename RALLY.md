@@ -274,12 +274,14 @@ asking permission.
 ```bash
 # Lead-agent title. Rally records and exposes the lead and does not enforce the
 # lead's decisions (see COORDINATION.md) — with one exception: the seat gates two
-# room-wide capabilities. A `workspace:*` / `repo:*` claim (RC-037) and an unscoped
-# blocker, which freezes every agent's `check before-write` (RC-038), are accepted
-# only from the seat holder; from anyone else they degrade to a warning. That check
-# compares self-asserted `--tool`, so it stops an agent acting under its own name
-# and does not stop one that passes `--tool <lead-id>`. Detail and residual:
-# docs/security/TRUST-MODEL.md.
+# room-wide capabilities, and each fails differently for a non-lead (RC-037,
+# RC-038). A `workspace:*` / `repo:*` claim from anyone but the seat holder is
+# refused outright at claim time — exit 2, nothing committed. An unscoped blocker
+# from a non-lead IS accepted as a fact, but `check before-write` demotes it to a
+# `severity: warn` finding instead of a room-wide stop, so `--strict` still exits
+# 0 and does not deny unrelated writes. Both checks compare self-asserted
+# `--tool`, so they stop an agent acting under its own name and do not stop one
+# that passes `--tool <lead-id>`. Detail and residual: docs/security/TRUST-MODEL.md.
 rally lead show --json                                          # current lead, tier, how-assigned
 rally lead handoff --tool <lead> --to <frontier-tool> --json    # transfer the title
 rally lead assign  --tool <you> --to <tool> [--user-designated] --json   # set lead (user-designated supersedes first-join)
