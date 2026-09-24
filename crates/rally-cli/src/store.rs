@@ -3729,6 +3729,25 @@ fn validate_canonical_line_at(entry: &LedgerLine, path: &Path, line_number: usiz
     Ok(fact)
 }
 
+/// `rally doctor`'s ledger-health scan already knows `raw` is valid JSON with
+/// an integer `seq` (its own crude check); this reuses the store's canonical
+/// validator to catch the class that check cannot see — a row that parses as
+/// JSON but would still make every store-opening command fail with
+/// "completed canonical segment corruption ...". Returns the validator's own
+/// error text (deserialization failure or [`validate_canonical_line_at`]'s
+/// message), or `None` when the row is canonically valid. Diagnosis only:
+/// never called from a store read/write path, so it cannot change what the
+/// store accepts or rejects.
+pub(crate) fn canonical_row_error(raw: &str, path: &Path, line_number: usize) -> Option<String> {
+    let entry: LedgerLine = match serde_json::from_str(raw) {
+        Ok(entry) => entry,
+        Err(error) => return Some(error.to_string()),
+    };
+    validate_canonical_line_at(&entry, path, line_number)
+        .err()
+        .map(|error| error.to_string())
+}
+
 /// Validate the entire active segment without changing it and classify only
 /// the final unterminated fragment. A complete syntactic/schema error is
 /// corruption even without a newline; only serde's EOF class is truncatable.

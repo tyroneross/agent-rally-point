@@ -58,13 +58,14 @@ use crate::discovery::{
 };
 use crate::error::{RallyError, Result};
 use crate::store::{
-    ARCHIVE_DIRNAME, CORRUPT_QUARANTINE_MAX_GROUPS, DB_ONLY_MIGRATION_MARKER_FILENAME,
-    DB_ONLY_MIGRATION_MARKER_STAGE_FILENAME, DbOnlyMigrationSegment, DbOnlyMigrationSourceRow,
-    LEDGER_FILENAME, LOG_DIRNAME, RoomStore, acquire_offline_migration_authority,
-    canonical_repo_root_string, count_corrupt_quarantine_groups, ensure_new_mutation_can_start,
-    is_reserved_fixture_engagement, observe_offline_migration_authority, read_corruption_counter,
-    render_db_only_migration_segment, sync_directory, validate_scoped_engagement,
-    verify_db_only_migration_extension, verify_db_only_migration_segment,
+    ARCHIVE_DIRNAME, ARCHIVED_MONOLITH_FILENAME, CORRUPT_QUARANTINE_MAX_GROUPS,
+    DB_ONLY_MIGRATION_MARKER_FILENAME, DB_ONLY_MIGRATION_MARKER_STAGE_FILENAME,
+    DbOnlyMigrationSegment, DbOnlyMigrationSourceRow, LEDGER_FILENAME, LOG_DIRNAME, RoomStore,
+    acquire_offline_migration_authority, canonical_repo_root_string, canonical_row_error,
+    count_corrupt_quarantine_groups, ensure_new_mutation_can_start, is_reserved_fixture_engagement,
+    observe_offline_migration_authority, read_corruption_counter, render_db_only_migration_segment,
+    sync_directory, validate_scoped_engagement, verify_db_only_migration_extension,
+    verify_db_only_migration_segment,
 };
 use crate::{
     mark_watchdog_command_commit, mark_watchdog_db_only_migration_outcome_unknown, normalize_path,
@@ -2269,6 +2270,15 @@ pub(crate) struct LedgerSegmentHealth {
     pub(crate) max_seq: Option<i64>,
     /// 1-based line numbers where seq goes backwards relative to the line before.
     pub(crate) out_of_order_lines: Vec<usize>,
+    /// 1-based lines that parse as JSON and carry an integer `seq` — so this
+    /// crude scan calls them a "row" — but fail the store's own canonical row
+    /// validation ([`crate::store::canonical_row_error`]). Only populated for
+    /// segments the store actually validates canonically (`log/` and
+    /// `archive/`, excluding the verbatim R1 monolith backup); the legacy
+    /// monolith itself is never checked here since the store re-parses it
+    /// structurally during migration rather than canonically validating it in
+    /// place.
+    pub(crate) invalid_row_lines: Vec<usize>,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -2309,11 +2319,36 @@ fn segment_paths_raw(rally_dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Whether the store canonically validates rows at `path` on a real read.
+/// True only for `log/` and `archive/` segments — the universe
+/// `canonical_segment_entries` folds via `replay_archive_segments`. False for
+/// the top-level R1 monolith (never validated canonically in place; migration
+/// re-parses it structurally and the resulting rows are validated once they
+/// land in `log/`) and for the verbatim monolith backup
+/// (`archive/ledger-pre-segment.jsonl`), which `replay_archive_segments`
+/// deliberately excludes from replay. Flagging either as `invalid_canonical_rows`
+/// would be a false positive on a healthy repo.
+fn is_canonically_validated_segment(path: &Path, rally_dir: &Path) -> bool {
+    if path.parent() == Some(rally_dir.join(LOG_DIRNAME).as_path()) {
+        return true;
+    }
+    if path.parent() == Some(rally_dir.join(ARCHIVE_DIRNAME).as_path()) {
+        return path.file_name().and_then(|n| n.to_str()) != Some(ARCHIVED_MONOLITH_FILENAME);
+    }
+    false
+}
+
 /// Pure core so tests can point it at a fixture directory.
 pub(crate) fn ledger_health_in_dir(rally_dir: &Path) -> LedgerHealthReport {
     let mut findings: Vec<LedgerFinding> = Vec::new();
     let rally_dir_exists = rally_dir.is_dir();
     let mut segments: Vec<LedgerSegmentHealth> = Vec::new();
+    // `path:line: <validator error>` examples for the `invalid_canonical_rows`
+    // finding below, capped at 3 so a large corrupted segment doesn't flood
+    // the message; `invalid_row_total` counts every such row, not just the
+    // examples kept.
+    let mut invalid_row_examples: Vec<String> = Vec::new();
+    let mut invalid_row_total = 0usize;
 
     if !rally_dir_exists {
         findings.push(LedgerFinding {
@@ -2349,7 +2384,9 @@ pub(crate) fn ledger_health_in_dir(rally_dir: &Path) -> LedgerHealthReport {
             min_seq: None,
             max_seq: None,
             out_of_order_lines: Vec::new(),
+            invalid_row_lines: Vec::new(),
         };
+        let validate_canonically = is_canonically_validated_segment(&path, rally_dir);
         let mut seen_in_segment: SeqRows = SeqRows::new();
         let mut prev: Option<i64> = None;
         for (idx, line) in text.lines().enumerate() {
@@ -2378,10 +2415,36 @@ pub(crate) fn ledger_health_in_dir(rally_dir: &Path) -> LedgerHealthReport {
             if seen_in_segment.insert(seq, line.to_string()).is_some() {
                 health.duplicate_seqs.push(seq);
             }
+            if validate_canonically && let Some(error) = canonical_row_error(line, &path, lineno) {
+                health.invalid_row_lines.push(lineno);
+                invalid_row_total += 1;
+                if invalid_row_examples.len() < 3 {
+                    invalid_row_examples.push(format!("{}:{lineno}: {error}", path.display()));
+                }
+            }
         }
         health.duplicate_seqs.sort_unstable();
         health.duplicate_seqs.dedup();
         segments.push(health);
+    }
+
+    if invalid_row_total > 0 {
+        findings.push(LedgerFinding {
+            code: "invalid_canonical_rows".to_string(),
+            severity: "error".to_string(),
+            message: format!(
+                "{invalid_row_total} row(s) are valid JSON with an integer seq but fail the \
+                 store's canonical row validation — the store rejects the whole segment on \
+                 read, so EVERY store-opening command fails with \"completed canonical segment \
+                 corruption\". Examples:\n{}",
+                invalid_row_examples.join("\n")
+            ),
+            remedy: Some(
+                "move the listed rows to .rally/quarantine/ (archive, never delete), then \
+                 re-run rally doctor"
+                    .to_string(),
+            ),
+        });
     }
 
     // Recompute conflicts across every segment with full-line equality, matching
@@ -4007,8 +4070,16 @@ mod ledger_health_tests {
         dir
     }
 
+    /// A canonically valid row — not just JSON-with-a-seq. Needed because
+    /// `ledger_health_in_dir` now runs the store's own canonical row
+    /// validation on `log/`/`archive/` segments, so a fixture row must carry
+    /// a real `Fact` payload (schema, non-empty `event_id`, `kind` matching
+    /// the envelope `event_type`) or every test using it would trip the new
+    /// `invalid_canonical_rows` finding.
     fn row(seq: i64, subject: &str) -> String {
-        format!(r#"{{"seq":{seq},"event_type":"artifact","payload":{{"subject":"{subject}"}}}}"#)
+        format!(
+            r#"{{"seq":{seq},"occurred_at":"2026-06-01T00:00:00Z","event_type":"artifact","payload":{{"schema":"agent-rally.fact.v1","event_id":"fact-{seq}","kind":"artifact","subject":"{subject}","created_at":"2026-06-01T00:00:00Z"}}}}"#
+        )
     }
 
     fn write_segment(dir: &Path, name: &str, rows: &[String]) {
@@ -4086,6 +4157,63 @@ mod ledger_health_tests {
         let report = ledger_health_in_dir(&dir);
         assert!(!report.healthy);
         assert_eq!(report.segments[0].unparseable_lines, vec![2]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Real incident: a test stub appended a row shaped like this (`"subject":
+    /// null` against a non-`Option` field) to `.rally/log/repo.jsonl`. It is
+    /// valid JSON with an integer `seq`, so the old crude scan reported
+    /// nothing — but the store's own canonical row validation rejects it, and
+    /// that rejection fails the ENTIRE segment open with "completed canonical
+    /// segment corruption", disabling rally for the repo. Doctor must surface
+    /// this row instead of staying silent about the very thing that bricked
+    /// every store-opening command.
+    #[test]
+    fn invalid_canonical_row_is_reported_as_error() {
+        let dir = fixture("invalid-canonical");
+        let bad_row = r#"{"seq":2,"occurred_at":"2026-06-01T00:00:00Z","event_type":"--help","payload":{"created_at":"2026-06-01T00:00:00Z","event_id":"fact_1","kind":"--help","tool":"unknown","target":null,"subject":null,"summary":null,"status":null,"scope":[],"evidence":[],"ref":null,"ref_id":null,"from_session_id":null,"seq":0,"schema":"agent-rally.fact.v1"},"engagement":"build-loop"}"#;
+        write_segment(&dir, "a.jsonl", &[row(1, "one"), bad_row.to_string()]);
+        let report = ledger_health_in_dir(&dir);
+        assert!(!report.healthy, "findings: {:?}", report.findings);
+        assert_eq!(report.segments[0].invalid_row_lines, vec![2]);
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.code == "invalid_canonical_rows")
+            .expect("invalid_canonical_rows finding");
+        assert_eq!(finding.severity, "error");
+        assert!(
+            finding.message.contains("a.jsonl:2:"),
+            "message must cite the offending file:line: {}",
+            finding.message
+        );
+        // Error severity alone must not claim `--repair-ledger` can fix this
+        // mechanically — it can't, and must not try.
+        assert!(!report.repairable);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A fully valid segment must not trip the new canonical-row check —
+    /// otherwise every healthy repo would get a false-positive error.
+    #[test]
+    fn fully_valid_segment_has_no_invalid_canonical_rows_finding() {
+        let dir = fixture("valid-canonical");
+        write_segment(
+            &dir,
+            "a.jsonl",
+            &[row(1, "one"), row(2, "two"), row(3, "three")],
+        );
+        let report = ledger_health_in_dir(&dir);
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| f.code != "invalid_canonical_rows"),
+            "{:?}",
+            report.findings
+        );
+        assert!(report.segments[0].invalid_row_lines.is_empty());
+        assert!(report.healthy);
         fs::remove_dir_all(&dir).ok();
     }
 
