@@ -2325,7 +2325,6 @@ fn rally_run_reserves_numbered_ids_under_parallel_launch() {
     // Daemon-serving mode (F4) when RALLY_TEST_RALLYD=1; no-op otherwise. Held
     // alive through the parallel launches AND the final `sessions` read below.
     let _daemon = maybe_start_daemon(&workspace.cwd, &workspace.home);
-    let daemon_mode = _daemon.is_some();
     // Scale concurrency to the host. The reservation is CAS-atomic (uniqueness
     // holds at any N — that is what this test asserts), so the only thing a
     // fixed high N buys is over-subscription on constrained CI runners (24
@@ -2348,8 +2347,8 @@ fn rally_run_reserves_numbered_ids_under_parallel_launch() {
     // the dead-socket error. The daemon stays a single total-order writer; only
     // ACCEPT concurrency widened. So this hammer once again runs at the full
     // clamp — a real falsification of #50 (0 corruption/drop/dup through the
-    // single writer) at the run-id test's max N. `daemon_mode` is still consulted
-    // below to grant routed launches the queued-op timeout headroom.
+    // single writer) at the run-id test's max N. Both direct and routed
+    // launches below receive enough timeout headroom for this stress test.
     let handles = (0..n)
         .map(|_| {
             let cwd = workspace.cwd.clone();
@@ -2367,17 +2366,12 @@ fn rally_run_reserves_numbered_ids_under_parallel_launch() {
                         "tmux",
                         "--tmux-bin",
                         "/usr/bin/true",
+                        "--timeout-ms",
+                        "20000",
                     ]);
-                // Routed ops queue behind the daemon's single total-order
-                // dispatcher, so a legitimately-queued op can exceed the 3s hook
-                // watchdog (a direct-mode safety, not a routed-latency bound —
-                // cf. the client's own 10s OP_TIMEOUT). Give routed launches the
-                // same generous budget the watchdog_concurrency test uses for
-                // its non-blocking invocations. No-op semantics in direct mode
-                // (direct ops don't queue), so this stays byte-safe for F2.
-                if daemon_mode {
-                    cmd.args(["--timeout-ms", "20000"]);
-                }
+                // Both routed and direct writes can queue: direct commands
+                // contend on direct.owner.lock. This test verifies unique ids,
+                // not the default watchdog under host load.
                 cmd.output().unwrap()
             })
         })
