@@ -484,9 +484,10 @@ fn tmux_connection(bin: &str) -> Result<Value> {
             "-p",
             "-t",
             "check:0.0",
-            "#{pane_input_off}\t#{synchronize-panes}",
+            &crate::backends::tmux_format(&["#{pane_input_off}", "#{synchronize-panes}"]),
         ])?;
-        if guards.trim() != "0\t0" {
+        let guard_fields = crate::backends::split_tmux_fields(&guards, 2, None);
+        if guard_fields.as_deref() != Some(&["0".to_string(), "0".to_string()][..]) {
             return Err(RallyError::Command("tmux does not expose the required safe-input guard fields; update tmux before using this adapter".into()));
         }
         call(&["send-keys", "-t", "check:0.0", "-l", &nonce])?;

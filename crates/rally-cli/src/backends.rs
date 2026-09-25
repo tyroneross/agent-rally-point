@@ -1060,10 +1060,12 @@ impl BackendRunner {
             "-p",
             "-t",
             target,
-            "#{pane_id}\t#{pane_pid}\t#{pid}\t#{socket_path}\t#{pane_dead}\t#{pane_in_mode}\t#{pane_input_off}\t#{synchronize-panes}"
+            tmux_format(&TMUX_IDENTITY_FIELDS)
         ];
         let output = run_command_output(&command)?;
-        let fields: Vec<_> = output.trim().split('\t').collect();
+        // socket_path (index 3) is the only field that may itself contain `_`.
+        let fields =
+            split_tmux_fields(&output, TMUX_IDENTITY_FIELDS.len(), Some(3)).unwrap_or_default();
         if fields.len() != 8
             || !fields[0].starts_with('%')
             || fields[1].parse::<u32>().is_err()
@@ -1079,10 +1081,10 @@ impl BackendRunner {
             ));
         }
         Ok(TmuxBinding {
-            pane: fields[0].into(),
-            pane_pid: fields[1].into(),
-            server_pid: fields[2].into(),
-            socket: fields[3].into(),
+            pane: fields[0].clone(),
+            pane_pid: fields[1].clone(),
+            server_pid: fields[2].clone(),
+            socket: fields[3].clone(),
         })
     }
 
@@ -1937,13 +1939,76 @@ fn tmux_inject_commands(bin: &str, session: &str, text: &str) -> Vec<Vec<String>
     vec![framed]
 }
 
+/// Printable field delimiter for multi-field tmux format strings.
+///
+/// tmux 3.6a renders control characters (TAB, LF) inside a `-F` / `display -p`
+/// format as `_`, so a TAB-separated probe came back as one `_`-joined field
+/// and every identity parse failed. This token is printable, tmux-safe, and
+/// cannot occur in pane ids, pids, flags, or a realistic socket path.
+pub(crate) const TMUX_FIELD_SEP: &str = ":::rally:::";
+
+const TMUX_IDENTITY_FIELDS: [&str; 8] = [
+    "#{pane_id}",
+    "#{pane_pid}",
+    "#{pid}",
+    "#{socket_path}",
+    "#{pane_dead}",
+    "#{pane_in_mode}",
+    "#{pane_input_off}",
+    "#{synchronize-panes}",
+];
+
+/// Join tmux format fields with [`TMUX_FIELD_SEP`].
+pub(crate) fn tmux_format(fields: &[&str]) -> String {
+    fields.join(TMUX_FIELD_SEP)
+}
+
+/// Split a multi-field tmux probe reply into exactly `expected` fields.
+///
+/// Accepts, in order: the [`TMUX_FIELD_SEP`] form (current probes), the legacy
+/// TAB form (older tmux / existing doubles), and tmux 3.6a's `_`-rendered TAB
+/// form. For the `_` form, `free_field` names the one field that may itself
+/// contain `_`; it absorbs the surplus pieces. Returns `None` on any mismatch.
+pub(crate) fn split_tmux_fields(
+    output: &str,
+    expected: usize,
+    free_field: Option<usize>,
+) -> Option<Vec<String>> {
+    let line = output.trim_matches(|c| c == '\n' || c == '\r' || c == ' ');
+    let owned = |parts: Vec<&str>| parts.into_iter().map(str::to_string).collect::<Vec<_>>();
+    if line.contains(TMUX_FIELD_SEP) {
+        let parts: Vec<_> = line.split(TMUX_FIELD_SEP).collect();
+        return (parts.len() == expected).then(|| owned(parts));
+    }
+    if line.contains('\t') {
+        let parts: Vec<_> = line.split('\t').collect();
+        return (parts.len() == expected).then(|| owned(parts));
+    }
+    let parts: Vec<_> = line.split('_').collect();
+    if parts.len() == expected {
+        return Some(owned(parts));
+    }
+    let free = free_field?;
+    if expected == 0 || parts.len() < expected || free >= expected {
+        return None;
+    }
+    let tail = expected - free - 1;
+    let mut fields = owned(parts[..free].to_vec());
+    fields.push(parts[free..parts.len() - tail].join("_"));
+    fields.extend(owned(parts[parts.len() - tail..].to_vec()));
+    Some(fields)
+}
+
 fn probe_tmux_liveness(bin: &str, targets: &[String]) -> Vec<SessionLiveness> {
     let output = Command::new(bin)
         .args([
             "list-panes",
             "-a",
             "-F",
-            "#{session_name}\n#{window_id}\n#{pane_id}",
+            // Space, not `\n`: tmux >= 3.6 renders control characters inside a
+            // format as `_`, which fused the three ids into one unmatched token.
+            // `target_tokens` splits on whitespace, so space works on every tmux.
+            "#{session_name} #{window_id} #{pane_id}",
         ])
         .output();
     classify_probe_output(output, targets)
@@ -2672,6 +2737,10 @@ mod tests {
         parse_etime_secs, pid_is_alive, resolve_executable, sanitize_inject_text, shell_words,
         tmux_inject_commands,
     };
+    use super::{
+        SessionLiveness, TMUX_FIELD_SEP, TMUX_IDENTITY_FIELDS, probe_tmux_liveness,
+        split_tmux_fields, tmux_format,
+    };
     use crate::check::CheckData;
     use crate::cli::BackendBins;
     use crate::store::Fact;
@@ -2681,6 +2750,7 @@ mod tests {
     };
     use schemars::schema_for;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     #[test]
     fn codex_task_command_is_one_shot_while_plain_command_is_interactive() {
@@ -2958,6 +3028,111 @@ mod tests {
                 "unsafe tmux state must refuse before write: {error}"
             );
         }
+    }
+
+    // ---- tmux format delimiter (tmux 3.6a renders TAB as `_`) --------------
+
+    #[test]
+    fn split_tmux_fields_accepts_delimiter_tab_and_tmux_36a_underscore_forms() {
+        let want: Vec<String> = [
+            "%3",
+            "123",
+            "45",
+            "/private/tmp/tmux-501/default",
+            "0",
+            "0",
+            "0",
+            "0",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let delim = want.join(TMUX_FIELD_SEP) + "\n";
+        let tab = want.join("\t") + "\n";
+        assert_eq!(split_tmux_fields(&delim, 8, Some(3)), Some(want.clone()));
+        assert_eq!(split_tmux_fields(&tab, 8, Some(3)), Some(want.clone()));
+        // tmux 3.6a output of the old TAB probe: every TAB became `_`.
+        let rendered = "%3_123_45_/private/tmp/tmux-501/default_0_0_0_0\n";
+        assert_eq!(split_tmux_fields(rendered, 8, Some(3)), Some(want));
+        // A socket path that itself contains `_` is absorbed by the free field.
+        let underscored = "%3_123_45_/tmp/rally_fix_sock_0_0_1_0";
+        let fields = split_tmux_fields(underscored, 8, Some(3)).unwrap();
+        assert_eq!(fields[3], "/tmp/rally_fix_sock");
+        assert_eq!(fields[6], "1");
+        // Two-field guard probe (runtime setup) in both the new and 3.6a forms.
+        let two = vec!["0".to_string(), "0".to_string()];
+        assert_eq!(
+            split_tmux_fields(&format!("0{TMUX_FIELD_SEP}0\n"), 2, None),
+            Some(two.clone())
+        );
+        assert_eq!(split_tmux_fields("0_0\n", 2, None), Some(two));
+    }
+
+    #[test]
+    fn split_tmux_fields_rejects_wrong_field_counts() {
+        assert_eq!(split_tmux_fields("", 8, Some(3)), None);
+        assert_eq!(split_tmux_fields("%3\t1\t2", 8, Some(3)), None);
+        assert_eq!(
+            split_tmux_fields(&["a"; 9].join(TMUX_FIELD_SEP), 8, Some(3)),
+            None
+        );
+        assert_eq!(split_tmux_fields("0_0_0", 2, None), None);
+        assert!(
+            !tmux_format(&TMUX_IDENTITY_FIELDS)
+                .chars()
+                .any(char::is_control)
+        );
+    }
+
+    #[test]
+    fn tmux_inject_accepts_new_delimiter_identity() {
+        let state = ["%1", "1", "1", "/socket", "0", "0", "0", "0"].join(TMUX_FIELD_SEP);
+        let bin = stub_tmux_with_state("delim", &state, 0);
+        assert!(iv_retry(&tmux_runner(&bin), "rally-delim-token").is_ok());
+    }
+
+    /// Real tmux on a private `-L` socket: the identity probe must bind a pane.
+    /// Skips when tmux is not installed. Never touches the default server.
+    #[test]
+    fn tmux_identity_binds_real_pane_on_private_socket() {
+        use std::os::unix::fs::PermissionsExt;
+        if Command::new("tmux").arg("-V").output().is_err() {
+            eprintln!("skip: tmux not installed");
+            return;
+        }
+        let sock = format!("rally-fix-test-{}", std::process::id());
+        let wrapper = std::env::temp_dir().join(format!("{sock}.sh"));
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\nunset TMUX\nexec tmux -L {sock} -f /dev/null \"$@\"\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = wrapper.to_string_lossy().into_owned();
+        let started = Command::new(&bin)
+            .args(["new-session", "-d", "-s", "probe", "sleep 30"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let result = started.then(|| tmux_runner(&bin).tmux_identity("probe:0.0"));
+        let liveness = started.then(|| probe_tmux_liveness(&bin, &["probe".to_string()]));
+        let _ = Command::new(&bin).arg("kill-server").status();
+        let _ = std::fs::remove_file(&wrapper);
+        if let Some(Ok(binding)) = &result {
+            let _ = std::fs::remove_file(&binding.socket);
+        }
+        let Some(result) = result else {
+            eprintln!("skip: could not start private tmux server");
+            return;
+        };
+        assert_eq!(
+            liveness,
+            Some(vec![SessionLiveness::Live]),
+            "liveness probe"
+        );
+        let binding = result.expect("identity probe must parse on this tmux");
+        assert!(binding.pane.starts_with('%'), "{binding:?}");
+        assert!(binding.socket.contains(&sock), "{binding:?}");
     }
 
     // ---- backend availability probe ---------------------------------------
