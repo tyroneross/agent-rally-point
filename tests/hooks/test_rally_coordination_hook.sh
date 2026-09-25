@@ -2385,10 +2385,10 @@ install_stub "$registration_bin"
   git -C "$repo" init -q
   cd "$repo"
   envelope='{"session_id":"duplicate-registration-session","hook_event_name":"SessionStart"}'
-  CALLS="$registration_calls" RALLY_HOOK_SOURCE=plugin RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
+  CALLS="$registration_calls" RALLY_HOOK_SOURCE=plugin RALLY_HOOK_DEDUPE_SECS=120 RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
     "$HOOK" start claude_code <<<"$envelope" >/dev/null 2>&1
   first_count="$(wc -l < "$registration_calls" | tr -d ' ')"
-  CALLS="$registration_calls" RALLY_HOOK_SOURCE=project RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
+  CALLS="$registration_calls" RALLY_HOOK_SOURCE=project RALLY_HOOK_DEDUPE_SECS=120 RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
     "$HOOK" start claude_code <<<"$envelope" >/dev/null 2>&1
   second_count="$(wc -l < "$registration_calls" | tr -d ' ')"
   if [ "$first_count" -eq 0 ] || [ "$second_count" != "$first_count" ]; then
@@ -2439,16 +2439,16 @@ T="dedupe source counts handle grouped registration arrival order"
   git -C "$repo" init -q
   cd "$repo"
   envelope='{"session_id":"grouped-source-session","hook_event_name":"SessionStart"}'
-  CALLS="$calls" RALLY_HOOK_SOURCE=plugin RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
+  CALLS="$calls" RALLY_HOOK_SOURCE=plugin RALLY_HOOK_DEDUPE_SECS=120 RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
     "$HOOK" start claude_code <<<"$envelope" >/dev/null 2>&1
   one="$(wc -l < "$calls" | tr -d ' ')"
-  CALLS="$calls" RALLY_HOOK_SOURCE=plugin RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
+  CALLS="$calls" RALLY_HOOK_SOURCE=plugin RALLY_HOOK_DEDUPE_SECS=120 RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
     "$HOOK" start claude_code <<<"$envelope" >/dev/null 2>&1
   two="$(wc -l < "$calls" | tr -d ' ')"
-  CALLS="$calls" RALLY_HOOK_SOURCE=project RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
+  CALLS="$calls" RALLY_HOOK_SOURCE=project RALLY_HOOK_DEDUPE_SECS=120 RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
     "$HOOK" start claude_code <<<"$envelope" >/dev/null 2>&1
   after_project_one="$(wc -l < "$calls" | tr -d ' ')"
-  CALLS="$calls" RALLY_HOOK_SOURCE=project RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
+  CALLS="$calls" RALLY_HOOK_SOURCE=project RALLY_HOOK_DEDUPE_SECS=120 RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
     "$HOOK" start claude_code <<<"$envelope" >/dev/null 2>&1
   after_project_two="$(wc -l < "$calls" | tr -d ' ')"
   if [ "$one" -eq 0 ] || [ "$two" -le "$one" ] || \
