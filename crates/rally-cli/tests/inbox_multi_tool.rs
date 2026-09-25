@@ -68,7 +68,12 @@ fn single_tool_form_keeps_the_original_envelope_shape() {
 #[test]
 fn multi_tool_form_equals_the_union_of_single_calls() {
     let sandbox = ChannelSandbox::spawn();
-    let a1 = handoff(&sandbox, "codex:07", "first for a", &["--ack-within", "90s"]);
+    let a1 = handoff(
+        &sandbox,
+        "codex:07",
+        "first for a",
+        &["--ack-within", "90s"],
+    );
     handoff(&sandbox, "codex:07", "second for a", &[]);
     handoff(&sandbox, "claude:02", "only for b", &[]);
 
@@ -109,7 +114,9 @@ fn multi_tool_form_equals_the_union_of_single_calls() {
 fn duplicate_tools_collapse_to_one_entry() {
     let sandbox = ChannelSandbox::spawn();
     handoff(&sandbox, "codex:07", "one", &[]);
-    let multi = sandbox.rally_json(&["inbox", "--json", "--tool", "codex:07", "--tool", "codex:07"]);
+    let multi = sandbox.rally_json(&[
+        "inbox", "--json", "--tool", "codex:07", "--tool", "codex:07",
+    ]);
     let inboxes = multi["data"]["inboxes"].as_object().expect("inboxes map");
     assert_eq!(inboxes.len(), 1);
     assert_eq!(inboxes["codex:07"]["count"], 1);
