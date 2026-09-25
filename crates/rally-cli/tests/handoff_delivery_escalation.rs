@@ -180,16 +180,18 @@ fn caller_cannot_override_or_forge_ack_deadline_evidence() {
 #[test]
 fn unanswered_handoff_escalates_once_and_receiver_ack_clears_it() {
     let sandbox = ChannelSandbox::spawn();
+    // Give the pre-deadline assertion its own long-lived handoff so a slow
+    // command under load cannot consume the short escalation window.
+    handoff(&sandbox, "codex:07", &["--ack-within", "90s"]);
+    let early = sandbox.rally_json(&["next", "--json", "--tool", SENDER]);
+    assert!(early["data"]["overdue_handoffs"].is_null(), "{early}");
+
     let said = handoff(&sandbox, "codex:07", &["--ack-within", "3s"]);
     let handoff_id = said["data"]["say"]["fact"]["event_id"]
         .as_str()
         .unwrap()
         .to_string();
     assert!(said["data"]["delivery"]["ack_by"].is_string(), "{said}");
-
-    // Before the deadline: nothing overdue, no risk written.
-    let early = sandbox.rally_json(&["next", "--json", "--tool", SENDER]);
-    assert!(early["data"]["overdue_handoffs"].is_null(), "{early}");
 
     std::thread::sleep(std::time::Duration::from_millis(4200));
     let late = sandbox.rally_json(&["next", "--json", "--tool", SENDER]);
