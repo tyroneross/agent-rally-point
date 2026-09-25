@@ -1321,7 +1321,11 @@ fn real_ptyd_inject_actually_submits_and_is_received() {
 
     let root = std::env::temp_dir().join(unique("real-ptyd"));
     let cwd = root.join("cwd");
-    let home = root.join("home");
+    // Autostart is allowed only on rally's canonical socket under HOME, with no
+    // RALLY_PTYD_SOCKET override (daemon_client::ensure_rally_owns_socket). A
+    // short HOME keeps that socket path under the 104-byte sun_path limit.
+    let home = PathBuf::from(format!("/tmp/rp{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
     let bin_dir = root.join("bin");
     fs::create_dir_all(cwd.join(".git")).unwrap();
     fs::create_dir_all(&home).unwrap();
@@ -1329,7 +1333,7 @@ fn real_ptyd_inject_actually_submits_and_is_received() {
     // Fake `claude` = a line reader echoing GOT:<line> per submitted line.
     write_claude_line_reader_shim(&bin_dir.join("claude"));
     // A single rally-owned socket (NOT the ET socket, NOT ~/.local/share/rally).
-    let socket = std::env::temp_dir().join(format!("{}.sock", unique("rptd")));
+    let socket = home.join(".local/share/rally/ptyd.sock");
     // PATH the child shells use must find the fake `claude` plus /bin, /usr/bin
     // (for sh/stty/printf). Put bin_dir FIRST so our shim shadows any real claude.
     let path_env = format!("{}:/usr/bin:/bin", bin_dir.display());
@@ -1346,7 +1350,7 @@ fn real_ptyd_inject_actually_submits_and_is_received() {
             .env("RALLY_HOOK_TIMEOUT_MS", "20000")
             .env("PATH", &path_env)
             .env("RALLY_PTYD_BIN", &ptyd_bin)
-            .env("RALLY_PTYD_SOCKET", &socket)
+            .env_remove("RALLY_PTYD_SOCKET")
             .env_remove("PTYD_SOCKET_PATH")
             .env_remove("PWD")
             .output()
@@ -1458,6 +1462,7 @@ fn real_ptyd_inject_actually_submits_and_is_received() {
     // / vendor ptyds use OTHER sockets and are untouched.
     let _ = rally(&["stop", &target, "--json"]);
     kill_socket_holder(&socket);
+    let _ = fs::remove_dir_all(&home);
 
     assert!(
         received,

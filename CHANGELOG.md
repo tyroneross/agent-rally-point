@@ -7,6 +7,25 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Fixed — rally never starts a ptyd daemon on a socket it does not own
+
+`rally run --backend ptyd` used to autostart a daemon on whatever socket
+`RALLY_PTYD_SOCKET` named when nothing answered there. When that socket
+belonged to Easy Terminal, a second `ptyd server` bound to it would take over
+the path and wipe every live workspace. Autostart now happens only on rally's
+own `~/.local/share/rally/ptyd.sock` with no override set, and never through a
+symlinked socket or an aliased directory. An overridden socket can still be
+used while its daemon is live; when it is not, the run fails and says to start
+the owning app or unset the override. Seven tests cover the refusal cases and
+the unchanged canonical path.
+
+### Added — brief notice verbosity for the coordination hook
+
+`RALLY_NOTICE_VERBOSITY=brief` prints the trust preamble in full once per
+session and a short tag afterwards, keys repeat suppression on the event ids a
+notice names, and drops the per-turn "nothing needs you" roster. `normal`, the
+default, keeps the previous output.
+
 ## 0.2.8
 
 ### Added — targeted handoffs deliver by inject and escalate when their ack deadline passes
