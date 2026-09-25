@@ -64,3 +64,9 @@ codegen-units = 1   # one unit → maximal optimization (no parallel-split inlin
 strip = true        # drop symbols from the shipped binary
 # opt-level stays 3 (release default); panic stays unwind (abort would change
 # runtime behavior and break unwind-dependent tests).
+
+# Build scripts and proc-macros are dlopen'd by rustc; stripping them on
+# current macOS corrupts the dylib ("mis-aligned LINKEDIT string pool") and
+# sqlx-macros fails to load. Only build-time artifacts; the binary stays stripped.
+[profile.release.build-override]
+strip = false
