@@ -3413,6 +3413,14 @@ EOF
 install_stub "$u4_bin"
 
 u4_now_ms() { node -e 'process.stdout.write(String(Date.now()))'; }
+u4_fresh_or_fail() {
+  local age_ms
+  age_ms="$(($(u4_now_ms) - $1))"
+  [ "$age_ms" -lt 10000 ] || {
+    printf 'test setup expired before result check (age=%sms)\n' "$age_ms" >&2
+    return 1
+  }
+}
 
 # u4_write_health <path> <updated_ms> <degraded true|false> <routed_identities JSON array> <delivered JSON object>
 u4_write_health() {
@@ -3460,10 +3468,12 @@ if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
 
 T="U4(c): degraded:true still shows the item"
 health_c="$tmpdir/u4-health-c.json"
+now_ms="$(u4_now_ms)"
 u4_write_health "$health_c" "$now_ms" "true" "[\"$u4_id\"]" "{\"$u4_id\":[\"$u4_eid\"]}"
 (
   cd "$u4_repo" || exit 1
   out="$(u4_call "$health_c" c)"
+  u4_fresh_or_fail "$now_ms" || exit 1
   u4_shows "$out" || { printf 'degraded:true must not suppress: [%s]\n' "$out" >&2; exit 1; }
   exit 0
 )
@@ -3471,10 +3481,12 @@ if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
 
 T="U4(d): this identity absent from routed_identities still shows the item"
 health_d="$tmpdir/u4-health-d.json"
+now_ms="$(u4_now_ms)"
 u4_write_health "$health_d" "$now_ms" "false" "[\"codex:someone-else\"]" "{\"$u4_id\":[\"$u4_eid\"]}"
 (
   cd "$u4_repo" || exit 1
   out="$(u4_call "$health_d" d)"
+  u4_fresh_or_fail "$now_ms" || exit 1
   u4_shows "$out" || { printf 'identity not in routed_identities must not suppress: [%s]\n' "$out" >&2; exit 1; }
   exit 0
 )
@@ -3482,10 +3494,12 @@ if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
 
 T="U4(e): a different, undelivered event id still shows the item"
 health_e="$tmpdir/u4-health-e.json"
+now_ms="$(u4_now_ms)"
 u4_write_health "$health_e" "$now_ms" "false" "[\"$u4_id\"]" "{\"$u4_id\":[\"fact_other_9999\"]}"
 (
   cd "$u4_repo" || exit 1
   out="$(u4_call "$health_e" e)"
+  u4_fresh_or_fail "$now_ms" || exit 1
   u4_shows "$out" || { printf 'an undelivered event id must not suppress: [%s]\n' "$out" >&2; exit 1; }
   exit 0
 )
@@ -3493,12 +3507,14 @@ if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
 
 T="U4(f): a symlinked health file still shows the item"
 health_f_real="$tmpdir/u4-health-f-real.json"
+now_ms="$(u4_now_ms)"
 u4_write_health "$health_f_real" "$now_ms" "false" "[\"$u4_id\"]" "{\"$u4_id\":[\"$u4_eid\"]}"
 health_f="$tmpdir/u4-health-f-link.json"
 ln -sf "$health_f_real" "$health_f"
 (
   cd "$u4_repo" || exit 1
   out="$(u4_call "$health_f" f)"
+  u4_fresh_or_fail "$now_ms" || exit 1
   u4_shows "$out" || { printf 'a symlinked health file must not suppress: [%s]\n' "$out" >&2; exit 1; }
   exit 0
 )
