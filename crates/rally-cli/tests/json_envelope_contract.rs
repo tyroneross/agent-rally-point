@@ -10,10 +10,12 @@
 //! This test drives off COMMANDS so any new subcommand that omits the contract
 //! will cause this test to fail, not silently skip.
 
+mod support;
+
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct Workspace {
@@ -36,7 +38,7 @@ impl Workspace {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_rally"))
+        support::rally_cmd::rally_command()
             .current_dir(&self.cwd)
             .env("HOME", &self.home)
             .env("RALLY_GLOBAL_INDEX", "1")
