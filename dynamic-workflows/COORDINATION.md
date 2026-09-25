@@ -64,7 +64,7 @@ above). So: 10 terminals → 10 squad ids in the room, regardless of how many ag
    The lead **routes**, and may delegate not only execution but **integration/synthesis** (e.g.,
    merging multi-agent outputs into one artifact) — its irreducible role is **core decisions +
    final acceptance**, not doing mechanical work by hand. Delegate, then verify.
-   - **Title lifecycle** (L-1 landed; `rally lead` surface per [`../docs/SPEC-lead-agent.md`](../docs/SPEC-lead-agent.md)).
+   - **Title lifecycle** (L-1 landed; `rally lead` surface per [`../docs/SPEC-lead-agent.md`](https://github.com/tyroneross/agent-rally-point/blob/main/docs/SPEC-lead-agent.md)).
      Lead auto-assign is **frontier-only** (`rally enter --tier frontier`); a declared `executing`/`fast`
      first-enter leaves the seat open until a frontier agent joins. The lead may **hand off** the title
      to another frontier agent or **relinquish** it; a **user-designated** lead supersedes a first-join lead.
@@ -151,6 +151,6 @@ rally next    --tool <your-stable-id> --json   # a concrete next-action contract
 
 Every `--json` result follows one envelope: `{ ok, command, product, schema, data }`, and the
 command's result is always at `data[<command>]` (e.g. `data.room`, `data.next`, `data["wake-due"]`).
-Parse by that rule — don't guess per-command nesting. Full map: [`../docs/JSON_ENVELOPE.md`](../docs/JSON_ENVELOPE.md).
+Parse by that rule — don't guess per-command nesting. Full map: [`../docs/JSON_ENVELOPE.md`](https://github.com/tyroneross/agent-rally-point/blob/main/docs/JSON_ENVELOPE.md).
 
 Keep it light. The rules above are the whole contract — everything else is each agent's own judgment.

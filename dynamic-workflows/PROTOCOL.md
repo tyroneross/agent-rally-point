@@ -84,9 +84,9 @@ stamp these as scope markers on every fact they emit (`rally say … --run <run_
 --parent-step <dep>`), which lets the orchestrator reconstruct the whole fan-out via
 `rally dag --run <run_id>` and resume dormant agents via `rally wake-due` (an idle agent emits
 `rally say standby --reason idle --wake-after +30m`; the runner fires the resume). The host skill
-([`../skills/rally-workflows/SKILL.md`](../skills/rally-workflows/SKILL.md) §4, §7) carries the exact
+([`../skills/rally-workflows/SKILL.md`](https://github.com/tyroneross/agent-rally-point/blob/main/skills/rally-workflows/SKILL.md) §4, §7) carries the exact
 call shapes; the event vocabulary and encoding are in
-[`../docs/ORCHESTRATOR_SEAM.md`](../docs/ORCHESTRATOR_SEAM.md). Markers are optional and additive —
+[`../docs/ORCHESTRATOR_SEAM.md`](https://github.com/tyroneross/agent-rally-point/blob/main/docs/ORCHESTRATOR_SEAM.md). Markers are optional and additive —
 omitting them costs only observability, never correctness.
 
 ### Lint rules (enforced)

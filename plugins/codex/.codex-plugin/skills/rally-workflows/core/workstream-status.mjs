@@ -27,6 +27,7 @@
  * Exit:   0 = complete (nothing left to dispatch) · 3 = work remains · 2 = usage/parse error
  */
 
+import { isMain } from "./is-main.mjs";
 import { readFileSync } from "node:fs";
 
 /**
@@ -173,6 +174,6 @@ function main(argv) {
   return 3; // work remains — host re-dispatches the to_dispatch set
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMain(import.meta.url)) {
   process.exit(main(process.argv));
 }

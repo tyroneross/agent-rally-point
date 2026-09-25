@@ -34,6 +34,7 @@
  * Exit:   0 clean · 1 lint violations · 2 usage/parse error
  */
 
+import { isMain } from "./is-main.mjs";
 import { readFileSync } from "node:fs";
 
 // Lifted verbatim from pi-dynamic-workflows/src/workflow.ts (MIT). A declared
@@ -371,6 +372,6 @@ function main(argv) {
 }
 
 // Run as CLI only when invoked directly (not when imported by tests).
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMain(import.meta.url)) {
   process.exit(main(process.argv));
 }

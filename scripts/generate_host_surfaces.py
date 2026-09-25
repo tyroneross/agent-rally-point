@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import sys
@@ -34,6 +35,7 @@ GENERATED_DIRS = (Path("plugins/codex/.codex-plugin"),)
 SKILL_ROOT = Path("skills")
 CODEX_ARTIFACT = Path("plugins/codex/.codex-plugin")
 CODEX_WORKFLOW_RUNTIME_FILES = (
+    "is-main.mjs",
     "checkpoint.mjs",
     "fanout.mjs",
     "limiter.mjs",
@@ -518,7 +520,20 @@ def copy_codex_artifact(
             source = source_root / relative
             target = dest / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
+            if source.suffix == ".md":
+                # npm docs use public URLs; the host artifact has these references
+                # locally and must keep them reachable without a network request.
+                text = source.read_text(encoding="utf-8")
+                bundled = [*CODEX_PACKAGED_REFERENCE_FILES]
+                bundled.extend(SKILL_ROOT / skill / "SKILL.md" for skill in config["skills"])
+                for reference in bundled:
+                    public = f"https://github.com/tyroneross/agent-rally-point/blob/main/{reference.as_posix()}"
+                    local = os.path.relpath(reference, relative.parent)
+                    text = text.replace(f"]({public})", f"]({local})")
+                    text = text.replace(f"]({public}#", f"]({local}#")
+                write_text(target, text)
+            else:
+                shutil.copy2(source, target)
     validate_codex_package_paths(dest.parent)
     return dest
 

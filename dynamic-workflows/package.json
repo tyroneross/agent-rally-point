@@ -1,7 +1,7 @@
 {
-  "name": "dynamic-workflows",
+  "name": "@tyroneross/rally-flow",
   "version": "0.1.0",
-  "description": "Rally Flow — Agent Rally Point's take on dynamic workflows: a portable workstream protocol + guardrail + host-facing skills + durable resume for coordinating multiple agents. Rally facilitates; hosts execute.",
+  "description": "Validate multi-agent workstream plans and derive the next tasks from Agent Rally Point records.",
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
@@ -17,17 +17,34 @@
   },
   "scripts": {
     "lint:example": "node core/workstream-lint.mjs examples/audit-repo.workstream.json",
-    "test": "node --test \"tests/**/*.test.mjs\""
+    "test": "node --test \"tests/**/*.test.mjs\"",
+    "prepublishOnly": "npm test"
   },
   "files": [
     "core/",
-    "skills/",
     "examples/",
     "PROTOCOL.md",
     "COORDINATION.md",
     "MODEL-TIERS.md",
     "NOTICE",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
-  "dependencies": {}
+  "dependencies": {},
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tyroneross/agent-rally-point.git",
+    "directory": "dynamic-workflows"
+  },
+  "homepage": "https://github.com/tyroneross/agent-rally-point/tree/main/dynamic-workflows#readme",
+  "bugs": {
+    "url": "https://github.com/tyroneross/agent-rally-point/issues"
+  },
+  "engines": {
+    "node": ">=22.22.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
 }

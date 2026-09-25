@@ -53,6 +53,7 @@
  * Exit: 0 ok · 2 usage/parse/validation error.
  */
 
+import { isMain } from "./is-main.mjs";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { readCheckpoint } from "./checkpoint.mjs";
@@ -474,6 +475,6 @@ function main(argv) {
 }
 
 // Run as CLI only when invoked directly (not when imported by tests).
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMain(import.meta.url)) {
   process.exit(main(process.argv));
 }

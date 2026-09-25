@@ -232,9 +232,24 @@ class GenerateHostSurfacesTests(unittest.TestCase):
                 (ROOT / GEN.CODEX_WORKFLOW_NOTICE_SOURCE).read_bytes(),
             )
             for relative in GEN.CODEX_PACKAGED_REFERENCE_FILES:
+                expected = (ROOT / relative).read_bytes()
+                if relative in {
+                    Path("dynamic-workflows/PROTOCOL.md"),
+                    Path("dynamic-workflows/COORDINATION.md"),
+                }:
+                    # These npm-facing docs link publicly; the host bundles the
+                    # four targets locally. All other bytes must remain exact.
+                    for target in (
+                        "skills/rally-workflows/SKILL.md",
+                        "docs/ORCHESTRATOR_SEAM.md",
+                        "docs/SPEC-lead-agent.md",
+                        "docs/JSON_ENVELOPE.md",
+                    ):
+                        public = f"https://github.com/tyroneross/agent-rally-point/blob/main/{target}"
+                        expected = expected.replace(public.encode(), f"../{target}".encode())
                 self.assertEqual(
                     (artifact / relative).read_bytes(),
-                    (ROOT / relative).read_bytes(),
+                    expected,
                 )
             skill_text = (
                 artifact / "skills/rally-workflows/SKILL.md"

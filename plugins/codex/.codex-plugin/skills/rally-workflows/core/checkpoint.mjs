@@ -5,7 +5,7 @@
 import { createHash } from 'node:crypto';
 import { constants, openSync, closeSync, readSync, writeFileSync, fsyncSync, fstatSync, mkdirSync, linkSync, unlinkSync } from 'node:fs';
 import { join, basename, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { isMain } from "./is-main.mjs";
 
 export const MAX_BYTES = 65536;
 // Logical ids include Build Loop's host-qualified run ids. Filenames use only
@@ -91,4 +91,4 @@ export function main(argv) {
     return 0;
   } catch (e) { process.stderr.write(`${e.message}\n`); return 2; }
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) process.exitCode = main(process.argv);
+if (isMain(import.meta.url)) process.exitCode = main(process.argv);
