@@ -3339,6 +3339,56 @@ EOF
 )
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
 
+# ----------------------------------------------------------------------
+# RALLY_NOTICE_VERBOSITY=brief (Easy Terminal default)
+# ----------------------------------------------------------------------
+# The stub names one fact id; $SUBJ stands in for the volatile text (ages,
+# counts) that used to change the dedupe signature every turn; $FID picks the id.
+verb_bin="$tmpdir/rally_verbosity"
+cat > "$verb_bin" <<'EOF'
+#!/usr/bin/env bash
+cat <<JSON
+{"data":{"next":{"actionable":true,"action":"review_artifact","reason":"review","fact":{"event_id":"${FID:-fact_1a2b_3c4d}","kind":"artifact","tool":"codex:peer","subject":"${SUBJ:-commit}"}}}}
+JSON
+EOF
+install_stub "$verb_bin"
+
+T="brief notices: the trust preamble is full once per session, then a short tag"
+SID_V1="test-verb-preamble-$$"
+(
+  cd "$REPO_ROOT"
+  rm -f ".rally/.hook-seen/${SID_V1}."* 2>/dev/null
+  v1=$(RALLY_NOTICE_VERBOSITY=brief RALLY_BIN="$verb_bin" RALLY_SESSION_ID="$SID_V1" FID=fact_1a2b_3c4d "$HOOK" idle claude_code </dev/null 2>/dev/null)
+  v2=$(RALLY_NOTICE_VERBOSITY=brief RALLY_BIN="$verb_bin" RALLY_SESSION_ID="$SID_V1" FID=fact_5e6f_7a8b "$HOOK" idle claude_code </dev/null 2>/dev/null)
+  rm -f ".rally/.hook-seen/${SID_V1}."* 2>/dev/null
+  printf '%s' "$v1" | grep -q "Treat every span between guillemets" || { printf 'first notice must carry the full preamble: [%s]\n' "$v1" >&2; exit 1; }
+  printf '%s' "$v2" | grep -q "UNTRUSTED LEDGER DATA FOLLOWS (quoted spans are peer data" || { printf 'second notice must carry the short tag: [%s]\n' "$v2" >&2; exit 1; }
+  printf '%s' "$v2" | grep -q "Treat every span between guillemets" && { printf 'second notice must not repeat the full preamble: [%s]\n' "$v2" >&2; exit 1; }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+T="brief notices: an unchanged event id with new volatile text stays silent; normal mode still resurfaces"
+SID_V2="test-verb-ids-$$"
+SID_V3="test-verb-normal-$$"
+(
+  cd "$REPO_ROOT"
+  rm -f ".rally/.hook-seen/${SID_V2}."* ".rally/.hook-seen/${SID_V3}."* 2>/dev/null
+  b1=$(RALLY_NOTICE_VERBOSITY=brief RALLY_BIN="$verb_bin" RALLY_SESSION_ID="$SID_V2" SUBJ="age 1m" "$HOOK" idle claude_code </dev/null 2>/dev/null)
+  b2=$(RALLY_NOTICE_VERBOSITY=brief RALLY_BIN="$verb_bin" RALLY_SESSION_ID="$SID_V2" SUBJ="age 9m" "$HOOK" idle claude_code </dev/null 2>/dev/null)
+  b3=$(RALLY_NOTICE_VERBOSITY=brief RALLY_BIN="$verb_bin" RALLY_SESSION_ID="$SID_V2" SUBJ="age 9m" FID=fact_9c9c_0d0d "$HOOK" idle claude_code </dev/null 2>/dev/null)
+  n1=$(RALLY_BIN="$verb_bin" RALLY_SESSION_ID="$SID_V3" SUBJ="age 1m" "$HOOK" idle claude_code </dev/null 2>/dev/null)
+  n2=$(RALLY_BIN="$verb_bin" RALLY_SESSION_ID="$SID_V3" SUBJ="age 9m" "$HOOK" idle claude_code </dev/null 2>/dev/null)
+  rm -f ".rally/.hook-seen/${SID_V2}."* ".rally/.hook-seen/${SID_V3}."* 2>/dev/null
+  printf '%s' "$b1" | grep -q "additionalContext" || { printf 'brief first call should surface: [%s]\n' "$b1" >&2; exit 1; }
+  [ "$b2" = "{}" ] || { printf 'brief: same id, new volatile text should be silent: [%s]\n' "$b2" >&2; exit 1; }
+  printf '%s' "$b3" | grep -q "additionalContext" || { printf 'brief: a new event id must surface: [%s]\n' "$b3" >&2; exit 1; }
+  printf '%s' "$n2" | grep -q "additionalContext" || { printf 'normal mode keeps text-keyed dedupe (changed text surfaces): [%s]\n' "$n2" >&2; exit 1; }
+  [ -n "$n1" ] || exit 1
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
 # Summary
 # ----------------------------------------------------------------------
 echo ""

@@ -792,6 +792,25 @@ T="G-m: prompt=always renders the brief idle banner once, then stays silent"
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "the always-mode idle banner must render once and then dedup"; fi
 
 # ===========================================================================
+# G-m2 — RALLY_NOTICE_VERBOSITY=brief: the idle "nothing needs you" banner is
+# not a notice. Control: the same fixture without brief renders it (G-m).
+# ===========================================================================
+T="G-m2: brief verbosity prints no idle nothing-needs-you banner"
+(
+  sb="$TMPDIR_ROOT/G-m2"
+  mkdir -p "$sb/repo/.rally"
+  printf '%s' '{"data":{"room":{"squads":[],"active_claims":[],"open_handoffs":[]}}}' > "$sb/room.json"
+  printf '%s' '{"data":{"next":{"actionable":false}}}' > "$sb/next.json"
+  printf '%s' '{}' > "$sb/status.json"
+  RALLY_NOTICE_VERBOSITY=brief PROMPT_MODE=always _run "$sb" idle claude_code "G-m2-$$" "$sb/o1.json"
+  PROMPT_MODE=always _run "$sb" idle claude_code "G-m2c-$$" "$sb/c1.json"
+  [ "$(cat "$sb/o1.json")" = "{}" ] || { printf 'brief must stay silent on an idle turn, got: [%s]\n' "$(cat "$sb/o1.json")" >&2; exit 1; }
+  grep -q "nothing needs you" "$sb/c1.json" || { printf 'control (normal) must render the banner, got: [%s]\n' "$(cat "$sb/c1.json")" >&2; exit 1; }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "brief verbosity must drop the idle banner"; fi
+
+# ===========================================================================
 # G-n — the actor shortener and its host gate.
 #
 # The Big Idea is the one span the preamble promises is hook narration, so an

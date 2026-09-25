@@ -772,7 +772,12 @@ const joined = src.join("\n");
   // human-only channel is outside the requirement rather than an exception to
   // it, and the per-span controls (the unforgeable "(untrusted)" stamp, the
   // guillemet exclusion in scrub, hook-authored headline) run on every path.
-  "const message = (hasLedgerData && audience === \"model\") ? UNTRUSTED_PREAMBLE + decorated : decorated;",
+  "const labelled = hasLedgerData && audience === \"model\";",
+  // brief verbosity swaps the full preamble for SHORT_TAG after the first
+  // showing. Both label strings start with PREAMBLE_MARK, which stripLabel()
+  // removes from every peer string, so the label stays hook-authored.
+  "const message = labelled ? (useShortTag ? SHORT_TAG : UNTRUSTED_PREAMBLE) + decorated : decorated;",
+  "const SHORT_TAG = PREAMBLE_MARK + ",
   // The audience decision must stay derived from (tool, phase) alone. Deriving
   // it from the message would let a peer influence whether the label is applied,
   // which is the same failure test_sanitizer_block_parity.sh forbids when it
