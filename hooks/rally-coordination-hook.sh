@@ -2750,7 +2750,7 @@ function composeBrief() {
   const inbox = (bnext && bnext.inbox) || {};
   const inboxCountRaw = Number.isFinite(Number(inbox.count)) ? Math.max(0, Math.trunc(Number(inbox.count))) : 0;
   // U4: inbox.items is a bounded sample, not a guaranteed-complete listing of
-  // every open item behind inbox.count (rally may cap it), so only items this
+  // every open item behind inbox.count (the CLI may cap it), so only items this
   // renderer can actually see are ever subtracted -- never the aggregate
   // blind. A delivered item still not listed in inbox.items keeps counting
   // toward inboxCount exactly as before; nothing is ever undercounted.
