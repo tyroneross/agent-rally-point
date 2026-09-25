@@ -25,6 +25,12 @@ This repo coordinates parallel coding agents via **agent-rally-point** (per-repo
 - **Handoffs & managed agents:** [docs/HANDOFFS-AND-LAUNCHING-AGENTS.md](docs/HANDOFFS-AND-LAUNCHING-AGENTS.md)
 <!-- rally:end -->
 
+## Build task routing
+
+This repository's lead policy is to enter Build Loop for each new code task before editing: use the `build-loop:build-loop` skill in Codex or `/build-loop:run <goal>` in Claude Code. Its scope check sends clearly small edits through quick verification and runs the full loop for multi-step builds, fixes, refactors, and migrations.
+
+Workers assigned within an active Build Loop run follow the parent plan instead of starting nested runs. A host without the entrypoint uses Rally's structured plan → execute → review → verify minimum and reports that limitation in its handoff.
+
 ## Status heartbeats (working agreement)
 
 During any operation expected to exceed ~10 minutes (long implementations, renders, big test runs, orchestration waits), post a brief status to the room every ~10 minutes:

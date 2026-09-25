@@ -25,6 +25,12 @@ This repo coordinates parallel coding agents via **agent-rally-point** (per-repo
 - **Handoffs & launching agents (Claude+Codex):** [docs/HANDOFFS-AND-LAUNCHING-AGENTS.md](docs/HANDOFFS-AND-LAUNCHING-AGENTS.md)
 <!-- rally:end -->
 
+## Build task routing
+
+This repository's lead policy is to enter Build Loop for each new code task before editing: use `/build-loop:run <goal>` in Claude Code or the `build-loop:build-loop` skill in Codex. Its scope check sends clearly small edits through quick verification and runs the full loop for multi-step builds, fixes, refactors, and migrations.
+
+Workers assigned within an active Build Loop run follow the parent plan instead of starting nested runs. A host without the entrypoint uses Rally's structured plan → execute → review → verify minimum and reports that limitation in its handoff.
+
 ## Performance claims (working agreement, set 2026-08-11)
 
 Absolute latency and token thresholds — 20 ms `before-write`, 150 ms `start`, 60 tokens per prompt — are **reference points, not pass conditions**. Round numbers invite optimizing the number instead of the product.
