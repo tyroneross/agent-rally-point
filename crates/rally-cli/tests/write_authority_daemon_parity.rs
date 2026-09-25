@@ -139,6 +139,12 @@ unsafe extern "C" {
 /// from converting a slow write into a fake refusal. The budget is separated
 /// from the observation window, not widened inside it.
 const WATCHDOG_BUDGET_MS: &str = "60000";
+const REAP_BUDGET_MS: &str = "30000";
+const DAEMON_READY_TIMEOUT_SECS: u64 = 90;
+
+fn daemon_required() -> bool {
+    std::env::var("RALLY_TEST_REQUIRE_DAEMON").as_deref() == Ok("1")
+}
 
 /// Stable markers for "this command lost a race with the host and never reached
 /// an authority decision".
@@ -276,6 +282,7 @@ impl Room {
             .env("RALLY_DAEMON_AUTOSTART", "0")
             .env("RALLY_SESSION_ID", session_id)
             .env("RALLY_HOOK_TIMEOUT_MS", WATCHDOG_BUDGET_MS)
+            .env("RALLY_REAP_BUDGET_MS", REAP_BUDGET_MS)
             // On GitHub Actions these ambient vars outrank RALLY_SESSION_ID in
             // EndpointInputs::from_env (Cloud source > Managed source), landing
             // writes under cloud:github-actions:<run-id> instead of the session
@@ -432,6 +439,20 @@ impl Room {
             })
     }
 
+    fn reap_stale(&self) -> bool {
+        let args = ["doctor", "--reap-stale", "--apply", "--json"];
+        let result = self.json(&args);
+        let remaining = result["data"]["doctor"]["remaining"]
+            .as_u64()
+            .unwrap_or_else(|| setup_defect(&args, "reaper report omitted `remaining`", &result));
+        assert_eq!(
+            remaining, 0,
+            "TEST SETUP DEFECT: the reaper exhausted its {REAP_BUDGET_MS}ms budget \
+             with {remaining} eligible item(s) unattempted: {result}"
+        );
+        result["ok"] == Value::Bool(true)
+    }
+
     fn lead(&self) -> Option<String> {
         self.json(&["room", "--json"])["data"]["room"]["lead"]
             .as_str()
@@ -489,7 +510,7 @@ impl Daemon {
             child,
             stopped: false,
         };
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(DAEMON_READY_TIMEOUT_SECS);
         while Instant::now() < deadline {
             if room.cwd.join(".rally").join("rallyd.sock.addr").exists()
                 && room.run(&["daemon", "status", "--json"]).status.success()
@@ -548,6 +569,10 @@ fn assert_parity<T: std::fmt::Debug + PartialEq>(
 
     let routed_room = Room::new(&format!("{name}-routed"));
     let Some(daemon) = Daemon::start(&routed_room) else {
+        assert!(
+            !daemon_required(),
+            "{name}: rallyd did not start; routed-path parity is required"
+        );
         eprintln!(
             "SKIP {name}: `rally daemon serve` did not come up; routed-path parity NOT asserted"
         );
@@ -699,6 +724,11 @@ fn reaper_lease_expiry_authorization_is_identical_in_direct_and_routed_mode() {
             "src/lib.rs",
             &["lease_expires_at:2000-01-01T00:00:00Z"],
         );
+        assert_eq!(
+            room.active_claim_count(),
+            1,
+            "TEST SETUP DEFECT: the expired claim is not standing before reaper assertions"
+        );
 
         // A hand-built ClaimExpired carrying the typed reaper evidence but NO
         // system role. It must be refused in both modes: the evidence set is
@@ -727,7 +757,7 @@ fn reaper_lease_expiry_authorization_is_identical_in_direct_and_routed_mode() {
         ]);
 
         // The genuine operator reaper, which mints the system role internally.
-        let reaped = room.ok(&["doctor", "--reap-stale", "--apply", "--json"]);
+        let reaped = room.reap_stale();
 
         (forged, reaped, room.active_claim_count())
     });
@@ -826,6 +856,10 @@ fn field_bounds_are_identical_in_direct_and_routed_mode() {
 fn the_daemon_fixture_actually_serves_before_parity_is_claimed() {
     let room = Room::new("fixture-selfcheck");
     let Some(daemon) = Daemon::start(&room) else {
+        assert!(
+            !daemon_required(),
+            "rallyd did not start; routed fixture is required"
+        );
         eprintln!("SKIP: daemon did not start; parity tests will skip too");
         return;
     };
