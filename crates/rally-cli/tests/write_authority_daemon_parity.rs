@@ -717,7 +717,7 @@ fn exact_session_close_authority_and_terminality_match_direct_and_routed_mode() 
 /// the room. An "authorized" that does not close is not parity.
 #[test]
 fn reaper_lease_expiry_authorization_is_identical_in_direct_and_routed_mode() {
-    assert_parity("reaper-lease-expiry", |room| {
+    let verdict = assert_parity("reaper-lease-expiry", |room| {
         // A claim whose lease has already run out, owned by someone else.
         let cid = room.claim_with(
             "victim",
@@ -760,7 +760,9 @@ fn reaper_lease_expiry_authorization_is_identical_in_direct_and_routed_mode() {
         let reaped = room.reap_stale();
 
         (forged, reaped, room.active_claim_count())
-    });
+    })
+    .expect("routed daemon required for reaper parity");
+    assert_eq!(verdict, (false, true, 0));
 }
 
 /// ARP-R-01 on both store modes.

@@ -979,22 +979,20 @@ pub(crate) fn aggregate_checks(judgments: Vec<PathJudgment>) -> AggregateCheck {
         // First named holder wins: a multi-path mutation can collide with more
         // than one peer, and the options block speaks to one of them. The rest
         // stay in `message`, which concatenates every target.
-        let owner = visible
+        // Keep the holder, path, and idle time from one judgment. An earlier
+        // unowned conflict may carry a path that the named peer does not hold.
+        let holder = visible
             .iter()
-            .find_map(|target| target.agent_visible.as_ref()?.owner.clone());
-        let path = visible
-            .iter()
-            .find_map(|target| target.agent_visible.as_ref()?.path.clone());
-        // Tied to the SAME target the owner came from, so the block never says
-        // "peer A holds X" beside peer B's idle time.
-        let owner_idle_secs = visible
-            .iter()
-            .find_map(|target| {
-                let v = target.agent_visible.as_ref()?;
-                v.owner.as_ref()?;
-                Some(v.owner_idle_secs)
-            })
-            .flatten();
+            .filter_map(|target| target.agent_visible.as_ref())
+            .find(|value| value.owner.is_some());
+        let owner = holder.and_then(|value| value.owner.clone());
+        let path = match holder {
+            Some(value) => value.path.clone(),
+            None => visible
+                .iter()
+                .find_map(|target| target.agent_visible.as_ref()?.path.clone()),
+        };
+        let owner_idle_secs = holder.and_then(|value| value.owner_idle_secs);
         Some(Visible {
             severity,
             message,
@@ -2993,6 +2991,7 @@ mod tests {
         ]);
         let visible = check.agent_visible.expect("a blocking judgment");
         assert_eq!(visible.owner.as_deref(), Some("codex:07"));
+        assert_eq!(visible.path.as_deref(), Some("b.rs"));
         assert_eq!(
             visible.owner_idle_secs,
             Some(60),
