@@ -5454,12 +5454,23 @@ impl DirectRoomStore {
         }
         let needs_authority = crate::write_authority::needs_authority_check(&fact);
         let needs_session_lifecycle = crate::write_authority::needs_session_lifecycle_check(&fact);
+        // Retained, not rebuilt. The claim-conflict arm below wants the
+        // holder's liveness, and projecting a snapshot for it would cost
+        // ~39 ms (p50, 21,474-fact ledger) INSIDE this write lock — the read
+        // it needs is 4.3 ms and the snapshot fold is the rest. Keeping the
+        // one this branch already built makes the timing clause free
+        // (0.054 ms of squad lookups) for the 94% of real claims that carry a
+        // tool + session and therefore pass through here; the remaining 6%
+        // render the untimed message rather than pay for a projection.
+        // `store::conflict_message_liveness_bench` is the measurement.
+        let mut authority_snapshot: Option<RoomSnapshot> = None;
         if needs_authority || needs_session_lifecycle {
             let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
             let coord =
                 crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
             let snapshot = snapshot_from_facts_with_policy(&facts, &coord, false);
             crate::write_authority::assert_write_authorized(&fact, &facts, &snapshot, &coord)?;
+            authority_snapshot = Some(snapshot);
         } else {
             crate::write_authority::assert_field_bounds(&fact)?;
         }
@@ -5487,8 +5498,26 @@ impl DirectRoomStore {
                 // once with a prose edit. Anything new goes AFTER the existing
                 // sentence, never before the owner. Pinned by
                 // `claim_conflict_message_keeps_owner_parseable`.
+                // Liveness only if it is already in hand: see the
+                // `authority_snapshot` comment above for the measurement that
+                // makes this a reuse rather than a new read.
+                let owner_idle_secs = conflict
+                    .existing_owner
+                    .as_deref()
+                    .and_then(|owner| authority_snapshot.as_ref()?.squad_for(owner)?.age_secs);
+                let reclaimable = authority_snapshot.as_ref().and_then(|snapshot| {
+                    let claim = snapshot
+                        .active_claims
+                        .iter()
+                        .find(|claim| claim.event_id == conflict.existing_claim_id)?;
+                    let coord = crate::hooks_config::resolve_coordination(&self.repo_root)
+                        .unwrap_or_default();
+                    Some(snapshot.claim_reclaim_eligible(claim, &coord).0)
+                });
                 return Err(RallyError::Usage(claim_authority::conflict_message(
                     &conflict,
+                    owner_idle_secs,
+                    reclaimable,
                 )));
             }
         }
@@ -21953,5 +21982,90 @@ mod lock_holder_stamp_tests {
         assert!(read_exclusive_holder(&dir, "probe.lock").is_none());
 
         fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod conflict_message_liveness_bench {
+    //! GAP 2b — the measurement behind rendering (or not rendering) owner
+    //! liveness into the `claim conflict:` refusal at `append_fact`.
+    //!
+    //! The question is NOT "how fast is a presence read". It is "does reaching
+    //! liveness extend the append WRITE-LOCK hold". Run it against the real
+    //! room ledger, which is the only realistic distribution available:
+    //!
+    //! ```text
+    //! cargo test -p rally-cli --release conflict_message_liveness_bench -- --ignored --nocapture
+    //! ```
+    //!
+    //! `RALLY_BENCH_LOG_DIR` overrides the ledger under test.
+    use super::*;
+    use std::time::Instant;
+
+    fn percentile(sorted: &[f64], p: f64) -> f64 {
+        if sorted.is_empty() {
+            return 0.0;
+        }
+        let idx = (((sorted.len() - 1) as f64) * p).round() as usize;
+        sorted[idx]
+    }
+
+    fn report(label: &str, mut samples: Vec<f64>) {
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "{label:<34} n={:<4} p50={:>9.3}ms  p95={:>9.3}ms  max={:>9.3}ms",
+            samples.len(),
+            percentile(&samples, 0.50),
+            percentile(&samples, 0.95),
+            samples.last().copied().unwrap_or(0.0),
+        );
+    }
+
+    #[test]
+    #[ignore = "benchmark: needs a populated ledger, run explicitly"]
+    fn measure_snapshot_cost_against_the_already_paid_ledger_read() {
+        let log_dir = std::env::var("RALLY_BENCH_LOG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".rally/log"));
+        let archive_dir = log_dir.parent().unwrap_or(Path::new(".")).join("archive");
+        if !log_dir.exists() {
+            println!("SKIP: no ledger at {}", log_dir.display());
+            return;
+        }
+        let coord = crate::hooks_config::CoordinationConfig::default();
+
+        // Warm the segment-fold memo exactly as a live append would find it:
+        // `append_fact` has already called `facts_from_segments` on this same
+        // process for the authority check before the claim arm runs.
+        let facts = facts_from_segments(&log_dir, &archive_dir).expect("read ledger");
+        println!("ledger: {} facts from {}", facts.len(), log_dir.display());
+
+        const N: usize = 40;
+        let mut read = Vec::with_capacity(N);
+        let mut snapshot = Vec::with_capacity(N);
+        let mut liveness = Vec::with_capacity(N);
+
+        for _ in 0..N {
+            let t = Instant::now();
+            let f = facts_from_segments(&log_dir, &archive_dir).expect("read ledger");
+            read.push(t.elapsed().as_secs_f64() * 1e3);
+
+            let t = Instant::now();
+            let snap = snapshot_from_facts_with_policy(&f, &coord, false);
+            snapshot.push(t.elapsed().as_secs_f64() * 1e3);
+
+            // The marginal work a liveness-bearing conflict message would add
+            // GIVEN the snapshot: the squad lookups themselves.
+            let t = Instant::now();
+            let idle = snap.idle_owner_tools();
+            let takeover = snap.takeover_eligible_owners();
+            let one = snap.squad_for("claude_code:01").map(|sq| sq.age_secs);
+            liveness.push(t.elapsed().as_secs_f64() * 1e3);
+            std::hint::black_box((idle, takeover, one));
+        }
+
+        report("facts_from_segments (memoized)", read);
+        report("snapshot_from_facts_with_policy", snapshot);
+        report("liveness lookups on snapshot", liveness);
     }
 }

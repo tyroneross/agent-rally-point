@@ -161,7 +161,9 @@ A claim is **auto-releasable** iff:
 - it is currently `LaneStatus::InFlight` (not closed or landed-unverified), AND
 - its owner is in the stale set (`last_seen_ts` older than `IDLE_THRESHOLD_SECS`).
 
-Per the charter, Rally **records and surfaces** — it never auto-executes the release. The host (or a lead) reads `auto_releasable_claims[]` and decides. The natural follow-on is `rally say release --tool <lead> --path <path>` to action the auto-release surface (now safe — see "Release fix" below).
+Per the charter, Rally **records and surfaces** — it never auto-executes the release. The host (or a lead) reads `auto_releasable_claims[]` and decides. The natural follow-on is `rally say release --tool <you> --path <path>` to action the auto-release surface (now safe — see "Release fix" below).
+
+`--tool` is always the id of whoever is running the command, never the id of the claim's owner or of the lead. Two reasons: `say release --path` resolves against the calling tool's own claims and applies the non-owner takeover bar to everything else, so the holder's id is the wrong argument on the merits; and identity here is self-asserted and unsigned, so any documented command spelled `--tool <someone-else>` is a working impersonation template (ARP-R-01). Pinned repo-wide by `no_lead_impersonation_advice`.
 
 ## Release fix (`rally say release`)
 

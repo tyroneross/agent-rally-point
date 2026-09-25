@@ -38,6 +38,11 @@ struct AgentVisible {
     owner: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+    /// Seconds since the holder's last presence beat. Same provenance as
+    /// `owner` and `path` — copied off the blocking finding, not re-derived and
+    /// not parsed out of `message`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_idle_secs: Option<i64>,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -51,6 +56,12 @@ struct CheckFinding {
     owner: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+    /// Seconds since the owner's last presence beat, when the room knows it.
+    /// Carried as a NUMBER so every consumer (the hook renderer, any future
+    /// host) reads liveness the way it reads `owner` and `path` — off a field,
+    /// never by parsing the sentence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_idle_secs: Option<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     scope: Vec<String>,
 }
@@ -68,10 +79,13 @@ pub(crate) fn build_check(
     path: Option<String>,
     strict: bool,
     snapshot: &RoomSnapshot,
+    coord: &crate::hooks_config::CoordinationConfig,
 ) -> Result<CheckOutcome> {
     let mut findings = Vec::new();
     match phase.as_str() {
-        "before-write" => check_before_write(snapshot, &tool, path.as_deref(), &mut findings),
+        "before-write" => {
+            check_before_write_with_coord(snapshot, coord, &tool, path.as_deref(), &mut findings)
+        }
         "before-complete" => check_before_complete(snapshot, &tool, caller_session, &mut findings),
         other => {
             return Err(RallyError::Usage(format!(
@@ -87,6 +101,7 @@ pub(crate) fn build_check(
     };
     let visible_owner = blocker.and_then(|finding| finding.owner.clone());
     let visible_path = blocker.and_then(|finding| finding.path.clone());
+    let visible_idle = blocker.and_then(|finding| finding.owner_idle_secs);
     let allow = !stop;
     let exit_code = if strict && stop { 4 } else { 0 };
     let finding_count = findings.len();
@@ -105,6 +120,7 @@ pub(crate) fn build_check(
                     message: visible_message,
                     owner: visible_owner,
                     path: visible_path,
+                    owner_idle_secs: visible_idle,
                 },
             },
         },
@@ -113,8 +129,47 @@ pub(crate) fn build_check(
     })
 }
 
+/// Seconds since the owner's last presence beat, straight off the squad
+/// projection already carried by the snapshot in hand. This costs no new read:
+/// `RoomSnapshot::squads` is projected once, before `build_check` is called.
+///
+/// `None` when the owner has no squad row, or its `last_seen_ts` did not parse
+/// (`freshness == "unknown"`). Callers must degrade to the untimed sentence
+/// rather than invent an age — a wrong "idle 3h" is exactly the claim that
+/// talks a reader into editing someone's live file.
+fn owner_idle_secs(snapshot: &RoomSnapshot, owner: &str) -> Option<i64> {
+    snapshot.squad_for(owner).and_then(|sq| sq.age_secs)
+}
+
+/// One coarse unit, largest that keeps the number meaningful. The reader is
+/// deciding "is this peer at the keyboard or gone", so `2h` and `3d` carry that
+/// decision and `9,481s` does not.
+pub(crate) fn humanize_age(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 90 {
+        format!("{secs}s")
+    } else if secs < 5_400 {
+        format!("{}m", secs / 60)
+    } else if secs < 172_800 {
+        format!("{}h", secs / 3_600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+#[cfg(test)]
 fn check_before_write(
     snapshot: &RoomSnapshot,
+    tool: &str,
+    path: Option<&str>,
+    findings: &mut Vec<CheckFinding>,
+) {
+    check_before_write_with_coord(snapshot, &Default::default(), tool, path, findings);
+}
+
+fn check_before_write_with_coord(
+    snapshot: &RoomSnapshot,
+    coord: &crate::hooks_config::CoordinationConfig,
     tool: &str,
     path: Option<&str>,
     findings: &mut Vec<CheckFinding>,
@@ -127,6 +182,7 @@ fn check_before_write(
             fact_id: None,
             owner: None,
             path: None,
+            owner_idle_secs: None,
             scope: Vec::new(),
         });
     }
@@ -137,9 +193,8 @@ fn check_before_write(
         // squat forever because `rally say release` was owner-only). Such a
         // claim downgrades from a hard `stop` to a reclaimable `warn` so the
         // peer can proceed. This is advisory only — it does NOT itself release
-        // the claim; the destructive takeover release applies a stricter
-        // staleness bar (`takeover_eligible_owners`, 2h) so a busy-but-quiet
-        // agent is not reclaimed out from under (independent-auditor HIGH).
+        // the claim; destructive takeover uses the configured per-claim work
+        // size threshold and durable authored activity.
         let stale_owners = snapshot.idle_owner_tools();
         for claim in &snapshot.active_claims {
             let is_different_tool = claim.tool.as_deref() != Some(tool);
@@ -154,23 +209,52 @@ fn check_before_write(
                 .unwrap_or(false);
             let owner = claim.tool.as_deref().unwrap_or("unknown owner");
 
+            let idle_secs = owner_idle_secs(snapshot, owner);
+
             if exact_or_dir && is_different_tool && owner_is_stale {
                 // Squatting claim: reclaimable, not a hard block.
-                findings.push(CheckFinding {
-                    code: "stale-owner-claim",
-                    severity: "warn",
-                    message: format!(
-                        "{} holds {} and has been idle >15m — not a hard block. \
+                //
+                // The two arms differ in the ONE thing the reader is deciding:
+                // whether this claim is eligible for release with their OWN
+                // tool id. The claim's work size and configured timeout matter.
+                // The previous text handed the refused caller
+                // `rally say release --path X --tool <owner>` — a pasteable
+                // command whose only effect is to post AS the owner, since
+                // identity here is self-asserted and unsigned (ARP-R-01).
+                // Naming the owner as the actor in prose keeps the fact; the
+                // command is gone.
+                let silence = idle_secs
+                    .map(|secs| format!("has been silent {}", humanize_age(secs)))
+                    .unwrap_or_else(|| "has been idle past the 15m window".to_string());
+                let (reclaimable, _) = snapshot.claim_reclaim_eligible(claim, coord);
+                let message = if reclaimable {
+                    format!(
+                        "{} holds {} and {} — past this claim's reclaim threshold, so it is \
+                         yours to reclaim. Your options: release it yourself with \
+                         `rally say release --path {} --tool {}`, hand the change over \
+                         with `rally say handoff --to {} --subject \"<change>\"`, or take \
+                         another task with `rally next --tool {}`",
+                        owner, path, silence, path, tool, owner, tool,
+                    )
+                } else {
+                    format!(
+                        "{} holds {} and {} — idle, but this claim is not proven eligible for \
+                         takeover and {} may still be working. \
                          Your options: proceed with coordination awareness, hand the \
                          change over with `rally say handoff --to {} --subject \
                          \"<change>\"`, or take another task with `rally next --tool {}`. \
-                         Only {} can release the claim, with \
-                         `rally say release --path {} --tool {}`",
-                        owner, path, owner, tool, owner, path, owner,
-                    ),
+                         {} releases its own claim when it returns",
+                        owner, path, silence, owner, owner, tool, owner,
+                    )
+                };
+                findings.push(CheckFinding {
+                    code: "stale-owner-claim",
+                    severity: "warn",
+                    message,
                     fact_id: Some(claim.event_id.clone()),
                     owner: claim.tool.clone(),
                     path: Some(path.to_string()),
+                    owner_idle_secs: idle_secs,
                     scope: Vec::new(),
                 });
             } else if exact_or_dir && is_different_tool {
@@ -182,15 +266,29 @@ fn check_before_write(
                     // frequent collision message in the room and identified
                     // none of the three, so the reader spent turns working out
                     // who to talk to. Same shape as `stale-owner-claim` above.
+                    // The liveness clause is the deciding fact, not decoration:
+                    // an A/B role-play reader given holder + path alone still
+                    // judged the holder stale on its own and edited unclaimed.
+                    // "active 2m ago" is what makes "hand it off" the obvious
+                    // option rather than a suggestion to argue with. Age comes
+                    // from the squad row already in this snapshot.
                     message: format!(
-                        "{} holds {} (claim {}) — hand the change over with \
+                        "{} holds {} (claim {}){} — hand the change over with \
                          `rally say handoff --to {} --subject \"<change>\"`, or take \
                          another task with `rally next --tool {}`",
-                        owner, path, claim.event_id, owner, tool,
+                        owner,
+                        path,
+                        claim.event_id,
+                        idle_secs
+                            .map(|secs| format!(", active {} ago", humanize_age(secs)))
+                            .unwrap_or_default(),
+                        owner,
+                        tool,
                     ),
                     fact_id: Some(claim.event_id.clone()),
                     owner: claim.tool.clone(),
                     path: Some(path.to_string()),
+                    owner_idle_secs: idle_secs,
                     scope: Vec::new(),
                 });
             } else if is_different_tool {
@@ -211,6 +309,7 @@ fn check_before_write(
                             fact_id: Some(claim.event_id.clone()),
                             owner: claim.tool.clone(),
                             path: Some(path.to_string()),
+                            owner_idle_secs: None,
                             scope: Vec::new(),
                         });
                         // One warning per claim is enough; don't fan out across scopes.
@@ -240,6 +339,7 @@ fn check_before_write(
                 fact_id: Some(decision.event_id.clone()),
                 owner: None,
                 path: path.map(str::to_string),
+                owner_idle_secs: None,
                 scope: Vec::new(),
             });
         } else if decision.scope.is_empty() {
@@ -250,6 +350,7 @@ fn check_before_write(
                 fact_id: Some(decision.event_id.clone()),
                 owner: None,
                 path: None,
+                owner_idle_secs: None,
                 scope: Vec::new(),
             });
         }
@@ -269,6 +370,7 @@ fn check_before_write(
                 fact_id: Some(blocker.event_id.clone()),
                 owner: None,
                 path: path.map(str::to_string),
+                owner_idle_secs: None,
                 scope: Vec::new(),
             });
         } else if blocker.scope.is_empty() {
@@ -318,6 +420,7 @@ fn check_before_write(
                     fact_id: Some(blocker.event_id.clone()),
                     owner: blocker.tool.clone(),
                     path: path.map(str::to_string),
+                    owner_idle_secs: None,
                     scope: Vec::new(),
                 });
             } else {
@@ -335,6 +438,7 @@ fn check_before_write(
                     fact_id: Some(blocker.event_id.clone()),
                     owner: blocker.tool.clone(),
                     path: None,
+                    owner_idle_secs: None,
                     scope: Vec::new(),
                 });
             }
@@ -362,6 +466,7 @@ fn check_before_complete(
                 fact_id: Some(claim.event_id.clone()),
                 owner: None,
                 path: None,
+                owner_idle_secs: None,
                 scope: claim.scope.clone(),
             });
         }
@@ -375,6 +480,7 @@ fn check_before_complete(
                 fact_id: Some(blocker.event_id.clone()),
                 owner: None,
                 path: None,
+                owner_idle_secs: None,
                 scope: Vec::new(),
             });
         }
@@ -568,6 +674,134 @@ mod tests {
         }
     }
 
+    /// A squad whose presence is `age_secs` old, with `last_seen_ts` set to
+    /// match so `takeover_eligible_owners` (which parses the timestamp, not the
+    /// age field) agrees with what the fixture says.
+    fn squad_aged(tool: &str, status: &str, age_secs: i64) -> Squad {
+        let seen = chrono::Utc::now() - chrono::Duration::seconds(age_secs);
+        Squad {
+            tool: tool.to_string(),
+            status: status.to_string(),
+            acknowledged: true,
+            age_secs: Some(age_secs),
+            last_seen_ts: seen.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            ..Default::default()
+        }
+    }
+
+    fn message_for(snapshot: &RoomSnapshot, code: &str) -> String {
+        let mut findings = Vec::new();
+        check_before_write(snapshot, "beta", Some("src/foo.rs"), &mut findings);
+        findings
+            .iter()
+            .find(|f| f.code == code)
+            .unwrap_or_else(|| panic!("expected a {code} finding, got {findings:#?}"))
+            .message
+            .clone()
+    }
+
+    /// GAP 2 — a collision message that names the holder but not how long ago
+    /// it was active leaves the reader to guess liveness, and in the A/B a
+    /// reader guessed "stale" and edited unclaimed. The age must be stated.
+    #[test]
+    fn live_owner_collision_states_how_recently_the_holder_was_active() {
+        let snapshot = RoomSnapshot {
+            active_claims: vec![claim_by("alpha", "src/foo.rs")],
+            squads: vec![squad_aged("alpha", "active", 120)],
+            ..Default::default()
+        };
+        let msg = message_for(&snapshot, "claimed-path");
+        assert!(
+            msg.contains("active 2m ago"),
+            "live-owner collision must state the holder's last-active age: {msg}"
+        );
+    }
+
+    /// GAP 2c — the timing exists to change the decision, so the two stale
+    /// states must not read the same. Inside the silence window the claim is
+    /// not the reader's to release; past it, it is.
+    #[test]
+    fn the_recommended_option_changes_with_the_holders_silence() {
+        let idle_only = RoomSnapshot {
+            active_claims: vec![claim_by("dead-owner", "src/foo.rs")],
+            squads: vec![squad_aged("dead-owner", "idle", 20 * 60)],
+            ..Default::default()
+        };
+        let msg = message_for(&idle_only, "stale-owner-claim");
+        assert!(
+            msg.contains("silent 20m"),
+            "idle message must state the silence: {msg}"
+        );
+        assert!(
+            !msg.contains("rally say release"),
+            "inside the silence window the claim is NOT the reader's to release: {msg}"
+        );
+
+        let small_claim = RoomSnapshot {
+            active_claims: vec![claim_by("dead-owner", "src/foo.rs")],
+            squads: vec![squad_aged("dead-owner", "idle", 45 * 60)],
+            ..Default::default()
+        };
+        let msg = message_for(&small_claim, "stale-owner-claim");
+        assert!(
+            msg.contains("rally say release --path src/foo.rs --tool beta"),
+            "a single-file claim uses the default 30m reclaim threshold: {msg}"
+        );
+        let mut findings = Vec::new();
+        let longer_policy = crate::hooks_config::CoordinationConfig {
+            reclaim_small_minutes: 60,
+            ..Default::default()
+        };
+        check_before_write_with_coord(
+            &small_claim,
+            &longer_policy,
+            "beta",
+            Some("src/foo.rs"),
+            &mut findings,
+        );
+        let msg = &findings
+            .iter()
+            .find(|f| f.code == "stale-owner-claim")
+            .expect("claim finding")
+            .message;
+        assert!(
+            !msg.contains("rally say release"),
+            "a configured 60m threshold keeps a 45m claim with its owner: {msg}"
+        );
+
+        let reclaimable = RoomSnapshot {
+            active_claims: vec![claim_by("dead-owner", "src/foo.rs")],
+            squads: vec![squad_aged("dead-owner", "idle", 3 * 60 * 60)],
+            ..Default::default()
+        };
+        let msg = message_for(&reclaimable, "stale-owner-claim");
+        assert!(
+            msg.contains("silent 3h"),
+            "reclaimable message must state the silence: {msg}"
+        );
+        assert!(
+            msg.contains("rally say release --path src/foo.rs --tool beta"),
+            "past the silence window the reader releases it with its OWN tool id: {msg}"
+        );
+    }
+
+    /// The age is absent whenever the room cannot vouch for it, and absence
+    /// must degrade to the untimed sentence rather than to a fabricated age.
+    #[test]
+    fn an_unknown_holder_age_omits_the_clause_instead_of_inventing_one() {
+        let snapshot = RoomSnapshot {
+            active_claims: vec![claim_by("ghost", "src/foo.rs")],
+            squads: Vec::new(),
+            ..Default::default()
+        };
+        let msg = message_for(&snapshot, "claimed-path");
+        assert!(
+            !msg.contains("active"),
+            "no squad row means no age claim: {msg}"
+        );
+        assert_actionable("claimed-path", &msg, "ghost", "src/foo.rs");
+    }
+
     /// fact_182e8 gap 1 — a peer's `before-write` against a path claimed by a
     /// LIVE owner is a hard `stop` (unchanged behaviour).
     #[test]
@@ -633,7 +867,16 @@ mod tests {
     /// just refused to post as the LEAD — identity here is self-asserted and
     /// unsigned, so the refusal would be coaching the reader around itself.
     /// ARP-R-01 removed that shape once already (`claim_authority.rs`).
-    const BANNED_SUGGESTIONS: [&str; 3] = ["claim --queue", "rally say ask", "--tool <lead>"];
+    // This denylist's VALUE is the banned string, so the repo-wide sweep
+    // (`tests/no_lead_impersonation_advice.rs`) has to skip exactly this line
+    // and nothing else — the ban cannot state what it bans otherwise. The
+    // marker is per-line and deliberate, which is what keeps it reviewable.
+    const BANNED_SUGGESTIONS: [&str; 4] = [
+        "claim --queue",
+        "rally say ask",
+        "--tool <lead>",  // ARP-R-01-ALLOW
+        "--tool <owner>", // ARP-R-01-ALLOW
+    ];
 
     /// A collision message is only useful if the reader can act on it alone:
     /// it names WHO holds the contested thing, names WHAT is contested, and
@@ -713,13 +956,16 @@ mod tests {
             "src/foo.rs",
         );
 
-        let conflict =
-            crate::claim_authority::conflict_message(&crate::claim_authority::ClaimConflict {
+        let conflict = crate::claim_authority::conflict_message(
+            &crate::claim_authority::ClaimConflict {
                 existing_claim_id: "fact_alpha".to_string(),
                 existing_owner: Some("alpha".to_string()),
                 scope: "file:src/foo.rs".to_string(),
                 existing_scope: "dir:src".to_string(),
-            });
+            },
+            None,
+            None,
+        );
         assert_actionable("claim conflict", &conflict, "alpha", "dir:src");
     }
 
@@ -740,6 +986,7 @@ mod tests {
             Some("src/foo.rs".to_string()),
             false,
             &snapshot,
+            &Default::default(),
         )
         .expect("check builds");
         let visible = &outcome.data.check.agent_visible;

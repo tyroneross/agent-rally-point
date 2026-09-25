@@ -29,7 +29,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::check::build_check;
+use crate::check::{build_check, humanize_age};
 use crate::error::Result as RallyResult;
 use crate::store::{Fact, FactKind, RoomStore};
 
@@ -903,6 +903,10 @@ pub(crate) struct Visible {
     /// blocker), and the renderer degrades rather than inventing one.
     pub(crate) owner: Option<String>,
     pub(crate) path: Option<String>,
+    /// Seconds since the holder's last presence beat, carried through the same
+    /// structured channel as `owner` and `path`. The renderer never parses the
+    /// age out of `message`: prose is the thing that drifts.
+    pub(crate) owner_idle_secs: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -981,11 +985,22 @@ pub(crate) fn aggregate_checks(judgments: Vec<PathJudgment>) -> AggregateCheck {
         let path = visible
             .iter()
             .find_map(|target| target.agent_visible.as_ref()?.path.clone());
+        // Tied to the SAME target the owner came from, so the block never says
+        // "peer A holds X" beside peer B's idle time.
+        let owner_idle_secs = visible
+            .iter()
+            .find_map(|target| {
+                let v = target.agent_visible.as_ref()?;
+                v.owner.as_ref()?;
+                Some(v.owner_idle_secs)
+            })
+            .flatten();
         Some(Visible {
             severity,
             message,
             owner,
             path,
+            owner_idle_secs,
         })
     };
     AggregateCheck {
@@ -1420,13 +1435,39 @@ pub(crate) fn render_before_write(
         (Some(owner), Some(path)) => {
             let owner = ident(owner, 60);
             let path = ident(path, 200);
+            // The A/B evidence is that liveness is the field agents actually
+            // act on: given holder + path with no age, a reader judged the
+            // holder stale on its own and edited unclaimed. So the age is
+            // stated, and it is stated where it changes the recommendation —
+            // "active 2m ago" makes handing off obviously right, while
+            // "no presence beat" tells the reader the room cannot vouch for
+            // the holder and the way to settle it is to ask, not to assume.
+            //
+            // Only the CLI settles reclaimability (`rally say release --path`
+            // enforces its own silence bar). This block therefore never offers
+            // a release: a `claimed-path` stop is by construction a LIVE owner,
+            // since a stale one downgrades to the advisory `stale-owner-claim`
+            // in `check.rs` and never reaches here.
+            let liveness = match visible.owner_idle_secs {
+                Some(secs) => format!(
+                    "{owner} was last active {} ago, so treat {path} as actively held.",
+                    humanize_age(secs)
+                ),
+                // Unknown is stated as unknown. Silence about the age reads as
+                // "nobody is there" to the next reader, which is the inference
+                // that produced the unclaimed edit this block exists to stop.
+                None => format!(
+                    "The room has no presence beat for {owner}, so it cannot tell you whether \
+                     {owner} is still working — treat {path} as held until {owner} says otherwise."
+                ),
+            };
             format!(
                 "Rally — here's what you can do right now. \
                  1) Hand it off (recommended): {owner} holds {path} and can fold your change in — \
                  `rally say handoff --to {owner} --subject \"<change>\"`. \
                  2) Work in parallel: take your next task — `{next_cmd}`. \
                  3) Work here: files outside {path} are open to you. \
-                 {owner} is editing {path} right now."
+                 {liveness}"
             )
         }
         // No holder named (a non-claim blocker, or a claim with no tool id):
@@ -1937,8 +1978,9 @@ pub(crate) fn run_before_write(req: HookRequest) -> Value {
     } else {
         paths.iter().cloned().map(Some).collect()
     };
+    let coord = crate::hooks_config::resolve_coordination(&root).unwrap_or_default();
     for path in &judged_paths {
-        match judge_path(&tool, path.as_deref(), req.strict, &snapshot) {
+        match judge_path(&tool, path.as_deref(), req.strict, &snapshot, &coord) {
             Ok(judgment) => judgments.push(judgment),
             Err(error) => {
                 // A later invalid response must not erase an earlier proven
@@ -2025,6 +2067,7 @@ fn judge_path(
     path: Option<&str>,
     strict: bool,
     snapshot: &crate::store::RoomSnapshot,
+    coord: &crate::hooks_config::CoordinationConfig,
 ) -> RallyResult<PathJudgment> {
     let outcome = build_check(
         "before-write".to_string(),
@@ -2033,6 +2076,7 @@ fn judge_path(
         path.map(str::to_string),
         strict,
         snapshot,
+        coord,
     )?;
     let value = serde_json::to_value(&outcome.data).unwrap_or_else(|_| json!({}));
     let check = value.get("check").cloned().unwrap_or_else(|| json!({}));
@@ -2061,6 +2105,9 @@ fn judge_path(
             .and_then(|value| value.get("path"))
             .and_then(Value::as_str)
             .map(str::to_string),
+        owner_idle_secs: visible
+            .and_then(|value| value.get("owner_idle_secs"))
+            .and_then(Value::as_i64),
     });
     Ok(PathJudgment {
         path: path.unwrap_or_default().to_string(),
@@ -2488,7 +2535,8 @@ mod tests {
              fold your change in \u{2014} `rally say handoff --to claude_code:c2 --subject \"<change>\"`. \
              2) Work in parallel: take your next task \u{2014} `rally next --tool claude_code:c1`. \
              3) Work here: files outside \u{ab}src/shared.rs\u{bb} are open to you. \
-             claude_code:c2 is editing \u{ab}src/shared.rs\u{bb} right now."
+             claude_code:c2 was last active 3m ago, so treat \u{ab}src/shared.rs\u{bb} as \
+             actively held."
         );
         assert_eq!(
             rendered["hookSpecificOutput"]["permissionDecision"],
@@ -2658,6 +2706,7 @@ mod tests {
                     message: "blocked".to_string(),
                     owner: None,
                     path: None,
+                    owner_idle_secs: None,
                 }),
             },
             PathJudgment {
@@ -2668,6 +2717,7 @@ mod tests {
                     message: "careful".to_string(),
                     owner: None,
                     path: None,
+                    owner_idle_secs: None,
                 }),
             },
         ]);
@@ -2876,6 +2926,81 @@ mod tests {
         );
     }
 
+    /// GAP 2 — the hook reads liveness off the structured field, never out of
+    /// `message`, and an absent age is reported as absent rather than dropped.
+    /// A dropped age is what the A/B reader filled in with its own guess.
+    #[test]
+    fn an_unknown_holder_age_is_stated_as_unknown_not_omitted() {
+        let check = aggregate_checks(vec![PathJudgment {
+            path: "src/shared.rs".to_string(),
+            allow: false,
+            agent_visible: Some(Visible {
+                severity: "stop".to_string(),
+                message: "claude_code:c2 holds src/shared.rs".to_string(),
+                owner: Some("claude_code:c2".to_string()),
+                path: Some("src/shared.rs".to_string()),
+                owner_idle_secs: None,
+            }),
+        }]);
+        let rendered = render_before_write(
+            HostFamily::ClaudeCode,
+            "claude_code:c1",
+            Some(&check),
+            false,
+        );
+        let text = rendered["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            text.contains("no presence beat for claude_code:c2"),
+            "unknown age must be stated: {text}"
+        );
+        assert!(
+            !text.contains("last active"),
+            "an unknown age must never be rendered as a measured one: {text}"
+        );
+    }
+
+    /// The age travels as a NUMBER through aggregation, tied to the same target
+    /// the owner came from — a multi-path collision must not pair peer A's name
+    /// with peer B's idle time.
+    #[test]
+    fn aggregation_pairs_the_age_with_the_owner_it_belongs_to() {
+        let check = aggregate_checks(vec![
+            PathJudgment {
+                path: "a.rs".to_string(),
+                allow: false,
+                agent_visible: Some(Visible {
+                    severity: "stop".to_string(),
+                    message: "no holder".to_string(),
+                    owner: None,
+                    path: Some("a.rs".to_string()),
+                    owner_idle_secs: Some(9_999),
+                }),
+            },
+            PathJudgment {
+                path: "b.rs".to_string(),
+                allow: false,
+                agent_visible: Some(Visible {
+                    severity: "stop".to_string(),
+                    message: "peer holds b.rs".to_string(),
+                    owner: Some("codex:07".to_string()),
+                    path: Some("b.rs".to_string()),
+                    owner_idle_secs: Some(60),
+                }),
+            },
+        ]);
+        let visible = check.agent_visible.expect("a blocking judgment");
+        assert_eq!(visible.owner.as_deref(), Some("codex:07"));
+        assert_eq!(
+            visible.owner_idle_secs,
+            Some(60),
+            "the age must come from the SAME target as the owner, not the first \
+             target that happened to carry one"
+        );
+    }
+
     fn conflict_aggregate() -> AggregateCheck {
         aggregate_checks(vec![PathJudgment {
             path: "src/shared.rs".to_string(),
@@ -2885,6 +3010,9 @@ mod tests {
                 message: "claude_code:c2 holds src/shared.rs (claim fact_c0ffee)".to_string(),
                 owner: Some("claude_code:c2".to_string()),
                 path: Some("src/shared.rs".to_string()),
+                // The common case: the room knows the holder's age, because a
+                // `claimed-path` stop only fires for an owner with presence.
+                owner_idle_secs: Some(180),
             }),
         }])
     }

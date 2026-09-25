@@ -49,20 +49,60 @@ pub(crate) struct ClaimConflict {
 /// store emits. The prefix `claim conflict: ` and the owner's position as the
 /// first whitespace-delimited token after it are a machine contract
 /// (`ClaimConflictEntry`, `lib.rs`); everything else is prose and may change.
-pub(crate) fn conflict_message(conflict: &ClaimConflict) -> String {
+/// `owner_idle_secs` is the holder's age from the room snapshot the caller
+/// ALREADY built, or `None`. See the call site in `store::append_fact` for why
+/// it is passed in rather than looked up here: projecting a snapshot costs
+/// ~39 ms on a 21k-fact ledger and this code runs inside the append write
+/// lock, so the timing clause is rendered only when the snapshot was going to
+/// be built anyway (94% of real claims) and omitted otherwise. Measured, not
+/// assumed — `store::conflict_message_liveness_bench`.
+pub(crate) fn conflict_message(
+    conflict: &ClaimConflict,
+    owner_idle_secs: Option<i64>,
+    reclaimable: Option<bool>,
+) -> String {
     let owner = conflict
         .existing_owner
         .as_deref()
         .unwrap_or("unknown-owner");
+    // Placed AFTER the owner token, never before it: `conflict_owner_from_message`
+    // parses the owner as the first whitespace-delimited token after the
+    // prefix, and RC-037 already broke that field once with a prose edit.
+    //
+    // The caller supplies the claim's actual configured reclaim eligibility.
+    // Age alone cannot decide it: single-file and coarse claims have different
+    // thresholds. `rally say release --path` enforces eligibility again, and
+    // the suggested command always uses the reader's OWN tool id.
+    let (liveness, options) = match owner_idle_secs {
+        Some(secs) if reclaimable == Some(true) => (
+            format!(" {owner} has been silent {}", crate::check::humanize_age(secs)),
+            "past this claim's reclaim threshold, so try releasing it with `rally say release --path \
+             <path> --tool <you>`, or take another task with `rally next --tool <you>`"
+                .to_string(),
+        ),
+        Some(secs) => (
+            format!(" {owner} was last active {} ago", crate::check::humanize_age(secs)),
+            format!(
+                "hand the change to {owner} with `rally say handoff --to {owner} \
+                 --subject \"<change>\"`, take another task with `rally next --tool <you>`, or \
+                 claim a narrower scope outside {}",
+                conflict.existing_scope
+            ),
+        ),
+        None => (
+            String::new(),
+            format!(
+                "hand the change to {owner} with `rally say handoff --to {owner} \
+                 --subject \"<change>\"`, take another task with `rally next --tool <you>`, or \
+                 claim a narrower scope outside {}",
+                conflict.existing_scope
+            ),
+        ),
+    };
     format!(
-        "claim conflict: {owner} holds {} (claim {}), which overlaps the scope you requested, {}. \
-         Next: hand the change to {owner} with `rally say handoff --to {owner} \
-         --subject \"<change>\"`, take another task with `rally next --tool <you>`, or claim a \
-         narrower scope outside {}",
-        conflict.existing_scope,
-        conflict.existing_claim_id,
-        conflict.scope,
-        conflict.existing_scope,
+        "claim conflict: {owner} holds {} (claim {}), which overlaps the scope you requested, \
+         {}.{liveness}. Next: {options}",
+        conflict.existing_scope, conflict.existing_claim_id, conflict.scope,
     )
 }
 
@@ -732,7 +772,47 @@ mod tests {
             scope: "file:src/lib.rs".to_string(),
             existing_scope: "dir:src".to_string(),
         };
-        let msg = conflict_message(&conflict);
+        // Graded across every liveness state, because the parse contract must
+        // hold for the branch that inserts a clause between the owner and
+        // `Next:` as much as for the one that inserts nothing.
+        for idle in [None, Some(120_i64), Some(3 * 60 * 60_i64)] {
+            let variant =
+                conflict_message(&conflict, idle, Some(idle.is_some_and(|secs| secs > 7200)));
+            assert!(
+                variant.starts_with("claim conflict: "),
+                "prefix is parsed for, not read: {variant}"
+            );
+            assert_eq!(
+                conflict_owner_from_message(&variant).as_deref(),
+                Some("codex:07"),
+                "owner must stay the first whitespace token in every liveness \
+                 branch: {variant}"
+            );
+        }
+
+        // GAP 2c — the offered option tracks the holder's silence. Recent
+        // activity points at the holder; silence past the takeover bar points
+        // at a release the reader runs under its OWN id.
+        let recent = conflict_message(&conflict, Some(120), Some(false));
+        assert!(
+            recent.contains("last active 2m ago") && recent.contains("rally say handoff"),
+            "a recently-active holder is a peer to hand off to: {recent}"
+        );
+        assert!(
+            !recent.contains("rally say release"),
+            "a live holder's claim is not offered for release: {recent}"
+        );
+        let silent = conflict_message(&conflict, Some(3 * 60 * 60), Some(true));
+        assert!(
+            silent.contains("silent 3h") && silent.contains("--tool <you>"),
+            "past the silence window, release is offered under the READER's id: {silent}"
+        );
+        assert!(
+            !silent.contains("--tool codex:07"),
+            "never hand the reader the holder's id as a --tool value: {silent}"
+        );
+
+        let msg = conflict_message(&conflict, None, None);
         assert!(
             msg.starts_with("claim conflict: "),
             "prefix is parsed for, not read: {msg}"
@@ -754,7 +834,8 @@ mod tests {
             ..conflict
         };
         assert_eq!(
-            conflict_owner_from_message(&conflict_message(&anonymous)).as_deref(),
+            conflict_owner_from_message(&conflict_message(&anonymous, Some(60), Some(false)))
+                .as_deref(),
             Some("unknown-owner"),
         );
     }

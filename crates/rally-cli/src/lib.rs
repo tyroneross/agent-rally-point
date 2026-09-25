@@ -7400,6 +7400,7 @@ fn command_check(args: CheckArgs) -> Result<Output> {
             path.clone(),
             args.strict,
             &cached,
+            &crate::hooks_config::resolve_coordination(&repo_root_path).unwrap_or_default(),
         )?;
         let body = envelope("check", SCHEMA_CHECK, check.data)?;
         let text = format!("check findings={} (cached)", check.finding_count);
@@ -7426,6 +7427,7 @@ fn command_check(args: CheckArgs) -> Result<Output> {
         path,
         args.strict,
         &snapshot,
+        &crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default(),
     )?;
     let body = envelope("check", SCHEMA_CHECK, check.data)?;
     let text = format!("check findings={}", check.finding_count);
