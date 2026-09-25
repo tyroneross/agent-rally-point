@@ -343,16 +343,18 @@ fn attach_append_outcomes(output: &mut Output, outcomes: Vec<store::AppendOutcom
             "warnings": [{"code": "serialization", "message": error.to_string()}]
         }])
     });
+    let mut has_command_data = false;
     if let Some(body) = output.body.as_object_mut()
         && let Some(data) = body.get_mut("data").and_then(Value::as_object_mut)
     {
+        has_command_data = true;
         data.insert("append_outcomes".to_string(), value);
         data.insert(
             "projection_complete".to_string(),
             Value::Bool(projection_complete),
         );
     }
-    if !projection_complete && !output.json {
+    if !projection_complete && !output.json && has_command_data {
         output.text.push_str(
             "\nwarning: canonical append committed; one or more derived projections are incomplete",
         );
@@ -363,12 +365,14 @@ fn attach_append_issues(output: &mut Output, issues: Vec<Value>) {
     if issues.is_empty() {
         return;
     }
+    let mut has_command_data = false;
     if let Some(body) = output.body.as_object_mut()
         && let Some(data) = body.get_mut("data").and_then(Value::as_object_mut)
     {
+        has_command_data = true;
         data.insert("append_issues".to_string(), Value::Array(issues));
     }
-    if !output.json {
+    if !output.json && has_command_data {
         output
             .text
             .push_str("\nwarning: optional durable append work did not complete; inspect append_issues in JSON");
@@ -12982,6 +12986,47 @@ pub(crate) static PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn append_warnings_do_not_corrupt_compact_host_hook_json() {
+        let host_envelope = json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": "rally coordination skipped; this edit is unclaimed"
+            }
+        });
+        let expected = host_envelope.to_string();
+        let mut output = Output::new(false, expected.clone(), host_envelope.clone());
+        attach_append_outcomes(
+            &mut output,
+            vec![store::AppendOutcome {
+                fact: store::Fact::default(),
+                committed: true,
+                projection_complete: false,
+                warnings: Vec::new(),
+            }],
+        );
+        attach_append_issues(&mut output, vec![json!({"code": "projection"})]);
+        assert_eq!(output.text, expected);
+        assert_eq!(output.body, host_envelope);
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.text).unwrap(),
+            output.body
+        );
+
+        let mut command = Output::new(false, "saved".to_string(), json!({"data": {}}));
+        attach_append_outcomes(
+            &mut command,
+            vec![store::AppendOutcome {
+                fact: store::Fact::default(),
+                committed: true,
+                projection_complete: false,
+                warnings: Vec::new(),
+            }],
+        );
+        assert!(command.text.contains("derived projections are incomplete"));
+        assert_eq!(command.body["data"]["projection_complete"], false);
+    }
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
