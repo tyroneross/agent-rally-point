@@ -70,6 +70,49 @@ pub(crate) fn rally_owned_socket() -> Option<String> {
     Some(format!("{home}/.local/share/rally/ptyd.sock"))
 }
 
+/// Socket-ownership invariant for autostart. Rally may START a daemon only on
+/// its own canonical socket (`~/.local/share/rally/ptyd.sock`), and only when
+/// no `RALLY_PTYD_SOCKET` override is set. An override names somebody else's
+/// daemon — Easy Terminal exports its production socket here — and a second
+/// `ptyd server` bound to that path takes it over and wipes every live
+/// workspace. Rally may still CONNECT to an overridden socket while it is live;
+/// it must never create one. The check runs before any spawn and fails closed.
+pub(crate) fn ensure_rally_owns_socket(socket: &str) -> Result<(), String> {
+    let refuse = |why: &str| {
+        Err(format!(
+            "rally ptyd daemon is not live at {socket}, and rally will not start one there: \
+             {why}. Start the app that owns this socket (for Easy Terminal, open Easy Terminal) \
+             or unset {RALLY_PTYD_SOCKET_ENV} to use rally's own daemon."
+        ))
+    };
+    if std::env::var(RALLY_PTYD_SOCKET_ENV).is_ok_and(|v| !v.is_empty()) {
+        return refuse(&format!("the socket comes from {RALLY_PTYD_SOCKET_ENV}, so rally does not own it"));
+    }
+    let Some(home) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) else {
+        return refuse("HOME is unset, so rally cannot resolve its own socket");
+    };
+    let canonical_dir = PathBuf::from(&home).join(".local/share/rally");
+    let canonical = canonical_dir.join("ptyd.sock");
+    if Path::new(socket) != canonical {
+        return refuse("it is not rally's own socket path");
+    }
+    // An existing entry must be a plain socket file, never a symlink that
+    // could point the bind at another daemon's path.
+    if let Ok(meta) = std::fs::symlink_metadata(&canonical)
+        && meta.file_type().is_symlink()
+    {
+        return refuse("rally's socket path is a symlink");
+    }
+    // The directory (or any ancestor) must not be an alias for somewhere else.
+    if let Ok(real_dir) = std::fs::canonicalize(&canonical_dir) {
+        let real_home = std::fs::canonicalize(&home).unwrap_or_else(|_| PathBuf::from(&home));
+        if real_dir != real_home.join(".local/share/rally") {
+            return refuse("rally's socket directory resolves somewhere else");
+        }
+    }
+    Ok(())
+}
+
 /// The rally-owned ptyd state dir (sibling of the socket default). Passed to an
 /// autostarted daemon via `PTYD_STATE_DIR` so it never shares Easy Terminal's
 /// persisted session tree.
@@ -550,6 +593,7 @@ pub(crate) fn live_pane_ids(socket: &str) -> Option<Vec<String>> {
 /// could not be started (missing binary, never bound) — the caller fails the
 /// run with that message.
 pub(crate) fn autostart_daemon(socket: &str) -> Result<(), String> {
+    ensure_rally_owns_socket(socket)?;
     let bin = ptyd_binary().ok_or_else(|| {
         format!(
             "rally ptyd daemon is not live at {socket} and no ptyd binary was found \

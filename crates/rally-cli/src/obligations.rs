@@ -45,6 +45,19 @@ pub(crate) struct InboxItem {
     pub(crate) stale: bool,
     /// The one command that clears this row.
     pub(crate) ack_command: String,
+    /// The handoff's ACK deadline (RFC 3339, UTC), when the authoring
+    /// `say handoff --ack-within` set one. Parsed from the same `ack-by:`
+    /// evidence marker `overdue_handoffs_at` uses — see
+    /// [`crate::ack_by_from_evidence`]. Omitted (not `null`) for obligations
+    /// with no deadline, which is every non-handoff kind and any handoff sent
+    /// without `--ack-within`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ack_by: Option<String>,
+    /// `ack_by` as epoch milliseconds, for callers that want to compare
+    /// against `now` without parsing RFC 3339. Always present together with
+    /// `ack_by` — both derive from the same marker in the same call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ack_by_ms: Option<u64>,
 }
 
 /// Inbox projection for one tool.
@@ -114,6 +127,14 @@ pub(crate) fn build_inbox(
         .take(limit)
         .map(|fact| {
             let age_secs = fact_age_secs(fact);
+            let (ack_by, ack_by_ms) = crate::ack_by_from_evidence(&fact.evidence)
+                .and_then(|(raw, deadline)| {
+                    u64::try_from(deadline.timestamp_millis())
+                        .ok()
+                        .map(|ms| (raw, ms))
+                })
+                .map(|(raw, ms)| (Some(raw), Some(ms)))
+                .unwrap_or((None, None));
             InboxItem {
                 event_id: fact.event_id.clone(),
                 kind: fact.kind.clone(),
@@ -122,6 +143,8 @@ pub(crate) fn build_inbox(
                 age_secs,
                 stale: age_secs > stale_wait_secs,
                 ack_command: ack_command(tool, &fact.event_id),
+                ack_by,
+                ack_by_ms,
             }
         })
         .collect::<Vec<_>>();
@@ -409,6 +432,52 @@ mod tests {
         assert_eq!(long.stale_window_secs, 600);
         assert!(short.items[0].stale);
         assert!(!long.items[0].stale);
+    }
+
+    /// A handoff sent with `say handoff --ack-within` carries the `ack-by:`
+    /// evidence marker; the inbox item must surface it as both the RFC 3339
+    /// string and its epoch-millisecond twin.
+    #[test]
+    fn item_with_ack_by_marker_reports_both_fields() {
+        let mut fact = obligation(
+            "with-deadline",
+            FactKind::Handoff,
+            "codex",
+            "2000-01-01T00:00:00Z",
+        );
+        fact.evidence = vec!["ack-by:2000-01-01T00:01:30Z".to_string()];
+        let snapshot = RoomSnapshot {
+            open_obligations: vec![fact],
+            ..RoomSnapshot::default()
+        };
+
+        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS);
+        assert_eq!(
+            inbox.items[0].ack_by.as_deref(),
+            Some("2000-01-01T00:01:30Z")
+        );
+        assert_eq!(inbox.items[0].ack_by_ms, Some(946_684_890_000));
+    }
+
+    /// No `ack-by:` marker in evidence (every non-handoff kind, and a handoff
+    /// sent without `--ack-within`) must omit both fields rather than emit a
+    /// placeholder deadline.
+    #[test]
+    fn item_without_ack_by_marker_omits_both_fields() {
+        let fact = obligation(
+            "no-deadline",
+            FactKind::Artifact,
+            "codex",
+            "2000-01-01T00:00:00Z",
+        );
+        let snapshot = RoomSnapshot {
+            open_obligations: vec![fact],
+            ..RoomSnapshot::default()
+        };
+
+        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS);
+        assert_eq!(inbox.items[0].ack_by, None);
+        assert_eq!(inbox.items[0].ack_by_ms, None);
     }
 
     #[test]

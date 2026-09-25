@@ -130,6 +130,7 @@ mod decay;
 mod discovery;
 mod doctor;
 mod error;
+mod et_router_health;
 mod event_envelope;
 mod hook_runtime;
 mod hooks_config;
@@ -21227,6 +21228,21 @@ fn help_text() -> String {
 
 /// Evidence marker carrying a handoff's ACK deadline (RFC 3339, UTC).
 const ACK_BY_MARKER: &str = "ack-by:";
+
+/// Find and parse the `ack-by:` deadline in a fact's evidence, if present.
+///
+/// The single parser for [`ACK_BY_MARKER`] — [`overdue_handoffs_at`] and
+/// `obligations::build_inbox` both call this rather than re-deriving the
+/// `strip_prefix` + `parse_from_rfc3339` pair. Returns the raw RFC 3339 string
+/// alongside the parsed UTC instant so callers needing the wire string (for
+/// `ack_by`) and callers needing epoch math (for `ack_by_ms`) share one walk
+/// over `evidence`.
+pub(crate) fn ack_by_from_evidence(evidence: &[String]) -> Option<(String, chrono::DateTime<Utc>)> {
+    let deadline_raw = evidence.iter().find_map(|e| e.strip_prefix(ACK_BY_MARKER))?;
+    let deadline = chrono::DateTime::parse_from_rfc3339(deadline_raw).ok()?;
+    Some((deadline_raw.to_string(), deadline.with_timezone(&Utc)))
+}
+
 /// Subject prefix of the one risk fact written per overdue handoff.
 const NO_RESPONSE_SUBJECT_PREFIX: &str = "no-response:";
 const MAX_ACK_WITHIN_SECS: i64 = 7 * 24 * 3600;
@@ -21327,6 +21343,17 @@ fn deliver_handoff(
     if mode == HandoffDeliveryMode::Record {
         return record_only("--deliver record: not injected".to_string());
     }
+    // stage2 LD-H / U5: when ET's rally-router already owns delivery to
+    // this identity (a fresh, non-degraded health file lists it), a second
+    // producer writing the same pane would race the router's own send.
+    // Behave exactly like `--deliver record` — commit the fact, write no
+    // PTY bytes — and say why in `detail`.
+    if et_router_health::et_router_owns_delivery(target_tool, et_router_health::now_ms()) {
+        return record_only(
+            "et-router: ET's rally-router already owns delivery to this identity; not injected"
+                .to_string(),
+        );
+    }
     // Only a LIVE rally-managed session is a pane we may type into. A bare
     // ledger agent id, a human pane, or a stale/gone session is never injected;
     // `resolve_inject_target` already refuses stale and renumbered sessions.
@@ -21400,17 +21427,13 @@ fn overdue_handoffs_at(
         .filter(|fact| fact.tool.as_deref() == Some(tool))
         .filter_map(|fact| {
             let target = fact.target.clone()?;
-            let deadline_raw = fact
-                .evidence
-                .iter()
-                .find_map(|e| e.strip_prefix(ACK_BY_MARKER))?;
-            let deadline = chrono::DateTime::parse_from_rfc3339(deadline_raw).ok()?;
-            let overdue_secs = (now - deadline.with_timezone(&Utc)).num_seconds();
+            let (deadline_raw, deadline) = ack_by_from_evidence(&fact.evidence)?;
+            let overdue_secs = (now - deadline).num_seconds();
             (overdue_secs >= 0).then(|| OverdueHandoff {
                 event_id: fact.event_id.clone(),
                 target,
                 subject: fact.subject.clone(),
-                ack_by: deadline_raw.to_string(),
+                ack_by: deadline_raw,
                 overdue_secs,
                 risk_event_id: snapshot
                     .current_risks

@@ -195,3 +195,71 @@ fn unanswered_handoff_escalates_once_and_receiver_ack_clears_it() {
     let cleared = sandbox.rally_json(&["next", "--json", "--tool", SENDER]);
     assert!(cleared["data"]["overdue_handoffs"].is_null(), "{cleared}");
 }
+
+/// `rally inbox --json` surfaces the same `ack-by:` deadline `next`'s
+/// `overdue_handoffs` reads, so a receiver can see the clock before it lapses,
+/// not only after — the sender already gets that signal via
+/// `delivery.ack_by`; the receiver's own inbox view had nothing until now.
+#[test]
+fn inbox_json_reports_ack_by_deadline_for_a_handoff_sent_with_ack_within() {
+    let sandbox = ChannelSandbox::spawn();
+    let before_ms = chrono::Utc::now().timestamp_millis();
+    let said = handoff(&sandbox, "codex:07", &["--ack-within", "90s"]);
+    let handoff_id = said["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let inbox = sandbox.rally_json(&["inbox", "--json", "--tool", "codex:07"]);
+    let items = inbox["data"]["inbox"]["items"]
+        .as_array()
+        .expect("inbox items");
+    let item = items
+        .iter()
+        .find(|item| item["event_id"] == handoff_id.as_str())
+        .unwrap_or_else(|| panic!("handoff {handoff_id} not in inbox: {inbox}"));
+
+    let ack_by = item["ack_by"].as_str().expect("ack_by string");
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(ack_by).is_ok(),
+        "ack_by must be RFC 3339: {ack_by}"
+    );
+    let ack_by_ms = item["ack_by_ms"].as_u64().expect("ack_by_ms integer") as i64;
+    let expected_ms = before_ms + 90_000;
+    assert!(
+        (ack_by_ms - expected_ms).abs() <= 5_000,
+        "ack_by_ms {ack_by_ms} not within 5s of expected {expected_ms}"
+    );
+}
+
+/// An obligation with no `--ack-within` deadline must omit both fields, not
+/// emit `null` placeholders — a consumer treating `ack_by_ms.is_some()` as
+/// "has a deadline" would otherwise get a false positive from an explicit
+/// `null`.
+#[test]
+fn inbox_json_omits_ack_by_fields_when_no_deadline_was_set() {
+    let sandbox = ChannelSandbox::spawn();
+    let said = handoff(&sandbox, "codex:07", &[]);
+    let handoff_id = said["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let inbox = sandbox.rally_json(&["inbox", "--json", "--tool", "codex:07"]);
+    let items = inbox["data"]["inbox"]["items"]
+        .as_array()
+        .expect("inbox items");
+    let item = items
+        .iter()
+        .find(|item| item["event_id"] == handoff_id.as_str())
+        .unwrap_or_else(|| panic!("handoff {handoff_id} not in inbox: {inbox}"));
+
+    assert!(
+        item.get("ack_by").is_none(),
+        "ack_by must be omitted, not null: {item}"
+    );
+    assert!(
+        item.get("ack_by_ms").is_none(),
+        "ack_by_ms must be omitted, not null: {item}"
+    );
+}
