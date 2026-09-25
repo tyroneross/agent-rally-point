@@ -63,6 +63,14 @@
                   "ack_command": {
                     "type": "string",
                     "description": "The receiver-authored ack that clears this row. A session-bound item requires the exact receiver session; the sender may retract its own request when that session is no longer available."
+                  },
+                  "ack_by": {
+                    "type": "string",
+                    "description": "The handoff's ACK deadline (RFC 3339, UTC), when the authoring `say handoff --ack-within` set one. Omitted for every obligation with no deadline, including all non-handoff kinds and any handoff sent without --ack-within."
+                  },
+                  "ack_by_ms": {
+                    "type": "integer",
+                    "description": "ack_by as epoch milliseconds, for consumers that want to compare against now without parsing RFC 3339. Present exactly when ack_by is present."
                   }
                 }
               }

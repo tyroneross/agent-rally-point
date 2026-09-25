@@ -21228,6 +21228,21 @@ fn help_text() -> String {
 
 /// Evidence marker carrying a handoff's ACK deadline (RFC 3339, UTC).
 const ACK_BY_MARKER: &str = "ack-by:";
+
+/// Find and parse the `ack-by:` deadline in a fact's evidence, if present.
+///
+/// The single parser for [`ACK_BY_MARKER`] — [`overdue_handoffs_at`] and
+/// `obligations::build_inbox` both call this rather than re-deriving the
+/// `strip_prefix` + `parse_from_rfc3339` pair. Returns the raw RFC 3339 string
+/// alongside the parsed UTC instant so callers needing the wire string (for
+/// `ack_by`) and callers needing epoch math (for `ack_by_ms`) share one walk
+/// over `evidence`.
+pub(crate) fn ack_by_from_evidence(evidence: &[String]) -> Option<(String, chrono::DateTime<Utc>)> {
+    let deadline_raw = evidence.iter().find_map(|e| e.strip_prefix(ACK_BY_MARKER))?;
+    let deadline = chrono::DateTime::parse_from_rfc3339(deadline_raw).ok()?;
+    Some((deadline_raw.to_string(), deadline.with_timezone(&Utc)))
+}
+
 /// Subject prefix of the one risk fact written per overdue handoff.
 const NO_RESPONSE_SUBJECT_PREFIX: &str = "no-response:";
 const MAX_ACK_WITHIN_SECS: i64 = 7 * 24 * 3600;
@@ -21412,17 +21427,13 @@ fn overdue_handoffs_at(
         .filter(|fact| fact.tool.as_deref() == Some(tool))
         .filter_map(|fact| {
             let target = fact.target.clone()?;
-            let deadline_raw = fact
-                .evidence
-                .iter()
-                .find_map(|e| e.strip_prefix(ACK_BY_MARKER))?;
-            let deadline = chrono::DateTime::parse_from_rfc3339(deadline_raw).ok()?;
-            let overdue_secs = (now - deadline.with_timezone(&Utc)).num_seconds();
+            let (deadline_raw, deadline) = ack_by_from_evidence(&fact.evidence)?;
+            let overdue_secs = (now - deadline).num_seconds();
             (overdue_secs >= 0).then(|| OverdueHandoff {
                 event_id: fact.event_id.clone(),
                 target,
                 subject: fact.subject.clone(),
-                ack_by: deadline_raw.to_string(),
+                ack_by: deadline_raw,
                 overdue_secs,
                 risk_event_id: snapshot
                     .current_risks
