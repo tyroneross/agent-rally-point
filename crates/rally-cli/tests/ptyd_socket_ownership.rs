@@ -11,7 +11,7 @@
 //! touches a marker file, so "was a daemon spawned" is observed directly.
 
 use std::fs;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,7 +45,13 @@ impl Sandbox {
         )
         .unwrap();
         fs::set_permissions(&fake_ptyd, fs::Permissions::from_mode(0o755)).unwrap();
-        Sandbox { root, home, cwd, fake_ptyd, marker }
+        Sandbox {
+            root,
+            home,
+            cwd,
+            fake_ptyd,
+            marker,
+        }
     }
 
     fn canonical_socket(&self) -> PathBuf {
@@ -54,13 +60,22 @@ impl Sandbox {
 
     fn run(&self, override_socket: Option<&Path>) -> Output {
         let mut cmd = Command::new(RALLY_BIN);
-        cmd.args(["run", "claude", "--json", "--name", "owner-check", "--shared", "--backend", "ptyd"])
-            .current_dir(&self.cwd)
-            .env("HOME", &self.home)
-            .env("RALLY_PTYD_BIN", &self.fake_ptyd)
-            .env("RALLY_HOOK_TIMEOUT_MS", "20000")
-            .env_remove("PTYD_SOCKET_PATH")
-            .env_remove("PWD");
+        cmd.args([
+            "run",
+            "claude",
+            "--json",
+            "--name",
+            "owner-check",
+            "--shared",
+            "--backend",
+            "ptyd",
+        ])
+        .current_dir(&self.cwd)
+        .env("HOME", &self.home)
+        .env("RALLY_PTYD_BIN", &self.fake_ptyd)
+        .env("RALLY_HOOK_TIMEOUT_MS", "20000")
+        .env_remove("PTYD_SOCKET_PATH")
+        .env_remove("PWD");
         match override_socket {
             Some(sock) => cmd.env("RALLY_PTYD_SOCKET", sock),
             None => cmd.env_remove("RALLY_PTYD_SOCKET"),
@@ -81,7 +96,10 @@ impl Drop for Sandbox {
 
 fn assert_refused(out: &Output, sb: &Sandbox, case: &str) {
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "{case}: rally must fail, stderr: {stderr}");
+    assert!(
+        !out.status.success(),
+        "{case}: rally must fail, stderr: {stderr}"
+    );
     assert!(
         stderr.contains("will not start one there"),
         "{case}: the error must say rally refuses to start a daemon; stderr: {stderr}"
@@ -95,7 +113,10 @@ fn override_with_absent_socket_never_spawns() {
     let foreign = sb.root.join("foreign.sock");
     let out = sb.run(Some(&foreign));
     assert_refused(&out, &sb, "override + absent");
-    assert!(!foreign.exists(), "the foreign socket path must not be created");
+    assert!(
+        !foreign.exists(),
+        "the foreign socket path must not be created"
+    );
 }
 
 #[test]
@@ -137,6 +158,22 @@ fn aliased_socket_directory_never_spawns() {
 }
 
 #[test]
+fn aliased_parent_with_missing_rally_directory_never_spawns() {
+    let sb = Sandbox::new();
+    let other = sb.root.join("other-dir");
+    fs::create_dir_all(&other).unwrap();
+    fs::create_dir_all(sb.home.join(".local")).unwrap();
+    symlink(&other, sb.home.join(".local/share")).unwrap();
+    let out = sb.run(None);
+    assert_refused(
+        &out,
+        &sb,
+        "socket parent is an alias and rally leaf is absent",
+    );
+    assert!(!other.join("rally").exists());
+}
+
+#[test]
 fn override_socket_appearing_mid_run_never_spawns() {
     // Restart window: the owning app is coming back while rally runs. Refusal
     // is decided from provenance, not from a liveness race, so timing cannot
@@ -160,6 +197,12 @@ fn canonical_socket_without_override_still_autostarts() {
     let sb = Sandbox::new();
     let out = sb.run(None);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(sb.spawned(), "rally must autostart on its own canonical socket; stderr: {stderr}");
-    assert!(!stderr.contains("will not start one there"), "no ownership refusal expected; stderr: {stderr}");
+    assert!(
+        sb.spawned(),
+        "rally must autostart on its own canonical socket; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("will not start one there"),
+        "no ownership refusal expected; stderr: {stderr}"
+    );
 }

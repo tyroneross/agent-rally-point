@@ -86,7 +86,9 @@ pub(crate) fn ensure_rally_owns_socket(socket: &str) -> Result<(), String> {
         ))
     };
     if std::env::var(RALLY_PTYD_SOCKET_ENV).is_ok_and(|v| !v.is_empty()) {
-        return refuse(&format!("the socket comes from {RALLY_PTYD_SOCKET_ENV}, so rally does not own it"));
+        return refuse(&format!(
+            "the socket comes from {RALLY_PTYD_SOCKET_ENV}, so rally does not own it"
+        ));
     }
     let Some(home) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) else {
         return refuse("HOME is unset, so rally cannot resolve its own socket");
@@ -102,6 +104,26 @@ pub(crate) fn ensure_rally_owns_socket(socket: &str) -> Result<(), String> {
         && meta.file_type().is_symlink()
     {
         return refuse("rally's socket path is a symlink");
+    }
+    // Check every existing component. Checking only the final directory misses
+    // an aliased parent when the `rally` leaf has not been created yet.
+    let home_path = PathBuf::from(&home);
+    for dir in [
+        home_path.join(".local"),
+        home_path.join(".local/share"),
+        canonical_dir.clone(),
+    ] {
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return refuse("rally's socket directory has a symlinked ancestor");
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return refuse("rally's socket directory has a non-directory ancestor");
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return refuse("rally cannot inspect its socket directory"),
+        }
     }
     // The directory (or any ancestor) must not be an alias for somewhere else.
     if let Ok(real_dir) = std::fs::canonicalize(&canonical_dir) {
@@ -603,7 +625,9 @@ pub(crate) fn autostart_daemon(socket: &str) -> Result<(), String> {
     let state_dir = rally_owned_state_dir()
         .ok_or_else(|| "cannot resolve rally ptyd state dir (HOME unset)".to_string())?;
     if let Some(parent) = Path::new(socket).parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("cannot create rally socket directory: {err}"))?;
+        ensure_rally_owns_socket(socket)?;
     }
     let _ = std::fs::create_dir_all(&state_dir);
 

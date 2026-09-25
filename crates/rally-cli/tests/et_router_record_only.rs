@@ -94,8 +94,11 @@ fn write_health(path: &Path, updated_ms: i64, degraded: bool, routed_identities:
         "degraded": degraded,
         "routed_identities": routed_identities,
     });
-    fs::write(path, serde_json::to_vec_pretty(&body).expect("serialize health fixture"))
-        .expect("write health fixture");
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&body).expect("serialize health fixture"),
+    )
+    .expect("write health fixture");
 }
 
 /// Run `rally <args>` hermetically inside `sandbox`, with `RALLY_ET_ROUTER_HEALTH`
@@ -373,7 +376,10 @@ fn suppressed_and_unsuppressed_deliveries_commit_the_same_fact_shape() {
 
     for said in [&suppressed, &unsuppressed] {
         assert_eq!(said["data"]["say"]["fact"]["kind"], "handoff", "{said}");
-        assert_eq!(said["data"]["say"]["fact"]["target"], session.tool, "{said}");
+        assert_eq!(
+            said["data"]["say"]["fact"]["target"], session.tool,
+            "{said}"
+        );
         assert_eq!(said["data"]["say"]["committed"], true, "{said}");
         assert!(said["data"]["delivery"]["ack_by"].is_string(), "{said}");
     }

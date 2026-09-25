@@ -127,7 +127,9 @@ pub(crate) fn build_inbox(
         .take(limit)
         .map(|fact| {
             let age_secs = fact_age_secs(fact);
-            let (ack_by, ack_by_ms) = crate::ack_by_from_evidence(&fact.evidence)
+            let (ack_by, ack_by_ms) = (fact.kind == FactKind::Handoff)
+                .then(|| crate::ack_by_from_evidence(&fact.evidence))
+                .flatten()
                 .and_then(|(raw, deadline)| {
                     u64::try_from(deadline.timestamp_millis())
                         .ok()
@@ -464,12 +466,14 @@ mod tests {
     /// placeholder deadline.
     #[test]
     fn item_without_ack_by_marker_omits_both_fields() {
-        let fact = obligation(
+        let mut fact = obligation(
             "no-deadline",
             FactKind::Artifact,
             "codex",
             "2000-01-01T00:00:00Z",
         );
+        // Legacy caller evidence must not turn an artifact into a timed handoff.
+        fact.evidence = vec!["ack-by:2000-01-01T00:01:30Z".to_string()];
         let snapshot = RoomSnapshot {
             open_obligations: vec![fact],
             ..RoomSnapshot::default()

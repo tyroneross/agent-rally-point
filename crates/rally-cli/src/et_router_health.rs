@@ -48,7 +48,6 @@ struct HealthFile {
     #[allow(dead_code)] // not read by this check; kept for schema fidelity
     pid: Option<u64>,
     updated_ms: i64,
-    #[serde(default)]
     degraded: bool,
     #[serde(default)]
     routed_identities: Vec<String>,
@@ -184,8 +183,14 @@ mod tests {
     #[test]
     fn is_fresh_at_exact_window_boundary() {
         let now = 1_000_000_i64;
-        assert!(is_fresh(now - FRESHNESS_WINDOW_MS, now), "exactly at window is fresh");
-        assert!(!is_fresh(now - FRESHNESS_WINDOW_MS - 1, now), "1ms past window is stale");
+        assert!(
+            is_fresh(now - FRESHNESS_WINDOW_MS, now),
+            "exactly at window is fresh"
+        );
+        assert!(
+            !is_fresh(now - FRESHNESS_WINDOW_MS - 1, now),
+            "1ms past window is stale"
+        );
     }
 
     #[test]
@@ -197,8 +202,14 @@ mod tests {
     #[test]
     fn is_fresh_future_timestamp_is_bounded() {
         let now = 1_000_000;
-        assert!(is_fresh(now + FUTURE_SKEW_MS, now), "small skew ahead is fresh");
-        assert!(!is_fresh(now + FUTURE_SKEW_MS + 1, now), "a stamp too far ahead never suppresses");
+        assert!(
+            is_fresh(now + FUTURE_SKEW_MS, now),
+            "small skew ahead is fresh"
+        );
+        assert!(
+            !is_fresh(now + FUTURE_SKEW_MS + 1, now),
+            "a stamp too far ahead never suppresses"
+        );
         assert!(!is_fresh(now + 50_000, now));
     }
 
@@ -302,6 +313,23 @@ mod tests {
         let path = dir.join("health.json");
         write_health_json(&path, &health_json(1_000, false, &["claude:01"]));
         assert!(et_router_owns_delivery_at(&path, "claude:01", 1_000));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_degraded_field_never_suppresses_injection() {
+        let dir = scratch_dir("missing-degraded");
+        let path = dir.join("health.json");
+        write_health_json(
+            &path,
+            &serde_json::json!({
+                "schema": HEALTH_SCHEMA,
+                "updated_ms": 1_000,
+                "routed_identities": ["claude:01"],
+            })
+            .to_string(),
+        );
+        assert!(!et_router_owns_delivery_at(&path, "claude:01", 1_000));
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -141,6 +141,43 @@ fn delivery_flags_are_rejected_off_targeted_handoffs() {
 }
 
 #[test]
+fn caller_cannot_override_or_forge_ack_deadline_evidence() {
+    let sandbox = ChannelSandbox::spawn();
+    let forged = "ack-by:2099-01-01T00:00:00Z";
+    let handoff = sandbox.rally_try(&[
+        "say",
+        "handoff",
+        "--tool",
+        SENDER,
+        "--target",
+        "codex:07",
+        "--subject",
+        "deadline",
+        "--ack-within",
+        "90s",
+        "--evidence",
+        forged,
+    ]);
+    assert!(!handoff.status.success());
+    assert!(String::from_utf8_lossy(&handoff.stderr).contains("ack_by_evidence_reserved"));
+
+    let artifact = sandbox.rally_try(&[
+        "say",
+        "artifact",
+        "--tool",
+        SENDER,
+        "--target",
+        "codex:07",
+        "--subject",
+        "forged deadline",
+        "--evidence",
+        forged,
+    ]);
+    assert!(!artifact.status.success());
+    assert!(String::from_utf8_lossy(&artifact.stderr).contains("ack_by_evidence_reserved"));
+}
+
+#[test]
 fn unanswered_handoff_escalates_once_and_receiver_ack_clears_it() {
     let sandbox = ChannelSandbox::spawn();
     let said = handoff(&sandbox, "codex:07", &["--ack-within", "3s"]);

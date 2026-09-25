@@ -3263,6 +3263,14 @@ fn command_say(args: SayArgs) -> Result<Output> {
 
     // B13: encode --produces / --depends as markers in evidence (self-describing claim).
     let mut evidence = args.evidence;
+    if evidence
+        .iter()
+        .any(|entry| entry.starts_with(ACK_BY_MARKER))
+    {
+        return Err(RallyError::Usage(
+            "ack_by_evidence_reserved: evidence entries beginning with `ack-by:` are written by Rally; use `say handoff --ack-within` instead".to_string(),
+        ));
+    }
     if kind == FactKind::Handoff && evidence.iter().any(|entry| entry.starts_with("protocol:")) {
         return Err(RallyError::Usage(
             "handoff_protocol_evidence_reserved: evidence entries beginning with `protocol:` are written by Rally; remove the caller-supplied marker and retry".to_string(),
@@ -21238,7 +21246,9 @@ const ACK_BY_MARKER: &str = "ack-by:";
 /// `ack_by`) and callers needing epoch math (for `ack_by_ms`) share one walk
 /// over `evidence`.
 pub(crate) fn ack_by_from_evidence(evidence: &[String]) -> Option<(String, chrono::DateTime<Utc>)> {
-    let deadline_raw = evidence.iter().find_map(|e| e.strip_prefix(ACK_BY_MARKER))?;
+    let deadline_raw = evidence
+        .iter()
+        .find_map(|e| e.strip_prefix(ACK_BY_MARKER))?;
     let deadline = chrono::DateTime::parse_from_rfc3339(deadline_raw).ok()?;
     Some((deadline_raw.to_string(), deadline.with_timezone(&Utc)))
 }
