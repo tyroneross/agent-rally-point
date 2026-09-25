@@ -5678,7 +5678,10 @@ fn routed_enter_keeps_managed_identity_over_eight_mib_ledger() {
 
     let daemon = start_daemon(&workspace.cwd, &workspace.home);
     for tool in ["worker-01", "worker-02", "worker-01"] {
-        let entered = workspace.json(&["enter", "--tool", tool, "--json"]);
+        // The 8 MiB replay can exceed the 3s default watchdog on a loaded CI
+        // runner (the watchdog itself advises `--timeout-ms` for large rooms).
+        // This test verifies identity classification, not the default budget.
+        let entered = workspace.json(&["enter", "--tool", tool, "--timeout-ms", "20000", "--json"]);
         let warnings = entered["data"]["enter"]["warnings"]
             .as_array()
             .cloned()
@@ -5708,7 +5711,10 @@ fn routed_enter_keeps_managed_identity_over_eight_mib_ledger() {
     // command boundary. Each tool remains visibly unmanaged on every enter,
     // but its exact durable risk subject must be appended only once.
     for tool in ["worker-03", "worker-04", "worker-03"] {
-        let entered = workspace.json(&["enter", "--tool", tool, "--json"]);
+        // The 8 MiB replay can exceed the 3s default watchdog on a loaded CI
+        // runner (the watchdog itself advises `--timeout-ms` for large rooms).
+        // This test verifies identity classification, not the default budget.
+        let entered = workspace.json(&["enter", "--tool", tool, "--timeout-ms", "20000", "--json"]);
         let warnings = entered["data"]["enter"]["warnings"]
             .as_array()
             .cloned()
