@@ -40,6 +40,12 @@ merge conflicts. See `docs/COMMAND-SEMANTICS.md`.
 The optional-runtime setup and live-route proof commands, previously available
 only from a source build of `main`, are included in this release.
 
+### Security — rustls 0.23.45 (RUSTSEC-2026-0285)
+
+The lockfile moves rustls from 0.23.40 to 0.23.45 (and rustls-webpki to
+0.103.15), which fixes TLS 1.3 handshake messages being accepted across
+encryption-level boundaries. rustls reaches Rally through sqlx-core.
+
 ### Fixed — bounded Codex workers release the synced-task writer lease
 
 `rally run codex --task "<prompt>"` now launches the prompt through `codex exec`
