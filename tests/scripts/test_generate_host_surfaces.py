@@ -319,7 +319,7 @@ class GenerateHostSurfacesTests(unittest.TestCase):
                         pending.append(resolved)
             self.assertEqual(unresolved, [])
             self.assertEqual(len(visited), 11)
-            self.assertEqual(local_edges, 18)
+            self.assertEqual(local_edges, 19)
 
     def test_packaged_workflow_commands_run_from_empty_consumer_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

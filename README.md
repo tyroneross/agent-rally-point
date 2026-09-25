@@ -183,8 +183,6 @@ This proves CLI claim enforcement. To verify an installed host integration, also
 
 ## Set up optional runtimes and test routes
 
-**Current source feature:** `rally setup` and `rally routes` are on `main`; the published v0.2.7 binary predates them. Build this checkout to use these commands until a newer release includes them.
-
 ```bash
 rally setup --component tmux --json  # inspect the installation/check plan
 rally setup --component tmux --apply

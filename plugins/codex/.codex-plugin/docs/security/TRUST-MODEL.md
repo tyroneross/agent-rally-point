@@ -163,9 +163,18 @@ malicious fork, verified compilation of malicious source produces a malicious bi
 verification tells you the artifact came from this repo's release pipeline. It does not tell you
 this repo is trustworthy. That judgement is yours and it is made before you clone.
 
-Rally also does not audit its own dependency tree for known vulnerabilities. No `cargo audit` or
-`cargo deny` vulnerability pass has been run. The issue #52 auditor did not run one either and
-said so.
+Rally's own dependency-vulnerability auditing is partial, and its coverage differs by pipeline.
+`.github/workflows/release.yml` installs `cargo-audit` and `cargo-deny` and runs
+`scripts/run-quality-gate.sh` for every release build. That script only runs `cargo audit`
+and `cargo deny check` when the commit being validated changed `Cargo.lock`, a `Cargo.toml`,
+`deny.toml`, or `.cargo/audit.toml` versus its immediate parent commit (`HEAD~1..HEAD`); a release
+tagged on a commit that did not touch dependencies skips both. `.github/workflows/ci.yml` (branch
+CI, run on every push and pull request) runs the same `scripts/run-quality-gate.sh`, but never
+installs `cargo-audit` or `cargo-deny`, and the script skips both with a logged SKIPPED line when
+either tool is absent. Branch CI therefore never runs a dependency audit; only a release build
+that itself changed dependency files does. `deny.toml` exists at the repo root and configures what
+`cargo deny check` would enforce, when it runs. The issue #52 auditor did not run a vulnerability
+pass either and said so.
 
 ## Opening this repo runs code. Here is exactly what.
 

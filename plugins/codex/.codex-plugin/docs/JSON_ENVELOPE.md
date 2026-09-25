@@ -36,26 +36,109 @@ measured wall time, not the configured budget. This replaces the former neutral
 `{"ok":true,"product":"rally"}` response, which made a watchdog timeout indistinguishable from a
 successful command with missing data.
 
+## Error envelope
+
+When a command fails outright (before it can build a `data[command]` result — a usage error, a
+not-found lookup, a claim refusal, an I/O failure, and so on), Rally writes a *different*, smaller
+envelope to **STDERR**, not stdout, and exits nonzero:
+
+```json
+{"ok":false,"product":"rally","error":"<message>","exit_code":<n>}
+```
+
+This shape has no `command`, `schema`, or `data` field — it is not the success envelope with `ok`
+flipped. Source: `crates/rally-cli/src/output.rs` (`CliError::error_text`), fed by
+`crates/rally-cli/src/error.rs` (`RallyError::exit_code`). See "Exit codes" below for what `<n>`
+can be.
+
+This is distinct from the `ok: false` results documented elsewhere in this file
+(`watchdog`, `partial_commit`, `mutation_outcome_unknown`, a failed `doctor` mode, a failed
+`migrate-legacy`): those are commands that ran to completion and produced a `data[command]`
+result on **stdout**, just one reporting a failure outcome. The error envelope above is for a
+command that did not produce a result at all.
+
 ## How to parse safely
+
+A caller must branch on the process exit code before trusting `data` to exist:
 
 ```python
 import json, subprocess
-out = subprocess.check_output(["rally", "<cmd>", "--json"])
-envelope = json.loads(out)
+
+proc = subprocess.run(["rally", "<cmd>", "--json"], capture_output=True, text=True)
+if proc.returncode != 0 and not proc.stdout.strip():
+    # Hard failure: no result envelope at all. The error envelope is on stderr.
+    error = json.loads(proc.stderr)
+    raise RuntimeError(f"rally {error['error']} (exit {error['exit_code']})")
+
+envelope = json.loads(proc.stdout)
 if envelope.get("data", {}).get("watchdog_timeout"):
     raise RuntimeError(envelope["data"]["reason"])
-result = envelope["data"][envelope["command"]]  # always works
+if not envelope["ok"]:
+    # Command ran, but reports a failure outcome (partial_commit, a failed
+    # doctor mode, a strict check/check-ci stop, ...). data[command] is still
+    # present; read it for the specifics before deciding whether to retry.
+    pass
+result = envelope["data"][envelope["command"]]  # always works when data is present
 ```
 
 ```bash
-rally <cmd> --json | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
+rally <cmd> --json > /tmp/rally_out.json 2> /tmp/rally_err.json
+if [ ! -s /tmp/rally_out.json ]; then
+  # nothing on stdout: read the error envelope from stderr instead
+  python3 -c "import json,sys; e=json.load(open('/tmp/rally_err.json')); sys.exit(f\"rally: {e['error']} (exit {e['exit_code']})\")"
+fi
+python3 -c "
+import json
+d = json.load(open('/tmp/rally_out.json'))
 if d.get('data', {}).get('watchdog_timeout'):
     raise SystemExit(d['data']['reason'])
 print(d['data'][d['command']])
 "
 ```
+
+## Exit codes
+
+`RallyError::exit_code()` (`crates/rally-cli/src/error.rs`) sets the default; specific commands
+override it for their own pass/fail or strict-mode semantics.
+
+| Code | Meaning | Where it comes from |
+|------|---------|----------------------|
+| 0 | Success, or a non-strict advisory result (warn mode) | Default |
+| 1 | Generic command/message/I/O/JSON error; `OutcomeUnknown`; `IncompatibleWire` | `RallyError::exit_code()` — `Command`, `Message`, `OutcomeUnknown`, `IncompatibleWire`, `Io`, `Json` variants |
+| 1 | Command ran but reports a failure outcome on stdout: `partial_commit`, `mutation_outcome_unknown`, a failed `doctor` mode (`--reap-stale` with write failures, `--ledger-health` unhealthy, bare `doctor`), `migrate-legacy` with `outcome_unknown > 0` | `crates/rally-cli/src/lib.rs` (`output_after_committed_error`, `command_doctor`, `command_migrate_legacy`) |
+| 2 | Usage error, including a claim refusal: a conflicting claim, or an unauthorized `workspace:*`/`repo:*`-breadth claim | `RallyError::Usage` — `crates/rally-cli/src/store.rs:5455-5475` (`claim_authority::breadth_violation`, `claim_authority::detect_conflict`) |
+| 3 | Not-found lookup | `RallyError::NotFound` |
+| 4 | `NotStarted` (rejected before any durable side effect; safe to retry) | `RallyError::NotStarted` |
+| 4 | `rally check <phase> --strict` with a stop finding; `rally check coordination --strict` when not passing; `rally check-ci --strict` with offenders; `rally routes --probe <actor>` when the probed route never reaches `ready` | `crates/rally-cli/src/check.rs:91`; `crates/rally-cli/src/lib.rs:7340-7341` (coordination); `crates/rally-cli/src/check_ci.rs` (`build_check_ci`); `crates/rally-cli/src/runtime_routes.rs:450` |
+| 4 | `rally setup --component <c> --apply` when the plan is `blocked`, requires permission that was not granted, or the apply attempt itself fails | `crates/rally-cli/src/runtime_setup.rs:514-655` (`render`, `command`) |
+| variable | `rally run codex --task ...` (the internal `TaskWorker` path): exits with the bounded child process's own exit code, clamped to `u8` | `crates/rally-cli/src/lib.rs:8409-8448` |
+
+Not every `with_exit_code` call site could be tied to a documented command from static reading
+alone; the table above covers every site found under `crates/rally-cli/src/{lib,check,check_ci,
+runtime_routes,runtime_setup}.rs`. `session ensure --strict` is a capability *attestation* flag
+(it asserts the host invokes Rally's native before-write transaction) and was not found to change
+`session ensure`'s own exit code.
+
+## The outer `.rally/log/<engagement>.jsonl` wrapper
+
+Each line of a segment file is a `LedgerLine` (`crates/rally-cli/src/store.rs:3570-3578`), not the
+raw fact:
+
+```json
+{"seq": 42, "occurred_at": "2026-09-24T18:03:11Z", "event_type": "claim", "payload": { /* the full Fact */ }, "engagement": "main"}
+```
+
+| Field | Source |
+|-------|--------|
+| `seq` | Canonical monotonic sequence number: max existing seq + 1 at append (`crates/rally-cli/src/store.rs` append path) |
+| `occurred_at` | `now_string()` (`crates/rally-cli/src/lib.rs:20308`) — RFC 3339, UTC, second precision, `Z` suffix, e.g. `2026-09-24T18:03:11Z` |
+| `event_type` | `fact.kind.as_str()` — the fact's `FactKind` as a string (`"claim"`, `"say"`, `"artifact"`, …) |
+| `payload` | The fact itself, serialized (`serde_json::to_value(&fact)`) — see [`docs/schemas/agent-rally.fact.v1.json`](schemas/agent-rally.fact.v1.json) |
+| `engagement` | The per-row engagement tag; omitted (not `null`) on older pre-R5 migrated lines that carry no tag |
+
+Replaying these lines in append order rebuilds `facts.db` verbatim — this is what
+`rebuild_db_from_segments` (`crates/rally-cli/src/store.rs:11289`) does, and why `.rally/facts.db`
+is a derived cache rather than a canonical store.
 
 ## Per-command field map
 
@@ -95,6 +178,16 @@ print(d['data'][d['command']])
 | `wake-due` | `wake-due: { due: [...] }` | — |
 | `mission` (GET) | `mission: { text?, set_by?, set_at?, envelopes }` | — |
 | `mission` (SET) | `mission: { action, fact }` | — |
+
+**Schema coverage: 16 of 48 top-level commands have a schema file under `docs/schemas/`.** The
+count is derived from the `CliCommand` enum (`crates/rally-cli/src/cli.rs:10-85`, 48 variants) and
+the 17 `docs/schemas/agent-rally.command.*.v1.json` files. `adopt`, `check`, `dag`, `enter`,
+`inbox`, `inject`, `locate`, `next`, `recent`, `room`, `run`, `say`, `session` (the
+`SessionLifecycle` variant), `session-action` (the `Session` variant, covering `attach`/`capture`/
+`stop`), `sessions`, and `wake-due` have a schema file. The 17th file, `watchdog`, documents the
+transport-level fail-open exception above rather than a distinct top-level command. The remaining
+32 commands have no schema file; their shapes are documented only in the field map above or not
+at all.
 
 **`inject.ack` shapes.** The `ack` key is always present. Its value is an object when an ACK wait runs and `null` otherwise. `--require-ack` requests the wait explicitly; `--handoff` and `--ref` request it implicitly. Dry-run mode never waits.
 

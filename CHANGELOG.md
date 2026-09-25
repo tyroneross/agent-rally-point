@@ -7,6 +7,39 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+## 0.2.8
+
+### Added — targeted handoffs deliver by inject and escalate when their ack deadline passes
+
+`rally say handoff` now takes `--deliver inject|record` (default `inject`).
+After the durable commit, a targeted handoff is injected into the recipient's
+live `rally run`-managed pane through the existing `rally inject` path and its
+safety gates; when the target is not a live managed session it degrades to
+`record_only` with a reason. The outcome is reported in `data.delivery`.
+`--ack-within 90s|10m|2h` stores an ack-by deadline on the handoff. When the
+sender runs `rally next`, open handoffs it authored that are past their
+deadline appear in `data.overdue_handoffs`, and Rally writes one
+`no-response` risk fact per handoff (`next --audit` reports without writing).
+A receiver ack closes the handoff and clears it from the overdue list.
+Escalation is evaluated on `rally next`, not by a background timer. See
+`docs/ACK-DEADLINE-ESCALATION.md`.
+
+### Added — `rally worktree plan` merge/update planner
+
+`rally worktree plan --json` reports every Git-registered worktree, local
+branch, and locally stored remote branch, with each branch's relation to the
+integration base (`--base BRANCH`, else the detected default), ahead/behind
+counts, upstream relation, dirty/unavailable worktree status, and suggested
+merge or update actions. It is read-only: it never fetches, merges, or writes
+a Rally fact, and its output is deterministic for an unchanged Git state.
+Recommendations are advisory and do not establish agent ownership or predict
+merge conflicts. See `docs/COMMAND-SEMANTICS.md`.
+
+### Added — `rally setup` and `rally routes` ship in the released binary
+
+The optional-runtime setup and live-route proof commands, previously available
+only from a source build of `main`, are included in this release.
+
 ### Fixed — bounded Codex workers release the synced-task writer lease
 
 `rally run codex --task "<prompt>"` now launches the prompt through `codex exec`
