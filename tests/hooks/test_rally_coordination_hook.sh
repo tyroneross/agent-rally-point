@@ -54,7 +54,7 @@ export RALLY_NATIVE_HOOK
 
 # Host sessionStart env (or a parent agent) can leak these into the suite and
 # override every test's intended --tool. Isolate.
-unset RALLY_TOOL_ID RALLY_SESSION_ID RALLY_AGENT_ID
+unset RALLY_TOOL_ID RALLY_SESSION_ID RALLY_AGENT_ID RALLY_ET_ROUTER_HEALTH
 
 PASS=0
 FAIL=0
@@ -3385,6 +3385,158 @@ SID_V3="test-verb-normal-$$"
   printf '%s' "$b3" | grep -q "additionalContext" || { printf 'brief: a new event id must surface: [%s]\n' "$b3" >&2; exit 1; }
   printf '%s' "$n2" | grep -q "additionalContext" || { printf 'normal mode keeps text-keyed dedupe (changed text surfaces): [%s]\n' "$n2" >&2; exit 1; }
   [ -n "$n1" ] || exit 1
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+# ----------------------------------------------------------------------
+# U4: RALLY_ET_ROUTER_HEALTH per-item suppression
+# (et-native-rally-stage2-plan.md LD-H, LD-I, component U4). The stub always
+# answers with one actionable respond_to_handoff fact; the health file is the
+# only thing that varies. Case (a) is the only one that must ever produce the
+# suppressed `{}`. Every other case is a falsifier for a narrower failure
+# mode of the same gate (staleness, degraded, wrong identity, a different
+# event id, a symlinked file, corrupt JSON, or the env unset entirely).
+# ----------------------------------------------------------------------
+u4_repo="$tmpdir/u4-repo"
+mkdir -p "$u4_repo/.rally"
+u4_id="claude_code:u4-test"
+u4_eid="fact_u4_1234"
+
+u4_bin="$tmpdir/rally_u4_stub"
+cat > "$u4_bin" <<'EOF'
+#!/usr/bin/env bash
+cat <<JSON
+{"data":{"next":{"actionable":true,"action":"respond_to_handoff","reason":"handoff","fact":{"event_id":"${U4_EID:-fact_u4_1234}","kind":"handoff","tool":"codex:peer","subject":"ship the release notes"}}}}
+JSON
+EOF
+install_stub "$u4_bin"
+
+u4_now_ms() { node -e 'process.stdout.write(String(Date.now()))'; }
+
+# u4_write_health <path> <updated_ms> <degraded true|false> <routed_identities JSON array> <delivered JSON object>
+u4_write_health() {
+  cat > "$1" <<EOF2
+{"schema":"et.rally-router.health.v1","pid":4321,"updated_ms":$2,"degraded":$3,"routed_identities":$4,"delivered":$5}
+EOF2
+}
+
+# u4_call <health-path-or-empty> <session-suffix>
+u4_call() {
+  if [ -n "$1" ]; then
+    RALLY_ET_ROUTER_HEALTH="$1" RALLY_BIN="$u4_bin" RALLY_TOOL_ID="$u4_id" \
+      RALLY_SESSION_ID="u4-$2-$$" U4_EID="$u4_eid" "$HOOK" idle claude_code </dev/null 2>/dev/null
+  else
+    RALLY_BIN="$u4_bin" RALLY_TOOL_ID="$u4_id" \
+      RALLY_SESSION_ID="u4-$2-$$" U4_EID="$u4_eid" "$HOOK" idle claude_code </dev/null 2>/dev/null
+  fi
+}
+u4_shows() { printf '%s' "$1" | grep -q "ship the release notes"; }
+
+now_ms="$(u4_now_ms)"
+
+T="U4(a): a delivered handoff event id is suppressed to {}"
+health_a="$tmpdir/u4-health-a.json"
+u4_write_health "$health_a" "$now_ms" "false" "[\"$u4_id\"]" "{\"$u4_id\":[\"$u4_eid\"]}"
+(
+  cd "$u4_repo" || exit 1
+  out="$(u4_call "$health_a" a)"
+  [ "$out" = "{}" ] || { printf 'expected suppression to {}: [%s]\n' "$out" >&2; exit 1; }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+T="U4(b): a stale health file (updated_ms 60s old) still shows the item"
+stale_ms="$((now_ms - 60000))"
+health_b="$tmpdir/u4-health-b.json"
+u4_write_health "$health_b" "$stale_ms" "false" "[\"$u4_id\"]" "{\"$u4_id\":[\"$u4_eid\"]}"
+(
+  cd "$u4_repo" || exit 1
+  out="$(u4_call "$health_b" b)"
+  u4_shows "$out" || { printf 'a stale health file must not suppress: [%s]\n' "$out" >&2; exit 1; }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+T="U4(c): degraded:true still shows the item"
+health_c="$tmpdir/u4-health-c.json"
+u4_write_health "$health_c" "$now_ms" "true" "[\"$u4_id\"]" "{\"$u4_id\":[\"$u4_eid\"]}"
+(
+  cd "$u4_repo" || exit 1
+  out="$(u4_call "$health_c" c)"
+  u4_shows "$out" || { printf 'degraded:true must not suppress: [%s]\n' "$out" >&2; exit 1; }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+T="U4(d): this identity absent from routed_identities still shows the item"
+health_d="$tmpdir/u4-health-d.json"
+u4_write_health "$health_d" "$now_ms" "false" "[\"codex:someone-else\"]" "{\"$u4_id\":[\"$u4_eid\"]}"
+(
+  cd "$u4_repo" || exit 1
+  out="$(u4_call "$health_d" d)"
+  u4_shows "$out" || { printf 'identity not in routed_identities must not suppress: [%s]\n' "$out" >&2; exit 1; }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+T="U4(e): a different, undelivered event id still shows the item"
+health_e="$tmpdir/u4-health-e.json"
+u4_write_health "$health_e" "$now_ms" "false" "[\"$u4_id\"]" "{\"$u4_id\":[\"fact_other_9999\"]}"
+(
+  cd "$u4_repo" || exit 1
+  out="$(u4_call "$health_e" e)"
+  u4_shows "$out" || { printf 'an undelivered event id must not suppress: [%s]\n' "$out" >&2; exit 1; }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+T="U4(f): a symlinked health file still shows the item"
+health_f_real="$tmpdir/u4-health-f-real.json"
+u4_write_health "$health_f_real" "$now_ms" "false" "[\"$u4_id\"]" "{\"$u4_id\":[\"$u4_eid\"]}"
+health_f="$tmpdir/u4-health-f-link.json"
+ln -sf "$health_f_real" "$health_f"
+(
+  cd "$u4_repo" || exit 1
+  out="$(u4_call "$health_f" f)"
+  u4_shows "$out" || { printf 'a symlinked health file must not suppress: [%s]\n' "$out" >&2; exit 1; }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+T="U4(g): a corrupt health file still shows the item"
+health_g="$tmpdir/u4-health-g.json"
+printf '{not valid json at all' > "$health_g"
+(
+  cd "$u4_repo" || exit 1
+  out="$(u4_call "$health_g" g)"
+  u4_shows "$out" || { printf 'corrupt JSON must not suppress: [%s]\n' "$out" >&2; exit 1; }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+T="U4(h): RALLY_ET_ROUTER_HEALTH unset is byte-identical to a control run"
+(
+  cd "$u4_repo" || exit 1
+  out_unset="$(u4_call "" h1)"
+  out_control="$(u4_call "" h2)"
+  u4_shows "$out_unset" || { printf 'env unset must still show the item: [%s]\n' "$out_unset" >&2; exit 1; }
+  [ "$out_unset" = "$out_control" ] || {
+    printf 'env unset must be deterministic/unchanged: [%s] vs [%s]\n' "$out_unset" "$out_control" >&2
+    exit 1
+  }
+  exit 0
+)
+if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+T="U4(i): updated_ms 60s in the future is stale (clock skew) and still shows the item"
+future_ms="$((now_ms + 60000))"
+health_i="$tmpdir/u4-health-i.json"
+u4_write_health "$health_i" "$future_ms" "false" "[\"$u4_id\"]" "{\"$u4_id\":[\"$u4_eid\"]}"
+(
+  cd "$u4_repo" || exit 1
+  out="$(u4_call "$health_i" i)"
+  u4_shows "$out" || { printf 'a future-dated health file must not suppress: [%s]\n' "$out" >&2; exit 1; }
   exit 0
 )
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi

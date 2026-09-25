@@ -108,6 +108,21 @@
 #                            anything else (default: unset) tries the native
 #                            `rally hook before-write` transaction first, per
 #                            a cached per-binary capabilities probe.
+#   RALLY_ET_ROUTER_HEALTH — path to Easy Terminal's rally-router health file
+#                            (et-native-rally-stage2-plan.md LD-H/LD-I/U4).
+#                            Set only when ET's router is routing this agent's
+#                            pane. When it names a fresh (updated_ms within
+#                            -5s..+10s of now), readable,
+#                            non-symlink regular file (<=1 MiB) whose JSON has
+#                            schema "et.rally-router.health.v1", degraded:false,
+#                            and this agent's tool id in routed_identities, the
+#                            per-prompt phases (start, idle) stop re-showing an
+#                            inbound handoff/artifact/inbox item once its event
+#                            id is in delivered[<tool id>] — the router already
+#                            pushed it into this pane. Unset, unreadable, stale,
+#                            degraded, or missing this identity: no change,
+#                            byte-identical to today (fail open). before-write
+#                            and after-write never read this variable.
 #
 # Exit code: 0 always (fail-open). Output goes on stdout per host hook contract.
 
@@ -2397,6 +2412,60 @@ const TEMPLATE_ACTIONS = [
   "update_plan_status", "continue_or_release_claim", "resolve_owned_blocker"
 ];
 
+// ---- U4: ET rally-router per-item suppression --------------------------
+// (et-native-rally-stage2-plan.md LD-H, LD-I, component U4). Identity: the
+// SAME `tool` value (process.argv[2] / RALLY_TOOL_ID) every other comparison
+// in this renderer already keys on -- see `h.target === tool`,
+// `c.tool !== tool`, `s.tool === tool` above, and the inbox clause own
+// `--tool " + BRIEF_SELF` copy-paste command. The ET router registers
+// identities under the same rally --tool value, not the shell-safe
+// hostId() rendering of it, so routed_identities/delivered below are
+// matched against raw `tool`, never BRIEF_SELF.
+//
+// The health file is written by the ET router process on this machine, not
+// peer-authored ledger data, so it never reaches model-visible text and the
+// ARP-004 ident()/prose() quoting contract does not apply -- it only gates a
+// boolean show-vs-suppress decision. It still gets the LD-H/LD-I fail-open
+// discipline: any read, parse, or shape problem, or staleness, or degraded,
+// or this identity missing from routed_identities, returns null and every
+// per-item decision below falls back to today behavior unchanged.
+const ROUTER_HEALTH_MAX_BYTES = 1048576;
+const ROUTER_HEALTH_FRESH_MS = 10000;
+// A stamp more than 5s in the future is ALSO stale, not just one more than
+// 10s in the past. Matched to the rally et_router_health.rs contract
+// exactly, so one bad clock (or a crafted file claiming to be freshly
+// written far ahead of now) cannot suppress notices forever by parking
+// updated_ms in the future.
+const ROUTER_HEALTH_FUTURE_SKEW_MS = 5000;
+function loadDeliveredIds() {
+  const p = process.env.RALLY_ET_ROUTER_HEALTH || "";
+  if (!p) return null;
+  try {
+    const st = fs.lstatSync(p);
+    if (st.isSymbolicLink() || !st.isFile()) return null;
+    if (st.size > ROUTER_HEALTH_MAX_BYTES) return null;
+    const h = JSON.parse(fs.readFileSync(p, "utf8"));
+    if (!h || typeof h !== "object") return null;
+    if (h.schema !== "et.rally-router.health.v1") return null;
+    if (h.degraded !== false) return null;
+    if (typeof h.updated_ms !== "number" || !Number.isFinite(h.updated_ms)) return null;
+    const ageMs = Date.now() - h.updated_ms;
+    if (ageMs > ROUTER_HEALTH_FRESH_MS || ageMs < -ROUTER_HEALTH_FUTURE_SKEW_MS) return null;
+    const routed = Array.isArray(h.routed_identities) ? h.routed_identities : [];
+    if (routed.indexOf(tool) === -1) return null;
+    const mine = h.delivered && typeof h.delivered === "object" ? h.delivered[tool] : null;
+    const ids = Array.isArray(mine) ? mine.filter(v => typeof v === "string") : [];
+    return new Set(ids);
+  } catch (_) {
+    return null;
+  }
+}
+// Only the per-prompt phases suppress (Behaviour, U4): before-write is a
+// separate binary-owned transaction this renderer never composes for
+// (briefMode excludes it), and after-write stays a turn-end notice exactly
+// as today, by locked scope.
+const deliveredIds = (phase === "start" || phase === "idle") ? loadDeliveredIds() : null;
+
 // The per-span trust tag. prose() and ident() emit «…»; this stamps
 // " (untrusted)" after EVERY closing guillemet, so the reader never has to infer
 // which span was quoted. It runs ONCE, on the finished body, AFTER the
@@ -2642,12 +2711,26 @@ function composeBrief() {
   const fact = (bnext && bnext.fact) || {};
   const factId = String(fact.event_id || fact.id || "");
   const action = String(bnext.action || "");
-  const roomHandoffs = Array.isArray(broom.handoffs_for_me) ? broom.handoffs_for_me : [];
+  const roomHandoffsAll = Array.isArray(broom.handoffs_for_me) ? broom.handoffs_for_me : [];
+  // U4: drop only the room-derived handoff items the ET router already
+  // delivered into this pane. `roomHandoffs.length` still drives whether
+  // `handoff_from_room` fires at all below, so an all-delivered inbox
+  // correctly falls through to the next situation in the ladder.
+  const roomHandoffs = deliveredIds
+    ? roomHandoffsAll.filter(h => !deliveredIds.has(String((h && h.event_id) || "")))
+    : roomHandoffsAll;
 
   // next is the ranking authority: the hook renders the rally verdict, it never
   // re-ranks. Room-derived situations only fill in where next said nothing.
+  // U4: an actionable respond_to_handoff/review_artifact whose own fact id is
+  // already in delivered[] is treated as not-actionable for THIS ladder pass
+  // -- the router already put it in front of the agent -- and the ladder
+  // falls through to whatever the rest of the room state resolves to.
+  const suppressActionable = Boolean(deliveredIds) && Boolean(factId)
+    && (action === "respond_to_handoff" || action === "review_artifact")
+    && deliveredIds.has(factId);
   let sit = "";
-  if (bnext.actionable === true) sit = TEMPLATE_ACTIONS.indexOf(action) >= 0 ? action : "generic";
+  if (bnext.actionable === true && !suppressActionable) sit = TEMPLATE_ACTIONS.indexOf(action) >= 0 ? action : "generic";
   else if (phase === "start" && roomHandoffs.length) sit = "handoff_from_room";
   if (!sit && conflict) sit = "before_write_conflict";
   if (!sit && action === "wait") sit = "wait";
@@ -2665,7 +2748,17 @@ function composeBrief() {
   // before_write_conflict): those already tell the reader exactly what to do,
   // and stacking an inbox clause on top would only be noise.
   const inbox = (bnext && bnext.inbox) || {};
-  const inboxCount = Number.isFinite(Number(inbox.count)) ? Math.max(0, Math.trunc(Number(inbox.count))) : 0;
+  const inboxCountRaw = Number.isFinite(Number(inbox.count)) ? Math.max(0, Math.trunc(Number(inbox.count))) : 0;
+  // U4: inbox.items is a bounded sample, not a guaranteed-complete listing of
+  // every open item behind inbox.count (rally may cap it), so only items this
+  // renderer can actually see are ever subtracted -- never the aggregate
+  // blind. A delivered item still not listed in inbox.items keeps counting
+  // toward inboxCount exactly as before; nothing is ever undercounted.
+  const inboxItems = Array.isArray(inbox.items) ? inbox.items : [];
+  const inboxDelivered = deliveredIds
+    ? inboxItems.filter(it => it && deliveredIds.has(String(it.event_id || "")))
+    : [];
+  const inboxCount = Math.max(0, inboxCountRaw - inboxDelivered.length);
   // Captured before the override below so the inbox branch can tell whether it
   // just hid a "notification" verdict -- and, if so, surface that as a peer
   // COUNT instead of silently dropping every peer status/claim/handoff line
@@ -2832,8 +2925,13 @@ function composeBrief() {
     // no actorRef() on anything under inbox. inbox.items[].from and event_id are
     // peer-authored spans this clause never reads, so there is nothing here to
     // quote and nothing to mislabel: that is also why `ledger` is false below.
-    const handoffs = Number.isFinite(Number(inbox.handoffs)) ? Math.max(0, Math.trunc(Number(inbox.handoffs))) : 0;
-    const artifacts = Number.isFinite(Number(inbox.artifacts)) ? Math.max(0, Math.trunc(Number(inbox.artifacts))) : 0;
+    const handoffsRaw = Number.isFinite(Number(inbox.handoffs)) ? Math.max(0, Math.trunc(Number(inbox.handoffs))) : 0;
+    const artifactsRaw = Number.isFinite(Number(inbox.artifacts)) ? Math.max(0, Math.trunc(Number(inbox.artifacts))) : 0;
+    // U4: subtract only the delivered items this renderer could actually
+    // match by event id above (inboxDelivered), same bounded-sample caveat.
+    const inboxDeliveredHandoffs = inboxDelivered.filter(it => it.kind === "handoff").length;
+    const handoffs = Math.max(0, handoffsRaw - inboxDeliveredHandoffs);
+    const artifacts = Math.max(0, artifactsRaw - (inboxDelivered.length - inboxDeliveredHandoffs));
     const oldestSecs = Number.isFinite(Number(inbox.oldest_age_secs)) ? Math.max(0, Math.trunc(Number(inbox.oldest_age_secs))) : 0;
     big = "You have " + inboxCount + " unanswered item" + (inboxCount === 1 ? "" : "s")
       + " addressed to you — they stay open until you answer, no matter how old they get";
