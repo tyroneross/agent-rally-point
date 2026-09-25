@@ -130,6 +130,7 @@ mod decay;
 mod discovery;
 mod doctor;
 mod error;
+mod et_router_health;
 mod event_envelope;
 mod hook_runtime;
 mod hooks_config;
@@ -21326,6 +21327,17 @@ fn deliver_handoff(
     };
     if mode == HandoffDeliveryMode::Record {
         return record_only("--deliver record: not injected".to_string());
+    }
+    // stage2 LD-H / U5: when ET's rally-router already owns delivery to
+    // this identity (a fresh, non-degraded health file lists it), a second
+    // producer writing the same pane would race the router's own send.
+    // Behave exactly like `--deliver record` — commit the fact, write no
+    // PTY bytes — and say why in `detail`.
+    if et_router_health::et_router_owns_delivery(target_tool, et_router_health::now_ms()) {
+        return record_only(
+            "et-router: ET's rally-router already owns delivery to this identity; not injected"
+                .to_string(),
+        );
     }
     // Only a LIVE rally-managed session is a pane we may type into. A bare
     // ledger agent id, a human pane, or a stale/gone session is never injected;
