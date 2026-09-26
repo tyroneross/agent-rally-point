@@ -302,7 +302,7 @@ pub(crate) fn probe_identity(
 ///
 /// Callers that have their own deadline pass what is left of it. A probe that
 /// outlives its caller's deadline turns a wait the caller sized into one it did
-/// not, which is how the store router's 250ms watchdog reserve was being spent
+/// not, which is how the store router's watchdog reserve was being spent
 /// three seconds at a time — see [`probe_live_within`].
 pub(crate) fn probe_identity_within(
     rally_dir: &Path,
@@ -367,8 +367,8 @@ pub(crate) fn probe_identity_within(
 ///
 /// # Why the clamp is load-bearing
 ///
-/// The store router waits `watchdog_remaining() - 250ms`, and that 250ms
-/// reserve exists so the router refuses with its own typed
+/// The store router reserves up to one second of its watchdog budget for
+/// attribution so it refuses with its own typed
 /// `direct-store-busy-unknown` — which names the contender — instead of being
 /// cut off by the wall-clock watchdog, which cannot.
 ///

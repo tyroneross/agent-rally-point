@@ -5,8 +5,9 @@
 //!
 //! # The failure these tests exist for
 //!
-//! `RoomStore::route` waits `watchdog_remaining() - 250ms` for either a live
-//! daemon route or exclusive direct ownership, then refuses. Because the wait
+//! `RoomStore::route` reserves up to one second of the watchdog budget for
+//! attribution after waiting for either a live daemon route or exclusive
+//! direct ownership, then refuses. Because the wait
 //! is derived from the caller's own budget, raising the budget makes that
 //! refusal slower and never rarer — measured 1 failing run in 20 at a 3,000ms
 //! budget and the same 1 in 20 at 30,000ms
@@ -298,8 +299,8 @@ fn a_stale_stamp_is_reported_as_stale_rather_than_as_the_contender() {
 ///
 /// # What this is really asserting
 ///
-/// `direct_owner_wait_bound()` is `watchdog_remaining() - 250ms`. That 250ms
-/// reserve exists for one reason: so the router refuses with its own typed
+/// `direct_owner_wait_bound()` reserves up to one second, and no more than
+/// half the budget, so the router refuses with its own typed
 /// `direct-store-busy-unknown`, which names the contender, rather than being cut
 /// off by the wall-clock watchdog, which names nothing.
 ///
@@ -365,9 +366,9 @@ fn the_router_refuses_within_its_own_bound_instead_of_losing_to_the_watchdog() {
     // The bound the router reports must be the one derived from THIS budget,
     // proving the refusal came from the wait under test and not from some other
     // bounded path. Compared as a range, not an equality: the bound is
-    // `watchdog_remaining() - 250ms` read a few milliseconds into the command,
-    // so it lands just under `budget - 250`, never exactly on it.
-    let ceiling = CONTENDED_BUDGET_MS.parse::<u64>().unwrap() - 250;
+    // half of the 2s budget, read a few milliseconds into the command, so it
+    // lands just under 1s rather than exactly on it.
+    let ceiling = CONTENDED_BUDGET_MS.parse::<u64>().unwrap() / 2;
     let reported: u64 = message
         .split("route within ")
         .nth(1)

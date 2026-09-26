@@ -4182,9 +4182,14 @@ fn direct_owner_busy_unknown_error(
 }
 
 fn direct_owner_wait_bound() -> Duration {
-    const WATCHDOG_RESERVE: Duration = Duration::from_millis(250);
     crate::watchdog_remaining()
-        .map(|remaining| remaining.saturating_sub(WATCHDOG_RESERVE))
+        .map(|remaining| {
+            // The refusal still reads lock-holder and daemon state after the
+            // wait. Leave enough of the outer budget for that attribution even
+            // under a loaded host; a 250ms reserve lost that race in CI.
+            let reserve = remaining.min(Duration::from_secs(2)) / 2;
+            remaining.saturating_sub(reserve)
+        })
         .unwrap_or(store_client::CORRIDOR_BOUND)
         .min(store_client::CORRIDOR_BOUND)
 }
@@ -4204,7 +4209,7 @@ fn acquire_direct_ownership_or_route_bounded(
     loop {
         // Clamp the probe to what is left of THIS wait. Without it a probe
         // against a socket that accepts and never answers blocks for its own
-        // full 3s timeout past the deadline, spending the 250ms watchdog
+        // full 3s timeout past the deadline, spending the watchdog
         // reserve that exists so this loop refuses before the watchdog does.
         let remaining = deadline.saturating_duration_since(Instant::now());
         if let Some(routed) =
