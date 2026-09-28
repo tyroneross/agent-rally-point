@@ -30,13 +30,8 @@
 //! opt-out is `--shared` / `--no-worktree` on `rally run`.
 //!
 //! # Cleanup
-//! `cleanup()` retains any worktree with modified or untracked files and
-//! returns its recovery path in a warning. For a clean worktree, it removes
-//! the directory and, if the per-agent branch is empty (no unmerged commits),
-//! the branch. If a clean branch has unmerged commits, the worktree is removed
-//! but the branch is retained and a `git bundle` is written next to the
-//! worktree path before removal so no committed work is lost. Always
-//! best-effort — a failure to clean up never blocks `rally stop`.
+//! `cleanup()` retains dirty or unmerged worktrees for explicit review.
+//! It only removes clean worktrees whose branch is merged into a known target.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -51,6 +46,9 @@ pub(crate) struct ProvisionedWorktree {
     pub(crate) path: PathBuf,
     /// Per-agent branch name (e.g. `rally/claude-reviewer-01`).
     pub(crate) branch: String,
+    /// The ref selected at creation, independent of the caller's later HEAD.
+    pub(crate) merge_target_ref: Option<String>,
+    pub(crate) merge_target_commit: String,
 }
 
 /// Compute the directory under which all per-agent worktrees live for the
@@ -106,6 +104,8 @@ Run `git worktree remove --force` against it first, or pick a different session 
     }
     let branch = planned_branch_name(session_id);
     let base = run_base(repo_root, git_bin).unwrap_or_else(|_| "HEAD".to_string());
+    let merge_target_ref = (base != "HEAD").then(|| base.clone());
+    let merge_target_commit = git_output(repo_root, git_bin, &["rev-parse", &base])?;
 
     // `git worktree add -b <branch> <path> <base>` creates the branch off
     // <base> and checks it out into <path> in one shot. Fails if the
@@ -133,7 +133,12 @@ The default is per-agent worktree isolation; pass --shared to opt out.",
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    Ok(ProvisionedWorktree { path, branch })
+    Ok(ProvisionedWorktree {
+        path,
+        branch,
+        merge_target_ref,
+        merge_target_commit: merge_target_commit.trim().to_string(),
+    })
 }
 
 /// Outcome of a cleanup attempt; informational only.
@@ -142,7 +147,6 @@ The default is per-agent worktree isolation; pass --shared to opt out.",
 /// hooks (e.g. `rally stop --json` could echo them).  The current
 /// production callers discard the outcome — cleanup is best-effort and
 /// must not block `rally stop`.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct CleanupOutcome {
     /// True when the worktree directory was removed (or did not exist).
@@ -151,25 +155,19 @@ pub(crate) struct CleanupOutcome {
     /// into the run base or empty). False when the branch was retained
     /// because it carried unmerged commits.
     pub(crate) branch_deleted: bool,
-    /// Optional path to a git bundle written before removal when the
-    /// branch had unmerged work.
+    /// Optional safety bundle. Implicit cleanup now retains unmerged source,
+    /// so this is always `None` and remains only for disposition compatibility.
     pub(crate) bundle_path: Option<PathBuf>,
     /// Non-fatal warnings collected during cleanup.
     pub(crate) warnings: Vec<String>,
-    /// True when the branch had unmerged work AND the bundle write failed.
-    ///
-    /// When this is true the caller MUST NOT count the worktree as reaped:
-    /// skipping it preserves the unmerged work until the bundle problem is
-    /// resolved.
-    pub(crate) bundle_failed: bool,
+    pub(crate) merged: Option<bool>,
+    pub(crate) dirty: Option<bool>,
+    pub(crate) reason: &'static str,
 }
 
 /// Remove a per-agent worktree and its branch (when safe).
 ///
-/// Dirty-worktree guard: modified or untracked files retain the worktree in
-/// place and return its recovery path in `warnings`. Bundle-before-remove:
-/// if the clean branch carries unmerged commits relative to the run base,
-/// this writes `<worktree-path>.bundle` first so no committed work is lost.
+/// Dirty or unmerged worktrees retain their checkout and recovery path.
 /// Then non-forcing `git worktree remove` performs Git's own final dirtiness
 /// check before removing the worktree directory, and (when safe) `git branch
 /// -d` removes the branch.
@@ -183,7 +181,37 @@ pub(crate) fn cleanup(
     branch: &str,
     git_bin: &str,
 ) -> CleanupOutcome {
+    let base = run_base(repo_root, git_bin)
+        .ok()
+        .filter(|base| base != "HEAD");
+    cleanup_against(repo_root, worktree_path, branch, base.as_deref(), git_bin)
+}
+
+/// Implicit lifecycle cleanup uses the recorded creation target. Legacy sessions
+/// without that ref retain their source rather than guessing from a moving HEAD.
+pub(crate) fn cleanup_against(
+    repo_root: &Path,
+    worktree_path: &Path,
+    branch: &str,
+    target_ref: Option<&str>,
+    git_bin: &str,
+) -> CleanupOutcome {
     let mut warnings = Vec::new();
+
+    // A missing directory may still be registered as a prunable Git worktree.
+    // Implicit cleanup never claims it was removed or deletes its branch.
+    if !worktree_path.exists() {
+        warnings.push(format!("rally stop: worktree path {} is missing; inspect Git registration before explicit prune", worktree_path.display()));
+        return CleanupOutcome {
+            worktree_removed: false,
+            branch_deleted: false,
+            bundle_path: None,
+            warnings,
+            merged: None,
+            dirty: None,
+            reason: "path_missing_registration_unverified",
+        };
+    }
 
     // Never force-remove a dirty worktree. A bundle protects commits, but it
     // cannot preserve modified or untracked files. If status cannot be read,
@@ -206,7 +234,9 @@ pub(crate) fn cleanup(
                     branch_deleted: false,
                     bundle_path: None,
                     warnings,
-                    bundle_failed: false,
+                    merged: None,
+                    dirty: Some(true),
+                    reason: "dirty",
                 };
             }
             Ok(out) => {
@@ -220,7 +250,9 @@ pub(crate) fn cleanup(
                     branch_deleted: false,
                     bundle_path: None,
                     warnings,
-                    bundle_failed: false,
+                    merged: None,
+                    dirty: None,
+                    reason: "inspection_failed",
                 };
             }
             Err(err) => {
@@ -233,64 +265,57 @@ pub(crate) fn cleanup(
                     branch_deleted: false,
                     bundle_path: None,
                     warnings,
-                    bundle_failed: false,
+                    merged: None,
+                    dirty: None,
+                    reason: "inspection_failed",
                 };
             }
         }
     }
-    let base = run_base(repo_root, git_bin).unwrap_or_else(|_| "HEAD".to_string());
-
-    // 1. If the branch has unmerged commits, bundle before remove.
-    //    Safety invariant (f3): if the bundle fails we must NOT remove the
-    //    worktree — unmerged work would be permanently lost.  Set
-    //    `bundle_failed = true` and return early so the GC caller can skip
-    //    this candidate rather than counting it as reaped.
-    let mut bundle_path = None;
-    let bundle_failed: bool;
-    let has_unmerged = branch_has_unmerged(repo_root, branch, &base, git_bin);
-    if has_unmerged {
-        let bundle = bundle_path_for(worktree_path);
-        let bundle_result = Command::new(git_bin)
-            .arg("-C")
-            .arg(repo_root)
-            .arg("bundle")
-            .arg("create")
-            .arg(&bundle)
-            .arg(branch)
-            .output();
-        match bundle_result {
-            Ok(out) if out.status.success() => {
-                bundle_path = Some(bundle);
-                bundle_failed = false;
-            }
-            Ok(out) => {
-                let msg = format!(
-                    "rally stop: bundle write for branch {branch} failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-                warnings.push(msg);
-                // Return immediately — do NOT remove unmerged work without a bundle.
-                return CleanupOutcome {
-                    worktree_removed: false,
-                    branch_deleted: false,
-                    bundle_path: None,
-                    warnings,
-                    bundle_failed: true,
-                };
-            }
-            Err(err) => {
-                warnings.push(format!("rally stop: could not invoke git bundle: {err}"));
-                return CleanupOutcome {
-                    worktree_removed: false,
-                    branch_deleted: false,
-                    bundle_path: None,
-                    warnings,
-                    bundle_failed: true,
-                };
-            }
+    let Some(base) = target_ref else {
+        warnings.push(format!(
+            "rally stop: no recorded merge target for {}; retained it for review",
+            worktree_path.display()
+        ));
+        return CleanupOutcome {
+            worktree_removed: false,
+            branch_deleted: false,
+            bundle_path: None,
+            warnings,
+            merged: None,
+            dirty: Some(false),
+            reason: "merge_target_unknown",
+        };
+    };
+    match branch_has_unmerged(repo_root, branch, base, git_bin) {
+        Some(false) => {}
+        Some(true) => {
+            warnings.push(format!("rally stop: retained unmerged worktree for review at {} (branch {branch}, target {base})", worktree_path.display()));
+            return CleanupOutcome {
+                worktree_removed: false,
+                branch_deleted: false,
+                bundle_path: None,
+                warnings,
+                merged: Some(false),
+                dirty: Some(false),
+                reason: "unmerged",
+            };
         }
-    } else {
-        bundle_failed = false;
+        None => {
+            warnings.push(format!(
+                "rally stop: could not verify merge status of {branch} against {base}; retained {}",
+                worktree_path.display()
+            ));
+            return CleanupOutcome {
+                worktree_removed: false,
+                branch_deleted: false,
+                bundle_path: None,
+                warnings,
+                merged: None,
+                dirty: Some(false),
+                reason: "merge_status_unknown",
+            };
+        }
     }
 
     // 2. Remove the worktree directory without --force. Git performs the
@@ -320,14 +345,11 @@ pub(crate) fn cleanup(
                 "rally stop: could not invoke git worktree remove: {err}"
             )),
         }
-    } else {
-        // Already gone — nothing to do.
-        worktree_removed = true;
     }
 
     // 3. Delete the branch if it's empty (-d is safe; refuses on unmerged).
     let mut branch_deleted = false;
-    if !has_unmerged {
+    if worktree_removed {
         let delete = Command::new(git_bin)
             .arg("-C")
             .arg(repo_root)
@@ -357,9 +379,15 @@ pub(crate) fn cleanup(
     CleanupOutcome {
         worktree_removed,
         branch_deleted,
-        bundle_path,
+        bundle_path: None,
         warnings,
-        bundle_failed,
+        merged: Some(true),
+        dirty: Some(false),
+        reason: if worktree_removed {
+            "removed"
+        } else {
+            "remove_failed"
+        },
     }
 }
 
@@ -410,24 +438,14 @@ fn run_base(repo_root: &Path, git_bin: &str) -> Result<String> {
     Ok("HEAD".to_string())
 }
 
-fn branch_has_unmerged(repo_root: &Path, branch: &str, base: &str, git_bin: &str) -> bool {
+fn branch_has_unmerged(repo_root: &Path, branch: &str, base: &str, git_bin: &str) -> Option<bool> {
     // `git rev-list <base>..<branch>` lists commits on branch not on base.
     // Empty output → branch is fully merged into base → safe to delete.
     let range = format!("{base}..{branch}");
     match git_output(repo_root, git_bin, &["rev-list", "--count", &range]) {
-        Ok(stdout) => stdout.trim() != "0",
-        Err(_) => {
-            // If we can't compute mergedness, treat as unmerged (conservative
-            // — never destroys work).
-            true
-        }
+        Ok(stdout) => stdout.trim().parse::<u64>().ok().map(|count| count > 0),
+        Err(_) => None,
     }
-}
-
-fn bundle_path_for(worktree_path: &Path) -> PathBuf {
-    let mut path = worktree_path.as_os_str().to_owned();
-    path.push(".bundle");
-    PathBuf::from(path)
 }
 
 fn git_output(repo_root: &Path, git_bin: &str, args: &[&str]) -> Result<String> {
@@ -582,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_bundles_and_retains_unmerged_branch() {
+    fn cleanup_retains_clean_unmerged_worktree_and_branch() {
         if !git_available() {
             eprintln!("skipping: git not on PATH");
             return;
@@ -598,17 +616,16 @@ mod tests {
 
         let outcome = cleanup(&repo, &pw.path, &pw.branch, "git");
 
-        assert!(outcome.worktree_removed);
+        assert!(!outcome.worktree_removed);
         assert!(
             !outcome.branch_deleted,
             "unmerged branch must be retained, not deleted"
         );
         assert!(
-            outcome.bundle_path.is_some(),
-            "must bundle before remove when work is unmerged"
+            outcome.bundle_path.is_none(),
+            "retained checkout needs no bundle"
         );
-        let bundle = outcome.bundle_path.unwrap();
-        assert!(bundle.exists(), "bundle file must exist on disk");
+        assert!(pw.path.exists(), "unmerged checkout must remain available");
 
         // Branch must still be present.
         let exists = Command::new("git")

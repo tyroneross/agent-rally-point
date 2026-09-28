@@ -7,35 +7,27 @@
 //!
 //! # Reap criteria
 //! A worktree is a **candidate** when it is rally-managed (branch starts with
-//! `rally/` OR path under `.rally/worktrees/`). It is **reapable** if either:
-//!
-//! - (a) The branch is fully merged into the default branch
-//!   (`git merge-base --is-ancestor <branch> <default>`), OR
-//! - (b) The owning agent's presence is stale beyond the configured TTL.
+//! `rally/` OR path under `.rally/worktrees/`). It is reapable only when clean,
+//! merged into the default branch, and no exact active managed owner exists.
 //!
 //! # NEVER reap
 //! - The default branch worktree (the canonical checkout).
 //! - The current worktree (the process's cwd) — identified by the `HEAD`
 //!   the git process resolves.
-//! - Any worktree whose owner has LIVE (non-stale) presence in the room.
-//! - An unmerged worktree whose owner is LIVE (cleanup() bundles unmerged
-//!   work, but we must not even attempt that when the owner is active).
+//! - Any worktree with an active exact managed-session owner, merged or not.
+//! - Any unmerged worktree or any tree whose ownership ledger is unavailable.
 //!
 //! # Reuse of cleanup()
-//! `run_worktree::cleanup` performs the safe remove sequence:
-//! bundle-if-unmerged → `git worktree remove --force` (with rm-rf+prune
-//! fallback) → `git branch -d` (safe, refuses unmerged). This module
+//! `run_worktree::cleanup_against` performs non-forcing removal only after
+//! confirming the branch is merged and the checkout is clean. This module
 //! ENUMERATES and FILTERS, then delegates every actual removal to `cleanup()`.
 //!
 //! # Liveness
 //! The caller supplies [`PresenceFact`] values (a flat projection of the room's
 //! `FactKind::Presence` facts). The reaper computes staleness from `created_at`
 //! vs `now_ts` using the same threshold as `agent_state::IDLE_THRESHOLD_SECS`
-//! (but overridable by the caller's `ttl_secs`). Owner derivation: the agent
-//! name is extracted from the branch name (`rally/<agent>-<rest>`) and matched
-//! against the `tool` field in each presence fact using prefix/substring
-//! matching — robust enough without requiring an exact-name contract between
-//! `rally run` and `rally worktree gc`.
+//! (but overridable by the caller's `ttl_secs`). Presence is only a secondary
+//! veto; authority comes from exact managed-session path and branch records.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -68,6 +60,15 @@ pub struct PresenceFact {
     pub created_at: String,
 }
 
+/// Active managed-session ownership from the exact Rally session ledger.
+#[derive(Clone, Debug)]
+pub struct ManagedOwner {
+    pub worktree_path: Option<PathBuf>,
+    pub branch: Option<String>,
+    pub session_id: String,
+    pub tool: String,
+}
+
 /// Configuration for a single GC run.
 pub struct GcConfig {
     /// The canonical repo root (parent of `.rally/`, `.git/`).
@@ -86,23 +87,13 @@ pub struct GcConfig {
     /// caller cannot open the room store (graceful degradation: falls back to
     /// TTL-only staleness with no live presence data).
     pub presence_facts: Vec<PresenceFact>,
+    /// `None` means the exact managed-session ledger was unavailable. In that
+    /// state GC must retain every worktree rather than infer ownership.
+    pub managed_owners: Option<Vec<ManagedOwner>>,
     /// Git binary to use (e.g. `"git"`).
     pub git_bin: String,
-    /// f2 — Backend-liveness gate for unmerged worktrees that are stale-by-TTL
-    /// only.
-    ///
-    /// When supplied, a worktree that is reapable ONLY because its owner is
-    /// TTL-stale (i.e. unmerged) is additionally required to be confirmed
-    /// backend-dead before it is reaped.  The probe is called with the
-    /// per-agent `session_id` (branch suffix after `rally/`), and returns
-    /// `true` when the backing tmux/cmux session is confirmed gone (dead) and
-    /// `false` when the session is still live.  If the probe returns `false`
-    /// (live backend), the GC skips the worktree with a reason mentioning the
-    /// live backend.
-    ///
-    /// `None` → no backend probe is performed (TTL-only staleness is
-    /// sufficient).  This preserves backward-compatibility for callers that
-    /// do not have a tmux/cmux binary available.
+    /// Compatibility input retained for callers of the v1 Rust helper.
+    /// Unmerged worktrees are now always retained, so GC does not invoke it.
     pub backend_liveness_probe: Option<BackendLivenessProbe>,
 }
 
@@ -222,7 +213,72 @@ pub fn run_gc(config: GcConfig) -> Result<GcReport, String> {
             continue;
         }
 
-        // Determine owner liveness.
+        // An active exact managed-session record retains the source, even when
+        // merged. A missing ledger or contradictory path/branch also retains it.
+        let Some(ref owners) = config.managed_owners else {
+            skipped.push(GcSkipped {
+                worktree_path: entry.path.clone(),
+                branch: entry.branch.clone(),
+                reason: "managed-session ledger unavailable".to_string(),
+            });
+            continue;
+        };
+        if owners
+            .iter()
+            .any(|owner| owner.worktree_path.is_none() || owner.branch.is_none())
+        {
+            skipped.push(GcSkipped {
+                worktree_path: entry.path.clone(),
+                branch: entry.branch.clone(),
+                reason: "incomplete managed-session ownership record".to_string(),
+            });
+            continue;
+        }
+        let exact: Vec<_> = owners
+            .iter()
+            .filter(|owner| {
+                owner
+                    .worktree_path
+                    .as_ref()
+                    .is_some_and(|path| same_path(path, &entry.path))
+            })
+            .collect();
+        if exact.len() > 1
+            || exact
+                .iter()
+                .any(|owner| owner.branch.as_deref() != Some(entry.branch.as_str()))
+        {
+            skipped.push(GcSkipped {
+                worktree_path: entry.path.clone(),
+                branch: entry.branch.clone(),
+                reason: "managed-session ownership ambiguous".to_string(),
+            });
+            continue;
+        }
+        if owners.iter().any(|owner| {
+            owner.branch.as_deref() == Some(entry.branch.as_str())
+                && owner
+                    .worktree_path
+                    .as_ref()
+                    .is_some_and(|path| !same_path(path, &entry.path))
+        }) {
+            skipped.push(GcSkipped {
+                worktree_path: entry.path.clone(),
+                branch: entry.branch.clone(),
+                reason: "managed-session branch/path conflict".to_string(),
+            });
+            continue;
+        }
+        if let Some(owner) = exact.first() {
+            skipped.push(GcSkipped {
+                worktree_path: entry.path.clone(),
+                branch: entry.branch.clone(),
+                reason: format!("active managed owner {}/{}", owner.tool, owner.session_id),
+            });
+            continue;
+        }
+
+        // Legacy presence is a secondary veto, never positive authority.
         let owner_prefix = derive_owner_prefix(&entry.branch);
         let owner_is_live = is_owner_live(&owner_prefix, &liveness);
 
@@ -234,66 +290,25 @@ pub fn run_gc(config: GcConfig) -> Result<GcReport, String> {
         };
 
         // Classify.
-        if owner_is_live && !merged {
+        if owner_is_live {
             // Live owner + unmerged → must NOT reap.
             skipped.push(GcSkipped {
                 worktree_path: entry.path.clone(),
                 branch: entry.branch.clone(),
-                reason: format!(
-                    "live owner ({owner_prefix}) — unmerged work; wait for agent to finish"
-                ),
+                reason: format!("live presence ({owner_prefix}); wait for agent to finish"),
             });
             continue;
         }
 
-        // f2 — backend-liveness gate: an unmerged worktree that is reapable
-        // ONLY by TTL staleness (not by merge) must also be confirmed
-        // backend-dead before we touch it.  A long-running agent that simply
-        // hasn't posted a heartbeat recently is indistinguishable from a dead
-        // one by TTL alone.  If the probe says the session is still live, skip.
         if !merged {
-            // Reapable only by TTL staleness (not by merge): we must confirm the
-            // agent is actually gone before deleting unmerged work.
-            let session_id = entry.branch.strip_prefix("rally/").unwrap_or(&entry.branch);
-            match config.backend_liveness_probe {
-                Some(ref probe) => {
-                    if !probe(session_id) {
-                        skipped.push(GcSkipped {
-                            worktree_path: entry.path.clone(),
-                            branch: entry.branch.clone(),
-                            reason: format!(
-                                "backend probe says session {session_id} is still live — not reaped"
-                            ),
-                        });
-                        continue;
-                    }
-                    // backend confirmed dead → fall through to reap (cleanup bundles).
-                }
-                None => {
-                    // No backend probe wired: TTL staleness alone cannot tell a dead
-                    // agent from a quiet long-running one. Conservatively refuse to reap
-                    // unmerged work. (Merged worktrees are already reaped above.)
-                    skipped.push(GcSkipped {
-                        worktree_path: entry.path.clone(),
-                        branch: entry.branch.clone(),
-                        reason: format!(
-                            "unmerged + no backend probe — refusing to reap on staleness alone (session {session_id})"
-                        ),
-                    });
-                    continue;
-                }
-            }
+            skipped.push(GcSkipped {
+                worktree_path: entry.path.clone(),
+                branch: entry.branch.clone(),
+                reason: "unmerged worktree retained for explicit review".to_string(),
+            });
+            continue;
         }
-
-        // Reapable: merged OR (unmerged + stale owner + backend-dead).
-        let reason = if merged {
-            "branch merged into default".to_string()
-        } else {
-            format!(
-                "owner stale (>{ttl}s since last presence)",
-                ttl = config.ttl_secs
-            )
-        };
+        let reason = "branch merged into default and no live owner observed".to_string();
 
         candidates.push(GcCandidate {
             worktree_path: entry.path.clone(),
@@ -307,23 +322,27 @@ pub fn run_gc(config: GcConfig) -> Result<GcReport, String> {
         }
 
         // Apply: call cleanup().
-        let outcome = run_worktree::cleanup(repo, &entry.path, &entry.branch, git_bin);
+        let outcome = run_worktree::cleanup_against(
+            repo,
+            &entry.path,
+            &entry.branch,
+            default_branch.as_deref(),
+            git_bin,
+        );
         for w in &outcome.warnings {
             warnings.push(w.clone());
         }
-        // f3 — bundle_failed guard: if cleanup() could not write the safety
-        // bundle for unmerged work, it did NOT remove the worktree.  Push to
-        // skipped (not reaped) so the caller knows the worktree is still
-        // present and surfaces the warning.
-        if outcome.bundle_failed {
+        // A cleanup refusal remains skipped; never report it as reaped.
+        if !outcome.worktree_removed {
             warnings.push(format!(
-                "worktree gc: skipped {} — bundle failed, unmerged work preserved",
-                entry.path.display()
+                "worktree gc: skipped {} — {}",
+                entry.path.display(),
+                outcome.reason
             ));
             skipped.push(GcSkipped {
                 worktree_path: entry.path.clone(),
                 branch: entry.branch.clone(),
-                reason: "bundle write failed — unmerged work not removed".to_string(),
+                reason: outcome.reason.to_string(),
             });
             continue;
         }

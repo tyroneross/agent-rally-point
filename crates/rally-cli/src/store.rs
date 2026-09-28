@@ -7279,6 +7279,26 @@ fn facts_from_segments(log_dir: &Path, archive_dir: &Path) -> Result<Vec<Fact>> 
     Ok(facts)
 }
 
+/// Read the canonical segment log for advisory worktree closeout without
+/// opening a RoomStore. `open_existing_at` can reconcile derived SQLite and
+/// indexes; this path intentionally performs no migration or filesystem write.
+/// DB-only and legacy-monolith rooms are unavailable until reconciled by an
+/// explicit maintenance operation.
+pub(crate) fn read_only_closeout_snapshot(
+    root: &Path,
+) -> Result<Option<(Vec<Fact>, RoomSnapshot)>> {
+    let dir = root.join(".rally");
+    let log = dir.join(LOG_DIRNAME);
+    let archive = dir.join(ARCHIVE_DIRNAME);
+    if read_segment_files(&log)?.is_empty() && read_segment_files(&archive)?.is_empty() {
+        return Ok(None);
+    }
+    let facts = facts_from_segments(&log, &archive)?;
+    let coord = crate::hooks_config::resolve_coordination(root).unwrap_or_default();
+    let snapshot = snapshot_from_facts_with_policy(&facts, &coord, false);
+    Ok(Some((facts, snapshot)))
+}
+
 /// Read exactly one engagement's live and archive segments. Rotation moves a
 /// segment between these directories, so both locations are always unioned;
 /// `include_archived` is a projection policy, not a storage-location switch.

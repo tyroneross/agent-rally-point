@@ -914,6 +914,12 @@ fn resolve_watchdog_timeout(args: &[String]) -> Duration {
     if matches!(first_positionals(args), (Some("worktree"), Some("plan"))) {
         return Duration::from_millis(WORKTREE_PLAN_WATCHDOG_TIMEOUT_MS);
     }
+    if matches!(
+        first_positionals(args),
+        (Some("worktree"), Some("closeout"))
+    ) {
+        return Duration::from_millis(WORKTREE_PLAN_WATCHDOG_TIMEOUT_MS);
+    }
 
     // (3) Everything else: the hook-safe default.
     Duration::from_millis(DEFAULT_WATCHDOG_TIMEOUT_MS)
@@ -1684,6 +1690,7 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
         // Sweep-reaper: GC leftover per-agent worktrees
         CliCommand::WorktreeGc(args) => command_worktree_gc(args),
         CliCommand::WorktreePlan(args) => command_worktree_plan(args),
+        CliCommand::WorktreeCloseout(args) => command_worktree_closeout(args),
         // Layer 1: completion-scoped self-exit re-check
         CliCommand::SelfExitCheck(args) => command_self_exit_check(args),
         // BACKLOG S-P3, Chunk C: rallyd store daemon lifecycle
@@ -2221,6 +2228,229 @@ fn command_daemon_status(json: bool) -> Result<Output> {
 
 const SCHEMA_WORKTREE_GC: &str = "agent-rally.command.worktree-gc.v1";
 const SCHEMA_WORKTREE_PLAN: &str = "agent-rally.command.worktree-plan.v1";
+const SCHEMA_WORKTREE_CLOSEOUT: &str = "agent-rally.command.worktree-closeout.v1";
+
+fn command_worktree_closeout(args: WorktreeCloseoutArgs) -> Result<Output> {
+    let repo = repo_root()?;
+    let plan = worktree_plan::build(&repo, None).map_err(RallyError::Message)?;
+    let common_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .map_err(|e| RallyError::Message(format!("git common dir: {e}")))?;
+    if !common_output.status.success() {
+        return Err(RallyError::Message(
+            "git common dir unavailable".to_string(),
+        ));
+    }
+    let common_raw = PathBuf::from(String::from_utf8_lossy(&common_output.stdout).trim());
+    let common = if common_raw.is_absolute() {
+        common_raw
+    } else {
+        repo.join(common_raw)
+    };
+    let common = common.canonicalize().unwrap_or(common);
+    let room_evidence = store::read_only_closeout_snapshot(&repo).and_then(|source| {
+        let (facts, snapshot) = source.ok_or_else(|| {
+            RallyError::Message("no canonical Rally segments available".to_string())
+        })?;
+        let sessions: Vec<SessionView> =
+            active_session_views_from_facts(facts, BackendBins::default())
+                .into_iter()
+                .map(|(_, view)| view)
+                .collect();
+        Ok((sessions, snapshot.active_claims))
+    });
+    let rally_available = room_evidence.is_ok();
+    let (sessions, claims) = room_evidence.unwrap_or_default();
+    let canonical =
+        |path: &std::path::Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut paths = std::collections::BTreeSet::new();
+    let mut rows = Vec::new();
+    for wt in &plan.worktrees {
+        let path = canonical(std::path::Path::new(&wt.path));
+        paths.insert(path.clone());
+        rows.push((path, Some(wt)));
+    }
+    for view in &sessions {
+        if let Some(path) = &view.session.worktree_path {
+            let path = canonical(path);
+            if paths.insert(path.clone()) {
+                rows.push((path, None));
+            }
+        }
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut worktrees = Vec::new();
+    for (path, wt) in rows {
+        let matches: Vec<_> = sessions
+            .iter()
+            .filter(|view| {
+                view.session
+                    .worktree_path
+                    .as_ref()
+                    .is_some_and(|p| canonical(p) == path)
+            })
+            .collect();
+        let sole = (matches.len() == 1)
+            .then(|| matches.first())
+            .flatten()
+            .copied();
+        let session_branch_matches = sole.is_none_or(|view| {
+            wt.and_then(|w| w.branch.as_deref())
+                == view
+                    .session
+                    .branch
+                    .as_deref()
+                    .map(|b| format!("refs/heads/{b}"))
+                    .as_deref()
+        });
+        // A live Rally record can retain an old path after Git moves a
+        // worktree. Neither the old Rally path nor Git's new path is safe to
+        // describe as unowned merely because the exact-path join missed it.
+        let branch_collision = sessions.iter().any(|view| {
+            let session_branch = view
+                .session
+                .branch
+                .as_deref()
+                .map(|branch| format!("refs/heads/{branch}"));
+            let session_path = view.session.worktree_path.as_ref().map(|p| canonical(p));
+            let git_path_for_session_branch = session_branch.as_deref().and_then(|branch| {
+                plan.worktrees
+                    .iter()
+                    .find(|other| other.branch.as_deref() == Some(branch))
+                    .map(|other| canonical(std::path::Path::new(&other.path)))
+            });
+            (wt.and_then(|w| w.branch.as_deref()) == session_branch.as_deref()
+                && session_path.as_ref() != Some(&path))
+                || (session_path.as_ref() == Some(&path)
+                    && git_path_for_session_branch.as_ref() != Some(&path))
+        });
+        let git_head_matches = wt.is_none_or(|worktree| {
+            worktree.branch.as_deref().is_none_or(|branch| {
+                plan.branches
+                    .iter()
+                    .find(|row| Some(row.name.as_str()) == branch.strip_prefix("refs/heads/"))
+                    .is_some_and(|row| row.head == worktree.head)
+            })
+        });
+        let liveness = sole.map(|view| format!("{:?}", view.liveness).to_lowercase());
+        let availability = if !rally_available {
+            "unavailable"
+        } else if matches.len() > 1
+            || !session_branch_matches
+            || branch_collision
+            || !git_head_matches
+        {
+            "ambiguous"
+        } else if liveness.as_deref() == Some("stale") {
+            "stale"
+        } else if liveness.as_deref() == Some("unknown") {
+            "unavailable"
+        } else {
+            "current"
+        };
+        let ownership_status = if availability != "current" {
+            "unknown"
+        } else if liveness.as_deref() == Some("live") {
+            "live_owner"
+        } else {
+            "no_live_owner_observed"
+        };
+        let target_ref = sole.and_then(|view| view.session.merge_target_ref.as_deref());
+        let target_commit = sole.and_then(|view| view.session.merge_target_commit.as_deref());
+        let merge_status = match (wt.and_then(|w| w.branch.as_deref()), target_ref) {
+            (Some(branch), Some(target)) => {
+                let out = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(["merge-base", "--is-ancestor", branch, target])
+                    .output();
+                match out {
+                    Ok(out) if out.status.success() => "merged",
+                    Ok(out) if out.status.code() == Some(1) => "unmerged",
+                    _ => "unknown",
+                }
+            }
+            _ => "unknown",
+        };
+        let claim_count = sole
+            .map(|view| {
+                claims
+                    .iter()
+                    .filter(|fact| {
+                        fact.tool.as_deref() == Some(view.session.tool.as_str())
+                            && fact.from_session_id.as_deref()
+                                == Some(view.session.session_id.as_str())
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        let branch_state = if wt.is_none() {
+            "missing"
+        } else if wt.is_some_and(|w| w.branch.is_none()) {
+            "detached"
+        } else if !session_branch_matches || branch_collision || !git_head_matches {
+            "mismatch"
+        } else {
+            "attached"
+        };
+        let git_status = wt.map(|w| w.status.as_str()).unwrap_or("missing");
+        let action = if git_status == "clean"
+            && merge_status == "merged"
+            && ownership_status == "no_live_owner_observed"
+            && availability == "current"
+        {
+            "review_removal"
+        } else {
+            "retain"
+        };
+        let reasons: Vec<&str> = [
+            branch_state != "attached" && branch_state != "missing",
+            git_status != "clean",
+            merge_status != "merged",
+            ownership_status != "no_live_owner_observed",
+            availability != "current",
+        ]
+        .into_iter()
+        .zip([
+            "branch_inconsistent",
+            "worktree_not_clean",
+            "merge_status_unproven",
+            "owner_not_cleared",
+            "ownership_evidence_unavailable",
+        ])
+        .filter_map(|(present, reason)| present.then_some(reason))
+        .collect();
+        worktrees.push(json!({
+            "path": path, "head": wt.map(|w| w.head.as_str()), "branch": wt.and_then(|w| w.branch.as_deref()),
+            "git_status": git_status, "branch_state": branch_state,
+            "merge_target": { "ref": target_ref, "commit": target_commit, "status": merge_status },
+            "ownership": { "status": ownership_status, "source": "rally_managed_session", "session_id": sole.map(|v| v.session.session_id.as_str()), "tool": sole.map(|v| v.session.tool.as_str()), "liveness": liveness, "claims_status": if !rally_available { "unavailable" } else if claim_count > 0 { "active" } else { "none_observed" }, "claim_count": claim_count, "availability": availability },
+            "disposition": { "action": action, "reasons": reasons },
+        }));
+    }
+    let count = worktrees.len();
+    let body = envelope_value(
+        "worktree_closeout",
+        SCHEMA_WORKTREE_CLOSEOUT,
+        json!({
+            "worktree_closeout": {
+                "schema_version": 1,
+                "repository": { "root": repo, "git_common_dir": common },
+                "generated_at": now_string(),
+                "sources": { "git": "current", "rally": if rally_available { "current" } else { "unavailable" } },
+                "worktrees": worktrees,
+            }
+        }),
+    )?;
+    Ok(Output::new(
+        args.json,
+        format!("rally worktree closeout: {count} worktrees (read-only)"),
+        body,
+    ))
+}
 
 fn command_worktree_plan(args: WorktreePlanArgs) -> Result<Output> {
     let plan =
@@ -2273,7 +2503,9 @@ fn command_worktree_gc(args: WorktreeGcArgs) -> Result<Output> {
     // supply empty facts and no probe (merged worktrees still reap; unmerged
     // are conservatively skipped until a probe is available).
     let bins = BackendBins::default();
-    let room_result = RoomStore::open();
+    let room_result = RoomStore::open_existing_at(repo.clone()).and_then(|room| {
+        room.ok_or_else(|| RallyError::Message("no Rally room exists".to_string()))
+    });
 
     let presence_facts: Vec<worktree_gc::PresenceFact> = room_result
         .as_ref()
@@ -2295,31 +2527,19 @@ fn command_worktree_gc(args: WorktreeGcArgs) -> Result<Output> {
         })
         .unwrap_or_default();
 
-    // f2 — build a real backend-liveness probe from the session ledger.
-    // `probe_session_liveness` queries tmux/cmux for each active managed
-    // session and returns Stale when the backing session is gone.
-    // The probe closure captures an Arc of the result map so it is cheap to
-    // clone and 'static-safe for the GcConfig field.
-    let backend_liveness_probe: Option<worktree_gc::BackendLivenessProbe> =
-        room_result.ok().and_then(|room| {
-            active_session_facts(&room).ok().map(|active| {
-                let liveness_map = probe_session_liveness(&active, bins);
-                let arc_map = std::sync::Arc::new(liveness_map);
-                let probe: worktree_gc::BackendLivenessProbe =
-                    std::sync::Arc::new(move |session_id: &str| -> bool {
-                        // Returns true when the backend is DEAD (Stale), allowing the GC
-                        // to proceed; false when still Live or Unknown (conservative skip).
-                        matches!(
-                            arc_map
-                                .get(session_id)
-                                .copied()
-                                .unwrap_or(SessionLiveness::Unknown),
-                            SessionLiveness::Stale
-                        )
-                    });
-                probe
-            })
-        });
+    let managed_owners = room_result.as_ref().ok().and_then(|room| {
+        active_session_views(room, bins.clone()).ok().map(|views| {
+            views
+                .into_iter()
+                .map(|(_, view)| worktree_gc::ManagedOwner {
+                    worktree_path: view.session.worktree_path,
+                    branch: view.session.branch,
+                    session_id: view.session.session_id,
+                    tool: view.session.tool,
+                })
+                .collect()
+        })
+    });
 
     let config = worktree_gc::GcConfig {
         repo_root: repo,
@@ -2327,10 +2547,9 @@ fn command_worktree_gc(args: WorktreeGcArgs) -> Result<Output> {
         ttl_secs: args.ttl_secs,
         now_ts: None, // use system clock
         presence_facts,
+        managed_owners,
         git_bin: "git".to_string(),
-        // f2: wired — queries tmux/cmux via probe_session_liveness; None only
-        // when the room store is unavailable (graceful degradation).
-        backend_liveness_probe,
+        backend_liveness_probe: None,
     };
 
     let report = worktree_gc::run_gc(config).map_err(RallyError::Message)?;
@@ -8174,6 +8393,8 @@ fn command_run(args: RunArgs) -> Result<Output> {
                     session.cwd = pw.path.clone();
                     session.worktree_path = Some(pw.path.clone());
                     session.branch = Some(pw.branch);
+                    session.merge_target_ref = pw.merge_target_ref;
+                    session.merge_target_commit = Some(pw.merge_target_commit);
                     provisioned_path = Some(pw.path);
                     // Refresh the session fact so the durable record reflects
                     // the worktree-rooted cwd + branch.
@@ -8627,7 +8848,13 @@ fn finalize_managed_task(
         if let (Some(path), Some(branch)) =
             (session.worktree_path.as_deref(), session.branch.as_deref())
         {
-            let outcome = run_worktree::cleanup(repo, path, branch, "git");
+            let outcome = run_worktree::cleanup_against(
+                repo,
+                path,
+                branch,
+                session.merge_target_ref.as_deref(),
+                "git",
+            );
             if outcome.worktree_removed {
                 cleanup_evidence.push("worktree_cleanup:removed".to_string());
             } else if path.exists() {
@@ -8643,7 +8870,7 @@ fn finalize_managed_task(
         }
         let summary = match retained_worktree.as_deref() {
             Some(path) => format!(
-                "Captured from Codex --output-last-message; this is process output, not a target-authored Rally acknowledgement. Dirty worktree retained for recovery at {}.",
+                "Captured from Codex --output-last-message; this is process output, not a target-authored Rally acknowledgement. Worktree retained for review at {}.",
                 path.display()
             ),
             None => "Captured from Codex --output-last-message; this is process output, not a target-authored Rally acknowledgement.".to_string(),
@@ -9250,7 +9477,7 @@ fn command_sessions(args: SessionsArgs) -> Result<Output> {
     let reaped = if args.reap {
         let mut count = 0;
         for (fact, view) in active_session_views(&room, args.bins.clone())? {
-            if view.liveness == SessionLiveness::Stale {
+            if view.liveness == SessionLiveness::Stale && view.liveness_source == "backend_probe" {
                 with_watchdog_command_commit(|| {
                     append_stopped_session_record(&room, &view.session, &fact)
                 })?;
@@ -9266,7 +9493,13 @@ fn command_sessions(args: SessionsArgs) -> Result<Output> {
                         view.session.worktree_path.as_deref(),
                         view.session.branch.as_deref(),
                     ) {
-                        let _ = run_worktree::cleanup(room.repo_root(), path, branch, "git");
+                        let _ = run_worktree::cleanup_against(
+                            room.repo_root(),
+                            path,
+                            branch,
+                            view.session.merge_target_ref.as_deref(),
+                            "git",
+                        );
                     }
                 }
                 count += 1;
@@ -11514,12 +11747,20 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
             } else {
                 backend_runner.stop_commands(&live_target)
             };
+            let mut stop_disposition = None;
             if !dry_run {
                 let _commit_guard = arm_watchdog_command_commit();
-                if !stop_without_target {
-                    let _ = backend_runner.stop(&live_target);
+                let stop_result = (!stop_without_target).then(|| backend_runner.stop(&live_target));
+                let death_confirmed = stop_result.as_ref().is_some_and(|result| result.is_ok())
+                    && backend_runner.liveness(std::slice::from_ref(&live_target))
+                        == [SessionLiveness::Stale];
+                if !death_confirmed && !stop_without_target {
+                    return Err(RallyError::Message(format!(
+                        "rally stop: backend death unconfirmed for session {}; registration, claims, and worktree retained for recovery",
+                        session.session_id
+                    )));
                 }
-                if !stop_without_target
+                if death_confirmed
                     && session.task_scoped
                     && let Some(task_id) = session.task_id.as_deref()
                 {
@@ -11530,16 +11771,38 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
                     );
                     remove_managed_task_files(Some(&paths), false);
                 }
-                // Cleanup the per-agent worktree (when present) before
-                // marking the session stopped.  Best-effort: warnings are
-                // discarded so `rally stop` never blocks on a leftover
-                // worktree.
+                // Close session authority independently of source cleanup.
+                // A failed or unconfirmed backend stop retains the worktree.
                 if let (Some(path), Some(branch)) =
                     (session.worktree_path.as_deref(), session.branch.as_deref())
-                    && !stop_without_target
                 {
-                    let repo = repo_root().unwrap_or_else(|_| PathBuf::from("."));
-                    let _ = run_worktree::cleanup(&repo, path, branch, "git");
+                    if death_confirmed {
+                        let repo = repo_root().unwrap_or_else(|_| PathBuf::from("."));
+                        let outcome = run_worktree::cleanup_against(
+                            &repo,
+                            path,
+                            branch,
+                            session.merge_target_ref.as_deref(),
+                            "git",
+                        );
+                        stop_disposition = Some(format!(
+                            "worktree={} branch={} removed={} merged={:?} dirty={:?} bundle={} reason={} warnings={}",
+                            path.display(),
+                            branch,
+                            outcome.worktree_removed,
+                            outcome.merged,
+                            outcome.dirty,
+                            outcome.bundle_path.is_some(),
+                            outcome.reason,
+                            outcome.warnings.join("; ")
+                        ));
+                    } else {
+                        stop_disposition = Some(format!(
+                            "worktree={} branch={} removed=false reason=target_unverified; backend was not stopped",
+                            path.display(),
+                            branch
+                        ));
+                    }
                 }
                 // Explicit operator stop keeps the historical compatibility
                 // fallback for sessionless same-tool claims. Session-stamped
@@ -11554,14 +11817,14 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
                 // managed target we just stopped, kill it too so it can never
                 // become a detached orphan the reaper has to clean up later.
                 // Best-effort; never blocks the stop path.
-                if !stop_without_target
+                if death_confirmed
                     && let Some(own) = backends::own_rally_tmux_session(&tmux_bin_for_self_kill)
                     && own != live_target
                 {
                     let _ = backends::kill_tmux_session(&tmux_bin_for_self_kill, &own);
                 }
             }
-            (commands, stop_without_target.then(|| "Registration closed; target identity could not be verified, so the backend was not stopped and any worktree/task files were retained.".to_string()))
+            (commands, stop_disposition.or_else(|| stop_without_target.then(|| "Registration closed; target identity could not be verified, so the backend was not stopped and any worktree/task files were retained.".to_string())))
         }
     };
     let output_text = output.clone();
@@ -11594,7 +11857,13 @@ fn read_session_views(room: &RoomStore, bins: BackendBins) -> Result<Vec<Session
 }
 
 fn active_session_views(room: &RoomStore, bins: BackendBins) -> Result<Vec<(Fact, SessionView)>> {
-    let facts = room.facts()?;
+    Ok(active_session_views_from_facts(room.facts()?, bins))
+}
+
+fn active_session_views_from_facts(
+    facts: Vec<Fact>,
+    bins: BackendBins,
+) -> Vec<(Fact, SessionView)> {
     let active = active_session_facts_from_facts(facts.clone());
     let probes = probe_session_liveness(&active, bins);
     let states = agent_state::project_agent_states(&facts, &now_string())
@@ -11602,7 +11871,7 @@ fn active_session_views(room: &RoomStore, bins: BackendBins) -> Result<Vec<(Fact
         .map(|entry| (entry.tool, entry.stale))
         .collect::<BTreeMap<_, _>>();
 
-    Ok(active
+    active
         .into_iter()
         .map(|(fact, session)| {
             let (liveness, liveness_source) =
@@ -11621,7 +11890,7 @@ fn active_session_views(room: &RoomStore, bins: BackendBins) -> Result<Vec<(Fact
                 },
             )
         })
-        .collect())
+        .collect()
 }
 
 fn managed_session_injectability(

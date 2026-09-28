@@ -134,6 +134,7 @@ therefore receive distinct operation identities.
 | `rally route-findings` | yes | yes | no | no | Converts verified findings into risks or handoffs. |
 | `rally worktree gc` | optional | yes | yes | no | Dry-run is inspection; apply removes worktrees/branches after its safety checks. |
 | `rally worktree plan` | no | no | no | yes | Reads Git's registered worktrees, local branches, and locally stored remote refs; never fetches, merges, updates, or writes a Rally fact. |
+| `rally worktree closeout` | no | no | no | yes | Joins Git worktree state to exact managed-session ownership; its disposition is advisory. Missing ownership evidence stays unknown. |
 
 ### Worktree merge/update plan
 
@@ -158,6 +159,14 @@ zero can indicate equivalent patches, but merge commits may still carry
 important topology or conflict choices. Recommendations do not attest to live
 agent ownership or predict merge conflicts. Verify both before executing a
 merge or removing a worktree.
+
+`rally worktree closeout --json` adds the versioned
+`agent-rally.command.worktree-closeout.v1` projection described in
+[WORKTREE-CLOSEOUT.md](WORKTREE-CLOSEOUT.md). It does not change `worktree plan`
+v1 or authorize cleanup. Its ownership join requires a canonical path and
+the exact managed-session record; branch names and tool labels alone cannot
+prove ownership. A repo without an existing Rally room is reported as
+`unavailable` and is not initialized by this read.
 
 ## Simplification Direction
 

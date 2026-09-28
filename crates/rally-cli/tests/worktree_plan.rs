@@ -87,6 +87,168 @@ fn git_available() -> bool {
 }
 
 #[test]
+fn closeout_reports_unavailable_ownership_without_creating_a_room() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let feature = fixture.worktree("feature");
+    let output = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .args(["worktree", "closeout", "--json"])
+        .current_dir(&feature)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["schema"], "agent-rally.command.worktree-closeout.v1");
+    let payload = &result["data"]["worktree_closeout"];
+    assert_eq!(payload["schema_version"], 1);
+    assert_eq!(payload["sources"]["rally"], "unavailable");
+    let row = payload["worktrees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["path"] == feature.to_str().unwrap())
+        .unwrap();
+    assert_eq!(row["ownership"]["status"], "unknown");
+    assert_eq!(row["ownership"]["availability"], "unavailable");
+    assert_eq!(row["merge_target"]["status"], "unknown");
+    assert_eq!(row["disposition"]["action"], "retain");
+    assert!(
+        !fixture.repo.join(".rally").exists(),
+        "read-only closeout must not create a Rally room"
+    );
+}
+
+#[test]
+fn closeout_does_not_mutate_an_existing_room() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let entered = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .args(["enter", "--tool", "test:closeout-owner", "--json"])
+        .current_dir(&fixture.repo)
+        .output()
+        .unwrap();
+    assert!(
+        entered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&entered.stderr)
+    );
+    let rally_dir = fixture.repo.join(".rally");
+    assert!(rally_dir.join("log").exists());
+    fn files(dir: &Path, out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files(&path, out);
+            } else {
+                out.insert(path.clone(), fs::read(path).unwrap());
+            }
+        }
+    }
+    let mut before = std::collections::BTreeMap::new();
+    files(&rally_dir, &mut before);
+    let output = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .args(["worktree", "closeout", "--json"])
+        .current_dir(&fixture.repo)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        result["data"]["worktree_closeout"]["sources"]["rally"],
+        "current"
+    );
+    let mut after = std::collections::BTreeMap::new();
+    files(&rally_dir, &mut after);
+    assert_eq!(before, after, "closeout must not mutate Rally files");
+}
+
+#[test]
+fn closeout_marks_moved_managed_worktree_ambiguous_at_both_paths() {
+    if !git_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let run = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .args([
+            "run",
+            "codex",
+            "--json",
+            "--name",
+            "moving",
+            "--backend",
+            "tmux",
+            "--tmux-bin",
+            "/usr/bin/true",
+        ])
+        .env("HOME", &fixture.root)
+        .current_dir(&fixture.repo)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let run: Value = serde_json::from_slice(&run.stdout).unwrap();
+    let old_path = PathBuf::from(
+        run["data"]["run"]["session"]["worktree_path"]
+            .as_str()
+            .unwrap(),
+    );
+    let branch = run["data"]["run"]["session"]["branch"].as_str().unwrap();
+    let moved_path = fixture.root.join("moved-managed");
+    fixture_git(
+        &fixture.repo,
+        &[
+            "worktree",
+            "move",
+            old_path.to_str().unwrap(),
+            moved_path.to_str().unwrap(),
+        ],
+    );
+    let closeout = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .args(["worktree", "closeout", "--json"])
+        .env("HOME", &fixture.root)
+        .current_dir(&fixture.repo)
+        .output()
+        .unwrap();
+    assert!(
+        closeout.status.success(),
+        "{}",
+        String::from_utf8_lossy(&closeout.stderr)
+    );
+    let closeout: Value = serde_json::from_slice(&closeout.stdout).unwrap();
+    let rows = closeout["data"]["worktree_closeout"]["worktrees"]
+        .as_array()
+        .unwrap();
+    let old = rows
+        .iter()
+        .find(|row| row["path"] == old_path.to_str().unwrap())
+        .unwrap();
+    let moved = rows
+        .iter()
+        .find(|row| row["path"] == moved_path.to_str().unwrap())
+        .unwrap();
+    assert_eq!(old["ownership"]["availability"], "ambiguous");
+    assert_eq!(moved["ownership"]["availability"], "ambiguous");
+    assert_eq!(moved["branch"], format!("refs/heads/{branch}"));
+    assert_eq!(old["disposition"]["action"], "retain");
+    assert_eq!(moved["disposition"]["action"], "retain");
+}
+
+#[test]
 fn plans_every_branch_and_worktree_without_writing_state() {
     if !git_available() {
         return;

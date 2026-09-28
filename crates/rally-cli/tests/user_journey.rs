@@ -137,7 +137,7 @@ struct Workspace {
 impl Workspace {
     fn observable_tmux_stub(&self) -> String {
         let path = self.home.join("observable-tmux");
-        fs::write(&path, "#!/bin/sh\ncase \"$1\" in\n display-message) printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '%1' '101' '202' '/tmp/rally-test.sock' '0' '0' '0' '0' ;;\nesac\nexit 0\n").unwrap();
+        fs::write(&path, "#!/bin/sh\ncase \"$1\" in\n display-message) printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '%1' '101' '202' '/tmp/rally-test.sock' '0' '0' '0' '0' ;;\n kill-session) touch \"$0.stopped\" ;;\n list-panes) if [ -f \"$0.stopped\" ]; then echo 'no server running' >&2; exit 1; fi ;;\nesac\nexit 0\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path.to_string_lossy().into_owned()
     }
@@ -2987,7 +2987,7 @@ fn rally_uses_native_cmux_managed_session_commands() {
     let cmux_bin = workspace.cwd.join("fake-cmux");
     fs::write(
         &cmux_bin,
-        "#!/bin/sh\nif [ \"$1\" = \"new-workspace\" ]; then echo workspace:cmux-builder; fi\n",
+        "#!/bin/sh\ncase \"$1\" in\n new-workspace) echo workspace:cmux-builder ;;\n close-workspace) touch \"$0.stopped\" ;;\n list-workspaces) if [ -f \"$0.stopped\" ]; then echo 'no server running' >&2; exit 1; fi ;;\nesac\n",
     )
     .unwrap();
     let mut permissions = fs::metadata(&cmux_bin).unwrap().permissions();
@@ -6146,6 +6146,55 @@ fn rally_stop_removes_per_agent_worktree() {
         "empty per-agent branch {branch} must be deleted after stop"
     );
 
+    workspace.cleanup();
+}
+
+#[test]
+fn rally_stop_retains_registration_and_worktree_when_death_is_unconfirmed() {
+    if !git_available() {
+        return;
+    }
+    let _run_guard = serialize_rally_run();
+    let workspace = real_repo_workspace("rally-stop-death-unconfirmed");
+    let tmux_stub = workspace.observable_tmux_stub();
+    let run = workspace.json(&[
+        "run",
+        "claude",
+        "--json",
+        "--name",
+        "stuck",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        &tmux_stub,
+    ]);
+    let session = &run["data"]["run"]["session"];
+    let session_id = session["session_id"].as_str().unwrap();
+    let worktree_path = PathBuf::from(session["worktree_path"].as_str().unwrap());
+    fs::write(
+        &tmux_stub,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n display-message) printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '%1' '101' '202' '/tmp/rally-test.sock' '0' '0' '0' '0' ;;\n list-panes) echo '%1 rally-{session_id}' ;;\nesac\nexit 0\n"
+        ),
+    )
+    .unwrap();
+    let output = workspace.output(&["stop", session_id, "--json", "--tmux-bin", &tmux_stub]);
+    assert!(
+        !output.status.success(),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("backend death unconfirmed"));
+    assert!(worktree_path.exists());
+    let sessions = workspace.json(&["sessions", "--json", "--tmux-bin", &tmux_stub]);
+    assert!(
+        sessions["data"]["sessions"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["session_id"] == session_id)
+    );
     workspace.cleanup();
 }
 

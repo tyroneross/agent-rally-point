@@ -122,6 +122,7 @@ fn merged_worktree_is_reaped_on_apply_listed_on_dry_run() {
         ttl_secs: 24 * 3600,
         now_ts: None,
         presence_facts: vec![],
+        managed_owners: Some(vec![]),
         git_bin: "git".to_string(),
         backend_liveness_probe: None,
     });
@@ -147,6 +148,7 @@ fn merged_worktree_is_reaped_on_apply_listed_on_dry_run() {
         ttl_secs: 24 * 3600,
         now_ts: None,
         presence_facts: vec![],
+        managed_owners: Some(vec![]),
         git_bin: "git".to_string(),
         backend_liveness_probe: None,
     });
@@ -161,6 +163,134 @@ fn merged_worktree_is_reaped_on_apply_listed_on_dry_run() {
         "worktree directory must be gone after --apply"
     );
 
+    fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn merged_worktree_with_exact_active_owner_is_retained() {
+    if !git_available() {
+        return;
+    }
+    let repo = tmp_dir("merged-live-exact");
+    init_repo(&repo);
+    let session_id = "codex-exact-01";
+    let wt = make_rally_worktree(&repo, session_id);
+    add_commit_in_worktree(&wt);
+    merge_branch_into_main(&repo, &format!("rally/{session_id}"));
+    let report = rally_cli::worktree_gc::run_gc(rally_cli::worktree_gc::GcConfig {
+        repo_root: repo.clone(),
+        apply: true,
+        ttl_secs: 3600,
+        now_ts: None,
+        presence_facts: vec![],
+        managed_owners: Some(vec![rally_cli::worktree_gc::ManagedOwner {
+            worktree_path: Some(wt.clone()),
+            branch: Some(format!("rally/{session_id}")),
+            session_id: session_id.to_string(),
+            tool: "codex:exact".to_string(),
+        }]),
+        git_bin: "git".to_string(),
+        backend_liveness_probe: None,
+    })
+    .unwrap();
+    assert!(report.reaped.is_empty());
+    assert!(wt.exists());
+    assert!(
+        report
+            .skipped
+            .iter()
+            .any(|row| row.worktree_path == wt && row.reason.contains(session_id))
+    );
+    fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn unavailable_managed_ledger_retains_merged_tree() {
+    if !git_available() {
+        return;
+    }
+    let repo = tmp_dir("merged-ledger-unavailable");
+    init_repo(&repo);
+    let wt = make_rally_worktree(&repo, "codex-ledger-01");
+    let report = rally_cli::worktree_gc::run_gc(rally_cli::worktree_gc::GcConfig {
+        repo_root: repo.clone(),
+        apply: true,
+        ttl_secs: 3600,
+        now_ts: None,
+        presence_facts: vec![],
+        managed_owners: None,
+        git_bin: "git".to_string(),
+        backend_liveness_probe: None,
+    })
+    .unwrap();
+    assert!(report.reaped.is_empty());
+    assert!(wt.exists());
+    assert!(
+        report
+            .skipped
+            .iter()
+            .any(|row| row.worktree_path == wt && row.reason.contains("unavailable"))
+    );
+    fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn incomplete_managed_owner_retains_merged_tree() {
+    if !git_available() {
+        return;
+    }
+    let repo = tmp_dir("merged-incomplete-owner");
+    init_repo(&repo);
+    let wt = make_rally_worktree(&repo, "codex-incomplete-01");
+    let report = rally_cli::worktree_gc::run_gc(rally_cli::worktree_gc::GcConfig {
+        repo_root: repo.clone(),
+        apply: true,
+        ttl_secs: 3600,
+        now_ts: None,
+        presence_facts: vec![],
+        managed_owners: Some(vec![rally_cli::worktree_gc::ManagedOwner {
+            worktree_path: Some(wt.clone()),
+            branch: None,
+            session_id: "incomplete-01".to_string(),
+            tool: "codex:incomplete".to_string(),
+        }]),
+        git_bin: "git".to_string(),
+        backend_liveness_probe: None,
+    })
+    .unwrap();
+    assert!(report.reaped.is_empty());
+    assert!(wt.exists());
+    assert!(
+        report
+            .skipped
+            .iter()
+            .any(|row| row.worktree_path == wt && row.reason.contains("incomplete"))
+    );
+    fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn missing_but_registered_tree_is_not_reported_reaped() {
+    if !git_available() {
+        return;
+    }
+    let repo = tmp_dir("missing-registered");
+    init_repo(&repo);
+    let wt = make_rally_worktree(&repo, "codex-missing-01");
+    fs::remove_dir_all(&wt).unwrap();
+    let report = rally_cli::worktree_gc::run_gc(rally_cli::worktree_gc::GcConfig {
+        repo_root: repo.clone(),
+        apply: true,
+        ttl_secs: 3600,
+        now_ts: None,
+        presence_facts: vec![],
+        managed_owners: Some(vec![]),
+        git_bin: "git".to_string(),
+        backend_liveness_probe: None,
+    })
+    .unwrap();
+    assert!(report.reaped.is_empty());
+    assert!(report.skipped.iter().any(|row| row.worktree_path == wt));
     fs::remove_dir_all(&repo).ok();
 }
 
@@ -192,6 +322,7 @@ fn unmerged_with_live_owner_is_never_reaped() {
         ttl_secs: 24 * 3600,
         now_ts: Some(now_ts.to_string()),
         presence_facts: facts,
+        managed_owners: Some(vec![]),
         git_bin: "git".to_string(),
         backend_liveness_probe: None,
     });
@@ -220,10 +351,9 @@ fn unmerged_with_live_owner_is_never_reaped() {
     fs::remove_dir_all(&repo).ok();
 }
 
-/// An unmerged worktree whose owning agent has STALE presence (last heartbeat
-/// older than TTL) must be bundled then reaped.
+/// Stale presence cannot authorize deletion of clean unmerged source.
 #[test]
-fn unmerged_with_stale_owner_is_bundled_then_reaped() {
+fn unmerged_with_stale_owner_is_retained() {
     if !git_available() {
         eprintln!("skipping: git not on PATH");
         return;
@@ -249,24 +379,20 @@ fn unmerged_with_stale_owner_is_bundled_then_reaped() {
         ttl_secs: 24 * 3600,
         now_ts: Some(now_ts.to_string()),
         presence_facts: facts,
+        managed_owners: Some(vec![]),
         git_bin: "git".to_string(),
         backend_liveness_probe: Some(dead_probe),
     });
     assert!(report.is_ok(), "must not error: {:?}", report);
     let report = report.unwrap();
 
+    assert!(report.reaped.is_empty());
+    assert!(wt.exists(), "unmerged checkout must remain available");
     assert!(
-        !report.reaped.is_empty(),
-        "stale-owner unmerged worktree must be reaped; reaped={:?}",
-        report.reaped
-    );
-    assert!(!wt.exists(), "worktree directory must be gone");
-
-    // The branch was unmerged, so cleanup() must have produced a bundle.
-    assert!(
-        !report.bundles.is_empty(),
-        "a bundle must have been created for the unmerged work; bundles={:?}",
-        report.bundles
+        report
+            .skipped
+            .iter()
+            .any(|s| s.worktree_path == wt && s.reason.contains("unmerged"))
     );
 
     fs::remove_dir_all(&repo).ok();
@@ -290,6 +416,7 @@ fn default_branch_and_cwd_worktree_are_never_reaped() {
         ttl_secs: 24 * 3600,
         now_ts: None,
         presence_facts: vec![],
+        managed_owners: Some(vec![]),
         git_bin: "git".to_string(),
         backend_liveness_probe: None,
     });
@@ -328,6 +455,7 @@ fn dry_run_makes_no_filesystem_changes() {
         ttl_secs: 24 * 3600,
         now_ts: None,
         presence_facts: vec![],
+        managed_owners: Some(vec![]),
         git_bin: "git".to_string(),
         backend_liveness_probe: None,
     });
@@ -399,16 +527,17 @@ fn ttl_boundary_respected() {
         ttl_secs: 3600, // 1 hour TTL
         now_ts: Some(now_ts.to_string()),
         presence_facts: facts,
+        managed_owners: Some(vec![]),
         git_bin: "git".to_string(),
         backend_liveness_probe: Some(dead_probe),
     });
     assert!(report.is_ok(), "must not error: {:?}", report);
     let report = report.unwrap();
 
-    // claude's worktree is stale + unmerged → reaped.
+    // Both branches contain unmerged commits; TTL does not authorize deletion.
     assert!(
-        report.reaped.iter().any(|r| r.worktree_path == wt_stale),
-        "stale worktree must be reaped; reaped={:?}",
+        report.reaped.iter().all(|r| r.worktree_path != wt_stale),
+        "stale but unmerged worktree must be retained; reaped={:?}",
         report.reaped
     );
     // codex's worktree is live → kept.
@@ -463,6 +592,7 @@ fn live_owner_hyphen_underscore_mismatch_not_reaped() {
         ttl_secs: 24 * 3600,
         now_ts: Some(now_ts.to_string()),
         presence_facts: facts,
+        managed_owners: Some(vec![]),
         git_bin: "git".to_string(),
         backend_liveness_probe: None,
     });
@@ -535,6 +665,7 @@ fn backend_live_stale_by_ttl_not_reaped() {
         ttl_secs: 24 * 3600,
         now_ts: Some(now_ts.to_string()),
         presence_facts: facts,
+        managed_owners: Some(vec![]),
         git_bin: "git".to_string(),
         backend_liveness_probe: Some(probe),
     });
@@ -557,8 +688,8 @@ fn backend_live_stale_by_ttl_not_reaped() {
     );
     let reason = &skipped.unwrap().reason;
     assert!(
-        reason.to_lowercase().contains("live"),
-        "f2: skip reason must mention live backend; got: {reason}"
+        reason.to_lowercase().contains("unmerged"),
+        "unmerged source must be retained; got: {reason}"
     );
 
     fs::remove_dir_all(&repo).ok();
@@ -619,6 +750,7 @@ fn bundle_failure_skips_unmerged_worktree() {
         ttl_secs: 24 * 3600,
         now_ts: Some(now_ts.to_string()),
         presence_facts: facts,
+        managed_owners: Some(vec![]),
         git_bin: fake_git.to_string_lossy().to_string(),
         backend_liveness_probe: Some(dead_probe),
     });
@@ -644,12 +776,7 @@ fn bundle_failure_skips_unmerged_worktree() {
         "f3: worktree must appear in skipped list; skipped={:?}",
         report.skipped
     );
-    // A warning must be emitted.
-    assert!(
-        !report.warnings.is_empty(),
-        "f3: a warning must be emitted when bundle fails; warnings={:?}",
-        report.warnings
-    );
+    assert!(skipped.unwrap().reason.contains("unmerged"));
 
     fs::remove_dir_all(&repo).ok();
     fs::remove_dir_all(&fake_git_dir).ok();
@@ -693,6 +820,7 @@ fn gc_from_linked_worktree_protects_cwd() {
         ttl_secs: 24 * 3600,
         now_ts: Some(now_ts.to_string()),
         presence_facts: facts,
+        managed_owners: Some(vec![]),
         git_bin: "git".to_string(),
         backend_liveness_probe: None,
     });

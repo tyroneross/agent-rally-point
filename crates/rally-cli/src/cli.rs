@@ -68,6 +68,8 @@ pub(crate) enum CliCommand {
     WorktreeGc(WorktreeGcArgs),
     /// Read-only merge/update plan for every registered worktree and local branch.
     WorktreePlan(WorktreePlanArgs),
+    /// Read-only Git and exact managed-session closeout projection.
+    WorktreeCloseout(WorktreeCloseoutArgs),
     /// Layer 1: completion-scoped self-exit re-check for a task-scoped session.
     SelfExitCheck(SelfExitCheckArgs),
     /// BACKLOG S-P3: `rally daemon serve|start|stop|status` — the rallyd
@@ -890,6 +892,11 @@ pub(crate) struct WorktreePlanArgs {
     pub(crate) base: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct WorktreeCloseoutArgs {
+    pub(crate) json: bool,
+}
+
 /// B13: arguments for `rally check ci`.
 #[derive(Clone, Debug)]
 pub(crate) struct CheckCiArgs {
@@ -1354,7 +1361,13 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .descr("Read-only Git snapshot of every worktree and local branch, with merge and update recommendations. Does not fetch or change Git state.")
         .command("plan")
         .map(CliCommand::WorktreePlan);
-    let worktree = construct!([worktree_gc, worktree_plan])
+    let worktree_closeout = json_flag()
+        .map(|json| WorktreeCloseoutArgs { json })
+        .to_options()
+        .descr("Read-only closeout evidence from Git and exact managed-session ownership. Recommendations are advisory.")
+        .command("closeout")
+        .map(CliCommand::WorktreeCloseout);
+    let worktree = construct!([worktree_gc, worktree_plan, worktree_closeout])
         .to_options()
         .descr("Worktree management: plan — inspect merge/update state; gc — sweep-reap managed worktrees.")
         .command("worktree")

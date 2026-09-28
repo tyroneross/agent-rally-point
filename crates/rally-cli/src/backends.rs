@@ -185,6 +185,13 @@ pub(crate) struct ManagedSession {
     /// worktree was provisioned.  Set together with `worktree_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) branch: Option<String>,
+    /// Exact ref selected for integration at provision time. Legacy records
+    /// lack this and must not infer it from the current checkout's HEAD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) merge_target_ref: Option<String>,
+    /// Target tip at provision time, for provenance and drift display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) merge_target_commit: Option<String>,
     /// Daemon-first inject routing (move 2): `true` when this session's pane was
     /// registered with the rally-termd daemon (`agent.register`), so the daemon
     /// owns the PTY and `inject` routes LEDGER-ONLY (the daemon performs the
