@@ -2499,9 +2499,8 @@ fn command_worktree_gc(args: WorktreeGcArgs) -> Result<Output> {
 
     // Open the room store once; derive both presence facts (for TTL-liveness)
     // and active sessions (for the f2 backend-probe) from it.
-    // Graceful degradation: if the store is unavailable (no .rally/ yet),
-    // supply empty facts and no probe (merged worktrees still reap; unmerged
-    // are conservatively skipped until a probe is available).
+    // If the room is unavailable, ownership evidence remains unavailable and
+    // GC retains every worktree. Empty presence facts cannot authorize removal.
     let bins = BackendBins::default();
     let room_result = RoomStore::open_existing_at(repo.clone()).and_then(|room| {
         room.ok_or_else(|| RallyError::Message("no Rally room exists".to_string()))
