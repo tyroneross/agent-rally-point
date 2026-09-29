@@ -224,7 +224,12 @@ pub(crate) fn cleanup_against(
         let status = Command::new(git_bin)
             .arg("-C")
             .arg(worktree_path)
-            .args(["status", "--porcelain", "--untracked-files=all", "--ignored"])
+            .args([
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--ignored",
+            ])
             .output();
         let ignored_only = |stdout: &[u8]| {
             let text = String::from_utf8_lossy(stdout);
@@ -239,7 +244,12 @@ pub(crate) fn cleanup_against(
                     .lines()
                     .filter_map(|line| line.strip_prefix("!! "))
                     .collect();
-                let sample = ignored.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+                let sample = ignored
+                    .iter()
+                    .take(5)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let more = ignored.len().saturating_sub(5);
                 warnings.push(format!(
                     "rally stop: retained worktree {} because it holds {} gitignored path(s) for review: {sample}{}",
