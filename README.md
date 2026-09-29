@@ -1,12 +1,36 @@
 # Agent Rally Point
 
-**Rally gives coding agents a shared record of who owns each task, what changed, and which handoffs were received.** Run agents from different LLMs in one project without relaying every status update yourself.
+**Rally Point turns your coding agents into a team: they delegate tasks, hand off work and solve problems together.**
+
+Works across Claude, Codex, Gemini, Cursor and any agent that can run a shell command.
+
+- **A lead agent delegates.** It assigns work to other agents or launches new ones, each in its own git worktree.
+- **Agents hand off work when done.** A handoff counts only when the receiving agent confirms it, and finished work comes with proof it was checked.
+- **Agents work together.** Blockers, decisions and findings go into one shared record every agent reads.
+- **Agents don't collide.** Agents Rally launches get their own worktrees. Agents sharing a checkout claim files before editing, and Rally flags overlapping claims. See [File claims](#file-claims).
 
 The `rally` CLI stores coordination facts in a local, append-only ledger. Any harness that can run shell commands can use that protocol: Codex, Claude Code, Gemini, Cursor, RossLabs Agent Harness, or a custom agent. Automatic hooks and direct prompt delivery depend on the host and backend; CLI access alone does not prove either integration works.
 
 ## The problem
 
-When several agents work on one project, they need to know who owns a file, where another agent stopped, and whether a requested review reached its recipient. Without a shared record, the operator has to reconstruct that state across conversations.
+Agents in separate terminals cannot see each other. Without a shared record, you become the handoff: you copy output from one terminal to the next, track who is editing which file, and check whether a requested review ever happened.
+
+## File claims
+
+A claim tells every other agent "I am editing this." Before editing, an agent claims the file. Other agents see the claim, and Rally refuses a second exclusive claim on the same file. Configured host hooks check claims automatically before each edit.
+
+### Do claims create bottlenecks?
+
+Claims are designed to be narrow and short-lived, so they block only real conflicts:
+
+- **A claim covers one file, not the repo.** A claim on `src/parser.rs` blocks nothing else. A claim on a directory blocks every file inside it, so agents should claim the files they will touch, not the folder.
+- **Reading is never blocked.** A `shared_read` claim coexists with an exclusive claim, so other agents can read, review and test a file while someone edits it.
+- **Claims expire.** By default a single-file claim lapses after 30 minutes without renewal and a broader claim after 2 hours, so a crashed agent cannot hold a file indefinitely.
+- **The edit check warns by default.** `rally check before-write` allows the edit with a warning; only `--strict` stops it. You choose how hard the gate is.
+- **The edit check adds 12 to 20 ms.** That is the median in a new repo and in a busy room with 18 MB of history. For scale, a typical screen draws a new picture 60 times a second, about once every 17 ms, so the check finishes in roughly the time your screen takes to refresh once. Measured over 30 runs each on rally 0.2.8, Apple silicon; cost grows with the size of the room's history.
+- **Worktrees remove most contention.** Agents Rally launches work in separate worktrees, so they rarely compete for the same checkout.
+
+When two agents need the same file at the same time, that is a sequencing decision worth surfacing. The conflict message names the holder, so the second agent can coordinate with it or pick other work. For non-file resources such as a database or a port, see [What a claim can cover](#what-a-claim-can-cover).
 
 ## How it works
 
