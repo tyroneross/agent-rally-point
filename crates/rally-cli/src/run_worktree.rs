@@ -216,14 +216,47 @@ pub(crate) fn cleanup_against(
     // Never force-remove a dirty worktree. A bundle protects commits, but it
     // cannot preserve modified or untracked files. If status cannot be read,
     // retain the worktree as the conservative recovery path.
+    //
+    // Gitignored files are also retained: agents keep local memory, run state
+    // and env files there, and non-forcing `git worktree remove` deletes them
+    // without complaint. They are listed for review, never removed.
     if worktree_path.exists() {
         let status = Command::new(git_bin)
             .arg("-C")
             .arg(worktree_path)
-            .args(["status", "--porcelain", "--untracked-files=all"])
+            .args(["status", "--porcelain", "--untracked-files=all", "--ignored"])
             .output();
+        let ignored_only = |stdout: &[u8]| {
+            let text = String::from_utf8_lossy(stdout);
+            let mut lines = text.lines().filter(|line| !line.is_empty()).peekable();
+            lines.peek().is_some() && lines.all(|line| line.starts_with("!! "))
+        };
         match status {
             Ok(out) if out.status.success() && out.stdout.is_empty() => {}
+            Ok(out) if out.status.success() && ignored_only(&out.stdout) => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                let ignored: Vec<&str> = text
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("!! "))
+                    .collect();
+                let sample = ignored.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+                let more = ignored.len().saturating_sub(5);
+                warnings.push(format!(
+                    "rally stop: retained worktree {} because it holds {} gitignored path(s) for review: {sample}{}",
+                    worktree_path.display(),
+                    ignored.len(),
+                    if more > 0 { format!(" (+{more} more)") } else { String::new() }
+                ));
+                return CleanupOutcome {
+                    worktree_removed: false,
+                    branch_deleted: false,
+                    bundle_path: None,
+                    warnings,
+                    merged: None,
+                    dirty: Some(false),
+                    reason: "ignored_files",
+                };
+            }
             Ok(out) if out.status.success() => {
                 warnings.push(format!(
                     "rally stop: retained dirty worktree for recovery at {}",
@@ -637,6 +670,43 @@ mod tests {
         assert!(
             exists.status.success(),
             "unmerged branch should still be present after cleanup"
+        );
+
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn cleanup_retains_worktree_holding_gitignored_files() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = tmp_dir("cleanup-ignored");
+        init_test_repo(&repo);
+        fs::write(repo.join(".gitignore"), b".env\nmemory/\n").unwrap();
+        crate::test_git_fixture::fixture_git(&repo, &["add", ".gitignore"]);
+        crate::test_git_fixture::fixture_git(&repo, &["commit", "-m", "ignore rules"]);
+        let pw = provision(&repo, "ignored-worker-01", "git").expect("provision");
+
+        // Merged (empty) branch and a porcelain-clean tree: the only thing
+        // standing between this worktree and removal is its ignored files.
+        fs::write(pw.path.join(".env"), b"SECRET=1").unwrap();
+        fs::create_dir_all(pw.path.join("memory")).unwrap();
+        fs::write(pw.path.join("memory/notes.md"), b"agent memory").unwrap();
+        let outcome = cleanup(&repo, &pw.path, &pw.branch, "git");
+
+        assert!(!outcome.worktree_removed);
+        assert!(!outcome.branch_deleted);
+        assert_eq!(outcome.reason, "ignored_files");
+        assert_eq!(fs::read(pw.path.join(".env")).unwrap(), b"SECRET=1");
+        assert_eq!(
+            fs::read(pw.path.join("memory/notes.md")).unwrap(),
+            b"agent memory"
+        );
+        assert!(
+            outcome.warnings.iter().any(|w| w.contains(".env")),
+            "warning must list ignored paths for review: {:?}",
+            outcome.warnings
         );
 
         fs::remove_dir_all(&repo).ok();

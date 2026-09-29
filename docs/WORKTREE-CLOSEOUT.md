@@ -61,7 +61,10 @@ agent has stopped. Consumers must re-read Git and ownership immediately before
 removing anything.
 
 Implicit `rally stop`, task completion, and session reaping now retain dirty,
-unmerged, and merge-unknown worktrees. Stop confirms backend death before any
+unmerged, and merge-unknown worktrees. They also retain any worktree that holds
+gitignored files (reason `ignored_files`), because agents keep local memory,
+run state and env files there; the warning lists those paths for review, and
+Rally never deletes them. Stop confirms backend death before any
 source cleanup. `rally worktree gc --apply` requires an available exact
 managed-session ledger, no active owner, a clean checkout, and a merged branch;
 its report marks `reaped` only after removal succeeds. Worktree paths remain
