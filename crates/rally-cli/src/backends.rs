@@ -739,11 +739,6 @@ impl Backend {
             "cmux" => Ok(Self::Cmux),
             "ptyd" => Ok(Self::Ptyd),
             "ptyd-strict" => Ok(Self::PtydStrict),
-            "herdr" => Err(RallyError::Usage(
-                "backend \"herdr\" is removed (Plan F): use the .rally ledger \
-                 (rally inject) and the rally-termd daemon; or fall back to tmux/cmux"
-                    .to_string(),
-            )),
             other => Err(RallyError::Usage(format!("unsupported backend {other}"))),
         }
     }
@@ -2758,6 +2753,25 @@ mod tests {
     use schemars::schema_for;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    #[test]
+    fn backend_parser_preserves_supported_routes_and_rejects_unknown_values() {
+        for (value, expected) in [
+            ("auto", Backend::Tmux),
+            ("tmux", Backend::Tmux),
+            ("cmux", Backend::Cmux),
+            ("ptyd", Backend::Ptyd),
+            ("ptyd-strict", Backend::PtydStrict),
+        ] {
+            assert_eq!(Backend::parse(value).unwrap(), expected);
+        }
+        let error = Backend::parse("retired-backend").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported backend retired-backend")
+        );
+    }
 
     #[test]
     fn codex_task_command_is_one_shot_while_plain_command_is_interactive() {
