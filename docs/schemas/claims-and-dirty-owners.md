@@ -26,13 +26,21 @@ remain unchanged. Each `data.owners.dirty` row adds:
 | `ownership_status` | string | `claimed` for an unexpired match; `expired_match` for expired evidence alongside an unexpired match; `unclaimed_after_expiry` when the path has only expired matches. |
 | `expired_match` | fact object or null | Original expired claim, including claimant identity, scope, and evidence; null for unexpired matches. |
 
-An expired match has `owner_tool: null`. Its claimant remains available in
-`expired_match.tool`. Session and heartbeat fields, including `is_owner_live`,
+`owner_tool` keeps its existing value for every row, including expired
+matches; read `ownership_status` and `lease_expired` to tell an expired match
+from a current owner. Session and heartbeat fields, including `is_owner_live`,
 continue to describe the claimant's observed liveness; they do not renew its
 lease. Missing or invalid lease timestamps do not establish expiry.
 
-Every overlapping match remains a separate row. `unclaimed_dirty_paths` includes
-paths with no unexpired match, including paths matched only by expired claims.
-The added `data.owners.dirty_after_expiry` integer counts distinct dirty paths
-whose matches are all expired, counting overlapping expired claims once.
-Human output includes this count and each matching row's ownership status.
+Every overlapping match remains a separate row. `unclaimed_dirty_paths` keeps
+its existing meaning: dirty paths with no matching claim at all. Two fields are
+added to `data.owners`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `unclaimed_or_expired_dirty_paths` | string array | Dirty paths with no unexpired match, including paths matched only by expired claims. |
+| `dirty_after_expiry` | integer | Distinct dirty paths whose matches are all expired, counting overlapping expired claims once. |
+
+Human output (not a stable contract) reports `unclaimed=` as the length of
+`unclaimed_or_expired_dirty_paths`, the `dirty_after_expiry` count, and one line
+per matching row with its ownership status and claimant tool.

@@ -6197,18 +6197,22 @@ fn command_owners(args: OwnersArgs) -> Result<Output> {
     let session_views = read_session_views(&room, args.bins)?;
     let dirty_paths = dirty_git_paths(&root);
     let dirty = build_dirty_owners(&snapshot, &session_views, &dirty_paths);
-    let (unclaimed_dirty_paths, dirty_after_expiry) = dirty_owner_summary(&dirty, &dirty_paths);
+    let DirtyOwnerSummary {
+        unclaimed: unclaimed_dirty_paths,
+        unclaimed_or_expired: unclaimed_or_expired_dirty_paths,
+        after_expiry: dirty_after_expiry,
+    } = dirty_owner_summary(&dirty, &dirty_paths);
     let mut text = format!(
         "owners dirty={} unclaimed={} dirty_after_expiry={dirty_after_expiry}",
         dirty.len(),
-        unclaimed_dirty_paths.len()
+        unclaimed_or_expired_dirty_paths.len()
     );
     for row in &dirty {
         text.push_str(&format!(
             "\n{} {} {}",
             row.path,
             row.ownership_status,
-            row.owner_tool.as_deref().unwrap_or("expired_match")
+            row.owner_tool.as_deref().unwrap_or("unknown")
         ));
     }
     let body = envelope(
@@ -6220,6 +6224,7 @@ fn command_owners(args: OwnersArgs) -> Result<Output> {
                 dirty_paths,
                 dirty,
                 unclaimed_dirty_paths,
+                unclaimed_or_expired_dirty_paths,
                 dirty_after_expiry,
             },
         },
@@ -6228,15 +6233,29 @@ fn command_owners(args: OwnersArgs) -> Result<Output> {
 }
 
 /// Count paths rather than matches, so overlapping expired claims count once.
-fn dirty_owner_summary(rows: &[DirtyOwner], dirty_paths: &[String]) -> (Vec<String>, usize) {
-    let claimed_paths: BTreeSet<_> = rows
+/// `unclaimed` keeps the original owners.v1 meaning (no matching claim at all);
+/// `unclaimed_or_expired` also counts paths whose only matches have expired.
+struct DirtyOwnerSummary {
+    unclaimed: Vec<String>,
+    unclaimed_or_expired: Vec<String>,
+    after_expiry: usize,
+}
+
+fn dirty_owner_summary(rows: &[DirtyOwner], dirty_paths: &[String]) -> DirtyOwnerSummary {
+    let matched_paths: BTreeSet<_> = rows.iter().map(|row| &row.path).collect();
+    let live_paths: BTreeSet<_> = rows
         .iter()
         .filter(|row| !row.lease_expired)
         .map(|row| &row.path)
         .collect();
     let unclaimed = dirty_paths
         .iter()
-        .filter(|path| !claimed_paths.contains(path))
+        .filter(|path| !matched_paths.contains(path))
+        .cloned()
+        .collect();
+    let unclaimed_or_expired = dirty_paths
+        .iter()
+        .filter(|path| !live_paths.contains(path))
         .cloned()
         .collect();
     let after_expiry = rows
@@ -6245,7 +6264,11 @@ fn dirty_owner_summary(rows: &[DirtyOwner], dirty_paths: &[String]) -> (Vec<Stri
         .map(|row| &row.path)
         .collect::<BTreeSet<_>>()
         .len();
-    (unclaimed, after_expiry)
+    DirtyOwnerSummary {
+        unclaimed,
+        unclaimed_or_expired,
+        after_expiry,
+    }
 }
 
 fn dirty_git_paths(root: &Path) -> Vec<String> {
@@ -6326,11 +6349,7 @@ fn build_dirty_owners(
             rows.push(DirtyOwner {
                 path: path.clone(),
                 claim_id: record.claim_id,
-                owner_tool: if lease_expired {
-                    None
-                } else {
-                    record.owner_tool
-                },
+                owner_tool: record.owner_tool,
                 ownership_status: if lease_expired {
                     "expired_match"
                 } else {
@@ -13464,7 +13483,21 @@ mod tests {
     }
 
     #[test]
-    fn dirty_owner_expired_single_match_keeps_evidence_without_owner() {
+    fn claims_expiry_non_utc_offset_compares_in_utc() {
+        let past = (Utc::now() - chrono::Duration::hours(1))
+            .with_timezone(&chrono::FixedOffset::east_opt(2 * 3600).unwrap())
+            .to_rfc3339();
+        let future = (Utc::now() + chrono::Duration::hours(1))
+            .with_timezone(&chrono::FixedOffset::west_opt(5 * 3600).unwrap())
+            .to_rfc3339();
+        assert!(past.ends_with("+02:00"), "{past}");
+        assert!(future.ends_with("-05:00"), "{future}");
+        assert!(lease_is_expired(&past));
+        assert!(!lease_is_expired(&future));
+    }
+
+    #[test]
+    fn dirty_owner_expired_single_match_keeps_evidence_and_owner_tool() {
         let claim = expiry_claim("old", Some("2000-01-01T00:00:00Z"));
         let snapshot = RoomSnapshot {
             active_claims: vec![claim.clone()],
@@ -13473,7 +13506,7 @@ mod tests {
         let rows = build_dirty_owners(&snapshot, &[], &["src/main.rs".to_string()]);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ownership_status, "unclaimed_after_expiry");
-        assert_eq!(rows[0].owner_tool, None);
+        assert_eq!(rows[0].owner_tool.as_deref(), Some("codex:old"));
         assert_eq!(
             rows[0].expired_match.as_ref().unwrap().event_id,
             claim.event_id
@@ -13515,16 +13548,14 @@ mod tests {
             rows.iter()
                 .all(|row| row.ownership_status != "unclaimed_after_expiry")
         );
-        assert_eq!(
-            rows.iter().filter(|row| row.owner_tool.is_some()).count(),
-            2
-        );
-        let (unclaimed, count) = dirty_owner_summary(
+        assert!(rows.iter().all(|row| row.owner_tool.is_some()));
+        let summary = dirty_owner_summary(
             &rows,
             &["src/main.rs".to_string(), "unmatched.rs".to_string()],
         );
-        assert_eq!(unclaimed, vec!["unmatched.rs"]);
-        assert_eq!(count, 0);
+        assert_eq!(summary.unclaimed, vec!["unmatched.rs"]);
+        assert_eq!(summary.unclaimed_or_expired, vec!["unmatched.rs"]);
+        assert_eq!(summary.after_expiry, 0);
     }
 
     #[test]
@@ -13538,12 +13569,17 @@ mod tests {
         };
         let rows = build_dirty_owners(&snapshot, &[], &["src/main.rs".to_string()]);
         assert_eq!(rows.len(), 2);
-        let (unclaimed, count) = dirty_owner_summary(
+        let summary = dirty_owner_summary(
             &rows,
             &["src/main.rs".to_string(), "unmatched.rs".to_string()],
         );
-        assert_eq!(count, 1);
-        assert_eq!(unclaimed, vec!["src/main.rs", "unmatched.rs"]);
+        assert_eq!(summary.after_expiry, 1);
+        // owners.v1 meaning is unchanged: an expired match still counts as matched.
+        assert_eq!(summary.unclaimed, vec!["unmatched.rs"]);
+        assert_eq!(
+            summary.unclaimed_or_expired,
+            vec!["src/main.rs", "unmatched.rs"]
+        );
         assert!(
             rows.iter()
                 .all(|row| row.ownership_status == "unclaimed_after_expiry"
@@ -20528,6 +20564,7 @@ struct OwnersPayload {
     dirty_paths: Vec<String>,
     dirty: Vec<DirtyOwner>,
     unclaimed_dirty_paths: Vec<String>,
+    unclaimed_or_expired_dirty_paths: Vec<String>,
     dirty_after_expiry: usize,
 }
 
