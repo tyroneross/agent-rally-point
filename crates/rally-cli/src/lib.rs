@@ -6197,14 +6197,24 @@ fn command_owners(args: OwnersArgs) -> Result<Output> {
     let session_views = read_session_views(&room, args.bins)?;
     let dirty_paths = dirty_git_paths(&root);
     let dirty = build_dirty_owners(&snapshot, &session_views, &dirty_paths);
-    let claimed_paths: BTreeSet<String> = dirty.iter().map(|owner| owner.path.clone()).collect();
-    let unclaimed_dirty_paths = dirty_paths
-        .iter()
-        .filter(|path| !claimed_paths.contains(*path))
-        .cloned()
-        .collect::<Vec<_>>();
-    let dirty_len = dirty.len();
-    let unclaimed_len = unclaimed_dirty_paths.len();
+    let DirtyOwnerSummary {
+        unclaimed: unclaimed_dirty_paths,
+        unclaimed_or_expired: unclaimed_or_expired_dirty_paths,
+        after_expiry: dirty_after_expiry,
+    } = dirty_owner_summary(&dirty, &dirty_paths);
+    let mut text = format!(
+        "owners dirty={} unclaimed={} dirty_after_expiry={dirty_after_expiry}",
+        dirty.len(),
+        unclaimed_or_expired_dirty_paths.len()
+    );
+    for row in &dirty {
+        text.push_str(&format!(
+            "\n{} {} {}",
+            row.path,
+            row.ownership_status,
+            row.owner_tool.as_deref().unwrap_or("unknown")
+        ));
+    }
     let body = envelope(
         "owners",
         SCHEMA_OWNERS,
@@ -6214,11 +6224,51 @@ fn command_owners(args: OwnersArgs) -> Result<Output> {
                 dirty_paths,
                 dirty,
                 unclaimed_dirty_paths,
+                unclaimed_or_expired_dirty_paths,
+                dirty_after_expiry,
             },
         },
     )?;
-    let text = format!("owners dirty={dirty_len} unclaimed={unclaimed_len}");
     Ok(Output::new(args.json, text, body))
+}
+
+/// Count paths rather than matches, so overlapping expired claims count once.
+/// `unclaimed` keeps the original owners.v1 meaning (no matching claim at all);
+/// `unclaimed_or_expired` also counts paths whose only matches have expired.
+struct DirtyOwnerSummary {
+    unclaimed: Vec<String>,
+    unclaimed_or_expired: Vec<String>,
+    after_expiry: usize,
+}
+
+fn dirty_owner_summary(rows: &[DirtyOwner], dirty_paths: &[String]) -> DirtyOwnerSummary {
+    let matched_paths: BTreeSet<_> = rows.iter().map(|row| &row.path).collect();
+    let live_paths: BTreeSet<_> = rows
+        .iter()
+        .filter(|row| !row.lease_expired)
+        .map(|row| &row.path)
+        .collect();
+    let unclaimed = dirty_paths
+        .iter()
+        .filter(|path| !matched_paths.contains(path))
+        .cloned()
+        .collect();
+    let unclaimed_or_expired = dirty_paths
+        .iter()
+        .filter(|path| !live_paths.contains(path))
+        .cloned()
+        .collect();
+    let after_expiry = rows
+        .iter()
+        .filter(|row| row.ownership_status == "unclaimed_after_expiry")
+        .map(|row| &row.path)
+        .collect::<BTreeSet<_>>()
+        .len();
+    DirtyOwnerSummary {
+        unclaimed,
+        unclaimed_or_expired,
+        after_expiry,
+    }
 }
 
 fn dirty_git_paths(root: &Path) -> Vec<String> {
@@ -6300,6 +6350,12 @@ fn build_dirty_owners(
                 path: path.clone(),
                 claim_id: record.claim_id,
                 owner_tool: record.owner_tool,
+                ownership_status: if lease_expired {
+                    "expired_match"
+                } else {
+                    "claimed"
+                },
+                expired_match: lease_expired.then(|| claim.clone()),
                 from_session_id: record.from_session_id,
                 owner_status,
                 lease_expires_at: record.lease_expires_at,
@@ -6310,6 +6366,16 @@ fn build_dirty_owners(
                 scope: claim.scope.clone(),
                 subject: claim.subject.clone(),
             });
+        }
+    }
+    let unexpired_paths: BTreeSet<_> = rows
+        .iter()
+        .filter(|row| !row.lease_expired)
+        .map(|row| row.path.clone())
+        .collect();
+    for row in &mut rows {
+        if row.lease_expired && !unexpired_paths.contains(&row.path) {
+            row.ownership_status = "unclaimed_after_expiry";
         }
     }
     rows.sort_by(|a, b| {
@@ -13369,6 +13435,158 @@ pub(crate) static PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new
 mod tests {
     use super::*;
 
+    fn expiry_claim(id: &str, lease: Option<&str>) -> Fact {
+        Fact {
+            event_id: id.to_string(),
+            kind: store::FactKind::Claim,
+            tool: Some(format!("codex:{id}")),
+            scope: vec!["file:src/main.rs".to_string()],
+            evidence: lease
+                .map(|lease| vec![format!("lease_expires_at:{lease}")])
+                .unwrap_or_default(),
+            subject: format!("claim {id}"),
+            ..Fact::default()
+        }
+    }
+
+    #[test]
+    fn claims_expiry_retains_and_sorts_rows_with_additive_json() {
+        let expired = expiry_claim("old", Some("2000-01-01T00:00:00Z"));
+        let original = serde_json::to_value(&expired).unwrap();
+        let rows = claims_expiry_rows(vec![
+            expired,
+            expiry_claim("future", Some("2999-01-01T00:00:00Z")),
+        ]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].fact.event_id, "future");
+        assert!(!rows[0].expired);
+        assert!(rows[1].expired);
+        let json = serde_json::to_value(&rows[1]).unwrap();
+        for (key, value) in original.as_object().unwrap() {
+            assert_eq!(&json[key], value, "original field {key}");
+        }
+        assert_eq!(json["lease_expires_at"], "2000-01-01T00:00:00Z");
+        assert_eq!(json["expired"], true);
+        assert!(claims_expiry_text(&rows).contains("claim old [expired]"));
+    }
+
+    #[test]
+    fn claims_expiry_missing_or_invalid_lease_is_not_expired() {
+        let rows = claims_expiry_rows(vec![
+            expiry_claim("missing", None),
+            expiry_claim("invalid", Some("invalid")),
+        ]);
+        assert!(rows.iter().all(|row| !row.expired));
+        assert_eq!(rows[0].lease_expires_at, None);
+        assert!(!claims_expiry_text(&rows).contains("[expired]"));
+        assert!(lease_is_expired(&Utc::now().to_rfc3339()));
+    }
+
+    #[test]
+    fn claims_expiry_non_utc_offset_compares_in_utc() {
+        let past = (Utc::now() - chrono::Duration::hours(1))
+            .with_timezone(&chrono::FixedOffset::east_opt(2 * 3600).unwrap())
+            .to_rfc3339();
+        let future = (Utc::now() + chrono::Duration::hours(1))
+            .with_timezone(&chrono::FixedOffset::west_opt(5 * 3600).unwrap())
+            .to_rfc3339();
+        assert!(past.ends_with("+02:00"), "{past}");
+        assert!(future.ends_with("-05:00"), "{future}");
+        assert!(lease_is_expired(&past));
+        assert!(!lease_is_expired(&future));
+    }
+
+    #[test]
+    fn dirty_owner_expired_single_match_keeps_evidence_and_owner_tool() {
+        let claim = expiry_claim("old", Some("2000-01-01T00:00:00Z"));
+        let snapshot = RoomSnapshot {
+            active_claims: vec![claim.clone()],
+            ..Default::default()
+        };
+        let rows = build_dirty_owners(&snapshot, &[], &["src/main.rs".to_string()]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ownership_status, "unclaimed_after_expiry");
+        assert_eq!(rows[0].owner_tool.as_deref(), Some("codex:old"));
+        assert_eq!(
+            rows[0].expired_match.as_ref().unwrap().event_id,
+            claim.event_id
+        );
+        assert!(rows[0].lease_expired);
+        let json = serde_json::to_value(&rows[0]).unwrap();
+        assert_eq!(json["expired_match"]["tool"], "codex:old");
+    }
+
+    #[test]
+    fn dirty_owner_overlapping_matches_stay_plural() {
+        let snapshot = RoomSnapshot {
+            active_claims: vec![
+                expiry_claim("old", Some("2000-01-01T00:00:00Z")),
+                expiry_claim("future", Some("2999-01-01T00:00:00Z")),
+                expiry_claim("missing", None),
+            ],
+            ..Default::default()
+        };
+        let rows = build_dirty_owners(
+            &snapshot,
+            &[],
+            &["src/main.rs".to_string(), "unmatched.rs".to_string()],
+        );
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.ownership_status == "claimed")
+                .count(),
+            2
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.ownership_status == "expired_match")
+                .count(),
+            1
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.ownership_status != "unclaimed_after_expiry")
+        );
+        assert!(rows.iter().all(|row| row.owner_tool.is_some()));
+        let summary = dirty_owner_summary(
+            &rows,
+            &["src/main.rs".to_string(), "unmatched.rs".to_string()],
+        );
+        assert_eq!(summary.unclaimed, vec!["unmatched.rs"]);
+        assert_eq!(summary.unclaimed_or_expired, vec!["unmatched.rs"]);
+        assert_eq!(summary.after_expiry, 0);
+    }
+
+    #[test]
+    fn dirty_owner_multiple_expired_matches_stay_plural() {
+        let snapshot = RoomSnapshot {
+            active_claims: vec![
+                expiry_claim("old-a", Some("2000-01-01T00:00:00Z")),
+                expiry_claim("old-b", Some("2000-01-01T00:00:00Z")),
+            ],
+            ..Default::default()
+        };
+        let rows = build_dirty_owners(&snapshot, &[], &["src/main.rs".to_string()]);
+        assert_eq!(rows.len(), 2);
+        let summary = dirty_owner_summary(
+            &rows,
+            &["src/main.rs".to_string(), "unmatched.rs".to_string()],
+        );
+        assert_eq!(summary.after_expiry, 1);
+        // owners.v1 meaning is unchanged: an expired match still counts as matched.
+        assert_eq!(summary.unclaimed, vec!["unmatched.rs"]);
+        assert_eq!(
+            summary.unclaimed_or_expired,
+            vec!["src/main.rs", "unmatched.rs"]
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.ownership_status == "unclaimed_after_expiry"
+                    && row.expired_match.is_some())
+        );
+    }
+
     #[test]
     fn append_warnings_do_not_corrupt_compact_host_hook_json() {
         let host_envelope = json!({
@@ -20346,10 +20564,14 @@ struct OwnersPayload {
     dirty_paths: Vec<String>,
     dirty: Vec<DirtyOwner>,
     unclaimed_dirty_paths: Vec<String>,
+    unclaimed_or_expired_dirty_paths: Vec<String>,
+    dirty_after_expiry: usize,
 }
 
 #[derive(JsonSchema, Serialize)]
 struct DirtyOwner {
+    ownership_status: &'static str,
+    expired_match: Option<Fact>,
     path: String,
     claim_id: String,
     owner_tool: Option<String>,
@@ -20919,6 +21141,46 @@ enum KindRead {
     Claims,
 }
 
+#[derive(Serialize)]
+struct ClaimExpiryRow {
+    #[serde(flatten)]
+    fact: Fact,
+    lease_expires_at: Option<String>,
+    expired: bool,
+}
+
+fn claims_expiry_rows(claims: Vec<Fact>) -> Vec<ClaimExpiryRow> {
+    let mut rows: Vec<_> = claims
+        .into_iter()
+        .map(|fact| {
+            let lease_expires_at = claim_authority::active_claim_record_from_fact(&fact)
+                .and_then(|record| record.lease_expires_at);
+            let expired = lease_expires_at.as_deref().is_some_and(lease_is_expired);
+            ClaimExpiryRow {
+                fact,
+                lease_expires_at,
+                expired,
+            }
+        })
+        .collect();
+    rows.sort_by_key(|row| row.expired);
+    rows
+}
+
+fn claims_expiry_text(rows: &[ClaimExpiryRow]) -> String {
+    let mut text = format!("claims {}", rows.len());
+    for row in rows {
+        text.push_str(&format!(
+            "\n{} {} {}{}",
+            row.fact.event_id,
+            row.fact.tool.as_deref().unwrap_or("unknown-owner"),
+            row.fact.subject,
+            if row.expired { " [expired]" } else { "" }
+        ));
+    }
+    text
+}
+
 /// Read-only per-kind projection of the room snapshot: `rally risks`,
 /// `rally decisions`, `rally artifacts`, `rally claims`. Each returns the
 /// corresponding `RoomSnapshot` bucket under `data.<verb>.rows` — a thin,
@@ -20927,11 +21189,17 @@ enum KindRead {
 fn command_kind_read(args: KindReadArgs, kind: KindRead) -> Result<Output> {
     let room = RoomStore::open()?;
     let snapshot = room.snapshot_with_archived(false)?;
+    if matches!(kind, KindRead::Claims) {
+        let rows = claims_expiry_rows(snapshot.active_claims);
+        let text = claims_expiry_text(&rows);
+        let body = envelope_value("claims", SCHEMA_CLAIMS, json!({"claims": {"rows": rows}}))?;
+        return Ok(Output::new(args.json, text, body));
+    }
     let (name, schema, rows) = match kind {
         KindRead::Risks => ("risks", SCHEMA_RISKS, snapshot.current_risks),
         KindRead::Decisions => ("decisions", SCHEMA_DECISIONS, snapshot.current_decisions),
         KindRead::Artifacts => ("artifacts", SCHEMA_ARTIFACTS, snapshot.recent_artifacts),
-        KindRead::Claims => ("claims", SCHEMA_CLAIMS, snapshot.active_claims),
+        KindRead::Claims => unreachable!("claims use the expiry projection above"),
     };
     let text = format!("{name} {}", rows.len());
     let rows_val = serde_json::to_value(&rows).map_err(RallyError::json("serialize facts"))?;
@@ -21597,7 +21865,7 @@ fn help_text() -> String {
         "  rally check coordination --tool <committer> [--changed <path>]... [--json]",
         "",
         "  Room projections (read-only slices of `rally room`):",
-        "  rally claims [--json]      # active claims",
+        "  rally claims [--json]      # retained claims, unexpired first; expired marked",
         "  rally risks [--json]       # active coordination risks",
         "  rally decisions [--json]   # current decisions",
         "  rally artifacts [--json]   # recent artifacts",
