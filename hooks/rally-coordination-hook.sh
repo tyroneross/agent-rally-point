@@ -1566,7 +1566,7 @@ if [ "$have_node" = "1" ]; then
   if [ "$phase" = "before-write" ] && { [ "$_rally_native_effect" = "mutation" ] || [ "$_rally_native_effect" = "legacy" ]; }; then
     hooks_status="$(rally_timeout_ms 400 hooks status --json 2>/dev/null)" || hooks_status_rc=$?
   else
-    hooks_status="$(rally_timeout hooks status --json 2>/dev/null)" || hooks_status_rc=$?
+    hooks_status="$(rally_timeout_ms 400 hooks status --json 2>/dev/null)" || hooks_status_rc=$?
   fi
   hooks_meta="$({ printf '%s' "$hooks_status" | node -e '
 const fs = require("fs");
@@ -1622,12 +1622,16 @@ if [ "$phase" = "start" ]; then
   # Register presence (auto-enter), then surface room awareness so a NEW agent
   # automatically knows there is an active room + who owns what, and deconflicts
   # before editing. Stays quiet (no nag) when the agent is solo.
-  rally_timeout enter --tool "$tool" --session-id "$session" --json >/dev/null 2>&1 || true
+  # Lifecycle hosts allow 5s for the WHOLE hook, not each CLI call. Five
+  # sequential 3s guards previously took 6.25s in a live room even without
+  # a hung binary. Keep the foreground CLI sum below 3.5s, leaving time for
+  # shell/Node startup and rendering. Idle status remains asynchronous.
+  rally_timeout_ms 1000 enter --tool "$tool" --session-id "$session" --json >/dev/null 2>&1 || true
   _rally_status_idle
   if [ "$have_node" = "1" ]; then
-    room_json="$(rally_timeout room --json 2>/dev/null || true)"
-    next_json="$(rally_timeout next --tool "$tool" --audit --json 2>/dev/null || true)"
-    status_json="$(rally_timeout status read --json 2>/dev/null || true)"
+    room_json="$(rally_timeout_ms 750 room --json 2>/dev/null || true)"
+    next_json="$(rally_timeout_ms 750 next --tool "$tool" --audit --json 2>/dev/null || true)"
+    status_json="$(rally_timeout_ms 400 status read --json 2>/dev/null || true)"
     rally_output="$({ printf '%s' "$room_json" | RALLY_NEXT_JSON="$next_json" RALLY_STATUS_JSON="$status_json" RALLY_SELF_TOOL="$tool" node -e '
 const fs = require("fs");
 const tool = process.env.RALLY_SELF_TOOL || "";
@@ -2061,7 +2065,7 @@ else
   before_complete_json=""
   if [ "$phase" = "after-write" ] || [ "$phase" = "idle" ]; then
     _rally_status_idle
-    status_json="$(rally_timeout status read --json 2>/dev/null || true)"
+    status_json="$(rally_timeout_ms 400 status read --json 2>/dev/null || true)"
   fi
   if [ "$phase" = "after-write" ]; then
     # Stop-phase completion gate: `rally check before-complete --strict`
@@ -2073,9 +2077,9 @@ else
     # translator below always renders Stop as advisory. Strict mode is a
     # mutation-boundary control; one conversation turn ending is not proof
     # that the agent completed or abandoned the work behind an active claim.
-    before_complete_json="$(rally_timeout check before-complete --tool "$tool" --strict --json 2>/dev/null || true)"
+    before_complete_json="$(rally_timeout_ms 750 check before-complete --tool "$tool" --strict --json 2>/dev/null || true)"
   fi
-  rally_output="$(rally_timeout next --tool "$tool" --audit --json 2>/dev/null || true)"
+  rally_output="$(rally_timeout_ms 750 next --tool "$tool" --audit --json 2>/dev/null || true)"
 fi
 
 # Render the host-specific output envelope from rally's JSON output.

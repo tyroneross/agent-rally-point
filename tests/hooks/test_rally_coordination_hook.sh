@@ -54,7 +54,7 @@ export RALLY_NATIVE_HOOK
 
 # Host sessionStart env (or a parent agent) can leak these into the suite and
 # override every test's intended --tool. Isolate.
-unset RALLY_TOOL_ID RALLY_SESSION_ID RALLY_AGENT_ID RALLY_ET_ROUTER_HEALTH
+unset RALLY_TOOL_ID RALLY_SESSION_ID RALLY_AGENT_ID RALLY_ET_ROUTER_HEALTH RALLY_NOTICE_VERBOSITY
 
 PASS=0
 FAIL=0
