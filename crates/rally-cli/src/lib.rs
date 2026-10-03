@@ -13449,6 +13449,104 @@ mod tests {
         }
     }
 
+    fn claims_readable_fixture() -> (chrono::DateTime<Utc>, Vec<Fact>) {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-03T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut none = expiry_claim("none", None);
+        none.created_at = "2026-09-25T12:00:00Z".to_string();
+        (
+            now,
+            vec![
+                expiry_claim("expired", Some("2026-10-03T09:00:00Z")),
+                expiry_claim("active", Some("2026-10-03T16:30:00+02:00")),
+                none,
+            ],
+        )
+    }
+
+    #[test]
+    fn claims_readable_multibyte_truncation() {
+        let short = "界".repeat(72);
+        assert_eq!(claims_readable_subject(&short), short);
+        let long = "é界🙂".repeat(30);
+        let rendered = claims_readable_subject(&long);
+        assert_eq!(rendered.chars().count(), 72);
+        assert_eq!(rendered, long.chars().take(71).collect::<String>() + "…");
+        assert_eq!(claims_readable_subject("one\ntwo\tthree"), "one two three");
+    }
+
+    #[test]
+    fn claims_readable_lease_states_and_summary() {
+        let (now, facts) = claims_readable_fixture();
+        let rows = claims_expiry_rows_at(facts, now, 7 * 86_400);
+        assert_eq!(
+            rows.iter().map(|row| row.lease_state).collect::<Vec<_>>(),
+            vec!["active", "none", "expired"]
+        );
+        let text = claims_expiry_text_at(&rows, now);
+        assert_eq!(
+            text,
+            "claims 3 (active 1, expired 1, no-lease 1)\nactive codex:active expires 14:30Z claim active\nnone codex:none no-lease age 8d claim none\nexpired codex:expired expired 3h ago claim expired"
+        );
+        assert_eq!(
+            claims_expiry_text_at(&[], now),
+            "claims 0 (active 0, expired 0, no-lease 0)"
+        );
+        let invalid = claims_expiry_rows_at(vec![expiry_claim("invalid", Some("bad"))], now, 0);
+        assert_eq!(invalid[0].lease_state, "none");
+        assert_eq!(invalid[0].age_seconds, None);
+        assert!(!invalid[0].stale_no_lease);
+        assert!(claims_expiry_text_at(&invalid, now).contains("no-lease age unknown"));
+    }
+
+    #[test]
+    fn claims_readable_stale_threshold_and_env_override() {
+        let _guard = PROCESS_ENV_LOCK.lock().unwrap();
+        let key = "RALLY_CLAIM_STALE_NO_LEASE_DAYS";
+        // Environment mutations are serialized by PROCESS_ENV_LOCK; run these tests serially.
+        let previous = std::env::var_os(key);
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(claims_stale_no_lease_seconds(), 7 * 86_400);
+        let (now, facts) = claims_readable_fixture();
+        let rows = claims_expiry_rows_at(facts.clone(), now, claims_stale_no_lease_seconds());
+        assert!(rows[1].stale_no_lease);
+        assert!(!rows[0].stale_no_lease);
+        assert!(!rows[2].stale_no_lease);
+        unsafe { std::env::set_var(key, "8") };
+        let rows = claims_expiry_rows_at(facts.clone(), now, claims_stale_no_lease_seconds());
+        assert!(!rows[1].stale_no_lease); // Equality is not stale.
+        unsafe { std::env::set_var(key, "0") };
+        assert_eq!(claims_stale_no_lease_seconds(), 0);
+        assert!(
+            claims_expiry_rows_at(facts, now, claims_stale_no_lease_seconds())[1].stale_no_lease
+        );
+        for value in ["bad", "-1", "9223372036854775807"] {
+            unsafe { std::env::set_var(key, value) };
+            assert_eq!(claims_stale_no_lease_seconds(), 7 * 86_400);
+        }
+        match previous {
+            Some(value) => unsafe { std::env::set_var(key, value) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn claims_readable_json_additive() {
+        let (now, facts) = claims_readable_fixture();
+        let original = serde_json::to_value(&facts[2]).unwrap();
+        let rows = claims_expiry_rows_at(facts, now, 7 * 86_400);
+        let json = serde_json::to_value(&rows[1]).unwrap();
+        for (key, value) in original.as_object().unwrap() {
+            assert_eq!(&json[key], value, "original field {key}");
+        }
+        assert_eq!(json["lease_expires_at"], Value::Null);
+        assert_eq!(json["expired"], false);
+        assert_eq!(json["lease_state"], "none");
+        assert_eq!(json["age_seconds"], 8 * 86_400);
+        assert_eq!(json["stale_no_lease"], true);
+    }
+
     #[test]
     fn claims_expiry_retains_and_sorts_rows_with_additive_json() {
         let expired = expiry_claim("old", Some("2000-01-01T00:00:00Z"));
@@ -13467,7 +13565,7 @@ mod tests {
         }
         assert_eq!(json["lease_expires_at"], "2000-01-01T00:00:00Z");
         assert_eq!(json["expired"], true);
-        assert!(claims_expiry_text(&rows).contains("claim old [expired]"));
+        assert!(claims_expiry_text(&rows).contains("expired"));
     }
 
     #[test]
@@ -21147,19 +21245,55 @@ struct ClaimExpiryRow {
     fact: Fact,
     lease_expires_at: Option<String>,
     expired: bool,
+    lease_state: &'static str,
+    age_seconds: Option<i64>,
+    stale_no_lease: bool,
+}
+
+fn claims_stale_no_lease_seconds() -> i64 {
+    std::env::var("RALLY_CLAIM_STALE_NO_LEASE_DAYS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|days| *days >= 0)
+        .and_then(|days| days.checked_mul(86_400))
+        .unwrap_or(7 * 86_400)
 }
 
 fn claims_expiry_rows(claims: Vec<Fact>) -> Vec<ClaimExpiryRow> {
+    claims_expiry_rows_at(claims, Utc::now(), claims_stale_no_lease_seconds())
+}
+
+fn claims_expiry_rows_at(
+    claims: Vec<Fact>,
+    now: chrono::DateTime<Utc>,
+    stale_seconds: i64,
+) -> Vec<ClaimExpiryRow> {
     let mut rows: Vec<_> = claims
         .into_iter()
         .map(|fact| {
             let lease_expires_at = claim_authority::active_claim_record_from_fact(&fact)
                 .and_then(|record| record.lease_expires_at);
-            let expired = lease_expires_at.as_deref().is_some_and(lease_is_expired);
+            let lease = lease_expires_at
+                .as_deref()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+            let expired = lease.is_some_and(|lease| lease <= now);
+            let lease_state = match lease {
+                Some(_) if expired => "expired",
+                Some(_) => "active",
+                None => "none",
+            };
+            let age_seconds = chrono::DateTime::parse_from_rfc3339(&fact.created_at)
+                .ok()
+                .map(|created| (now - created.with_timezone(&Utc)).num_seconds());
+            let stale_no_lease =
+                lease_state == "none" && age_seconds.is_some_and(|age| age > stale_seconds);
             ClaimExpiryRow {
                 fact,
                 lease_expires_at,
                 expired,
+                lease_state,
+                age_seconds,
+                stale_no_lease,
             }
         })
         .collect();
@@ -21167,15 +21301,60 @@ fn claims_expiry_rows(claims: Vec<Fact>) -> Vec<ClaimExpiryRow> {
     rows
 }
 
+fn claims_readable_subject(subject: &str) -> String {
+    // Keep each claim on one line, and cap the rendered subject including ellipsis.
+    let subject: String = subject
+        .chars()
+        .map(|ch| if ch.is_whitespace() { ' ' } else { ch })
+        .collect();
+    if subject.chars().count() <= 72 {
+        subject
+    } else {
+        subject
+            .chars()
+            .take(71)
+            .chain(std::iter::once('…'))
+            .collect()
+    }
+}
+
 fn claims_expiry_text(rows: &[ClaimExpiryRow]) -> String {
-    let mut text = format!("claims {}", rows.len());
+    claims_expiry_text_at(rows, Utc::now())
+}
+
+fn claims_expiry_text_at(rows: &[ClaimExpiryRow], now: chrono::DateTime<Utc>) -> String {
+    let active = rows
+        .iter()
+        .filter(|row| row.lease_state == "active")
+        .count();
+    let expired = rows.iter().filter(|row| row.expired).count();
+    let none = rows.len() - active - expired;
+    let mut text = format!(
+        "claims {} (active {active}, expired {expired}, no-lease {none})",
+        rows.len()
+    );
     for row in rows {
+        let lease = row
+            .lease_expires_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+        let state = match lease {
+            Some(lease) if row.expired => format!(
+                "expired {}h ago",
+                (now - lease.with_timezone(&Utc)).num_hours().max(0)
+            ),
+            Some(lease) => format!("expires {}Z", lease.with_timezone(&Utc).format("%H:%M")),
+            None => match row.age_seconds {
+                Some(age) => format!("no-lease age {}d", age.max(0) / 86_400),
+                None => "no-lease age unknown".to_string(),
+            },
+        };
         text.push_str(&format!(
-            "\n{} {} {}{}",
+            "\n{} {} {} {}",
             row.fact.event_id,
             row.fact.tool.as_deref().unwrap_or("unknown-owner"),
-            row.fact.subject,
-            if row.expired { " [expired]" } else { "" }
+            state,
+            claims_readable_subject(&row.fact.subject),
         ));
     }
     text
