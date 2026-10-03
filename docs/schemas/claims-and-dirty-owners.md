@@ -12,9 +12,21 @@ all existing fact fields and adds:
 | --- | --- | --- |
 | `lease_expires_at` | string or null | Lease marker parsed by claim authority; null if absent. |
 | `expired` | boolean | A parseable RFC 3339 lease is at or before the current time. Missing or invalid timestamps yield false. |
+| `lease_state` | string | `active` for a parseable future lease, `expired` for a parseable lease at or before now, `none` for a missing or invalid lease. |
+| `age_seconds` | integer or null | Current time minus `created_at` in whole seconds; null if the creation timestamp is unparseable. Future creation timestamps yield negative ages. |
+| `stale_no_lease` | boolean | `lease_state` is `none` and age strictly exceeds the threshold. Defaults to 7 days; `RALLY_CLAIM_STALE_NO_LEASE_DAYS` accepts a nonnegative integer, including zero. Invalid, negative, or overflowing values fall back to 7 days. |
 
-Rows appear with unexpired claims first, preserving ledger order within each
-group. Human output lists every claim and marks expired rows with `[expired]`.
+Rows appear with unexpired claims first (including no-lease claims), preserving
+ledger order within each group. These fields are display metadata only and do
+not change claim authority, release, reaping, or dirty-owner behavior.
+
+Human output starts with `claims N (active A, expired E, no-lease L)`, followed
+by one line per claim: `<event_id> <tool> <lease-state> <subject>`.
+Lease state is `expires HH:MMZ` in UTC, `expired Nh ago` in whole hours, or
+`no-lease age Nd` in whole days. Unparseable creation timestamps display
+`no-lease age unknown`; future ages display zero days. Subjects have whitespace
+flattened to spaces and are capped at 72 Unicode characters, including a trailing
+`…` when truncated. JSON retains the full original subject.
 
 ## `rally owners --dirty --json`
 
