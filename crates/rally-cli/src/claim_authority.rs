@@ -708,6 +708,20 @@ pub(crate) fn no_lease_max_age_days() -> Option<i64> {
     (days > 0 && chrono::Duration::try_days(days).is_some()).then_some(days)
 }
 
+/// Require the preview policy stamp and retain whichever threshold is stricter.
+/// A disabled current policy vetoes the close even when the preview allowed it.
+pub(crate) fn no_lease_reap_max_age_days(evidence: &[String]) -> Option<i64> {
+    let stamped = evidence
+        .iter()
+        .find_map(|item| item.strip_prefix("reaper:max_age_days="))?
+        .parse::<i64>()
+        .ok()?;
+    if stamped <= 0 || chrono::Duration::try_days(stamped).is_none() {
+        return None;
+    }
+    Some(stamped.max(no_lease_max_age_days()?))
+}
+
 pub(crate) fn no_lease_over_age(
     created_at: &str,
     effective_lease: Option<&str>,

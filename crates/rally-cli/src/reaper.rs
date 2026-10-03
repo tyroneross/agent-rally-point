@@ -56,6 +56,9 @@ pub(crate) struct ReapedClaim {
     /// Whole days since creation, when the manual no-lease age reason applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) age_days: Option<i64>,
+    /// Close-policy evidence retained in both preview and apply reports.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) evidence: Vec<String>,
 }
 
 /// A handoff that was (or would be) expired.
@@ -678,7 +681,7 @@ fn run_reap_stale_in_room_with_budget(
         }
         attempted_actions += 1;
 
-        let reason = if no_lease_age.is_some() {
+        let reason = if !owner_eligible && !lease_eligible && no_lease_age.is_some() {
             "no-lease-over-age"
         } else {
             match (owner_eligible, lease_eligible) {
@@ -704,6 +707,14 @@ fn run_reap_stale_in_room_with_budget(
             lease_expires_at,
             reason: reason.clone(),
             age_days: no_lease_age,
+            evidence: if reason == "no-lease-over-age" {
+                vec![format!(
+                    "reaper:max_age_days={}",
+                    no_lease_max_age_days.unwrap()
+                )]
+            } else {
+                Vec::new()
+            },
         };
 
         if apply {
@@ -741,19 +752,23 @@ fn run_reap_stale_in_room_with_budget(
                 // can re-check owner age, effective durable lease, and an
                 // observed-stale verdict under the mutation lock. The owner is
                 // explicit so no subject parsing participates in authority.
-                evidence: vec![
-                    format!("reaper:ref_id={}", claim.event_id),
-                    format!("reaper:reason={}", reaped.reason),
-                    format!("reaper:observed={}", observed.as_str()),
-                    format!(
-                        "reaper:owner={}",
-                        claim.tool.as_deref().unwrap_or("unknown")
-                    ),
-                    format!(
-                        "reaper:owner_session={}",
-                        claim.from_session_id.as_deref().unwrap_or("legacy")
-                    ),
-                ],
+                evidence: [
+                    reaped.evidence.clone(),
+                    vec![
+                        format!("reaper:ref_id={}", claim.event_id),
+                        format!("reaper:reason={}", reaped.reason),
+                        format!("reaper:observed={}", observed.as_str()),
+                        format!(
+                            "reaper:owner={}",
+                            claim.tool.as_deref().unwrap_or("unknown")
+                        ),
+                        format!(
+                            "reaper:owner_session={}",
+                            claim.from_session_id.as_deref().unwrap_or("legacy")
+                        ),
+                    ],
+                ]
+                .concat(),
                 target: None,
                 ref_id: Some(claim.event_id.clone()),
                 status: None,
@@ -3215,6 +3230,55 @@ mod tests {
     }
 
     #[test]
+    fn reap_no_lease_old_stale_owner_keeps_owner_stale_precedence() {
+        let _env = NoLeaseEnv::new(None);
+        let room = RoomStore::open_at(unique_root("no-lease-precedence")).unwrap();
+        append_claim_ago(&room, "old-stale", "stale-owner", 84 * 86_400);
+        let preview = run_reap_stale_in_room_with_mode(&room, false, ReapMode::Full).unwrap();
+        assert_eq!(preview.claims_reaped.len(), 1);
+        assert_eq!(preview.claims_reaped[0].reason, "owner-stale");
+        fs::remove_dir_all(room.repo_root()).unwrap();
+    }
+
+    #[test]
+    fn reap_no_lease_over_age_future_creation_is_ineligible() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-03T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            crate::claim_authority::no_lease_over_age("2026-10-04T00:00:00Z", None, now, Some(14)),
+            None
+        );
+    }
+
+    #[test]
+    fn reap_no_lease_over_age_offset_uses_utc() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-03T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // At +02:00, this is 14 days and one hour old in UTC.
+        assert_eq!(
+            crate::claim_authority::no_lease_over_age(
+                "2026-09-19T01:00:00+02:00",
+                None,
+                now,
+                Some(14)
+            ),
+            Some(14)
+        );
+        // The same UTC instant exactly at the threshold is not over age.
+        assert_eq!(
+            crate::claim_authority::no_lease_over_age(
+                "2026-09-19T02:00:00+02:00",
+                None,
+                now,
+                Some(14)
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn reap_no_lease_old_full_preview_and_apply() {
         let _env = NoLeaseEnv::new(None);
         let room = no_lease_fixture("no-lease-full", &past_ts(84 * 86_400), None);
@@ -3222,6 +3286,10 @@ mod tests {
         assert_eq!(preview.claims_reaped.len(), 1);
         assert_eq!(preview.claims_reaped[0].reason, "no-lease-over-age");
         assert_eq!(preview.claims_reaped[0].age_days, Some(84));
+        assert_eq!(
+            preview.claims_reaped[0].evidence,
+            vec!["reaper:max_age_days=14"]
+        );
         assert_eq!(preview.attempted_writes, 0);
         assert!(
             room.snapshot()
@@ -3233,6 +3301,13 @@ mod tests {
         let applied = run_reap_stale_in_room_with_mode(&room, true, ReapMode::Full).unwrap();
         assert!(applied.applied);
         assert_eq!(applied.write_failures, 0);
+        assert!(room.facts().unwrap().iter().any(|fact| {
+            fact.kind == FactKind::ClaimExpired
+                && fact
+                    .evidence
+                    .contains(&"reaper:max_age_days=14".to_string())
+        }));
+
         assert!(
             !room
                 .snapshot()

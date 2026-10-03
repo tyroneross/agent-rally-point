@@ -439,7 +439,7 @@ fn authorize_claim_removal(
                 &claim.created_at,
                 lease,
                 chrono::Utc::now(),
-                claim_authority::no_lease_max_age_days(),
+                claim_authority::no_lease_reap_max_age_days(&fact.evidence),
             )
             .is_some()
         {
@@ -1104,6 +1104,7 @@ mod tests {
             evidence: vec![
                 format!("reaper:ref_id={}", claim.event_id),
                 "reaper:reason=no-lease-over-age".to_string(),
+                "reaper:max_age_days=14".to_string(),
                 "reaper:owner=victim:01".to_string(),
                 "reaper:owner_session=sess:victim:01".to_string(),
                 "reaper:observed=unknown".to_string(),

@@ -2902,11 +2902,24 @@ mod tests {
 
     #[test]
     fn abort_envelope_from_args_derives_the_host_from_argv() {
+        let _guard = crate::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("RALLY_TOOL_ID");
+        unsafe {
+            std::env::remove_var("RALLY_TOOL_ID");
+        }
         let args: Vec<String> = ["hook", "before-write", "--tool", "codex"]
             .iter()
             .map(|value| value.to_string())
             .collect();
         let rendered = abort_envelope_from_args(&args, "coordination budget exceeded");
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("RALLY_TOOL_ID", value),
+                None => std::env::remove_var("RALLY_TOOL_ID"),
+            }
+        }
         let value: Value = serde_json::from_str(&rendered).unwrap();
         // The point of this test is that the HOST is derived from argv; the
         // sink follows from that host. Codex reads model context from
