@@ -561,18 +561,8 @@ fn run_reap_stale_in_room_with_budget(
     // claim eligibility below instead requires the exact observed session.
     let stale_owners = snapshot.takeover_eligible_owners();
 
-    // Compute the lease-expired claim_id set: claims whose OWN lease timestamp
-    // has provably passed NOW, regardless of owner-squad liveness.
-    // fail-closed: expired_claims only includes claims with a parseable
-    // lease_expires_at <= now; unparseable or missing lease → not included.
     let facts = room.facts()?;
     let observed_sessions = crate::observed_liveness::observe_sessions(room.repo_root(), &facts);
-    let claim_index = crate::claim_authority::index_from_facts(&facts);
-    let lease_expired_ids: std::collections::BTreeSet<String> =
-        crate::claim_authority::expired_claims(&claim_index, &facts, chrono::Utc::now())
-            .into_iter()
-            .map(|r| r.claim_id)
-            .collect();
 
     let now = chrono::Utc::now();
     let no_lease_max_age_days = (mode == ReapMode::Full)
@@ -582,21 +572,23 @@ fn run_reap_stale_in_room_with_budget(
     // --- Evaluate each active claim ---
     for claim in &snapshot.active_claims {
         let (legacy_owner_eligible, _size) = snapshot.claim_reclaim_eligible(claim, &coord);
-        let lease_eligible = lease_expired_ids.contains(&claim.event_id);
-        let no_lease_age = claim_index.claims.get(&claim.event_id).and_then(|record| {
-            crate::claim_authority::no_lease_over_age(
-                &claim.created_at,
-                record.lease_expires_at.as_deref(),
-                now,
-                no_lease_max_age_days,
-            )
-        });
-        let lease_boundary = claim
+        // Snapshot claims already carry their effective durable renewal. Read
+        // that lease directly: the resource-conflict index deliberately omits
+        // empty/unparseable scopes, but those claims still need lifecycle cleanup.
+        let effective_lease = claim
             .evidence
             .iter()
-            .find_map(|item| item.strip_prefix("lease_expires_at:"))
+            .find_map(|item| item.strip_prefix("lease_expires_at:"));
+        let lease_boundary = effective_lease
             .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
             .map(|time| time.with_timezone(&chrono::Utc));
+        let lease_eligible = lease_boundary.is_some_and(|expires| expires <= now);
+        let no_lease_age = crate::claim_authority::no_lease_over_age(
+            &claim.created_at,
+            effective_lease,
+            now,
+            no_lease_max_age_days,
+        );
         let observed = if lease_eligible {
             observed_sessions.for_claim_since(
                 claim.tool.as_deref(),
@@ -3227,6 +3219,211 @@ mod tests {
         // Fresh squad activity isolates age eligibility from owner staleness.
         append_presence(&room, "no-lease-owner", 0);
         room
+    }
+
+    #[test]
+    fn empty_scope_renew_expired_lease_preserves_live_presence_after_boundary() {
+        let root = unique_root("empty-scope-live-after-boundary");
+        init_observed_worktree(&root);
+        let room = RoomStore::open_at(root.clone()).unwrap();
+        let mut claim = append_claim_with_lease(&room, "seed", "seed-owner", &past_ts(3600));
+        claim.event_id = "empty-scope-live".to_string();
+        claim.tool = Some("live-owner".to_string());
+        claim.from_session_id = Some("sess:test:live-owner".to_string());
+        claim.scope.clear();
+        room.append_fact_verified(&claim).unwrap();
+        append_observed_presence_for_session(
+            &room,
+            "live-owner",
+            "sess:test:live-owner",
+            &root,
+            std::process::id(),
+        );
+        let facts = room.facts().unwrap();
+        assert_eq!(
+            crate::observed_liveness::observe_sessions(&root, &facts).for_claim_since(
+                claim.tool.as_deref(),
+                claim.from_session_id.as_deref(),
+                Some(
+                    chrono::DateTime::parse_from_rfc3339(&past_ts(3600))
+                        .unwrap()
+                        .with_timezone(&chrono::Utc)
+                )
+            ),
+            crate::observed_liveness::ObservedLiveness::Live
+        );
+        for mode in [ReapMode::LeaseOnly, ReapMode::Full] {
+            let result = run_reap_stale_in_room_with_mode(&room, true, mode).unwrap();
+            assert!(
+                !result
+                    .claims_reaped
+                    .iter()
+                    .any(|row| row.claim_id == claim.event_id)
+            );
+            assert!(
+                room.snapshot()
+                    .unwrap()
+                    .active_claims
+                    .iter()
+                    .any(|row| row.event_id == claim.event_id)
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_scope_renew_lease_only_reaps_expired_observed_dead_owner() {
+        let root = unique_root("empty-scope-dead-expired");
+        init_observed_worktree(&root);
+        let room = RoomStore::open_at(root.clone()).unwrap();
+        let mut claim = append_claim_with_lease(&room, "seed", "seed-owner", &past_ts(3600));
+        claim.event_id = "empty-scope-dead".to_string();
+        claim.tool = Some("dead-owner".to_string());
+        claim.from_session_id = Some("sess:test:dead-owner".to_string());
+        claim.scope.clear();
+        room.append_fact_verified(&claim).unwrap();
+        append_observed_presence_for_session(
+            &room,
+            "dead-owner",
+            "sess:test:dead-owner",
+            &root,
+            2_000_000_000,
+        );
+        assert_eq!(
+            crate::observed_liveness::observe_sessions(&root, &room.facts().unwrap())
+                .for_claim(claim.tool.as_deref(), claim.from_session_id.as_deref()),
+            crate::observed_liveness::ObservedLiveness::Stale
+        );
+        let result = run_reap_stale_in_room_with_mode(&room, true, ReapMode::LeaseOnly).unwrap();
+        assert_eq!(result.write_failures, 0);
+        let row = result
+            .claims_reaped
+            .iter()
+            .find(|row| row.claim_id == claim.event_id)
+            .unwrap();
+        assert_eq!(row.reason, "owner-stale+lease-expired");
+        assert!(
+            !room
+                .snapshot()
+                .unwrap()
+                .active_claims
+                .iter()
+                .any(|row| row.event_id == claim.event_id)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reap_empty_scope_session_claims_use_effective_lease_and_age() {
+        let _env = NoLeaseEnv::new(None);
+        for (session, age_days) in [
+            (
+                "sess:term:host:116ea021-8d59-4a8d-9452-dd8e3fbbc4ee#live",
+                84,
+            ),
+            ("sess:proc:host:94916#live", 23),
+            ("sess:proc:host:82106#live", 16),
+        ] {
+            for (lease, expected_reason) in [
+                (None, Some("no-lease-over-age")),
+                (
+                    Some(past_ts((age_days - 1) * 86_400)),
+                    Some("lease-expired"),
+                ),
+                (Some(past_ts(-86_400)), None),
+            ] {
+                let room = RoomStore::open_at(unique_root("empty-scope-session")).unwrap();
+                let mut claim = append_claim_ago(&room, "seed", "seed-owner", 0);
+                claim.event_id = "no-lease-claim".to_string();
+                claim.tool = Some("no-lease-owner".to_string());
+                claim.created_at = past_ts(age_days * 86_400);
+                claim.scope.clear();
+                claim.from_session_id = Some(session.to_string());
+                claim.evidence = lease
+                    .as_ref()
+                    .map(|raw| vec![format!("lease_expires_at:{raw}")])
+                    .unwrap_or_default();
+                room.append_fact_verified(&claim).unwrap();
+                let facts = room.facts().unwrap();
+                assert!(
+                    !crate::claim_authority::index_from_facts(&facts)
+                        .claims
+                        .contains_key("no-lease-claim")
+                );
+
+                assert!(
+                    run_reap_stale_in_room_with_mode(&room, false, ReapMode::LeaseOnly)
+                        .unwrap()
+                        .claims_reaped
+                        .is_empty()
+                );
+                let preview =
+                    run_reap_stale_in_room_with_mode(&room, false, ReapMode::Full).unwrap();
+                if expected_reason.is_none() {
+                    assert!(preview.claims_reaped.is_empty());
+                } else {
+                    assert_eq!(preview.claims_reaped.len(), 1);
+                    assert_eq!(preview.claims_reaped[0].reason, expected_reason.unwrap());
+                    assert_eq!(preview.attempted_writes, 0);
+                    let applied =
+                        run_reap_stale_in_room_with_mode(&room, true, ReapMode::Full).unwrap();
+                    assert_eq!(applied.write_failures, 0);
+                    assert_eq!(applied.claims_reaped.len(), 1);
+                    assert!(
+                        !room
+                            .snapshot()
+                            .unwrap()
+                            .active_claims
+                            .iter()
+                            .any(|c| c.event_id == "no-lease-claim")
+                    );
+                }
+                assert!(
+                    run_reap_stale_in_room_with_mode(&room, false, ReapMode::LeaseOnly)
+                        .unwrap()
+                        .claims_reaped
+                        .is_empty()
+                );
+                fs::remove_dir_all(room.repo_root()).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn reap_empty_scope_no_lease_claim_preserves_observed_live_owner() {
+        let _env = NoLeaseEnv::new(None);
+        let room = RoomStore::open_at(unique_root("empty-scope-live-renewal")).unwrap();
+        init_observed_worktree(room.repo_root());
+        let session = "sess:proc:host:94916#live";
+        let mut claim = append_claim_ago(&room, "seed", "seed-owner", 0);
+        claim.event_id = "empty-scope-claim".to_string();
+        claim.tool = Some("empty-scope-owner".to_string());
+        claim.from_session_id = Some(session.to_string());
+        claim.scope.clear();
+        claim.created_at = past_ts(84 * 86_400);
+        claim.evidence.clear();
+        room.append_fact_verified(&claim).unwrap();
+        assert_eq!(
+            run_reap_stale_in_room(&room, false)
+                .unwrap()
+                .claims_reaped
+                .len(),
+            1
+        );
+        append_observed_presence_for_session(
+            &room,
+            "empty-scope-owner",
+            session,
+            room.repo_root(),
+            std::process::id(),
+        );
+        assert!(
+            run_reap_stale_in_room(&room, false)
+                .unwrap()
+                .claims_reaped
+                .is_empty()
+        );
+        fs::remove_dir_all(room.repo_root()).unwrap();
     }
 
     #[test]

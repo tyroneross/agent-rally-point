@@ -142,6 +142,8 @@ therefore receive distinct operation identities.
 claims. Full mode accepts owner staleness, expired leases, and
 `no-lease-over-age`: an absent or unparseable effective `lease_expires_at` and
 parseable `created_at` older than `RALLY_CLAIM_NO_LEASE_MAX_AGE_DAYS` days.
+An unparseable lease intentionally counts as no lease for this manual age rule;
+it does not establish lease expiry and cannot authorize LeaseOnly cleanup.
 Age counts from claim creation, not owner activity. In a manual reap, any owner
 not observed Live loses a claim that qualifies for this age reason, even if
 its owner has recent activity.

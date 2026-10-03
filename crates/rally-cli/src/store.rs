@@ -5356,7 +5356,7 @@ impl DirectRoomStore {
             })?;
             let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
             let current =
-                claim_authority::active_claim_record(&facts, claim_id).ok_or_else(|| {
+                claim_authority::renewable_claim_record(&facts, claim_id).ok_or_else(|| {
                     RallyError::Usage(format!(
                         "renew claim lease: ref {claim_id} is not an active claim"
                     ))
@@ -6059,7 +6059,7 @@ impl DirectRoomStore {
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
         let _guard = acquire_room_mutation_lock(room_dir)?;
         let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
-        let current = claim_authority::active_claim_record(&facts, claim_id);
+        let current = claim_authority::renewable_claim_record(&facts, claim_id);
         let existing = facts.iter().find(|fact| fact.event_id == event_id);
         let scope = current
             .as_ref()
@@ -14506,7 +14506,74 @@ mod ledger_tests {
     }
 
     #[test]
-    fn claim_lease_renewal_appends_durable_event_and_projects_effective_lease() {
+    fn empty_scope_renew_non_owner_refused_and_latest_lease_monotonic() {
+        let root = unique_root("empty-scope-renew-owner");
+        let store = RoomStore::open_at(root.clone()).unwrap();
+        let mut claim = claim_fact(
+            "claim-renew",
+            "tool-a",
+            "file:src/lib.rs",
+            "2000-01-01T00:00:00Z",
+        );
+        claim.scope.clear();
+        claim.from_session_id = Some("session-owner".to_string());
+        store.append_fact_verified(&claim).unwrap();
+        for (tool, session) in [("tool-b", "session-owner"), ("tool-a", "session-sibling")] {
+            assert!(
+                store
+                    .renew_claim_lease(
+                        "claim-renew",
+                        "2099-01-01T00:30:00Z".to_string(),
+                        tool,
+                        Some(session),
+                        Some("session-owner")
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            !store
+                .facts()
+                .unwrap()
+                .iter()
+                .any(|fact| fact.kind == FactKind::ClaimRenewed)
+        );
+        let renewed = store
+            .renew_claim_lease(
+                "claim-renew",
+                "2099-01-01T00:30:00Z".to_string(),
+                "tool-a",
+                Some("session-owner"),
+                Some("session-owner"),
+            )
+            .unwrap();
+        assert!(renewed.append_outcome.is_some());
+        let count = store.facts().unwrap().len();
+        let older = store
+            .renew_claim_lease(
+                "claim-renew",
+                "2099-01-01T00:15:00Z".to_string(),
+                "tool-a",
+                Some("session-owner"),
+                Some("session-owner"),
+            )
+            .unwrap();
+        assert!(older.append_outcome.is_none());
+        assert_eq!(
+            older.record.unwrap().lease_expires_at.as_deref(),
+            Some("2099-01-01T00:30:00Z")
+        );
+        assert_eq!(store.facts().unwrap().len(), count);
+        assert!(
+            !claim_authority::index_from_facts(&store.facts().unwrap())
+                .claims
+                .contains_key("claim-renew")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_scope_renew_scoped_renewal_unchanged() {
         let root = unique_root("claim-lease-renew");
         let store = RoomStore::open_at(root.clone()).unwrap();
         let claim = claim_fact(
