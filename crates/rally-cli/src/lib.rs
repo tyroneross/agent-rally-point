@@ -13569,6 +13569,16 @@ mod tests {
     }
 
     #[test]
+    fn claims_expiry_empty_scope_claim_reads_lease_from_evidence() {
+        let mut claim = expiry_claim("scopeless", Some("2000-01-01T00:00:00Z"));
+        claim.scope = Vec::new();
+        let rows = claims_expiry_rows(vec![claim]);
+        assert_eq!(rows[0].lease_state, "expired");
+        assert!(rows[0].expired);
+        assert!(!rows[0].stale_no_lease);
+    }
+
+    #[test]
     fn claims_expiry_missing_or_invalid_lease_is_not_expired() {
         let rows = claims_expiry_rows(vec![
             expiry_claim("missing", None),
@@ -21271,8 +21281,17 @@ fn claims_expiry_rows_at(
     let mut rows: Vec<_> = claims
         .into_iter()
         .map(|fact| {
+            // Empty-scope claims have no authority record, but the snapshot's
+            // effective claim still carries its (possibly renewed) lease in the
+            // evidence; fall back to it so such claims are not shown as no-lease.
             let lease_expires_at = claim_authority::active_claim_record_from_fact(&fact)
-                .and_then(|record| record.lease_expires_at);
+                .and_then(|record| record.lease_expires_at)
+                .or_else(|| {
+                    fact.evidence
+                        .iter()
+                        .find_map(|item| item.strip_prefix("lease_expires_at:"))
+                        .map(str::to_string)
+                });
             let lease = lease_expires_at
                 .as_deref()
                 .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
