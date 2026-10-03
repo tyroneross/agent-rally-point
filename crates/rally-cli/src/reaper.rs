@@ -8,9 +8,10 @@
 //!
 //! Design principles:
 //! - COMPOSE existing eligibility functions; do NOT reimplement staleness math.
-//! - FAIL-CLOSED: any claim whose owner timestamp is unparseable or whose squad
-//!   entry is absent is NEVER staged for removal. This guarantee is INHERITED
-//!   from `claim_reclaim_eligible` and `takeover_eligible_owners`.
+//! - FAIL-CLOSED: owner-stale eligibility requires a parseable owner timestamp
+//!   and squad entry; lease expiry requires a parseable lease. Manual-only
+//!   no-lease-over-age requires a parseable claim creation time. Observed Live
+//!   always vetoes cleanup.
 //! - Idempotent: re-running on an already-clean room is a safe no-op because
 //!   `active_claims` only surfaces claims that are not yet closed.
 //! - When `apply` is false the report describes WHAT WOULD happen (dry-run).
@@ -50,8 +51,11 @@ pub(crate) struct ReapedClaim {
     /// The `lease_expires_at` evidence value from the claim, if any.
     pub(crate) lease_expires_at: Option<String>,
     /// Why this claim was reaped: "owner-stale" | "lease-expired" |
-    /// "owner-stale+lease-expired".
+    /// "owner-stale+lease-expired" | "no-lease-over-age".
     pub(crate) reason: String,
+    /// Whole days since creation, when the manual no-lease age reason applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) age_days: Option<i64>,
 }
 
 /// A handoff that was (or would be) expired.
@@ -386,9 +390,13 @@ pub(crate) fn maybe_reap_on_enter(room: &RoomStore, entering_tool: &str) -> Opti
 /// So the automatic path requires BOTH writer-stamped lease expiry and an
 /// external observed-dead verdict. Owner-staleness stays behind the deliberate
 /// operator command. Unknown observer evidence never authorizes auto-removal.
+/// Manual Full also accepts `no-lease-over-age`: absent/unparseable effective
+/// lease and a parseable `created_at` older than
+/// `RALLY_CLAIM_NO_LEASE_MAX_AGE_DAYS` (default 14; zero/invalid disables).
+/// This age fallback never participates in automatic LeaseOnly cleanup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReapMode {
-    /// Act on both signals. `rally doctor --reap-stale --apply` — a human ran it.
+    /// Act on owner staleness, lease expiry, or the no-lease age fallback. `rally doctor --reap-stale --apply` — a human ran it.
     Full,
     /// Act only on writer-stamped lease expiry corroborated by observed death.
     /// The automatic `enter` path.
@@ -563,10 +571,23 @@ fn run_reap_stale_in_room_with_budget(
             .map(|r| r.claim_id)
             .collect();
 
+    let now = chrono::Utc::now();
+    let no_lease_max_age_days = (mode == ReapMode::Full)
+        .then(crate::claim_authority::no_lease_max_age_days)
+        .flatten();
+
     // --- Evaluate each active claim ---
     for claim in &snapshot.active_claims {
         let (legacy_owner_eligible, _size) = snapshot.claim_reclaim_eligible(claim, &coord);
         let lease_eligible = lease_expired_ids.contains(&claim.event_id);
+        let no_lease_age = claim_index.claims.get(&claim.event_id).and_then(|record| {
+            crate::claim_authority::no_lease_over_age(
+                &claim.created_at,
+                record.lease_expires_at.as_deref(),
+                now,
+                no_lease_max_age_days,
+            )
+        });
         let lease_boundary = claim
             .evidence
             .iter()
@@ -621,7 +642,7 @@ fn run_reap_stale_in_room_with_budget(
         // writer and durably renewed by its heartbeat. The automatic mode also
         // requires the external observed-dead verdict computed above.
         let eligible = match mode {
-            ReapMode::Full => owner_eligible || lease_eligible,
+            ReapMode::Full => owner_eligible || lease_eligible || no_lease_age.is_some(),
             // `authorizes_automatic_reap`, not `observed_verdict`. Both flavours
             // of stale flatten to `Liveness::Stale` through `as_signal`, so
             // reading the flattened verdict here would silently hand the
@@ -657,11 +678,15 @@ fn run_reap_stale_in_room_with_budget(
         }
         attempted_actions += 1;
 
-        let reason = match (owner_eligible, lease_eligible) {
-            (true, true) => "owner-stale+lease-expired",
-            (true, false) => "owner-stale",
-            (false, true) => "lease-expired",
-            (false, false) => unreachable!(),
+        let reason = if no_lease_age.is_some() {
+            "no-lease-over-age"
+        } else {
+            match (owner_eligible, lease_eligible) {
+                (true, true) => "owner-stale+lease-expired",
+                (true, false) => "owner-stale",
+                (false, true) => "lease-expired",
+                (false, false) => unreachable!(),
+            }
         }
         .to_string();
 
@@ -678,15 +703,15 @@ fn run_reap_stale_in_room_with_budget(
             scope: claim.scope.clone(),
             lease_expires_at,
             reason: reason.clone(),
+            age_days: no_lease_age,
         };
 
         if apply {
             // Append a ClaimExpired fact that closes this claim.
             // `append_state_transition_verified` re-asserts eligibility under
             // the held mutation lock (SEC-001 safeguard for Release facts).
-            // For ClaimExpired we use `append_fact_verified` (no pre-condition
-            // check needed beyond the claim still being live — the projection
-            // already handles duplicate ClaimExpired via ref_id dedup).
+            // ClaimExpired eligibility and the Live veto are rechecked by
+            // `append_fact_verified` under the store mutation lock.
             let action_target = claim.event_id.as_str();
             let expired_fact = Fact {
                 // This is the claim-takeover audit trail. Naming the reaper is
@@ -755,7 +780,11 @@ fn run_reap_stale_in_room_with_budget(
                         "reaper: skipping {} (already closed or lock error): {}",
                         claim.event_id, e
                     );
-                    write_failures += 1;
+                    if reason == "no-lease-over-age" && e.to_string().contains("reap refused:") {
+                        preserved += 1;
+                    } else {
+                        write_failures += 1;
+                    }
                     continue;
                 }
             }
@@ -3130,6 +3159,227 @@ mod tests {
             session: None,
         };
         room.append_fact_verified(&fact).unwrap().fact
+    }
+
+    struct NoLeaseEnv {
+        previous: Option<std::ffi::OsString>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl NoLeaseEnv {
+        fn new(value: Option<&str>) -> Self {
+            let guard = crate::PROCESS_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var_os("RALLY_CLAIM_NO_LEASE_MAX_AGE_DAYS");
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var("RALLY_CLAIM_NO_LEASE_MAX_AGE_DAYS", value),
+                    None => std::env::remove_var("RALLY_CLAIM_NO_LEASE_MAX_AGE_DAYS"),
+                }
+            }
+            Self {
+                previous,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for NoLeaseEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("RALLY_CLAIM_NO_LEASE_MAX_AGE_DAYS", value),
+                    None => std::env::remove_var("RALLY_CLAIM_NO_LEASE_MAX_AGE_DAYS"),
+                }
+            }
+        }
+    }
+
+    fn no_lease_fixture(label: &str, created_at: &str, lease: Option<&str>) -> RoomStore {
+        let root = unique_root(label);
+        let room = RoomStore::open_at(root).unwrap();
+        let mut claim = append_claim_ago(&room, "seed", "seed-owner", 0);
+        // Distinct owner/scope; leave the seed fresh so it is never a candidate.
+        claim.event_id = "no-lease-claim".to_string();
+        claim.tool = Some("no-lease-owner".to_string());
+        claim.scope = vec!["file:src/no_lease.rs".to_string()];
+        claim.created_at = created_at.to_string();
+        claim.evidence = lease
+            .map(|raw| vec![format!("lease_expires_at:{raw}")])
+            .unwrap_or_default();
+        room.append_fact_verified(&claim).unwrap();
+        // Fresh squad activity isolates age eligibility from owner staleness.
+        append_presence(&room, "no-lease-owner", 0);
+        room
+    }
+
+    #[test]
+    fn reap_no_lease_old_full_preview_and_apply() {
+        let _env = NoLeaseEnv::new(None);
+        let room = no_lease_fixture("no-lease-full", &past_ts(84 * 86_400), None);
+        let preview = run_reap_stale_in_room_with_mode(&room, false, ReapMode::Full).unwrap();
+        assert_eq!(preview.claims_reaped.len(), 1);
+        assert_eq!(preview.claims_reaped[0].reason, "no-lease-over-age");
+        assert_eq!(preview.claims_reaped[0].age_days, Some(84));
+        assert_eq!(preview.attempted_writes, 0);
+        assert!(
+            room.snapshot()
+                .unwrap()
+                .active_claims
+                .iter()
+                .any(|c| c.event_id == "no-lease-claim")
+        );
+        let applied = run_reap_stale_in_room_with_mode(&room, true, ReapMode::Full).unwrap();
+        assert!(applied.applied);
+        assert_eq!(applied.write_failures, 0);
+        assert!(
+            !room
+                .snapshot()
+                .unwrap()
+                .active_claims
+                .iter()
+                .any(|c| c.event_id == "no-lease-claim")
+        );
+        fs::remove_dir_all(room.repo_root()).unwrap();
+    }
+
+    #[test]
+    fn reap_no_lease_old_not_eligible_in_lease_only() {
+        let _env = NoLeaseEnv::new(None);
+        let room = no_lease_fixture("no-lease-auto", &past_ts(84 * 86_400), None);
+        let report = run_reap_stale_in_room_with_mode(&room, true, ReapMode::LeaseOnly).unwrap();
+        assert!(report.claims_reaped.is_empty());
+        assert!(
+            room.snapshot()
+                .unwrap()
+                .active_claims
+                .iter()
+                .any(|c| c.event_id == "no-lease-claim")
+        );
+        fs::remove_dir_all(room.repo_root()).unwrap();
+    }
+
+    #[test]
+    fn reap_no_lease_young_not_eligible() {
+        let _env = NoLeaseEnv::new(None);
+        let room = no_lease_fixture("no-lease-young", &past_ts(7 * 86_400), None);
+        assert!(
+            run_reap_stale_in_room(&room, false)
+                .unwrap()
+                .claims_reaped
+                .is_empty()
+        );
+        fs::remove_dir_all(room.repo_root()).unwrap();
+    }
+
+    #[test]
+    fn reap_no_lease_live_owner_vetoes() {
+        let _env = NoLeaseEnv::new(None);
+        let room = no_lease_fixture("no-lease-live", &past_ts(84 * 86_400), None);
+        init_observed_worktree(room.repo_root());
+        append_observed_presence(
+            &room,
+            "no-lease-owner",
+            room.repo_root(),
+            std::process::id(),
+        );
+        let report = run_reap_stale_in_room(&room, true).unwrap();
+        assert!(report.claims_reaped.is_empty());
+        assert!(
+            room.snapshot()
+                .unwrap()
+                .active_claims
+                .iter()
+                .any(|c| c.event_id == "no-lease-claim")
+        );
+        fs::remove_dir_all(room.repo_root()).unwrap();
+    }
+
+    #[test]
+    fn reap_no_lease_env_zero_disables() {
+        let _env = NoLeaseEnv::new(Some("0"));
+        let room = no_lease_fixture("no-lease-disabled", &past_ts(84 * 86_400), None);
+        assert!(
+            run_reap_stale_in_room(&room, false)
+                .unwrap()
+                .claims_reaped
+                .is_empty()
+        );
+        fs::remove_dir_all(room.repo_root()).unwrap();
+    }
+
+    #[test]
+    fn reap_no_lease_env_invalid_disables() {
+        for value in ["invalid", "-1", "9223372036854775807"] {
+            let _env = NoLeaseEnv::new(Some(value));
+            assert_eq!(crate::claim_authority::no_lease_max_age_days(), None);
+        }
+    }
+
+    #[test]
+    fn reap_no_lease_env_override_changes_threshold() {
+        let room = no_lease_fixture("no-lease-override", &past_ts(7 * 86_400), None);
+        {
+            let _env = NoLeaseEnv::new(Some("10"));
+            assert!(
+                run_reap_stale_in_room(&room, false)
+                    .unwrap()
+                    .claims_reaped
+                    .is_empty()
+            );
+        }
+        {
+            let _env = NoLeaseEnv::new(Some("5"));
+            assert_eq!(
+                run_reap_stale_in_room(&room, false).unwrap().claims_reaped[0].reason,
+                "no-lease-over-age"
+            );
+        }
+        fs::remove_dir_all(room.repo_root()).unwrap();
+    }
+
+    #[test]
+    fn reap_no_lease_unparseable_created_at_never_eligible() {
+        let _env = NoLeaseEnv::new(None);
+        let room = no_lease_fixture("no-lease-bad-created", "not-a-time", None);
+        assert!(
+            run_reap_stale_in_room(&room, false)
+                .unwrap()
+                .claims_reaped
+                .is_empty()
+        );
+        fs::remove_dir_all(room.repo_root()).unwrap();
+    }
+
+    #[test]
+    fn reap_no_lease_unparseable_lease_is_eligible() {
+        let _env = NoLeaseEnv::new(None);
+        let room = no_lease_fixture(
+            "no-lease-bad-lease",
+            &past_ts(84 * 86_400),
+            Some("not-a-time"),
+        );
+        let report = run_reap_stale_in_room(&room, false).unwrap();
+        assert_eq!(report.claims_reaped[0].reason, "no-lease-over-age");
+        fs::remove_dir_all(room.repo_root()).unwrap();
+    }
+
+    #[test]
+    fn reap_no_lease_valid_future_lease_blocks_age_reason() {
+        let _env = NoLeaseEnv::new(None);
+        let room = no_lease_fixture(
+            "no-lease-future",
+            &past_ts(84 * 86_400),
+            Some(&past_ts(-86_400)),
+        );
+        assert!(
+            run_reap_stale_in_room(&room, false)
+                .unwrap()
+                .claims_reaped
+                .is_empty()
+        );
+        fs::remove_dir_all(room.repo_root()).unwrap();
     }
 
     #[test]

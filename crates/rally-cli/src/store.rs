@@ -5198,6 +5198,50 @@ impl DirectRoomStore {
         // proceed only while at least one remains true.
         if fact.kind == FactKind::ClaimExpired {
             let reason = Self::reaper_marker(&fact.evidence, "reason");
+            if reason == Some("no-lease-over-age") {
+                let coord =
+                    crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
+                let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
+                let fresh = snapshot_from_facts_with_policy(&facts, &coord, false);
+                let claim = fresh
+                    .active_claims
+                    .iter()
+                    .find(|claim| Some(claim.event_id.as_str()) == fact.ref_id.as_deref());
+                let observed = crate::observed_liveness::observe_sessions(&self.repo_root, &facts);
+                let eligible = claim.is_some_and(|claim| {
+                    let lease = claim
+                        .evidence
+                        .iter()
+                        .find_map(|item| item.strip_prefix("lease_expires_at:"));
+                    let renewed = facts.iter().any(|event| {
+                        event.kind == FactKind::ClaimRenewed
+                            && event.ref_id.as_deref() == Some(claim.event_id.as_str())
+                    });
+                    !renewed
+                        && Self::reaper_marker(&fact.evidence, "ref_id")
+                            == Some(claim.event_id.as_str())
+                        && Self::reaper_marker(&fact.evidence, "owner")
+                            == Some(claim.tool.as_deref().unwrap_or("unknown"))
+                        && Self::reaper_marker(&fact.evidence, "owner_session")
+                            == Some(claim.from_session_id.as_deref().unwrap_or("legacy"))
+                        && crate::claim_authority::no_lease_over_age(
+                            &claim.created_at,
+                            lease,
+                            chrono::Utc::now(),
+                            crate::claim_authority::no_lease_max_age_days(),
+                        )
+                        .is_some()
+                        && observed
+                            .for_claim(claim.tool.as_deref(), claim.from_session_id.as_deref())
+                            != crate::observed_liveness::ObservedLiveness::Live
+                });
+                if !eligible {
+                    return Err(RallyError::Usage(format!(
+                        "reap refused: claim {} is no longer eligible for no-lease-over-age under the mutation lock (released, renewed, or owner live)",
+                        fact.ref_id.as_deref().unwrap_or("<missing>")
+                    )));
+                }
+            }
             let owner_reason = matches!(reason, Some("owner-stale" | "owner-stale+lease-expired"));
             let lease_reason =
                 matches!(reason, Some("lease-expired" | "owner-stale+lease-expired"));
@@ -20498,6 +20542,70 @@ mod sec001_takeover_guard_tests {
             "reaper:owner_session=legacy".to_string(),
         ];
         f
+    }
+
+    #[test]
+    fn reap_no_lease_store_revalidation_aborts_renewed_or_released_claim() {
+        let _guard = crate::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for release in [false, true] {
+            let r = root(if release {
+                "no-lease-release-race"
+            } else {
+                "no-lease-renew-race"
+            });
+            let store = RoomStore::open_at(r.clone()).unwrap();
+            let claim = fact_at(
+                "claim-old",
+                FactKind::Claim,
+                "owner",
+                "file:src/a.rs",
+                &iso_ago(84 * 86_400),
+            );
+            store.append_fact(&claim).unwrap();
+            // Stage the same transition as the unlocked preview, then mutate
+            // the target before the apply append acquires the store lock.
+            let expired = reaper_claim_expired("claim-old", "owner", "no-lease-over-age");
+            if release {
+                let mut released = fact_at(
+                    "release-old",
+                    FactKind::Release,
+                    "owner",
+                    "file:src/a.rs",
+                    &iso_ago(0),
+                );
+                released.ref_id = Some(claim.event_id.clone());
+                store.append_fact(&released).unwrap();
+            } else {
+                store
+                    .renew_claim_lease(
+                        "claim-old",
+                        "2099-01-01T00:00:00Z".to_string(),
+                        "owner",
+                        None,
+                        None,
+                    )
+                    .unwrap();
+            }
+            let err = store.append_fact(&expired).unwrap_err().to_string();
+            assert!(
+                err.contains("reap refused") && err.contains("no-lease-over-age"),
+                "{err}"
+            );
+            let facts = store.facts().unwrap();
+            assert!(!facts.iter().any(|fact| fact.kind == FactKind::ClaimExpired));
+            assert_eq!(
+                store
+                    .snapshot()
+                    .unwrap()
+                    .active_claims
+                    .iter()
+                    .any(|fact| fact.event_id == "claim-old"),
+                !release
+            );
+            fs::remove_dir_all(r).unwrap();
+        }
     }
 
     #[test]

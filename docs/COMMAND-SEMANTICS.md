@@ -136,6 +136,21 @@ therefore receive distinct operation identities.
 | `rally worktree plan` | no | no | no | yes | Reads Git's registered worktrees, local branches, and locally stored remote refs; never fetches, merges, updates, or writes a Rally fact. |
 | `rally worktree closeout` | no | no | no | yes | Joins Git worktree state to exact managed-session ownership; its disposition is advisory. Missing ownership evidence stays unknown. |
 
+### Manual stale-claim reaping
+
+`rally doctor --reap-stale` previews cleanup; add `--apply` to close eligible
+claims. Full mode accepts owner staleness, expired leases, and
+`no-lease-over-age`: an absent or unparseable effective `lease_expires_at` and
+parseable `created_at` older than `RALLY_CLAIM_NO_LEASE_MAX_AGE_DAYS` days.
+The default is 14 days; `0` or an invalid value disables this age reason.
+The dry-run report includes `reason: "no-lease-over-age"` and `age_days`.
+An unparseable creation time never qualifies for this reason. Observed Live
+owners still veto cleanup, and the existing budgets and caps still apply.
+Before appending an age-based close, the store rechecks eligibility and the
+observed-Live veto under its write lock. A claim released, renewed, or otherwise
+made ineligible after staging is skipped and counted as preserved.
+The automatic `rally enter` LeaseOnly path never uses this age reason.
+
 ### Worktree merge/update plan
 
 `rally worktree plan --json` reports every registered worktree, local branch,

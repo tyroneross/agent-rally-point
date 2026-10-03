@@ -696,6 +696,32 @@ pub(crate) fn expired_claims(
         .collect()
 }
 
+/// Manual-only fallback for legacy claims without a usable effective lease.
+/// Missing configuration defaults to 14 days; zero, invalid, or overflowing
+/// values disable this reason. Automatic reaping must not consult this policy.
+pub(crate) fn no_lease_max_age_days() -> Option<i64> {
+    let days = match std::env::var("RALLY_CLAIM_NO_LEASE_MAX_AGE_DAYS") {
+        Ok(raw) => raw.parse::<i64>().ok()?,
+        Err(std::env::VarError::NotPresent) => 14,
+        Err(_) => return None,
+    };
+    (days > 0 && chrono::Duration::try_days(days).is_some()).then_some(days)
+}
+
+pub(crate) fn no_lease_over_age(
+    created_at: &str,
+    effective_lease: Option<&str>,
+    now: DateTime<Utc>,
+    max_age_days: Option<i64>,
+) -> Option<i64> {
+    if effective_lease.and_then(parse_time).is_some() {
+        return None;
+    }
+    let threshold = chrono::Duration::try_days(max_age_days?)?;
+    let age = now - parse_time(created_at)?;
+    (age > threshold).then_some(age.num_days())
+}
+
 fn write_index(path: &Path, index: &ActiveClaimIndex) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
