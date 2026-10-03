@@ -278,12 +278,35 @@ pub(crate) fn active_claim_record_from_facts(
     Some(record)
 }
 
-/// Return the active claim record for `claim_id`, including durable renewal.
+/// Return the resource-indexed claim record for test assertions.
+#[cfg(test)]
 pub(crate) fn active_claim_record(facts: &[Fact], claim_id: &str) -> Option<ActiveClaimRecord> {
     facts
         .iter()
         .find(|fact| fact.event_id == claim_id && is_active_claim_fact(fact, facts))
         .and_then(|fact| active_claim_record_from_facts(fact, facts))
+}
+
+/// Resolve lifecycle renewal independently of the resource-conflict index.
+/// Empty scopes still carry ownership and an effective durable lease.
+pub(crate) fn renewable_claim_record(facts: &[Fact], claim_id: &str) -> Option<ActiveClaimRecord> {
+    let claim = facts
+        .iter()
+        .find(|fact| fact.event_id == claim_id && is_active_claim_fact(fact, facts))?;
+    let effective = project_effective_claim(claim, facts);
+    let lease_expires_at = lease_expires_at(&effective);
+    Some(ActiveClaimRecord {
+        claim_id: effective.event_id,
+        owner_tool: effective.tool,
+        from_session_id: effective.from_session_id,
+        resource_scopes: effective
+            .scope
+            .iter()
+            .filter_map(|scope| ResourceScope::parse_claim_scope(scope))
+            .collect(),
+        lease_expires_at,
+        raw_scope: effective.scope,
+    })
 }
 
 /// Clone an active claim fact with its effective lease marker projected into

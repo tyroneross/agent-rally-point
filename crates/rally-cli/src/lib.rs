@@ -14784,6 +14784,73 @@ mod tests {
     }
 
     #[test]
+    fn empty_scope_renew_heartbeat_extends_effective_lease_and_full_reap_preserves() {
+        let root = unique_root("heartbeat-renews-claims");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        ensure_presence(&room, "tool-x").unwrap();
+        let claim = store::Fact {
+            from_session_id: Some(
+                current_protocol_session(Some("tool-x"))
+                    .from_session_id()
+                    .to_string(),
+            ),
+            schema: FACT_SCHEMA.to_string(),
+            event_id: "claim-heartbeat-renew".to_string(),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Claim,
+            tool: Some("tool-x".to_string()),
+            role: None,
+            subject: "claim for heartbeat renewal".to_string(),
+            scope: Vec::new(),
+            created_at: now_string(),
+            summary: None,
+            evidence: vec!["lease_expires_at:2000-01-01T00:00:00Z".to_string()],
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        };
+        room.append_fact_verified(&claim).unwrap();
+        let before = room.facts().unwrap().len();
+
+        assert_eq!(renew_owned_claim_leases(&room, "tool-x").unwrap(), 1);
+
+        let facts = room.facts().unwrap();
+        assert_eq!(facts.len(), before + 1);
+        assert_eq!(facts.last().unwrap().kind, store::FactKind::ClaimRenewed);
+        assert_eq!(
+            facts.last().unwrap().ref_id.as_deref(),
+            Some("claim-heartbeat-renew")
+        );
+        let projected = room.snapshot().unwrap().active_claims;
+        let lease = projected[0]
+            .evidence
+            .iter()
+            .find_map(|item| item.strip_prefix("lease_expires_at:"))
+            .unwrap();
+        assert!(chrono::DateTime::parse_from_rfc3339(lease).unwrap() > chrono::Utc::now());
+        let reaped = crate::reaper::run_reap_stale_in_room_with_mode(
+            &room,
+            true,
+            crate::reaper::ReapMode::Full,
+        )
+        .unwrap();
+        assert!(reaped.claims_reaped.is_empty());
+        assert!(
+            room.snapshot()
+                .unwrap()
+                .active_claims
+                .iter()
+                .any(|fact| fact.event_id == claim.event_id)
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn heartbeat_renews_every_owned_claim_durably() {
         let root = unique_root("heartbeat-renews-claims");
         std::fs::create_dir_all(root.join(".git")).unwrap();
