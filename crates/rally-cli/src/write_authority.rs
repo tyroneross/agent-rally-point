@@ -428,6 +428,27 @@ fn authorize_claim_removal(
     coord: &CoordinationConfig,
 ) -> Result<()> {
     let claim_id = claim.event_id.as_str();
+    // Age alone grants authority only to the typed manual reaper transition.
+    if reaper_marker(fact, "reason") == Some("no-lease-over-age") {
+        let lease = claim
+            .evidence
+            .iter()
+            .find_map(|item| item.strip_prefix("lease_expires_at:"));
+        if is_typed_reaper_close(fact, claim, &["no-lease-over-age"])
+            && claim_authority::no_lease_over_age(
+                &claim.created_at,
+                lease,
+                chrono::Utc::now(),
+                claim_authority::no_lease_reap_max_age_days(&fact.evidence),
+            )
+            .is_some()
+        {
+            return Ok(());
+        }
+        return Err(RallyError::Usage(format!(
+            "reap refused: claim {claim_id} is not eligible for no-lease-over-age cleanup"
+        )));
+    }
     // 1. Self-close. Session identity is authoritative when present. A modern
     // stamped caller retains one-way compatibility with a historical
     // sessionless claim only when both name the same present, nonblank tool.
@@ -491,6 +512,10 @@ fn reaper_marker<'a>(fact: &'a Fact, key: &str) -> Option<&'a str> {
 /// Does this fact carry the typed evidence that routes lease expiry through
 /// the store's under-lock reaper checks?
 fn is_typed_reaper_lease_expiry(fact: &Fact, claim: &Fact) -> bool {
+    is_typed_reaper_close(fact, claim, &["lease-expired", "owner-stale+lease-expired"])
+}
+
+fn is_typed_reaper_close(fact: &Fact, claim: &Fact, reasons: &[&str]) -> bool {
     // This arm used to require `tool == "rally"`, which made the reaper's
     // authority to close an expired lease inseparable from its inability to say
     // who it was. Attributing the reaper would therefore have silently REVOKED
@@ -518,13 +543,12 @@ fn is_typed_reaper_lease_expiry(fact: &Fact, claim: &Fact) -> bool {
     let expected_owner = claim.tool.as_deref().unwrap_or("unknown");
     let expected_session = claim.from_session_id.as_deref().unwrap_or("legacy");
     reaper_marker(fact, "ref_id") == Some(ref_id)
-        && matches!(
-            reaper_marker(fact, "reason"),
-            Some("lease-expired" | "owner-stale+lease-expired")
-        )
+        && reaper_marker(fact, "reason").is_some_and(|reason| reasons.contains(&reason))
         && reaper_marker(fact, "owner") == Some(expected_owner)
         && reaper_marker(fact, "owner_session") == Some(expected_session)
-        && matches!(reaper_marker(fact, "observed"), Some("stale" | "unknown"))
+        && (matches!(reaper_marker(fact, "observed"), Some("stale" | "unknown"))
+            || (reaper_marker(fact, "reason") == Some("no-lease-over-age")
+                && reaper_marker(fact, "observed") == Some("stale-unobserved")))
 }
 
 /// Has this claim's own `lease_expires_at:` marker passed?
@@ -1065,6 +1089,41 @@ mod tests {
             err.contains("another victim:01 session"),
             "the refusal must say the label is not the identity; got: {err}"
         );
+    }
+
+    #[test]
+    fn write_authority_no_lease_age_rejects_leased_young_and_untyped_closes() {
+        let _guard = crate::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (mut claim, mut snapshot) = room_with_claim("victim:01", 60);
+        let expiry = Fact {
+            kind: FactKind::ClaimExpired,
+            tool: Some("rally".to_string()),
+            ref_id: Some(claim.event_id.clone()),
+            evidence: vec![
+                format!("reaper:ref_id={}", claim.event_id),
+                "reaper:reason=no-lease-over-age".to_string(),
+                "reaper:max_age_days=14".to_string(),
+                "reaper:owner=victim:01".to_string(),
+                "reaper:owner_session=sess:victim:01".to_string(),
+                "reaper:observed=unknown".to_string(),
+            ],
+            ..Fact::default()
+        };
+        assert!(refusal(&expiry, &snapshot).contains("reap refused"));
+        claim.created_at = iso_ago(84 * 86_400);
+        claim
+            .evidence
+            .push("lease_expires_at:2000-01-01T00:00:00Z".to_string());
+        snapshot.active_claims = vec![claim.clone()];
+        assert!(refusal(&expiry, &snapshot).contains("reap refused"));
+        claim.evidence.clear();
+        snapshot.active_claims = vec![claim];
+        authorized(&expiry, &snapshot);
+        let mut ordinary = expiry;
+        ordinary.kind = FactKind::Release;
+        assert!(refusal(&ordinary, &snapshot).contains("reap refused"));
     }
 
     /// Arm 3's negative control. Every typed reaper marker and the expired
