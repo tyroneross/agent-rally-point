@@ -3359,11 +3359,9 @@ mod tests {
                 );
                 let preview =
                     run_reap_stale_in_room_with_mode(&room, false, ReapMode::Full).unwrap();
-                if expected_reason.is_none() {
-                    assert!(preview.claims_reaped.is_empty());
-                } else {
+                if let Some(expected_reason) = expected_reason {
                     assert_eq!(preview.claims_reaped.len(), 1);
-                    assert_eq!(preview.claims_reaped[0].reason, expected_reason.unwrap());
+                    assert_eq!(preview.claims_reaped[0].reason, expected_reason);
                     assert_eq!(preview.attempted_writes, 0);
                     let applied =
                         run_reap_stale_in_room_with_mode(&room, true, ReapMode::Full).unwrap();
@@ -3377,6 +3375,8 @@ mod tests {
                             .iter()
                             .any(|c| c.event_id == "no-lease-claim")
                     );
+                } else {
+                    assert!(preview.claims_reaped.is_empty());
                 }
                 assert!(
                     run_reap_stale_in_room_with_mode(&room, false, ReapMode::LeaseOnly)
