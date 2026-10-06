@@ -78,6 +78,10 @@
 #   RALLY_HOOK_TIMEOUT_MS  — default wall-clock budget for lifecycle and legacy
 #                            Rally calls (default 5000). Classified mutations use
 #                            fixed documented sub-budgets under the host timeout.
+#   RALLY_HOOK_DEADLINE_MS — whole-hook deadline for start/idle/after-write
+#                            (default 4000, under the host's 5s; 100..59999).
+#                            On overrun the hook prints `{}` and exits 0. See
+#                            "Lifecycle deadline supervisor" below.
 #   RALLY_BIN              — dev override for the rally binary. Must be an
 #                            ABSOLUTE path outside the scanned repo. A relative
 #                            path, or any path that resolves inside the repo, is
@@ -377,6 +381,101 @@ tool="${2:-claude_code}"
 # and no filesystem/Rally work from this hook.
 case "$(printf '%s' "${RALLY_HOOKS:-}" | tr '[:upper:]' '[:lower:]')" in
   0|off|false|no|disabled) exit 0 ;;
+esac
+
+# --- Lifecycle deadline supervisor (start / idle / after-write) ------------
+# SessionStart, UserPromptSubmit and Stop get 5s in hooks.json, and
+# `async: true` cannot help any of them: per
+# https://code.claude.com/docs/en/hooks ("Run hooks in the background") async
+# is honoured only on observational events, is ignored on blocking events such
+# as Stop, and discards all output. A host-side timeout discards the hook's
+# output and is logged as a hook failure; Easy Terminal's hook-failure store
+# recorded such timeouts on all three events. Measured against a hung binary
+# at load-avg ~30, SessionStart took 3.8s of its 5s: the per-call budgets fit,
+# but shell/perl/node overhead under load left ~1s of margin.
+#
+# This supervisor makes the deadline a property of the hook, not of the load.
+# It re-runs this script as a child in its own process group, buffers the
+# child's stdout, and returns it verbatim when the child finishes inside
+# RALLY_HOOK_DEADLINE_MS (default 4000; 100..59999; scaled by
+# RALLY_HOOK_MS_BUDGET_SCALE like every other budget). On overrun it kills the
+# child's group, writes one stderr line (host debug log only) and prints the
+# host-valid no-op `{}` -- the fail-open result a host timeout produced, minus
+# the failure. It also hands the child a call deadline (hard deadline minus a
+# render reserve) that rally_timeout_ms clamps every foreground Rally call to,
+# so a slow room degrades to partial context instead of losing the envelope.
+# Before-write is not supervised: it has its own budget proof and 10s limit.
+# Without perl the hook runs unsupervised, exactly as before.
+case "$phase" in
+  start|idle|after-write)
+    if [ "${RALLY_HOOK_SUPERVISED_CHILD:-}" = "1" ]; then
+      unset RALLY_HOOK_SUPERVISED_CHILD
+      # Keep the value for this shell; never leak it into Rally or anything
+      # Rally might launch.
+      export -n RALLY_HOOK_CALL_DEADLINE_AT_MS 2>/dev/null || true
+    elif command -v perl >/dev/null 2>&1 && find_rally_root >/dev/null 2>&1; then
+      unset RALLY_HOOK_CALL_DEADLINE_AT_MS
+      _rally_deadline_ms="${RALLY_HOOK_DEADLINE_MS:-4000}"
+      case "$_rally_deadline_ms" in
+        [1-9][0-9][0-9]|[1-9][0-9][0-9][0-9]|[1-5][0-9][0-9][0-9][0-9]) ;;
+        *) _rally_deadline_ms=4000 ;;
+      esac
+      _rally_deadline_scale="${RALLY_HOOK_MS_BUDGET_SCALE:-1}"
+      case "$_rally_deadline_scale" in
+        [1-9]|1[0-6]) _rally_deadline_ms=$(( _rally_deadline_ms * _rally_deadline_scale )) ;;
+      esac
+      exec perl -e '
+        use strict;
+        use POSIX qw(setsid :sys_wait_h);
+        use Time::HiRes qw(time);
+        my ($ms, $phase) = (shift @ARGV, shift @ARGV);
+        my $t0 = time;
+        my $reserve = $ms >= 2100 ? 700 : int($ms / 3);
+        $ENV{RALLY_HOOK_CALL_DEADLINE_AT_MS} = int($t0 * 1000) + $ms - $reserve;
+        $ENV{RALLY_HOOK_SUPERVISED_CHILD} = "1";
+        my ($r, $w);
+        pipe($r, $w) or exec @ARGV;
+        my $pid = fork();
+        if (!defined $pid) { close $r; close $w; exec @ARGV; exit 0; }
+        if ($pid == 0) {
+          close $r;
+          setsid();
+          open(STDOUT, ">&", $w) or exit 0;
+          close $w;
+          exec @ARGV;
+          exit 0;
+        }
+        close $w;
+        my $kill = sub { kill "KILL", -$pid; kill "KILL", $pid; waitpid($pid, 0); };
+        $SIG{TERM} = $SIG{INT} = $SIG{HUP} = sub { $kill->(); exit 0; };
+        my $deadline = $t0 + $ms / 1000;
+        my ($buf, $eof, $reaped) = ("", 0, 0);
+        while (1) {
+          my $left = $deadline - time;
+          last if $left <= 0;
+          my $rin = "";
+          vec($rin, fileno($r), 1) = 1;
+          my $n = select(my $rout = $rin, undef, undef, $left < 0.05 ? $left : 0.05);
+          if ($n > 0) {
+            my $got = sysread($r, $buf, 65536, length $buf);
+            $eof = 1 if !$got;
+          }
+          $reaped = 1 if !$reaped && waitpid($pid, WNOHANG) == $pid;
+          # Once the hook itself has exited, a detached grandchild that kept
+          # the pipe open must not hold the result hostage.
+          last if $reaped && ($eof || $n == 0);
+        }
+        if ($reaped) { print STDOUT $buf; exit 0; }
+        $kill->();
+        printf STDERR "rally hook: %s exceeded its %dms internal deadline; returned {} (fail-open)\n", $phase, $ms;
+        print STDOUT "{}";
+        exit 0;
+      ' "$_rally_deadline_ms" "$phase" "$BASH" "$0" ${1+"$@"}
+    fi
+    ;;
+  *)
+    unset RALLY_HOOK_SUPERVISED_CHILD RALLY_HOOK_CALL_DEADLINE_AT_MS
+    ;;
 esac
 
 # Read the host envelope once. Native before-write used to exec before this
@@ -1055,6 +1154,24 @@ case "$_rally_ms_scale" in
   *) _rally_ms_scale=1 ;;
 esac
 
+# Lifecycle call deadline (set only by the supervisor above, never exported).
+# Shrinks the caller's `budget_ms` so the call ends before the render reserve;
+# returns 1 when less than 100ms remain, so the caller skips the call and
+# fails open exactly as it does on a CLI timeout. No deadline: no change.
+_rally_clamp_to_deadline() {
+  [ -n "${RALLY_HOOK_CALL_DEADLINE_AT_MS:-}" ] || return 0
+  local now left
+  now="$(date +%s%3N 2>/dev/null || true)"
+  case "$now" in
+    ''|*[!0-9]*) now="$(perl -MTime::HiRes=time -e 'printf "%d", time * 1000' 2>/dev/null || true)" ;;
+  esac
+  case "$now" in ''|*[!0-9]*) return 0 ;; esac
+  left=$(( RALLY_HOOK_CALL_DEADLINE_AT_MS - now ))
+  [ "$left" -ge 100 ] || return 1
+  [ "$left" -lt "$budget_ms" ] && budget_ms="$left"
+  return 0
+}
+
 # Millisecond guard for the bounded multi-target transaction. The CLI receives
 # the same explicit watchdog value, while the outer guard still kills an old or
 # wedged binary that ignores it. Appending the global flag preserves subcommand
@@ -1064,6 +1181,7 @@ if command -v timeout >/dev/null 2>&1; then
   rally_timeout_ms() {
     local budget_ms=$(( $1 * _rally_ms_scale )) whole rem duration
     shift
+    _rally_clamp_to_deadline || return 124
     whole=$((budget_ms / 1000)); rem=$((budget_ms % 1000))
     duration="${whole}.$(printf '%03d' "$rem")s"
     timeout -s KILL "$duration" "$RALLY_BIN" "$@" --timeout-ms "$budget_ms"
@@ -1073,6 +1191,7 @@ elif command -v gtimeout >/dev/null 2>&1; then
   rally_timeout_ms() {
     local budget_ms=$(( $1 * _rally_ms_scale )) whole rem duration
     shift
+    _rally_clamp_to_deadline || return 124
     whole=$((budget_ms / 1000)); rem=$((budget_ms % 1000))
     duration="${whole}.$(printf '%03d' "$rem")s"
     gtimeout -s KILL "$duration" "$RALLY_BIN" "$@" --timeout-ms "$budget_ms"
@@ -1082,9 +1201,17 @@ elif command -v perl >/dev/null 2>&1; then
   rally_timeout_ms() {
     local budget_ms=$(( $1 * _rally_ms_scale ))
     shift
-    perl -MTime::HiRes=ualarm -e '
+    perl -MTime::HiRes=ualarm,time -e '
       use POSIX qw(setsid);
       my $ms = shift;
+      # Lifecycle call deadline, clamped here so the common macOS path pays
+      # no extra process. The CLI flag value is the last argument.
+      my $at = shift;
+      if ($at =~ /^[0-9]+$/ && $at > 0) {
+        my $left = $at - int(time * 1000);
+        exit 124 if $left < 100;
+        if ($left < $ms) { $ms = $left; $ARGV[-1] = $ms; }
+      }
       my $pid = fork();
       die "fork failed" unless defined $pid;
       if ($pid == 0) {
@@ -1099,7 +1226,7 @@ elif command -v perl >/dev/null 2>&1; then
       ualarm($ms * 1000);
       waitpid($pid, 0);
       exit($? >> 8);
-    ' "$budget_ms" "$RALLY_BIN" "$@" --timeout-ms "$budget_ms"
+    ' "$budget_ms" "${RALLY_HOOK_CALL_DEADLINE_AT_MS:-0}" "$RALLY_BIN" "$@" --timeout-ms "$budget_ms"
   }
 else
   _rally_timeout_ms_capable=0
@@ -1147,12 +1274,19 @@ _rally_status_idle() {
   # is not waiting for. Fire and forget instead.
   #
   # stdin/stdout/stderr are all redirected so the host never waits on an
-  # inherited descriptor, and the child is disowned so no job-control notice
-  # can reach the hook's own stdout (which must stay pure JSON).
+  # inherited descriptor, and the child is disowned. Job-control notices are
+  # an interactive-shell feature; this hook never runs interactively.
+  #
+  # NOT wrapped in `{ ... & } 2>/dev/null` any more: bash saves the caller's
+  # fd 2 in a high descriptor (fd 10) while a group redirection is active, and
+  # the forked background subshell inherited that copy -- holding the HOST's
+  # stderr pipe open for the heartbeat's whole life (up to its 3s budget after
+  # the hook exited). Harmless while the heartbeat ran first; once it moved
+  # after the reads, a host waiting for stderr EOF would wait for it.
   if [ -n "$wake_after" ]; then
-    { rally_timeout status post --tool "$tool" --state idle --wake-after "$wake_after" --json >/dev/null 2>&1 </dev/null & } 2>/dev/null
+    rally_timeout status post --tool "$tool" --state idle --wake-after "$wake_after" --json >/dev/null 2>&1 </dev/null &
   else
-    { rally_timeout status post --tool "$tool" --state idle --json >/dev/null 2>&1 </dev/null & } 2>/dev/null
+    rally_timeout status post --tool "$tool" --state idle --json >/dev/null 2>&1 </dev/null &
   fi
   disown 2>/dev/null || true
 }
@@ -1627,7 +1761,11 @@ if [ "$phase" = "start" ]; then
   # a hung binary. Keep the foreground CLI sum below 3.5s, leaving time for
   # shell/Node startup and rendering. Idle status remains asynchronous.
   rally_timeout_ms 1000 enter --tool "$tool" --session-id "$session" --json >/dev/null 2>&1 || true
-  _rally_status_idle
+  # The detached idle heartbeat is posted AFTER the foreground reads below,
+  # not before them. Without a daemon every Rally command takes the room's
+  # direct.owner.lock; a heartbeat launched first held it for 0.4-2.7s
+  # (measured on a 870 MB ledger) and made this same hook's room/next/status
+  # reads fail with direct-store-busy, so the agent got an empty room.
   if [ "$have_node" = "1" ]; then
     room_json="$(rally_timeout_ms 750 room --json 2>/dev/null || true)"
     next_json="$(rally_timeout_ms 750 next --tool "$tool" --audit --json 2>/dev/null || true)"
@@ -1972,6 +2110,7 @@ msg += "Provably stale peers, inactive claims, and non-actionable waits are omit
 process.stdout.write(JSON.stringify({ agent_visible: { present: true, severity: "warn", message: msg }, ledger_data: ledgerData, brief: briefData }));
 ' ; } 2>/dev/null)"
   fi
+  _rally_status_idle
 elif [ "$phase" = "before-write" ]; then
   checked_paths="$(printf '%s\n' "$paths" | sed '/^$/d' | wc -l | tr -d ' ')"
   case "$checked_paths" in ''|*[!0-9]*) checked_paths=0 ;; esac
@@ -2064,7 +2203,6 @@ else
   status_json=""
   before_complete_json=""
   if [ "$phase" = "after-write" ] || [ "$phase" = "idle" ]; then
-    _rally_status_idle
     status_json="$(rally_timeout_ms 400 status read --json 2>/dev/null || true)"
   fi
   if [ "$phase" = "after-write" ]; then
@@ -2080,6 +2218,10 @@ else
     before_complete_json="$(rally_timeout_ms 750 check before-complete --tool "$tool" --strict --json 2>/dev/null || true)"
   fi
   rally_output="$(rally_timeout_ms 750 next --tool "$tool" --audit --json 2>/dev/null || true)"
+  # Heartbeat after the foreground reads; see the start branch for why.
+  if [ "$phase" = "after-write" ] || [ "$phase" = "idle" ]; then
+    _rally_status_idle
+  fi
 fi
 
 # Render the host-specific output envelope from rally's JSON output.
