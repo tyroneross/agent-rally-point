@@ -2950,8 +2950,9 @@ fn rally_run_rejects_herdr_backend_with_clear_error() {
     let _run_guard = serialize_rally_run();
     let workspace = Workspace::new("rally-herdr-removed");
 
-    // `rally run --backend herdr` must now fail with a clear, actionable
-    // error pointing at Plan F. The 34-caller audit
+    // `rally run --backend herdr` must fail with a clear usage error. Since
+    // 95dbb43 the retired backend gets the generic "unsupported backend"
+    // diagnostic rather than a Plan F-specific message. The 34-caller audit
     // (tools/check_inject_callsites.sh) is unaffected because no rally
     // CALLER passes `--backend herdr` on the inject critical path
     // (audit-verified pre-removal).
@@ -2971,9 +2972,8 @@ fn rally_run_rejects_herdr_backend_with_clear_error() {
     // The error envelope is JSON-on-stderr per rally's error contract.
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("backend \\\"herdr\\\" is removed (Plan F)")
-            && stderr.contains(".rally ledger"),
-        "error must reference Plan F and the ledger; got: {stderr}"
+        stderr.contains("unsupported backend herdr"),
+        "error must name herdr as an unsupported backend; got: {stderr}"
     );
 
     workspace.cleanup();
