@@ -77,6 +77,22 @@ fn sorted_keys(value: &Value) -> Vec<String> {
     keys
 }
 
+/// Identity a developer's shell inherits from an Easy Terminal pane or a
+/// managed Rally session. Left in place it outranks the fixture's own identity
+/// and the pre-push run fails only when pushed from a pane.
+const AMBIENT_IDENTITY_ENV: &[&str] = &[
+    "RALLY_TOOL_ID",
+    "RALLY_SESSION_ID",
+    "RALLY_AGENT_ID",
+    "RALLY_BIN",
+    "RALLY_PTYD_SOCKET",
+    "RALLY_ET_ROUTER_HEALTH",
+    "EASY_TERMINAL_PANE_ID",
+    "EASY_TERMINAL_PTYD_BIN",
+    "EASY_TERMINAL_SCOPE_CAPABILITY",
+    "EASY_TERMINAL_DAEMON_SESSION_GENERATION",
+];
+
 /// In-file fixture: a scratch repo + scratch HOME, per
 /// `tests/json_envelope_contract.rs`'s `Workspace` pattern.
 struct Fixture {
@@ -135,6 +151,9 @@ impl Fixture {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for key in AMBIENT_IDENTITY_ENV {
+            cmd.env_remove(key);
+        }
         for (key, value) in extra_envs {
             cmd.env(key, value);
         }
@@ -172,6 +191,9 @@ impl Fixture {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for key in AMBIENT_IDENTITY_ENV {
+            cmd.env_remove(key);
+        }
         for (key, value) in extra_envs {
             cmd.env(key, value);
         }
