@@ -117,6 +117,8 @@ macro_rules! cmd {
 
 mod agent_state;
 mod agent_view;
+#[cfg(test)]
+mod append_path_tests;
 mod backends;
 mod backlog;
 mod board;
@@ -2930,7 +2932,11 @@ fn ensure_presence_tiered_for_session_with_evidence(
     from_session_id: &str,
     extra_evidence: &[String],
 ) -> Result<()> {
-    let facts = room.facts()?;
+    // Stage 0 item 6: the guard needs only this session's presence rows, not
+    // the whole ledger. Same predicate as before; a session that has posted
+    // presence is never re-posted (no time window), so the implicit append
+    // happens once per (tool family, session).
+    let facts = room.session_presence_facts(from_session_id)?;
     if facts.iter().any(|fact| {
         fact.kind == FactKind::Presence
             && claim_authority::same_session_owner(
@@ -2946,14 +2952,14 @@ fn ensure_presence_tiered_for_session_with_evidence(
     }) {
         return Ok(());
     }
-    let snapshot = room.snapshot()?;
+    let lead_seat_open = room.projected_lead()?.is_none();
     append_presence_tiered(
         room,
         tool,
         tier,
         from_session_id,
         extra_evidence,
-        snapshot.lead.is_none(),
+        lead_seat_open,
     )
 }
 
@@ -21124,11 +21130,29 @@ fn resolve_git_path(base: &Path, value: &str) -> PathBuf {
 }
 
 pub(crate) fn new_id(prefix: &str) -> String {
-    let nanos = SystemTime::now()
+    let wall = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    format!("{prefix}_{:x}_{:x}", std::process::id(), nanos)
+    // Strictly increasing within this process. The wall clock's resolution
+    // (microseconds on macOS) and backward steps could otherwise hand two
+    // calls the same `<prefix>_<pid>_<nanos>` id; the append path's fresh-id
+    // fast path (see `store::note_minted_fact_id`) relies on in-process
+    // uniqueness, so the counter, not the clock, guarantees it.
+    static LAST_NANOS: std::sync::Mutex<u128> = std::sync::Mutex::new(0);
+    let nanos = {
+        let mut last = LAST_NANOS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let next = wall.max(last.saturating_add(1));
+        *last = next;
+        next
+    };
+    let id = format!("{prefix}_{:x}_{:x}", std::process::id(), nanos);
+    if prefix == "fact" {
+        store::note_minted_fact_id(&id);
+    }
+    id
 }
 
 fn stable_operation_id(action: &str, target: &str) -> String {

@@ -3567,7 +3567,7 @@ pub(crate) fn acquire_named_exclusive_nb(
 /// the R1 monolith may carry the UTC date that the row was first observed (no
 /// tag was recorded pre-R5). `serde(default)` keeps the format
 /// forward-compatible — readers that don't know the field treat it as absent.
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct LedgerLine {
     seq: i64,
     occurred_at: String,
@@ -3752,6 +3752,7 @@ pub(crate) fn canonical_row_error(raw: &str, path: &Path, line_number: usize) ->
 /// the final unterminated fragment. A complete syntactic/schema error is
 /// corruption even without a newline; only serde's EOF class is truncatable.
 fn inspect_active_segment_tail(path: &Path) -> Result<ActiveTailRepair> {
+    history_probe::note(history_probe::Work::SegmentFileParse);
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -3819,6 +3820,130 @@ fn inspect_active_segment_tail(path: &Path) -> Result<ActiveTailRepair> {
                 RallyError::Message(format!("canonical tail offset overflow: {overflow}"))
             })?,
         )),
+        Err(error) => Err(RallyError::Message(format!(
+            "unterminated canonical segment corruption in {}: {}; refusing mutation",
+            path.display(),
+            error
+        ))),
+    }
+}
+
+/// Seq of the newest row physically at the end of `path` (a valid unterminated
+/// final row counts, as it does for replay; a torn fragment does not), read
+/// backwards from EOF. `Some(0)` for an empty or absent file; `None` when the
+/// tail cannot be read or parsed, which callers treat as "no proof".
+fn segment_tail_seq(path: &Path) -> Option<i64> {
+    use std::io::{Read, SeekFrom};
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Some(0),
+        Err(_) => return None,
+    };
+    let len = file.metadata().ok()?.len();
+    let mut tail: Vec<u8> = Vec::new();
+    let mut end = len;
+    // Collect bytes until the buffer holds one complete line before any
+    // trailing fragment: at least two newlines, or the start of the file.
+    loop {
+        let start = end.saturating_sub(64 * 1024);
+        let mut chunk = vec![0u8; usize::try_from(end - start).ok()?];
+        file.seek(SeekFrom::Start(start)).ok()?;
+        file.read_exact(&mut chunk).ok()?;
+        chunk.extend_from_slice(&tail);
+        tail = chunk;
+        let newlines = tail.iter().filter(|byte| **byte == b'\n').count();
+        if start == 0 || newlines >= 2 {
+            break;
+        }
+        end = start;
+    }
+    let completed_end = tail
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let fragment = &tail[completed_end..];
+    if !fragment.iter().all(|byte| byte.is_ascii_whitespace())
+        && let Ok(entry) = serde_json::from_slice::<LedgerLine>(fragment)
+    {
+        return Some(entry.seq);
+    }
+    let completed = &tail[..completed_end];
+    let last = completed
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .map(|raw| raw.strip_suffix(b"\r").unwrap_or(raw))
+        .find(|raw| !raw.iter().all(|byte| byte.is_ascii_whitespace()));
+    match last {
+        None => Some(0),
+        Some(raw) => serde_json::from_slice::<LedgerLine>(raw)
+            .ok()
+            .map(|entry| entry.seq),
+    }
+}
+
+/// Stage 0 item 5: classify only the final unterminated fragment of the active
+/// segment, reading backwards from EOF to the last newline.
+///
+/// Callers use this ONLY while a [`DerivedDbProof`] holds: the reconcile
+/// sidecar was published from a validated canonical scan (full fold, or the
+/// previous append's exact one-row advance) for the current fingerprint, so
+/// every completed line is already certified. Without that proof the full
+/// [`inspect_active_segment_tail`] still runs. The fragment classification is
+/// byte-for-byte the full inspector's: a valid final record wants a newline, a
+/// serde EOF fragment is a torn append to truncate, anything else refuses.
+fn inspect_active_segment_tail_bounded(path: &Path) -> Result<ActiveTailRepair> {
+    use std::io::{Read, SeekFrom};
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ActiveTailRepair::None);
+        }
+        Err(error) => return Err(RallyError::io(format!("read {}", path.display()))(error)),
+    };
+    let len = file
+        .metadata()
+        .map_err(RallyError::io(format!("stat {}", path.display())))?
+        .len();
+    if len == 0 {
+        return Ok(ActiveTailRepair::None);
+    }
+    const CHUNK: u64 = 64 * 1024;
+    let mut tail: Vec<u8> = Vec::new();
+    let mut end = len;
+    let completed_end = loop {
+        let start = end.saturating_sub(CHUNK);
+        let mut chunk = vec![0u8; usize::try_from(end - start).unwrap_or(0)];
+        file.seek(SeekFrom::Start(start))
+            .and_then(|_| file.read_exact(&mut chunk))
+            .map_err(RallyError::io(format!("read {}", path.display())))?;
+        if let Some(index) = chunk.iter().rposition(|byte| *byte == b'\n') {
+            chunk.drain(..=index);
+            chunk.extend_from_slice(&tail);
+            tail = chunk;
+            break start + index as u64 + 1;
+        }
+        chunk.extend_from_slice(&tail);
+        tail = chunk;
+        if start == 0 {
+            break 0;
+        }
+        end = start;
+    };
+    if tail.is_empty() {
+        return Ok(ActiveTailRepair::None);
+    }
+    match serde_json::from_slice::<LedgerLine>(&tail) {
+        Ok(entry) => {
+            validate_canonical_line_at(&entry, path, 0).map_err(|error| {
+                RallyError::Message(format!(
+                    "unterminated canonical segment corruption in {} at its final line: {}",
+                    path.display(),
+                    error
+                ))
+            })?;
+            Ok(ActiveTailRepair::AddNewline)
+        }
+        Err(error) if error.is_eof() => Ok(ActiveTailRepair::TruncateTo(completed_end)),
         Err(error) => Err(RallyError::Message(format!(
             "unterminated canonical segment corruption in {}: {}; refusing mutation",
             path.display(),
@@ -3911,6 +4036,40 @@ fn normalized_fact_value(fact: &Fact, seq: i64) -> Result<Value> {
 }
 
 const MAX_APPEND_EVENT_ID_BYTES: usize = 256;
+
+/// Fact event ids minted by THIS process (`new_id("fact")`) and not yet offered
+/// to an append. Stage 0 item 2 (docs/design/append-and-return-writes.md):
+/// such an id cannot already name a canonical row — `new_id` embeds this
+/// process's pid and a per-process strictly increasing nanosecond stamp — so
+/// the append may skip the O(history) identity scan for it.
+///
+/// The first append attempt CONSUMES the entry. Any later attempt with the same
+/// id (an in-process retry after `OutcomeUnknown`, or a caller re-offering the
+/// fact) is no longer "fresh" and takes the full identity resolution, so the
+/// idempotent-retry contract (I5) is unchanged. Bounded: overflow clears the
+/// set, which only costs the fast path.
+static FRESH_FACT_IDS: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+const FRESH_FACT_IDS_CAP: usize = 4096;
+
+pub(crate) fn note_minted_fact_id(event_id: &str) {
+    let mut guard = FRESH_FACT_IDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let set = guard.get_or_insert_with(std::collections::HashSet::new);
+    if set.len() >= FRESH_FACT_IDS_CAP {
+        set.clear();
+    }
+    set.insert(event_id.to_string());
+}
+
+/// True exactly once per minted id: removes it from the fresh set.
+fn take_fresh_fact_id(event_id: &str) -> bool {
+    FRESH_FACT_IDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_mut()
+        .is_some_and(|set| set.remove(event_id))
+}
 
 /// Validate identity fields that determine whether an append can ever be
 /// queried or retried. This must run before tail inspection or any filesystem
@@ -4395,6 +4554,31 @@ impl RoomStore {
         match self {
             RoomStore::Direct(d) => d.facts(),
             RoomStore::Routed(r) => r.facts(),
+        }
+    }
+
+    /// Presence facts stamped with `session_id` (Stage 0 implicit-presence
+    /// guard). Routed stores filter the full fact list as before.
+    pub(crate) fn session_presence_facts(&self, session_id: &str) -> Result<Vec<Fact>> {
+        match self {
+            RoomStore::Direct(d) => d.session_presence_facts(session_id),
+            RoomStore::Routed(r) => Ok(r
+                .facts()?
+                .into_iter()
+                .filter(|fact| {
+                    fact.kind == FactKind::Presence
+                        && fact.from_session_id.as_deref() == Some(session_id)
+                })
+                .collect()),
+        }
+    }
+
+    /// The lead seat as the room snapshot reports it (Stage 0: scoped read in
+    /// direct mode; routed stores take the full snapshot as before).
+    pub(crate) fn projected_lead(&self) -> Result<Option<String>> {
+        match self {
+            RoomStore::Direct(d) => d.projected_lead(),
+            RoomStore::Routed(r) => Ok(r.snapshot()?.lead),
         }
     }
 
@@ -5084,13 +5268,34 @@ impl DirectRoomStore {
         validate_append_identity(&fact)?;
         crate::write_authority::assert_field_bounds(&fact)?;
         let active_segment = self.active_segment_path();
-        let tail_repair = inspect_active_segment_tail(&active_segment)?;
-        if let Some((existing, source_paths)) = resolve_canonical_event_id(
-            &self.log_dir,
-            &self.archive_dir,
-            &fact,
-            &self.active_engagement,
-        )? {
+        // Stage 0: one O(#segments) fingerprint check, under the mutation lock,
+        // decides whether the reconcile sidecar may stand in for the canonical
+        // folds below. Without it every step takes its original full path.
+        let proof = self.derived_db_proof();
+        let tail_repair = if proof.is_some() {
+            inspect_active_segment_tail_bounded(&active_segment)?
+        } else {
+            inspect_active_segment_tail(&active_segment)?
+        };
+        // Stage 0 item 2: an id this process just minted cannot already be
+        // canonical; any other id is looked up in the derived event-id index
+        // while the proof holds, and only a hit (a real retry) or a missing
+        // proof pays for the authoritative scan.
+        let identity = if take_fresh_fact_id(&fact.event_id)
+            || proof
+                .as_ref()
+                .is_some_and(|_| self.event_id_absent_by_index(&fact.event_id))
+        {
+            None
+        } else {
+            resolve_canonical_event_id(
+                &self.log_dir,
+                &self.archive_dir,
+                &fact,
+                &self.active_engagement,
+            )?
+        };
+        if let Some((existing, source_paths)) = identity {
             let rally_dir = rally_dir_for_segment(&active_segment)?;
             trigger_o26_fault(rally_dir, O26FaultPoint::BeforeCanonicalMutation).map_err(
                 |detail| RallyError::outcome_unknown(&fact.event_id, "retry-resync", detail),
@@ -5513,7 +5718,25 @@ impl DirectRoomStore {
         // render the untimed message rather than pay for a projection.
         // `store::conflict_message_liveness_bench` is the measurement.
         let mut authority_snapshot: Option<RoomSnapshot> = None;
-        if needs_authority || needs_session_lifecycle {
+        // Stage 0: a fact that needs ONLY the session-lifecycle gate (not an
+        // authority kind, not a claim whose conflict message wants liveness)
+        // is checked against exactly the rows that gate reads — this session's
+        // facts — fetched from the session index while the proof holds. The
+        // check still runs here, under the mutation lock (I7).
+        let scoped_lifecycle = if !needs_authority
+            && needs_session_lifecycle
+            && fact.kind != FactKind::Claim
+            && proof.is_some()
+        {
+            fact.from_session_id
+                .as_deref()
+                .and_then(|session| self.session_facts_by_index(session))
+        } else {
+            None
+        };
+        if let Some(session_facts) = scoped_lifecycle {
+            crate::write_authority::assert_session_lifecycle_authorized(&fact, &session_facts)?;
+        } else if needs_authority || needs_session_lifecycle {
             let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
             let coord =
                 crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
@@ -5570,10 +5793,19 @@ impl DirectRoomStore {
                 )));
             }
         }
-        let live = read_segment_files(&self.log_dir)?;
-        let archived = replay_archive_segments(&self.archive_dir)?;
-        fact.seq = segment_seq_stats(&live, &archived)?
-            .max_seq
+        // Stage 0 item 1: the proof's sidecar carries the exact canonical
+        // high-water for the current fingerprint (every segment's length and
+        // tail hash), so tails stay authoritative: any change since it was
+        // published fails the proof and this falls back to the full fold.
+        let canonical_max_seq = match proof.as_ref() {
+            Some(proof) => proof.cache.canonical_max_seq,
+            None => {
+                let live = read_segment_files(&self.log_dir)?;
+                let archived = replay_archive_segments(&self.archive_dir)?;
+                segment_seq_stats(&live, &archived)?.max_seq
+            }
+        };
+        fact.seq = canonical_max_seq
             .checked_add(1)
             .ok_or_else(|| RallyError::Message("canonical sequence overflow".to_string()))?;
         let event_type = fact.kind.as_str().to_string();
@@ -5604,7 +5836,22 @@ impl DirectRoomStore {
                 RallyError::outcome_unknown(&fact.event_id, "after-tail-repair", detail)
             })?;
         }
-        append_canonical_line_and_readback(&active_segment, &entry, &rendered, &fact.event_id)?;
+        let pre_write_len = fs::metadata(&active_segment).map_or(0, |meta| meta.len());
+        append_canonical_line_and_readback(
+            &active_segment,
+            &entry,
+            &rendered,
+            &fact.event_id,
+            pre_write_len,
+        )?;
+        let projection_context = proof.map(|proof| AppendProjectionContext {
+            proof,
+            active_segment: active_segment.clone(),
+            pre_write_len,
+            appended_len: rendered.len() as u64,
+            repaired: tail_repair != ActiveTailRepair::None,
+            entry: entry.clone(),
+        });
 
         let mut outcome = AppendOutcome::committed(fact.clone(), Vec::new());
         outcome.projection_complete = false;
@@ -5618,14 +5865,24 @@ impl DirectRoomStore {
                 message: format!("post-readback projection seam: {detail}"),
             });
         }
-        outcome.warnings.extend(self.project_canonical_fact(&fact));
+        outcome
+            .warnings
+            .extend(self.project_canonical_fact_with(&fact, projection_context.as_ref()));
         outcome.projection_complete = outcome.warnings.is_empty();
         crate::mark_watchdog_append_outcome(&outcome);
         Ok(outcome)
     }
 
     fn project_canonical_fact(&self, fact: &Fact) -> Vec<ProjectionWarning> {
-        let warnings = self.project_canonical_fact_inner(fact);
+        self.project_canonical_fact_with(fact, None)
+    }
+
+    fn project_canonical_fact_with(
+        &self,
+        fact: &Fact,
+        context: Option<&AppendProjectionContext>,
+    ) -> Vec<ProjectionWarning> {
+        let warnings = self.project_canonical_fact_inner(fact, context);
         if !warnings.is_empty() {
             self.invalidate_projection_sidecars();
         }
@@ -5645,7 +5902,11 @@ impl DirectRoomStore {
         let _ = fs::remove_file(&self.claim_index_path);
     }
 
-    fn project_canonical_fact_inner(&self, fact: &Fact) -> Vec<ProjectionWarning> {
+    fn project_canonical_fact_inner(
+        &self,
+        fact: &Fact,
+        context: Option<&AppendProjectionContext>,
+    ) -> Vec<ProjectionWarning> {
         let mut warnings = Vec::new();
         let rally_dir = self
             .facts_db_path
@@ -5669,7 +5930,22 @@ impl DirectRoomStore {
             }
         };
 
-        let before = match facts_from_store(&fact_store) {
+        // Stage 0 item 3: the before/after identity checks are point queries on
+        // the derived event-id index instead of two full decodes of facts.db.
+        // A missing index or any index error falls back to the full load, so
+        // the checks themselves are unchanged.
+        let index = derived_index::open(&self.facts_db_path)
+            .ok()
+            .filter(|connection| derived_index::ensure_indexes(connection).is_ok());
+        let load_same_id = |index: &Option<rusqlite::Connection>| -> Result<Vec<Fact>> {
+            match index.as_ref().and_then(|connection| {
+                derived_index::facts_by_event_id(connection, &fact.event_id).ok()
+            }) {
+                Some(facts) => Ok(facts),
+                None => facts_from_store(&fact_store),
+            }
+        };
+        let before = match load_same_id(&index) {
             Ok(facts) => facts,
             Err(error) => {
                 warnings.push(ProjectionWarning {
@@ -5729,7 +6005,7 @@ impl DirectRoomStore {
             }
         }
 
-        match facts_from_store(&fact_store) {
+        match load_same_id(&index) {
             Ok(after) => {
                 let exact = after
                     .iter()
@@ -5758,6 +6034,11 @@ impl DirectRoomStore {
                 return warnings;
             }
         }
+        let db_stats = index
+            .as_ref()
+            .and_then(|connection| derived_index::stats(connection).ok());
+        // Close every connection before fingerprinting facts.db and its WAL.
+        drop(index);
         drop(fact_store);
 
         if let Err(detail) = trigger_o26_fault(rally_dir, O26FaultPoint::ReconcileCacheProjection) {
@@ -5765,13 +6046,15 @@ impl DirectRoomStore {
                 code: ProjectionWarningCode::ReconcileCache,
                 message: format!("reconcile cache projection fault: {detail}"),
             });
-        } else if let Err(error) = self.refresh_reconcile_cache_after_append(fact.seq) {
+        } else if let Err(error) =
+            self.refresh_reconcile_cache_after_append(fact.seq, context, db_stats)
+        {
             warnings.push(ProjectionWarning {
                 code: ProjectionWarningCode::ReconcileCache,
                 message: error.to_string(),
             });
         }
-        if let Err(error) = self.refresh_log_index() {
+        if let Err(error) = self.refresh_log_index_after_append(context) {
             warnings.push(ProjectionWarning {
                 code: ProjectionWarningCode::LogIndex,
                 message: error.to_string(),
@@ -5818,9 +6101,234 @@ impl DirectRoomStore {
     /// self-corrected by a fingerprint mismatch on the next open, which triggers
     /// the authoritative full scan. No data loss is possible — the canonical
     /// JSONL segments are not affected by sidecar drift.
-    fn refresh_reconcile_cache_after_append(&self, appended_seq: i64) -> Result<()> {
+    /// Stage 0: see [`DerivedDbProof`]. O(#segments) stats plus one 4 KB tail
+    /// read per segment; `None` sends every caller down its full path.
+    fn derived_db_proof(&self) -> Option<DerivedDbProof> {
+        let live = read_segment_files(&self.log_dir).ok()?;
+        let archived = replay_archive_segments(&self.archive_dir).ok()?;
+        let cache = read_reconcile_cache(&self.facts_db_path)?;
+        let seg_fp = segments_fingerprint(&live, &archived);
+        let db_fp = fingerprint_db(&self.facts_db_path);
+        let wal_fp = fingerprint_wal(&self.facts_db_path);
+        if !reconcile_cache_matches(&cache, &seg_fp, &db_fp, &wal_fp) {
+            return None;
+        }
+        // Tails stay authoritative (I1): the last row of every segment must sit
+        // at or below the sidecar's high-water, or the sidecar is not trusted.
+        let mut tails_max = 0_i64;
+        for path in live.iter().chain(archived.iter()) {
+            tails_max = tails_max.max(segment_tail_seq(path)?);
+        }
+        if tails_max > cache.canonical_max_seq {
+            return None;
+        }
+        // The sidecar's database half must match the LIVE database, not just
+        // its file fingerprint: a self-consistent sidecar can outlive a rewound
+        // or replaced facts.db (the "never advance a lie" rule). The indexed
+        // count/high-water read is O(log n).
+        let connection = derived_index::open(&self.facts_db_path).ok()?;
+        if !derived_index::indexes_present(&connection) {
+            return None;
+        }
+        let live_db = derived_index::stats(&connection).ok()?;
+        drop(connection);
+        (live_db.count == cache.db_count && live_db.max_seq == cache.db_max_seq)
+            .then_some(DerivedDbProof { cache })
+    }
+
+    /// True only when the derived event-id index exists and has no row for
+    /// `event_id`. Callers must hold a [`DerivedDbProof`]; any error is "not
+    /// proven absent" and sends the caller to the authoritative scan.
+    fn event_id_absent_by_index(&self, event_id: &str) -> bool {
+        let Ok(connection) = derived_index::open(&self.facts_db_path) else {
+            return false;
+        };
+        derived_index::indexes_present(&connection)
+            && derived_index::facts_by_event_id(&connection, event_id)
+                .is_ok_and(|rows| rows.is_empty())
+    }
+
+    /// Every fact stamped with `session_id`, in seq order, from the derived
+    /// session index. `None` when the index is missing or unreadable.
+    fn session_facts_by_index(&self, session_id: &str) -> Option<Vec<Fact>> {
+        let connection = derived_index::open(&self.facts_db_path).ok()?;
+        if !derived_index::indexes_present(&connection) {
+            return None;
+        }
+        derived_index::facts_by_session(&connection, session_id).ok()
+    }
+
+    /// Presence facts recorded for `session_id` (any tool), for the implicit
+    /// presence guard. Reconciles first, like [`Self::facts`], then answers from
+    /// the session index while the proof holds; otherwise filters the full
+    /// fact load exactly as before.
+    pub(crate) fn session_presence_facts(&self, session_id: &str) -> Result<Vec<Fact>> {
+        let room_dir = self
+            .facts_db_path
+            .parent()
+            .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
+        let _guard = acquire_room_mutation_lock(room_dir)?;
+        reconcile_segments_and_db(
+            &self.log_dir,
+            &self.archive_dir,
+            &self.facts_db_path,
+            self.warm_fact_store.is_none(),
+        )?;
+        let scoped = self
+            .derived_db_proof()
+            .and_then(|_| self.session_facts_by_index(session_id));
+        let facts = match scoped {
+            Some(facts) => facts,
+            None => self.facts_under_lock()?,
+        };
+        Ok(facts
+            .into_iter()
+            .filter(|fact| {
+                fact.kind == FactKind::Presence
+                    && fact.from_session_id.as_deref() == Some(session_id)
+            })
+            .collect())
+    }
+
+    /// The lead seat as `RoomSnapshot::lead` reports it, computed from the
+    /// lead-family decisions and retractions only (the inputs
+    /// `claim_authority::projected_lead` reads) while the proof holds;
+    /// otherwise from a full snapshot exactly as before.
+    pub(crate) fn projected_lead(&self) -> Result<Option<String>> {
+        let room_dir = self
+            .facts_db_path
+            .parent()
+            .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
+        {
+            let _guard = acquire_room_mutation_lock(room_dir)?;
+            reconcile_segments_and_db(
+                &self.log_dir,
+                &self.archive_dir,
+                &self.facts_db_path,
+                self.warm_fact_store.is_none(),
+            )?;
+            if self.derived_db_proof().is_some()
+                && let Ok(connection) = derived_index::open(&self.facts_db_path)
+                && derived_index::indexes_present(&connection)
+                && let Ok(scope) = derived_index::lead_scope_facts(&connection)
+            {
+                return Ok(claim_authority::projected_lead(&scope));
+            }
+        }
+        Ok(self.snapshot()?.lead)
+    }
+
+    /// Stage 0 item 4: advance `log/index.json` by the one row this append
+    /// wrote when the index was current for the pre-append segment set and
+    /// only the active segment grew (by exactly our bytes, prefix intact).
+    /// Anything else rebuilds it with [`Self::refresh_log_index`].
+    fn refresh_log_index_after_append(
+        &self,
+        context: Option<&AppendProjectionContext>,
+    ) -> Result<()> {
+        let Some(context) = context.filter(|context| !context.repaired) else {
+            return self.refresh_log_index();
+        };
+        let index_path = self.log_dir.join(LOG_INDEX_FILENAME);
+        let advanced = (|| -> Option<String> {
+            let segments = read_segment_files(&self.log_dir).ok()?;
+            let archived = read_segment_files(&self.archive_dir).ok()?;
+            let current_fp = segments_fingerprint(&segments, &archived);
+            let text = fs::read_to_string(&index_path).ok()?;
+            let mut index: Value = serde_json::from_str(&text).ok()?;
+            let previous_fp: Vec<FileFingerprint> =
+                serde_json::from_value(index.get("fingerprint")?.clone()).ok()?;
+            if !fingerprint_advanced_by_one_append(
+                &previous_fp,
+                &current_fp,
+                &context.active_segment,
+                context.pre_write_len,
+                context.appended_len,
+            ) {
+                return None;
+            }
+            let active_name = context.active_segment.file_name()?.to_str()?.to_string();
+            let mut entries: Vec<SegmentIndexEntry> =
+                serde_json::from_value(index.get("segments")?.clone()).ok()?;
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.segment == active_name)?;
+            if context.entry.seq <= entry.last_seq {
+                return None;
+            }
+            entry.count += 1;
+            entry.last_seq = context.entry.seq;
+            entry.last_ts = Some(context.entry.occurred_at.clone());
+            let object = index.as_object_mut()?;
+            object.insert("segments".to_string(), serde_json::to_value(&entries).ok()?);
+            object.insert(
+                "fingerprint".to_string(),
+                serde_json::to_value(&current_fp).ok()?,
+            );
+            object.insert("updated_at".to_string(), json!(now_string()));
+            serde_json::to_string_pretty(&index).ok()
+        })();
+        let Some(rendered) = advanced else {
+            return self.refresh_log_index();
+        };
+        let temp_path = index_path.with_extension(format!("json.tmp-{}", short_id()));
+        fs::write(&temp_path, format!("{rendered}\n"))
+            .map_err(RallyError::io(format!("write {}", temp_path.display())))?;
+        fs::rename(&temp_path, &index_path).map_err(|error| {
+            let _ = fs::remove_file(&temp_path);
+            RallyError::io(format!("replace {}", index_path.display()))(error)
+        })
+    }
+
+    fn refresh_reconcile_cache_after_append(
+        &self,
+        appended_seq: i64,
+        context: Option<&AppendProjectionContext>,
+        db_stats: Option<SeqStats>,
+    ) -> Result<()> {
         let segments = read_segment_files(&self.log_dir)?;
         let archived = replay_archive_segments(&self.archive_dir)?;
+        // Stage 0 items 3-4: advance the sidecar by exactly the one row this
+        // append wrote. Allowed only when (a) the pre-append proof held, (b) no
+        // tail repair rewrote the active segment, (c) the segment set differs
+        // from the proven fingerprint by exactly our bytes on the active
+        // segment with its old prefix intact, and (d) facts.db's indexed
+        // count/high-water equals the advanced canonical stats. Anything else
+        // takes the original full re-measure below.
+        if let (Some(context), Some(db_stats)) = (context, db_stats)
+            && !context.repaired
+        {
+            let current = segments_fingerprint(&segments, &archived);
+            if fingerprint_advanced_by_one_append(
+                &context.proof.cache.segments_fingerprint,
+                &current,
+                &context.active_segment,
+                context.pre_write_len,
+                context.appended_len,
+            ) && context.entry.seq == appended_seq
+            {
+                let canonical_stats = SeqStats {
+                    count: context.proof.cache.canonical_count + 1,
+                    max_seq: appended_seq,
+                };
+                // A disagreement is not trusted either way: fall through to
+                // the authoritative re-measure below, which publishes only
+                // when a full canonical scan and facts.db agree.
+                if canonical_stats == db_stats {
+                    let cache = ReconcileCache {
+                        schema_version: RECONCILE_CACHE_SCHEMA_VERSION,
+                        segments_fingerprint: current,
+                        db_fingerprint: fingerprint_db(&self.facts_db_path),
+                        wal_fingerprint: fingerprint_wal(&self.facts_db_path),
+                        canonical_count: canonical_stats.count,
+                        canonical_max_seq: canonical_stats.max_seq,
+                        db_count: db_stats.count,
+                        db_max_seq: db_stats.max_seq,
+                    };
+                    return write_reconcile_cache(&self.facts_db_path, &cache);
+                }
+            }
+        }
         // Never advance counts from the previous sidecar. A lost WAL can leave
         // that sidecar internally consistent while facts.db has rewound. Re-read
         // both authoritative segments and the live SQLite view after the append;
@@ -6570,19 +7078,34 @@ impl DirectRoomStore {
             .parent()
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
         let _guard = acquire_room_mutation_lock(room_dir)?;
-        if resolve_canonical_event_id(
-            &self.log_dir,
-            &self.archive_dir,
-            checkpoint,
-            &self.active_engagement,
-        )?
-        .is_some()
+        // Stage 0: the identity probe and the coalescing guard read only the
+        // checkpoint id and this room's `read` rows while the derived-db proof
+        // holds (the same proof the append below re-takes under this lock).
+        let proof = self.derived_db_proof();
+        let known_absent = proof.is_some() && self.event_id_absent_by_index(&checkpoint.event_id);
+        if !known_absent
+            && resolve_canonical_event_id(
+                &self.log_dir,
+                &self.archive_dir,
+                checkpoint,
+                &self.active_engagement,
+            )?
+            .is_some()
         {
             return self
                 .append_fact_under_lock(checkpoint)
                 .map(ConditionalAppendOutcome::Applied);
         }
-        let facts = facts_from_segments(&self.log_dir, &self.archive_dir)?;
+        let scoped = proof.as_ref().and_then(|_| {
+            let connection = derived_index::open(&self.facts_db_path).ok()?;
+            derived_index::indexes_present(&connection)
+                .then(|| derived_index::facts_by_event_type(&connection, "read").ok())
+                .flatten()
+        });
+        let facts = match scoped {
+            Some(facts) => facts,
+            None => facts_from_segments(&self.log_dir, &self.archive_dir)?,
+        };
         let last_checkpoint = facts
             .iter()
             .filter(|fact| fact.kind == FactKind::Read && fact.tool.as_deref() == Some(tool))
@@ -7014,9 +7537,11 @@ fn refresh_snapshot_totals(snapshot: &mut RoomSnapshot) {
 }
 
 fn facts_from_store(store: &SqliteStore) -> Result<Vec<Fact>> {
+    history_probe::note(history_probe::Work::FactsDbFullLoad);
     let query = store
         .query(&FactQuery::all())
         .map_err(|err| RallyError::Message(format!("query facts: {err}")))?;
+    history_probe::note_materialized(query.event_records.len());
     query
         .event_records
         .into_iter()
@@ -7026,6 +7551,197 @@ fn facts_from_store(store: &SqliteStore) -> Result<Vec<Fact>> {
             Fact::from_value(record.payload, seq)
         })
         .collect()
+}
+
+/// Point queries and aggregate stats over `facts.db` for the Stage 0 append
+/// path (docs/design/append-and-return-writes.md §4 items 2-3).
+///
+/// factstr's `query` loads every row and filters in memory, so a "does this
+/// event id exist" question cost a full decode of the ledger. These helpers
+/// answer the same questions with SQL against expression indexes that live in
+/// the DERIVED database only:
+///
+/// * `rally_events_event_id`  — `json_extract(payload,'$.event_id')`
+/// * `rally_events_session`   — `json_extract(payload,'$.from_session_id')`
+/// * `rally_events_seq`       — the canonical seq exactly as
+///   [`Fact::from_value`] derives it (payload seq, else the row sequence)
+/// * `rally_events_retraction` — partial index over `retract:` subjects
+///
+/// The indexes are derived state: `CREATE INDEX IF NOT EXISTS` rebuilds them
+/// after any `facts.db` rebuild, older binaries ignore them, and every caller
+/// falls back to the full path when they are absent or a query fails. Callers
+/// only trust an answer while the reconcile sidecar proves `facts.db` holds the
+/// canonical segment set (see [`DirectRoomStore::derived_db_proof`]).
+mod derived_index {
+    use super::{Fact, RallyError, Result, SeqStats};
+    use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+    use std::path::Path;
+    use std::time::Duration;
+
+    /// Every char `str::trim` strips (Unicode `White_Space`), so the SQL
+    /// prefilter for `retract:` subjects is a superset of `retraction::target_of`.
+    const UNICODE_WS: &str = "\u{9}\u{a}\u{b}\u{c}\u{d}\u{20}\u{85}\u{a0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}";
+
+    pub(super) const SEQ_EXPR: &str =
+        "coalesce(nullif(json_extract(payload,'$.seq'),0),sequence_number)";
+
+    fn retraction_predicate() -> String {
+        format!("substr(ltrim(json_extract(payload,'$.subject'),'{UNICODE_WS}'),1,8) = 'retract:'")
+    }
+
+    const INDEX_NAMES: [&str; 4] = [
+        "rally_events_event_id",
+        "rally_events_session",
+        "rally_events_seq",
+        "rally_events_retraction",
+    ];
+
+    fn sql_error(context: &str, error: rusqlite::Error) -> RallyError {
+        RallyError::Message(format!("{context}: {error}"))
+    }
+
+    /// Open an existing `facts.db` without creating it. The busy timeout is a
+    /// fraction of the watchdog budget, like the factstr pool's.
+    pub(super) fn open(path: &Path) -> Result<Connection> {
+        let budgets = crate::retry_budget::budgets_for(crate::watchdog_remaining());
+        let busy = if budgets.busy_timeout.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            budgets.busy_timeout
+        };
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| sql_error("open facts.db index connection", error))?;
+        connection
+            .busy_timeout(busy)
+            .map_err(|error| sql_error("set facts.db busy timeout", error))?;
+        Ok(connection)
+    }
+
+    pub(super) fn indexes_present(connection: &Connection) -> bool {
+        let Ok(count) = connection.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name IN (?1, ?2, ?3, ?4)",
+            params![
+                INDEX_NAMES[0],
+                INDEX_NAMES[1],
+                INDEX_NAMES[2],
+                INDEX_NAMES[3]
+            ],
+            |row| row.get::<_, i64>(0),
+        ) else {
+            return false;
+        };
+        count == INDEX_NAMES.len() as i64
+    }
+
+    /// Create the derived indexes. Writes `facts.db`, so callers run this only
+    /// in the projection phase, never while proving the database unchanged.
+    pub(super) fn ensure_indexes(connection: &Connection) -> Result<()> {
+        if indexes_present(connection) {
+            return Ok(());
+        }
+        let ddl = format!(
+            "CREATE INDEX IF NOT EXISTS rally_events_event_id ON events(json_extract(payload,'$.event_id'));
+             CREATE INDEX IF NOT EXISTS rally_events_session ON events(json_extract(payload,'$.from_session_id'));
+             CREATE INDEX IF NOT EXISTS rally_events_seq ON events({SEQ_EXPR});
+             CREATE INDEX IF NOT EXISTS rally_events_retraction ON events(sequence_number) WHERE {};",
+            retraction_predicate()
+        );
+        connection
+            .execute_batch(&ddl)
+            .map_err(|error| sql_error("create facts.db derived indexes", error))
+    }
+
+    fn decode(rows: Vec<(i64, String)>) -> Result<Vec<Fact>> {
+        let mut facts = Vec::with_capacity(rows.len());
+        for (sequence, payload) in rows {
+            let value = serde_json::from_str(&payload)
+                .map_err(RallyError::json("parse facts.db payload"))?;
+            facts.push(Fact::from_value(value, sequence)?);
+        }
+        super::history_probe::note_materialized(facts.len());
+        facts.sort_by_key(|fact| fact.seq);
+        Ok(facts)
+    }
+
+    fn rows(connection: &Connection, sql: &str, param: Option<&str>) -> Result<Vec<Fact>> {
+        let mut statement = connection
+            .prepare(sql)
+            .map_err(|error| sql_error("prepare facts.db point query", error))?;
+        let mapper =
+            |row: &rusqlite::Row<'_>| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?));
+        let collected = match param {
+            Some(value) => statement
+                .query_map(params![value], mapper)
+                .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>()),
+            None => statement
+                .query_map([], mapper)
+                .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>()),
+        }
+        .map_err(|error| sql_error("run facts.db point query", error))?;
+        decode(collected)
+    }
+
+    pub(super) fn facts_by_event_id(connection: &Connection, event_id: &str) -> Result<Vec<Fact>> {
+        rows(
+            connection,
+            "SELECT sequence_number, payload FROM events \
+             WHERE json_extract(payload,'$.event_id') = ?1",
+            Some(event_id),
+        )
+    }
+
+    pub(super) fn facts_by_event_type(
+        connection: &Connection,
+        event_type: &str,
+    ) -> Result<Vec<Fact>> {
+        rows(
+            connection,
+            "SELECT sequence_number, payload FROM events WHERE event_type = ?1",
+            Some(event_type),
+        )
+    }
+
+    pub(super) fn facts_by_session(connection: &Connection, session_id: &str) -> Result<Vec<Fact>> {
+        rows(
+            connection,
+            "SELECT sequence_number, payload FROM events \
+             WHERE json_extract(payload,'$.from_session_id') = ?1",
+            Some(session_id),
+        )
+    }
+
+    /// Every fact the lead-seat projection can depend on: lead-family
+    /// decisions plus every retraction (a superset; the caller applies
+    /// `claim_authority::projected_lead`, the projection's own body).
+    pub(super) fn lead_scope_facts(connection: &Connection) -> Result<Vec<Fact>> {
+        let sql = format!(
+            "SELECT sequence_number, payload FROM events \
+             WHERE (event_type = 'decision' AND json_extract(payload,'$.subject') IN (?1, 'role:lead:relinquished')) \
+             OR ({})",
+            retraction_predicate()
+        );
+        rows(connection, &sql, Some(crate::claim_authority::LEAD_SUBJECT))
+    }
+
+    /// `count(*)` and the canonical high-water exactly as
+    /// `read_db_event_stats` computes them, from the indexes.
+    pub(super) fn stats(connection: &Connection) -> Result<SeqStats> {
+        let sql = format!("SELECT count(*), max({SEQ_EXPR}) FROM events");
+        let (count, max_seq) = connection
+            .query_row(&sql, [], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+            })
+            .optional()
+            .map_err(|error| sql_error("read facts.db stats", error))?
+            .unwrap_or((0, None));
+        Ok(SeqStats {
+            count,
+            max_seq: max_seq.unwrap_or(0),
+        })
+    }
 }
 
 const CLAIM_LIFECYCLE_EVENT_TYPES: [&str; 8] = [
@@ -7272,6 +7988,39 @@ struct SegmentFoldMemo {
 
 /// Forget the memo. Call from any path that rewrites a segment file without
 /// changing its length.
+/// Test seam: true when `.rally/.reconcile-cache.json` exists, matches the
+/// current segment fingerprint, and its canonical and facts.db stats equal an
+/// authoritative full scan of both.
+#[cfg(test)]
+pub(crate) fn reconcile_sidecar_matches_full_scan_for_test(root: &Path) -> bool {
+    let rally = root.join(".rally");
+    let facts_db = rally.join("facts.db");
+    let live = read_segment_files(&rally.join(LOG_DIRNAME)).unwrap();
+    let archived = replay_archive_segments(&rally.join(ARCHIVE_DIRNAME)).unwrap();
+    let Some(cache) = read_reconcile_cache(&facts_db) else {
+        return false;
+    };
+    let canonical = segment_seq_stats(&live, &archived).unwrap();
+    let db = read_db_event_stats(&facts_db, false).unwrap();
+    cache.segments_fingerprint == segments_fingerprint(&live, &archived)
+        && cache.canonical_count == canonical.count
+        && cache.canonical_max_seq == canonical.max_seq
+        && cache.db_count == db.count
+        && cache.db_max_seq == db.max_seq
+}
+
+#[cfg(test)]
+pub(crate) fn remove_reconcile_sidecar_for_test(root: &Path) {
+    let _ = fs::remove_file(root.join(".rally").join(RECONCILE_CACHE_FILENAME));
+}
+
+/// Test seam: drop every per-process memo so an in-process command behaves
+/// like a fresh CLI process (the probe tests' "cold command" model).
+#[cfg(test)]
+pub(crate) fn forget_process_memos_for_test() {
+    invalidate_segment_fold_memo();
+}
+
 fn invalidate_segment_fold_memo() {
     if let Ok(mut memo) = SEGMENT_FOLD_MEMO.lock() {
         *memo = None;
@@ -7303,6 +8052,7 @@ fn facts_from_segments(log_dir: &Path, archive_dir: &Path) -> Result<Vec<Fact>> 
     if let Ok(memo) = SEGMENT_FOLD_MEMO.lock()
         && let Some(facts) = segment_fold_memo_hit(&memo, log_dir, archive_dir, &fingerprint)
     {
+        history_probe::note_materialized(facts.len());
         return Ok(facts);
     }
 
@@ -7311,6 +8061,7 @@ fn facts_from_segments(log_dir: &Path, archive_dir: &Path) -> Result<Vec<Fact>> 
     for entry in entries {
         facts.push(Fact::from_segment_value(entry.payload, entry.seq)?);
     }
+    history_probe::note_materialized(facts.len());
 
     if let Ok(mut memo) = SEGMENT_FOLD_MEMO.lock() {
         *memo = Some(SegmentFoldMemo {
@@ -8089,6 +8840,7 @@ fn snapshot_from_facts_with_policy_at(
     include_archived: bool,
     now_secs: i64,
 ) -> RoomSnapshot {
+    history_probe::note(history_probe::Work::SnapshotFold);
     // Retraction resolution (read-time, append-only): a fact withdrawn by a
     // `retract: <event-id>` fact is dropped from EVERY projection bucket here,
     // while the retraction fact itself survives (it is an artifact, so peers
@@ -9800,6 +10552,101 @@ fn full_reconcile_scan_count() -> u64 {
 #[inline]
 fn note_full_reconcile_scan() {}
 
+/// O(history) work counters for the append-and-return Stage 0 proof tests.
+///
+/// Same pattern as [`note_full_reconcile_scan`]: thread-local, compiled to a
+/// no-op outside `cfg(test)`. Each counter names one class of work whose cost
+/// grows with the ledger rather than with the request:
+///
+/// * `CanonicalFold` — one [`canonical_segment_entries`] pass (every live and
+///   archived segment parsed, validated and deduplicated by seq).
+/// * `FactsDbFullLoad` — one unfiltered `facts.db` row load decoded into
+///   `Fact`s ([`facts_from_store`], [`read_db_event_stats`]'s scan).
+/// * `SnapshotFold` — one [`snapshot_from_facts_with_policy_at`] fold.
+/// * `SegmentFileParse` — one whole-file parse of a canonical segment
+///   (`read_segment_entries*`, full active-tail inspection, full readback).
+/// * `facts_materialized` — facts a path decoded, so read-relevance tests can
+///   compare facts read against items returned.
+pub(crate) mod history_probe {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Work {
+        CanonicalFold,
+        FactsDbFullLoad,
+        SnapshotFold,
+        SegmentFileParse,
+    }
+
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub(crate) struct Counts {
+        pub(crate) canonical_folds: u64,
+        pub(crate) facts_db_full_loads: u64,
+        pub(crate) snapshot_folds: u64,
+        pub(crate) segment_file_parses: u64,
+        pub(crate) facts_materialized: u64,
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static COUNTS: std::cell::Cell<Counts> = const {
+            std::cell::Cell::new(Counts {
+                canonical_folds: 0,
+                facts_db_full_loads: 0,
+                snapshot_folds: 0,
+                segment_file_parses: 0,
+                facts_materialized: 0,
+            })
+        };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note(work: Work) {
+        if std::env::var_os("HISTORY_PROBE_TRACE").is_some() {
+            eprintln!(
+                "history_probe {work:?}\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        COUNTS.with(|cell| {
+            let mut counts = cell.get();
+            match work {
+                Work::CanonicalFold => counts.canonical_folds += 1,
+                Work::FactsDbFullLoad => counts.facts_db_full_loads += 1,
+                Work::SnapshotFold => counts.snapshot_folds += 1,
+                Work::SegmentFileParse => counts.segment_file_parses += 1,
+            }
+            cell.set(counts);
+        });
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    pub(crate) fn note(_work: Work) {}
+
+    #[cfg(test)]
+    pub(crate) fn note_materialized(n: usize) {
+        COUNTS.with(|cell| {
+            let mut counts = cell.get();
+            counts.facts_materialized += n as u64;
+            cell.set(counts);
+        });
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    pub(crate) fn note_materialized(_n: usize) {}
+
+    #[cfg(test)]
+    pub(crate) fn reset() {
+        COUNTS.with(|cell| cell.set(Counts::default()));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn counts() -> Counts {
+        COUNTS.with(std::cell::Cell::get)
+    }
+}
+
 // ---- G10 cold-open probe (test-only, mirrors note_full_reconcile_scan) ----
 //
 // Counts [`DirectRoomStore::fact_store_handle`] COLD-branch opens (a fresh
@@ -10109,16 +10956,7 @@ fn reconcile_segments_and_db(
     let db_fp = fingerprint_db(facts_db_path);
     let wal_fp = fingerprint_wal(facts_db_path);
     if let Some(cache) = read_reconcile_cache(facts_db_path)
-        && cache.segments_fingerprint == seg_fp
-        && cache.canonical_count == cache.db_count
-        && cache.canonical_max_seq == cache.db_max_seq
-        && (cache.canonical_count == 0 || cache.canonical_max_seq >= cache.canonical_count)
-        // facts.db must be present AND byte-identical (same len + mtime) to when
-        // we last verified the count. A corrupt-in-place db has a fresh mtime,
-        // so this guard fails and we fall through to corruption detection.
-        && db_fp.is_some()
-        && cache.db_fingerprint == db_fp
-        && cache.wal_fingerprint == wal_fp
+        && reconcile_cache_matches(&cache, &seg_fp, &db_fp, &wal_fp)
     {
         return Ok(());
     }
@@ -10189,6 +11027,111 @@ fn reconcile_segments_and_db(
     Ok(())
 }
 
+/// Proof, taken under the room mutation lock, that the reconcile sidecar
+/// describes the CURRENT canonical segment set (every segment's length, mtime
+/// and tail hash) and that `facts.db` holds exactly that set. While it holds,
+/// the sidecar's `canonical_max_seq` / `canonical_count` are the exact
+/// canonical high-water and distinct-row count, every completed segment line
+/// was validated by the scan (or one-row advance) that published it, and the
+/// derived indexes in `facts.db` answer for the canonical ledger.
+#[derive(Clone, Debug)]
+struct DerivedDbProof {
+    cache: ReconcileCache,
+}
+
+/// What a canonical append hands its projection so the post-append sidecars
+/// can advance by one row instead of re-folding history.
+#[derive(Clone, Debug)]
+struct AppendProjectionContext {
+    proof: DerivedDbProof,
+    active_segment: PathBuf,
+    pre_write_len: u64,
+    appended_len: u64,
+    repaired: bool,
+    entry: LedgerLine,
+}
+
+/// The reconcile fast-path predicate: the sidecar proves `facts.db` holds the
+/// canonical segment set (same distinct count and high-water) for exactly the
+/// current segment, database and WAL fingerprints. Shared by the open-time
+/// reconcile and the Stage 0 append path so the two can never disagree.
+fn reconcile_cache_matches(
+    cache: &ReconcileCache,
+    seg_fp: &[FileFingerprint],
+    db_fp: &Option<FileFingerprint>,
+    wal_fp: &Option<FileFingerprint>,
+) -> bool {
+    cache.segments_fingerprint == seg_fp
+        && cache.canonical_count == cache.db_count
+        && cache.canonical_max_seq == cache.db_max_seq
+        && (cache.canonical_count == 0 || cache.canonical_max_seq >= cache.canonical_count)
+        // facts.db must be present AND byte-identical (same len + mtime) to when
+        // we last verified the count. A corrupt-in-place db has a fresh mtime,
+        // so this guard fails and we fall through to corruption detection.
+        && db_fp.is_some()
+        && &cache.db_fingerprint == db_fp
+        && &cache.wal_fingerprint == wal_fp
+}
+
+/// Hash of the 4096 bytes that END at `len` in `path` — the value
+/// [`hash_file_tail`] produced when the file was exactly `len` bytes long. A
+/// match proves (to the strength of the tail hash) that an append-only file
+/// still carries the prefix it had then.
+fn hash_file_prefix_tail(path: &Path, len: u64) -> Option<u64> {
+    use std::io::{Read, SeekFrom};
+    let mut file = fs::File::open(path).ok()?;
+    let start = len.saturating_sub(4096);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::with_capacity(4096);
+    file.take(len - start).read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 == len - start).then(|| hash_bytes_fnv1a(&bytes))
+}
+
+/// True when `after` differs from `before` ONLY by `appended_len` bytes added
+/// to the file named `active` (which grew from `pre_len`, or was created when
+/// absent from `before`), with that file's old prefix intact. Every other
+/// segment must carry an identical fingerprint. This is what lets a
+/// post-append sidecar advance by exactly one canonical row instead of
+/// re-folding history; any other difference means someone else changed the
+/// segment set and the caller must take the full path.
+fn fingerprint_advanced_by_one_append(
+    before: &[FileFingerprint],
+    after: &[FileFingerprint],
+    active: &Path,
+    pre_len: u64,
+    appended_len: u64,
+) -> bool {
+    let Some(active_name) = active.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let others = |list: &[FileFingerprint]| {
+        list.iter()
+            .filter(|fp| fp.name != active_name)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    if others(before) != others(after) {
+        return false;
+    }
+    let old: Vec<&FileFingerprint> = before.iter().filter(|fp| fp.name == active_name).collect();
+    let new: Vec<&FileFingerprint> = after.iter().filter(|fp| fp.name == active_name).collect();
+    let [new] = new.as_slice() else {
+        return false;
+    };
+    if new.len != pre_len.saturating_add(appended_len) {
+        return false;
+    }
+    match old.as_slice() {
+        [] => pre_len == 0,
+        [old] => {
+            old.len == pre_len
+                && old.tail_hash.is_some()
+                && hash_file_prefix_tail(active, pre_len) == old.tail_hash
+        }
+        _ => false,
+    }
+}
+
 /// Recompute the sidecar after a rebuild (db was recreated, so its fingerprint
 /// and count are now fresh). `canonical_count` is already known from the caller;
 /// after a successful rebuild the db holds exactly that many events. Best-effort.
@@ -10252,6 +11195,48 @@ fn read_segment_files(dir: &Path) -> Result<Vec<PathBuf>> {
 /// Any malformed newline-terminated record is completed corruption and fails
 /// loudly with path and line evidence. A valid final record is accepted even
 /// when it lacks a newline.
+/// Parse the canonical rows that start at or after byte `offset` (which must
+/// be a line boundary) with the same framing policy as
+/// [`read_segment_entries`]: completed rows must validate, a torn final
+/// fragment is ignored, a valid unterminated final row is accepted.
+fn read_segment_entries_from(path: &Path, offset: u64) -> Result<Vec<LedgerLine>> {
+    use std::io::{Read, SeekFrom};
+    let mut file =
+        fs::File::open(path).map_err(RallyError::io(format!("read {}", path.display())))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(RallyError::io(format!("seek {}", path.display())))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(RallyError::io(format!("read {}", path.display())))?;
+    let mut entries = Vec::new();
+    let completed_end = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    for raw in bytes[..completed_end].split(|byte| *byte == b'\n') {
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if raw.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+        let entry = serde_json::from_slice::<LedgerLine>(raw).map_err(|error| {
+            RallyError::Message(format!(
+                "completed canonical segment corruption in {} after byte {offset}: {error}",
+                path.display()
+            ))
+        })?;
+        validate_canonical_line_at(&entry, path, 0)?;
+        entries.push(entry);
+    }
+    let tail = &bytes[completed_end..];
+    if !tail.iter().all(|byte| byte.is_ascii_whitespace())
+        && let Ok(entry) = serde_json::from_slice::<LedgerLine>(tail)
+        && validate_canonical_line_at(&entry, path, 0).is_ok()
+    {
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
 fn read_segment_entries(path: &Path) -> Result<Vec<LedgerLine>> {
     read_segment_entries_matching(path, |_| true)
 }
@@ -10279,6 +11264,7 @@ fn read_segment_entries_matching_with_policy(
     tolerate_missing: bool,
     mut include: impl FnMut(&LedgerLine) -> bool,
 ) -> Result<Vec<LedgerLine>> {
+    history_probe::note(history_probe::Work::SegmentFileParse);
     let file = match fs::File::open(path) {
         Ok(file) => file,
         // f4: ordinary replay callers may list immediately before rotation
@@ -10642,6 +11628,7 @@ fn replay_archive_segments(archive_dir: &Path) -> Result<Vec<PathBuf>> {
 /// Anything else has no authoritative winner, so fail before projection or DB
 /// replacement instead of selecting whichever file happened to be read first.
 fn canonical_segment_entries(live: &[PathBuf], archived: &[PathBuf]) -> Result<Vec<LedgerLine>> {
+    history_probe::note(history_probe::Work::CanonicalFold);
     let mut by_seq = BTreeMap::<i64, LedgerLine>::new();
     for path in live.iter().chain(archived.iter()) {
         for entry in read_segment_entries(path)? {
@@ -10744,6 +11731,7 @@ fn read_db_event_stats(facts_db_path: &Path, allow_cache_replacement: bool) -> R
         Err(err) => return Err(err),
     };
     // TODO(perf): O(N) full load — replace with count() when factstr exposes one.
+    history_probe::note(history_probe::Work::FactsDbFullLoad);
     // Mid-page corruption (SQLITE_CORRUPT / code 11) only surfaces during
     // b-tree traversal, not at open time. Catch it here so the same
     // quarantine+rebuild path fires for code-11 as for code-26 (header).
@@ -11468,6 +12456,7 @@ fn append_canonical_line_and_readback(
     entry: &LedgerLine,
     rendered_record: &[u8],
     event_id: &str,
+    pre_write_len: u64,
 ) -> Result<()> {
     let parent = segment_path.parent().ok_or_else(|| {
         RallyError::outcome_unknown(event_id, "canonical-parent", "segment path has no parent")
@@ -11517,7 +12506,11 @@ fn append_canonical_line_and_readback(
         |detail| RallyError::outcome_unknown(event_id, "canonical-sync-before-readback", detail),
     )?;
 
-    let entries = read_segment_entries(segment_path).map_err(|error| {
+    // Stage 0 item 5: read back only what this append wrote. The caller holds
+    // the mutation lock and allocated `entry.seq` above every canonical row, so
+    // the exact row cannot exist before `pre_write_len`; the bytes at and after
+    // it are the only place it can be (or be missing from).
+    let entries = read_segment_entries_from(segment_path, pre_write_len).map_err(|error| {
         RallyError::outcome_unknown(event_id, "canonical-readback", error.to_string())
     })?;
     let exact_matches = entries

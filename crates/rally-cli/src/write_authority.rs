@@ -153,7 +153,13 @@ pub(crate) fn assert_write_authorized(
     Ok(())
 }
 
-fn assert_session_lifecycle_authorized(fact: &Fact, facts_before: &[Fact]) -> Result<()> {
+/// The session-lifecycle arm of [`assert_write_authorized`]. It reads only
+/// facts with exactly `fact`'s tool and session, so the append path may pass
+/// just that session's rows (in seq order) instead of the whole ledger.
+pub(crate) fn assert_session_lifecycle_authorized(
+    fact: &Fact,
+    facts_before: &[Fact],
+) -> Result<()> {
     if !needs_session_lifecycle_check(fact) {
         return Ok(());
     }
