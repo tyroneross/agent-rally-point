@@ -3844,8 +3844,9 @@ fn segment_tail_seq(path: &Path) -> Option<i64> {
     let mut end = len;
     // Collect bytes until the buffer holds one complete line before any
     // trailing fragment: at least two newlines, or the start of the file.
+    let mut step = 8 * 1024_u64;
     loop {
-        let start = end.saturating_sub(64 * 1024);
+        let start = end.saturating_sub(step);
         let mut chunk = vec![0u8; usize::try_from(end - start).ok()?];
         file.seek(SeekFrom::Start(start)).ok()?;
         file.read_exact(&mut chunk).ok()?;
@@ -3856,6 +3857,7 @@ fn segment_tail_seq(path: &Path) -> Option<i64> {
             break;
         }
         end = start;
+        step = (step * 2).min(1024 * 1024);
     }
     let completed_end = tail
         .iter()
@@ -7717,26 +7719,44 @@ mod derived_index {
     /// decisions plus every retraction (a superset; the caller applies
     /// `claim_authority::projected_lead`, the projection's own body).
     pub(super) fn lead_scope_facts(connection: &Connection) -> Result<Vec<Fact>> {
-        let sql = format!(
+        // Two statements, not one OR: SQLite plans the OR as a full scan,
+        // while each half alone uses its index (`idx_events_type`, the partial
+        // retraction index).
+        let mut facts = rows(
+            connection,
             "SELECT sequence_number, payload FROM events \
-             WHERE (event_type = 'decision' AND json_extract(payload,'$.subject') IN (?1, 'role:lead:relinquished')) \
-             OR ({})",
+             WHERE event_type = 'decision' \
+             AND json_extract(payload,'$.subject') IN (?1, 'role:lead:relinquished')",
+            Some(crate::claim_authority::LEAD_SUBJECT),
+        )?;
+        let retractions = format!(
+            "SELECT sequence_number, payload FROM events WHERE {}",
             retraction_predicate()
         );
-        rows(connection, &sql, Some(crate::claim_authority::LEAD_SUBJECT))
+        facts.extend(rows(connection, &retractions, None)?);
+        facts.sort_by_key(|fact| fact.seq);
+        facts.dedup_by(|a, b| a.seq == b.seq && a.event_id == b.event_id);
+        Ok(facts)
     }
 
     /// `count(*)` and the canonical high-water exactly as
-    /// `read_db_event_stats` computes them, from the indexes.
+    /// `read_db_event_stats` computes them, from the indexes. Two statements
+    /// on purpose: combined, SQLite 3.46 scans the table and re-evaluates the
+    /// JSON expression per row; apart, `count(*)` walks a covering index and
+    /// `max(...)` is one index seek.
     pub(super) fn stats(connection: &Connection) -> Result<SeqStats> {
-        let sql = format!("SELECT count(*), max({SEQ_EXPR}) FROM events");
-        let (count, max_seq) = connection
-            .query_row(&sql, [], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+        let count = connection
+            .query_row("SELECT count(*) FROM events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|error| sql_error("count facts.db rows", error))?;
+        let max_seq = connection
+            .query_row(&format!("SELECT max({SEQ_EXPR}) FROM events"), [], |row| {
+                row.get::<_, Option<i64>>(0)
             })
             .optional()
-            .map_err(|error| sql_error("read facts.db stats", error))?
-            .unwrap_or((0, None));
+            .map_err(|error| sql_error("read facts.db high-water", error))?
+            .flatten();
         Ok(SeqStats {
             count,
             max_seq: max_seq.unwrap_or(0),
@@ -8014,6 +8034,18 @@ pub(crate) fn remove_reconcile_sidecar_for_test(root: &Path) {
     let _ = fs::remove_file(root.join(".rally").join(RECONCILE_CACHE_FILENAME));
 }
 
+/// Test seam: the bucketed handoff-closure check agrees with the original
+/// per-handoff scan for every handoff in `facts`.
+#[cfg(test)]
+pub(crate) fn handoff_closure_index_agrees_for_test(facts: &[Fact]) -> (usize, bool) {
+    let closers = HandoffClosers::new(facts);
+    let handoffs: Vec<&Fact> = facts.iter().filter(|f| f.kind == "handoff").collect();
+    let agrees = handoffs
+        .iter()
+        .all(|handoff| closers.is_closed(handoff) == handoff_is_closed(handoff, facts));
+    (handoffs.len(), agrees)
+}
+
 /// Test seam: drop every per-process memo so an in-process command behaves
 /// like a fresh CLI process (the probe tests' "cold command" model).
 #[cfg(test)]
@@ -8219,10 +8251,48 @@ fn fact_closes_handoff(handoff: &Fact, closer: &Fact) -> bool {
         && handoff_closer_matches_target(handoff, closer)
 }
 
+#[cfg(test)]
 fn handoff_is_closed(handoff: &Fact, facts: &[Fact]) -> bool {
     facts
         .iter()
         .any(|closer| fact_closes_handoff(handoff, closer))
+}
+
+/// [`handoff_is_closed`] for every handoff of one fold, in O(facts) instead of
+/// O(handoffs x facts). A closer must name the handoff in `ref`
+/// ([`fact_closes_handoff`]), so candidates are bucketed by `ref` once and each
+/// handoff tests only its own bucket with the unchanged predicate. Measured on
+/// a 60k-fact room: the per-handoff full scan was ~430 ms of every snapshot.
+struct HandoffClosers<'a> {
+    by_ref: std::collections::HashMap<&'a str, Vec<&'a Fact>>,
+}
+
+impl<'a> HandoffClosers<'a> {
+    fn new(facts: &'a [Fact]) -> Self {
+        let mut by_ref: std::collections::HashMap<&'a str, Vec<&'a Fact>> =
+            std::collections::HashMap::new();
+        for fact in facts {
+            if let Some(ref_id) = fact.ref_id.as_deref()
+                && matches!(
+                    fact.kind,
+                    FactKind::Resolve | FactKind::Receipt | FactKind::Artifact
+                )
+            {
+                by_ref.entry(ref_id).or_default().push(fact);
+            }
+        }
+        Self { by_ref }
+    }
+
+    fn is_closed(&self, handoff: &Fact) -> bool {
+        self.by_ref
+            .get(handoff.event_id.as_str())
+            .is_some_and(|closers| {
+                closers
+                    .iter()
+                    .any(|closer| fact_closes_handoff(handoff, closer))
+            })
+    }
 }
 
 // =============================================================================
@@ -8917,11 +8987,12 @@ fn snapshot_from_facts_with_policy_at(
         .filter(|f| !resolved.contains(&f.event_id))
         .cloned()
         .collect::<Vec<_>>();
+    let handoff_closers = HandoffClosers::new(facts);
     let open_handoffs = facts
         .iter()
         .filter(|f| f.kind == "handoff")
         .filter(|f| handoff_is_protocol_request(f))
-        .filter(|f| !handoff_is_closed(f, facts))
+        .filter(|f| !handoff_closers.is_closed(f))
         // B18: exclude external-intake facts from repo-local backlog.
         .filter(|f| !f.scope.iter().any(|s| s == "external-intake"))
         .cloned()

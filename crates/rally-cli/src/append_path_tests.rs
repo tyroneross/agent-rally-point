@@ -1294,3 +1294,19 @@ fn stage0_enter_appends_do_no_canonical_fold() {
         );
     });
 }
+
+/// The O(facts) handoff-closure index used by the snapshot fold agrees with
+/// the original per-handoff scan on every handoff of a realistic room
+/// (resolved, receipt-closed, open, and ones closed by a wrong-target fact).
+#[test]
+fn snapshot_handoff_closure_index_matches_original_scan() {
+    with_relevance_room("handoff-closure-index", 3_000, |_| {
+        let facts = crate::store::RoomStore::open().unwrap().facts().unwrap();
+        let (handoffs, agrees) = crate::store::handoff_closure_index_agrees_for_test(&facts);
+        assert!(
+            handoffs > 100,
+            "fixture must carry many handoffs: {handoffs}"
+        );
+        assert!(agrees);
+    });
+}
