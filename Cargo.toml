@@ -58,6 +58,17 @@ factstr-sqlite = { path = "vendor/factstr-sqlite" }
 # target). Defaults leave codegen-units=16 and no LTO, so the release binary is
 # under-optimized. `rally` runs on every commit (before-write/before-complete
 # hooks), so smaller + faster startup is directly user-visible.
+# Dev/test builds keep line tables for backtraces and drop full DWARF, for
+# dependencies too. Dependencies cannot go to debug = false: dyld then refuses
+# the sqlx-macros proc-macro dylib ("mis-aligned LINKEDIT string pool"), the
+# same failure that keeps strip off build-time artifacts below. Release builds
+# are untouched.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = "line-tables-only"
+
 [profile.release]
 lto = true          # fat cross-crate LTO: inlining across crates, smaller code
 codegen-units = 1   # one unit → maximal optimization (no parallel-split inlining loss)

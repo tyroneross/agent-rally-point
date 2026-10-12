@@ -23,6 +23,10 @@
 # default `cargo` on PATH if the pinned toolchain isn't installed via rustup.
 set -euo pipefail
 
+# A gate builds each crate once; incremental caches only add tens of GB to
+# target/debug across worktrees without speeding a one-shot run.
+export CARGO_INCREMENTAL=0
+
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
