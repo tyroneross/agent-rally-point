@@ -118,7 +118,9 @@ Run `git worktree remove --force` against it first, or pick a different session 
         .arg("-b")
         .arg(&branch)
         .arg(&path)
-        .arg(&base)
+        // Check out the recorded SHA, not the branch name, so a base that moves
+        // between rev-parse and worktree add cannot desync the checkout from the record.
+        .arg(merge_target_commit.trim())
         .output()
         .map_err(|err| {
             RallyError::Message(format!(
