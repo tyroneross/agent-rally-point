@@ -204,4 +204,4 @@ Once Stages 0–2 hold, `rallyd` (or ez-ptyd as supervisor) can host the project
 
 ## Appendix: reproduction
 
-Scratch harness (not committed): `bench.py` (N-way concurrent launcher), `cat_sample.py` (phase attribution from `sample` output), `oappend.py` (interleave test). Steps: `cp -Rp <repo>/.rally` into a fresh `git init` dir (skip `worktrees/`), set `HOME` to scratch, `RALLY_DAEMON_AUTOSTART=0 RALLY_HOOKS=off RALLY_NO_AUTO_REAP=1`, then run `rally --timeout-ms 60000 say artifact --tool bench:<i> --subject … --json` N-way, and `sample <pid> 3 1` on one process.
+Scratch harness (not committed): `bench.py` (N-way concurrent launcher), `cat_sample.py` (phase attribution from `sample` output), `oappend.py` (interleave test). Steps: `cp -Rp <repo>/.rally` into a fresh `git init` dir (skip `worktrees/`), set `HOME` to scratch, `RALLY_DAEMON_AUTOSTART=0 RALLY_HOOKS=off RALLY_NO_AUTO_REAP=1`, then run `rally say artifact --timeout-ms 60000 --tool bench:<i> --subject … --json` N-way, and `sample <pid> 3 1` on one process.
