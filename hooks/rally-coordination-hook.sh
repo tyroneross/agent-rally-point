@@ -398,7 +398,9 @@ esac
 # It re-runs this script as a child in its own process group, buffers the
 # child's stdout, and returns it verbatim when the child finishes inside
 # RALLY_HOOK_DEADLINE_MS (default 4000; 100..59999; scaled by
-# RALLY_HOOK_MS_BUDGET_SCALE like every other budget). On overrun it kills the
+# RALLY_HOOK_MS_BUDGET_SCALE, capped at the 4000ms production limit). A core
+# alarm bounds module initialization before the normal watchdog can run.
+# On overrun it kills the
 # child's group, writes one stderr line (host debug log only) and prints the
 # host-valid no-op `{}` -- the fail-open result a host timeout produced, minus
 # the failure. It also hands the child a call deadline (hard deadline minus a
@@ -424,12 +426,24 @@ case "$phase" in
       case "$_rally_deadline_scale" in
         [1-9]|1[0-6]) _rally_deadline_ms=$(( _rally_deadline_ms * _rally_deadline_scale )) ;;
       esac
+      # Test/load tuning must never outgrow the host's five-second limit.
+      [ "$_rally_deadline_ms" -gt 4000 ] && _rally_deadline_ms=4000
       exec perl -e '
+        # Core alarm works before loading any modules. The cleanup callback
+        # becomes available once a supervised child has been created.
+        our $cleanup;
+        BEGIN {
+          $SIG{ALRM} = sub { $cleanup->() if $cleanup; print STDOUT "{}"; exit 0; };
+          alarm(4);
+        }
         use strict;
-        use POSIX qw(setsid :sys_wait_h);
         use Time::HiRes qw(time);
+        our $started_at;
+        BEGIN { $started_at = time; }
+        # Loading POSIX can stall under startup contention. Count it too.
+        use POSIX qw(setsid :sys_wait_h);
         my ($ms, $phase) = (shift @ARGV, shift @ARGV);
-        my $t0 = time;
+        my $t0 = $started_at;
         my $reserve = $ms >= 2100 ? 700 : int($ms / 3);
         $ENV{RALLY_HOOK_CALL_DEADLINE_AT_MS} = int($t0 * 1000) + $ms - $reserve;
         $ENV{RALLY_HOOK_SUPERVISED_CHILD} = "1";
@@ -447,6 +461,7 @@ case "$phase" in
         }
         close $w;
         my $kill = sub { kill "KILL", -$pid; kill "KILL", $pid; waitpid($pid, 0); };
+        $cleanup = $kill;
         $SIG{TERM} = $SIG{INT} = $SIG{HUP} = sub { $kill->(); exit 0; };
         my $deadline = $t0 + $ms / 1000;
         my ($buf, $eof, $reaped) = ("", 0, 0);
