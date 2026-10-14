@@ -4675,8 +4675,12 @@ fn command_room(args: RoomArgs) -> Result<Output> {
     let readers = projected.readers.clone();
     let mission = projected.mission.clone();
     let session_views = read_session_views(&room, BackendBins::default()).unwrap_or_default();
-    let agent_injectability =
-        build_agent_injectability(&projected, &session_views, query.tool.as_deref());
+    let agent_injectability = build_agent_injectability(
+        &projected,
+        &session_views,
+        query.tool.as_deref(),
+        collect_et_reach,
+    );
     let measure_query = query.clone();
     let measure_readers = readers.clone();
     let measure_mission = mission.clone();
@@ -12008,6 +12012,7 @@ fn build_agent_injectability(
     snapshot: &RoomSnapshot,
     session_views: &[SessionView],
     requested_tool: Option<&str>,
+    load_et_reach: impl FnOnce() -> EtReach,
 ) -> Vec<AgentInjectability> {
     let mut tools = BTreeSet::new();
     if let Some(tool) = requested_tool {
@@ -12042,6 +12047,11 @@ fn build_agent_injectability(
         }
     }
 
+    // Socket and health-file I/O happens at most once, and only when some
+    // agent lacks a managed-session record.
+    let mut et_reach: Option<EtReach> = None;
+    let mut load_et_reach = Some(load_et_reach);
+
     tools
         .into_iter()
         .map(|tool| {
@@ -12058,6 +12068,39 @@ fn build_agent_injectability(
                     } else {
                         Some("managed session is stale; run `rally sessions --reap`, relaunch with `rally run`, or adopt a live pane before injecting".to_string())
                     },
+                };
+            }
+
+            let reach = et_reach.get_or_insert_with(|| {
+                load_et_reach
+                    .take()
+                    .map(|load| load())
+                    .unwrap_or_default()
+            });
+            if reach.router_routed.contains(&tool) {
+                return AgentInjectability {
+                    injectable: false,
+                    status: "et_router_routed".to_string(),
+                    via: Some("et_router".to_string()),
+                    session_id: None,
+                    target: reach.daemon_bound.get(&tool).cloned(),
+                    reason: Some(format!(
+                        "Easy Terminal's router lists {tool} in a fresh health file and pushes open Rally obligations addressed to it into its pane. Rally records handoffs to it rather than typing into that pane; send work with `rally say handoff`."
+                    )),
+                    tool,
+                };
+            }
+            if let Some(pane_id) = reach.daemon_bound.get(&tool) {
+                return AgentInjectability {
+                    injectable: false,
+                    status: "daemon_registered_pane".to_string(),
+                    via: Some("daemon".to_string()),
+                    session_id: None,
+                    target: Some(pane_id.clone()),
+                    reason: Some(format!(
+                        "{tool} is bound by `agent.register` to live ptyd pane {pane_id}, but has no Rally managed session and no fresh Easy Terminal router health lists it. `rally inject` only writes a ledger directive for the daemon to deliver; nothing confirms the pane receives it."
+                    )),
+                    tool,
                 };
             }
 
@@ -14370,18 +14413,158 @@ mod tests {
             inject_via: "tmux".to_string(),
         }];
 
-        let rows = build_agent_injectability(&snapshot, &session_views, None);
+        let rows = build_agent_injectability(&snapshot, &session_views, None, EtReach::default);
         let tools: BTreeSet<_> = rows.iter().map(|row| row.tool.as_str()).collect();
         assert_eq!(
             tools,
             BTreeSet::from(["claim-owner", "lead-tool", "managed-tool", "recent-tool"])
         );
 
-        let requested =
-            build_agent_injectability(&snapshot, &session_views, Some("historical-tool"));
+        let requested = build_agent_injectability(
+            &snapshot,
+            &session_views,
+            Some("historical-tool"),
+            EtReach::default,
+        );
         assert!(
             requested.iter().any(|row| row.tool == "historical-tool"),
             "an explicit --tool query must include the requested historical agent"
+        );
+    }
+
+    fn injectability_snapshot(lead: &str, claim_owners: &[&str]) -> RoomSnapshot {
+        let mut snapshot = RoomSnapshot {
+            lead: Some(lead.to_string()),
+            ..RoomSnapshot::default()
+        };
+        for owner in claim_owners {
+            snapshot.active_claims.push(Fact {
+                tool: Some((*owner).to_string()),
+                ..Fact::default()
+            });
+        }
+        snapshot
+    }
+
+    fn injectability_row(rows: &[AgentInjectability], tool: &str) -> AgentInjectability {
+        rows.iter()
+            .find(|row| row.tool == tool)
+            .unwrap_or_else(|| panic!("row for {tool}"))
+            .clone()
+    }
+
+    fn live_view(tool: &str) -> SessionView {
+        SessionView {
+            session: liveness_session("live-session", tool),
+            liveness: SessionLiveness::Live,
+            liveness_source: "backend_probe",
+            injectable: true,
+            inject_status: "live_managed_session".to_string(),
+            inject_via: "tmux".to_string(),
+        }
+    }
+
+    #[test]
+    fn injectability_reports_et_router_routed_with_bound_pane_target() {
+        let snapshot = injectability_snapshot("lead-tool", &[]);
+        let reach = EtReach {
+            router_routed: BTreeSet::from(["lead-tool".to_string()]),
+            daemon_bound: BTreeMap::from([("lead-tool".to_string(), "pane-9".to_string())]),
+        };
+        let rows = build_agent_injectability(&snapshot, &[], None, || reach);
+        let row = injectability_row(&rows, "lead-tool");
+        assert!(!row.injectable);
+        assert_eq!(row.status, "et_router_routed");
+        assert_eq!(row.via.as_deref(), Some("et_router"));
+        assert_eq!(row.session_id, None);
+        assert_eq!(row.target.as_deref(), Some("pane-9"));
+        assert!(row.reason.unwrap().contains("rally say handoff"));
+    }
+
+    #[test]
+    fn injectability_reports_daemon_registered_pane_when_only_bound() {
+        let snapshot = injectability_snapshot("lead-tool", &[]);
+        let reach = EtReach {
+            router_routed: BTreeSet::new(),
+            daemon_bound: BTreeMap::from([("lead-tool".to_string(), "pane-3".to_string())]),
+        };
+        let rows = build_agent_injectability(&snapshot, &[], None, || reach);
+        let row = injectability_row(&rows, "lead-tool");
+        assert!(!row.injectable);
+        assert_eq!(row.status, "daemon_registered_pane");
+        assert_eq!(row.via.as_deref(), Some("daemon"));
+        assert_eq!(row.target.as_deref(), Some("pane-3"));
+        assert!(row.reason.unwrap().contains("pane-3"));
+    }
+
+    #[test]
+    fn injectability_router_routed_wins_over_daemon_bound() {
+        let snapshot = injectability_snapshot("lead-tool", &[]);
+        let reach = EtReach {
+            router_routed: BTreeSet::from(["lead-tool".to_string()]),
+            daemon_bound: BTreeMap::from([("lead-tool".to_string(), "pane-1".to_string())]),
+        };
+        let rows = build_agent_injectability(&snapshot, &[], None, || reach);
+        assert_eq!(
+            injectability_row(&rows, "lead-tool").status,
+            "et_router_routed"
+        );
+    }
+
+    #[test]
+    fn injectability_managed_session_ignores_et_reach() {
+        let snapshot = injectability_snapshot("managed-tool", &[]);
+        let reach = EtReach {
+            router_routed: BTreeSet::from(["managed-tool".to_string()]),
+            daemon_bound: BTreeMap::from([("managed-tool".to_string(), "pane-1".to_string())]),
+        };
+        let rows =
+            build_agent_injectability(&snapshot, &[live_view("managed-tool")], None, || reach);
+        let row = injectability_row(&rows, "managed-tool");
+        assert_eq!(row.status, "live_managed_session");
+        assert!(row.injectable);
+    }
+
+    #[test]
+    fn injectability_skips_et_reach_loader_when_every_agent_is_managed() {
+        let snapshot = injectability_snapshot("managed-tool", &[]);
+        let called = std::cell::Cell::new(false);
+        let rows = build_agent_injectability(&snapshot, &[live_view("managed-tool")], None, || {
+            called.set(true);
+            EtReach::default()
+        });
+        assert_eq!(rows.len(), 1);
+        assert!(
+            !called.get(),
+            "loader must not run when all agents are managed"
+        );
+    }
+
+    #[test]
+    fn injectability_loads_et_reach_once_and_keeps_unmatched_presence_only() {
+        let snapshot = injectability_snapshot("lead-tool", &["other-tool", "third-tool"]);
+        let calls = std::cell::Cell::new(0);
+        let reach = EtReach {
+            router_routed: BTreeSet::from(["third-tool".to_string()]),
+            daemon_bound: BTreeMap::new(),
+        };
+        let mut reach = Some(reach);
+        let rows = build_agent_injectability(&snapshot, &[], None, || {
+            calls.set(calls.get() + 1);
+            reach.take().unwrap()
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            injectability_row(&rows, "other-tool").status,
+            "presence_only_unmanaged"
+        );
+        assert_eq!(
+            injectability_row(&rows, "lead-tool").status,
+            "presence_only_unmanaged"
+        );
+        assert_eq!(
+            injectability_row(&rows, "third-tool").status,
+            "et_router_routed"
         );
     }
 
@@ -20685,11 +20868,10 @@ fn existing_unique_paths(candidates: &[String]) -> Vec<String> {
     found
 }
 
-/// Detect resolvable ptyd sockets. Lists every on-disk candidate, then probes
-/// which of those files actually answer (`socket_is_live`). Ambiguity is a
-/// live-daemon conflict, not "two socket files exist".
-fn detect_host_runtime() -> HostRuntime {
-    let bound = env::var("PTYD_SOCKET_PATH").ok().filter(|s| !s.is_empty());
+/// Candidate ptyd socket paths (existing or not), in probe order: the Easy
+/// Terminal app socket, ptyd CLI sockets, `$XDG_RUNTIME_DIR/ptyd.sock`, and
+/// `$PTYD_SOCKET_PATH`. Callers filter with [`existing_unique_paths`].
+fn ptyd_socket_candidates() -> Vec<String> {
     let home = env::var("HOME").unwrap_or_default();
     let mut candidates: Vec<String> = vec![
         // Easy Terminal app daemon socket (was herdr.sock, renamed to ptyd.sock).
@@ -20703,9 +20885,52 @@ fn detect_host_runtime() -> HostRuntime {
     {
         candidates.push(format!("{xdg}/ptyd.sock"));
     }
-    if let Some(b) = &bound {
-        candidates.push(b.clone());
+    if let Some(b) = env::var("PTYD_SOCKET_PATH").ok().filter(|s| !s.is_empty()) {
+        candidates.push(b);
     }
+    candidates
+}
+
+/// What Easy Terminal's side can truthfully be seen doing for an identity.
+/// Read-only evidence for `agent_injectability`; never a delivery path.
+#[derive(Default)]
+struct EtReach {
+    /// Identities a fresh, healthy ET router health file lists as routed.
+    router_routed: BTreeSet<String>,
+    /// identity -> pane_id for live ptyd panes bound via `agent.register`.
+    daemon_bound: BTreeMap<String, String>,
+}
+
+/// Gathers [`EtReach`]. Fails closed: an unreadable/untrusted health file or an
+/// unreachable socket contributes nothing. The first binding seen for an
+/// identity wins.
+fn collect_et_reach() -> EtReach {
+    let mut reach = EtReach {
+        router_routed: et_router_health::et_router_routed_identities(et_router_health::now_ms())
+            .into_iter()
+            .collect(),
+        daemon_bound: BTreeMap::new(),
+    };
+    let mut candidates = ptyd_socket_candidates();
+    if let Some(owned) = daemon_client::rally_owned_socket() {
+        candidates.push(owned);
+    }
+    for socket in existing_unique_paths(&candidates) {
+        if let Some(bound) = daemon_client::live_bound_identities(&socket) {
+            for (identity, pane_id) in bound {
+                reach.daemon_bound.entry(identity).or_insert(pane_id);
+            }
+        }
+    }
+    reach
+}
+
+/// Detect resolvable ptyd sockets. Lists every on-disk candidate, then probes
+/// which of those files actually answer (`socket_is_live`). Ambiguity is a
+/// live-daemon conflict, not "two socket files exist".
+fn detect_host_runtime() -> HostRuntime {
+    let bound = env::var("PTYD_SOCKET_PATH").ok().filter(|s| !s.is_empty());
+    let candidates = ptyd_socket_candidates();
     let found = existing_unique_paths(&candidates);
     let live: Vec<String> = found
         .iter()
