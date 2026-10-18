@@ -162,6 +162,7 @@ mod store;
 mod store_client;
 #[cfg(test)]
 mod test_git_fixture;
+mod text_spacing;
 mod tier_fit;
 pub mod worktree_gc;
 mod worktree_guard;
@@ -3804,6 +3805,19 @@ fn command_say(args: SayArgs) -> Result<Output> {
     // B18: append ONE durable risk fact for each external-intake detection so
     // the contamination event is permanently auditable.  Never blocks the write.
     let mut say_warnings: Vec<SayWarning> = Vec::new();
+
+    // Advisory: words run together in the subject or summary. Rally stores
+    // text as sent, so the write is the only point where the sender can still
+    // fix it. Also printed to stderr, because senders often redirect `--json`
+    // stdout to a file and would never see the JSON warning.
+    if let Some(message) = text_spacing::glued_text_warning(&fact.subject, fact.summary.as_deref())
+    {
+        eprintln!("rally: warning: {message}");
+        say_warnings.push(SayWarning {
+            code: "text:glued_words".to_string(),
+            message,
+        });
+    }
 
     // Advisory protocol-envelope validation (lenient, never blocks): surfaces
     // missing causal ids — e.g. an ACK/resolve that doesn't cite its ref_event_id.
