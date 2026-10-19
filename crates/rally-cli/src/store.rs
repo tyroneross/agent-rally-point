@@ -12901,7 +12901,11 @@ const SNAPSHOT_CACHE_FILENAME: &str = "snapshot.cache.json";
 /// Bumped 5 -> 6 when [`SnapshotInternals`] gained `open_queue_signals`. A
 /// generation-5 cache would deserialize with empty signals and report every
 /// room's open queue as having no pickup history.
-const SNAPSHOT_CACHE_GENERATION: u32 = 6;
+///
+/// Bumped 6 -> 7 when `room_pickup_p95_secs` started being set for rooms with
+/// fewer than 20 picked-up items (room blend). A generation-6 cache would
+/// report those rooms as having no history and apply the bare prior.
+const SNAPSHOT_CACHE_GENERATION: u32 = 7;
 
 /// Snapshot and freshness proof captured while one room mutation lock is held.
 /// This pair is the only value accepted by the cache writer.

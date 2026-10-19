@@ -144,6 +144,7 @@ mod obligations;
 mod observed_liveness;
 mod open_queue;
 mod output;
+mod pickup_threshold;
 pub mod rallyd_core;
 mod reaper;
 mod relevance;

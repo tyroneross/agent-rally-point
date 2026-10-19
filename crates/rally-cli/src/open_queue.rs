@@ -48,21 +48,6 @@ use std::path::{Path, PathBuf};
 use crate::next::{HandoffAddress, handoff_address};
 use crate::store::{Fact, FactKind, RoomSnapshot};
 
-/// Fewest CLOSED open-queue items a room needs before its own p95 is trusted.
-///
-/// Below this the nearest-rank p95 is the max or near it, which one outlier
-/// decides. 20 is the smallest sample where p95 is not the single largest value.
-pub(crate) const MIN_PICKUP_SAMPLE: usize = 20;
-
-/// p95 used when a room has fewer than [`MIN_PICKUP_SAMPLE`] closed items.
-///
-/// MEASURED, not chosen: the cross-room open-queue time-to-close p95 over 518
-/// closed items in 37 rooms on 2026-10-18 (backlog item
-/// AGEN-RALLY-NEXT-m590zk409zjqpzxdevzb3, `handoff_lifetimes.py`). It is only a
-/// revalidation trigger, so a wrong value costs one extra read, never a lost item.
-/// Output names its source so a reader can tell the two apart.
-pub(crate) const FALLBACK_PICKUP_P95_SECS: i64 = 208 * 3600;
-
 /// Most items one probe looks at, most recent first. Bounds hook cost in a
 /// room with a large open queue; items past the bound simply carry no
 /// filesystem reasons (fail open — they still show).
@@ -91,8 +76,8 @@ pub(crate) struct OpenQueueSignals {
     /// Closed open-queue items the p95 was computed from.
     #[serde(default)]
     pub(crate) pickup_sample: usize,
-    /// The room's own p95 time-to-close for open-queue items, when
-    /// `pickup_sample >= MIN_PICKUP_SAMPLE`.
+    /// The room's own nearest-rank p95 time-to-close for open-queue items,
+    /// whenever it has at least one picked-up item.
     #[serde(default)]
     pub(crate) room_pickup_p95_secs: Option<i64>,
     /// Open-queue item id → later facts that report it done.
@@ -107,12 +92,9 @@ pub(crate) struct OpenQueueSignals {
 }
 
 impl OpenQueueSignals {
-    /// The threshold actually applied, and where it came from.
-    pub(crate) fn effective_p95(&self) -> (i64, &'static str) {
-        match self.room_pickup_p95_secs {
-            Some(secs) if self.pickup_sample >= MIN_PICKUP_SAMPLE => (secs, "room"),
-            _ => (FALLBACK_PICKUP_P95_SECS, "cross_room_fallback"),
-        }
+    /// The threshold actually applied, and how it was formed.
+    pub(crate) fn effective_p95(&self) -> crate::pickup_threshold::PickupThreshold {
+        crate::pickup_threshold::blended_p95(self.room_pickup_p95_secs, self.pickup_sample)
     }
 }
 
@@ -137,7 +119,12 @@ pub(crate) struct OpenQueueItem {
     pub(crate) revalidate_before_claiming: bool,
     pub(crate) reasons: Vec<RevalidateReason>,
     pub(crate) pickup_p95_secs: i64,
+    /// `"cross_room"` (no pickup history) or `"room_blend"`.
     pub(crate) pickup_p95_source: &'static str,
+    /// Weight on this room's own p95 in the blend, `n / (n + 5)`.
+    pub(crate) pickup_room_weight: f64,
+    /// Picked-up open-queue items the room p95 came from.
+    pub(crate) pickup_room_sample: usize,
 }
 
 /// Filesystem-derived reasons keyed by item id. Empty is always safe.
@@ -165,7 +152,8 @@ pub(crate) fn open_queue_items(
     fs: &FsSignals,
     now_secs: i64,
 ) -> Vec<OpenQueueItem> {
-    let (p95, source) = snapshot.open_queue_signals.effective_p95();
+    let threshold = snapshot.open_queue_signals.effective_p95();
+    let p95 = threshold.secs;
     let mut items = snapshot
         .open_handoffs
         .iter()
@@ -182,7 +170,10 @@ pub(crate) fn open_queue_items(
             if age_secs.is_some_and(|age| age > p95) {
                 reasons.push(RevalidateReason {
                     code: "older_than_room_pickup_p95",
-                    detail: format!("p95={p95}s source={source}"),
+                    detail: format!(
+                        "p95={p95}s source={} room_weight={:.2} n={}",
+                        threshold.source, threshold.room_weight, threshold.room_sample
+                    ),
                 });
             }
             (
@@ -198,7 +189,9 @@ pub(crate) fn open_queue_items(
                     revalidate_before_claiming: !reasons.is_empty(),
                     reasons,
                     pickup_p95_secs: p95,
-                    pickup_p95_source: source,
+                    pickup_p95_source: threshold.source,
+                    pickup_room_weight: threshold.room_weight,
+                    pickup_room_sample: threshold.room_sample,
                 },
             )
         })
@@ -308,7 +301,7 @@ fn rejected_named(facts: &[Fact], open_handoffs: &[Fact]) -> BTreeSet<String> {
 /// "Closed" = the first later non-system resolve / receipt / artifact that
 /// references it — the kinds that close a handoff in the room projection.
 /// System-authored closes (reaper expiry) are not pickups and are excluded.
-/// Returns `(sample, None)` below [`MIN_PICKUP_SAMPLE`].
+/// Returns `(0, None)` when the room has no picked-up item.
 pub(crate) fn room_pickup_p95(facts: &[Fact]) -> (usize, Option<i64>) {
     let mut first_close: HashMap<&str, i64> = HashMap::new();
     for fact in facts {
@@ -341,8 +334,8 @@ pub(crate) fn room_pickup_p95(facts: &[Fact]) -> (usize, Option<i64>) {
         })
         .collect::<Vec<_>>();
     let sample = durations.len();
-    if sample < MIN_PICKUP_SAMPLE {
-        return (sample, None);
+    if sample == 0 {
+        return (0, None);
     }
     durations.sort_unstable();
     // Nearest-rank: the smallest value with at least 95% of the sample at or below it.
@@ -893,9 +886,10 @@ mod tests {
     }
 
     #[test]
-    fn p95_needs_the_minimum_sample_and_then_uses_nearest_rank() {
+    fn room_p95_is_nearest_rank_at_any_sample_size() {
+        assert_eq!(room_pickup_p95(&[]), (0, None));
         let mut facts = Vec::new();
-        for i in 0..(MIN_PICKUP_SAMPLE as i64 - 1) {
+        for i in 0..19_i64 {
             facts.push(handoff(&format!("h{i}"), i * 2 + 1, None, &at(0)));
             facts.push(closer(
                 &format!("c{i}"),
@@ -904,11 +898,10 @@ mod tests {
                 &at(i + 1),
             ));
         }
-        assert_eq!(room_pickup_p95(&facts), (MIN_PICKUP_SAMPLE - 1, None));
-
-        let i = MIN_PICKUP_SAMPLE as i64 - 1;
-        facts.push(handoff(&format!("h{i}"), 1000, None, &at(0)));
-        facts.push(closer("last", 1001, &format!("h{i}"), &at(i + 1)));
+        // Durations 1..=19 h; nearest-rank p95 of 19 = the 19th value.
+        assert_eq!(room_pickup_p95(&facts), (19, Some(19 * 3600)));
+        facts.push(handoff("h19", 1000, None, &at(0)));
+        facts.push(closer("last", 1001, "h19", &at(20)));
         // Durations 1..=20 h; nearest-rank p95 of 20 = the 19th value.
         assert_eq!(room_pickup_p95(&facts), (20, Some(19 * 3600)));
     }
@@ -930,21 +923,6 @@ mod tests {
         facts.push(handoff("q", 998, None, &at(0)));
         facts.push(reaper);
         assert_eq!(room_pickup_p95(&facts), (0, None));
-    }
-
-    #[test]
-    fn fallback_is_named_when_the_room_has_too_little_history() {
-        let signals = OpenQueueSignals::default();
-        assert_eq!(
-            signals.effective_p95(),
-            (FALLBACK_PICKUP_P95_SECS, "cross_room_fallback")
-        );
-        let room = OpenQueueSignals {
-            pickup_sample: 40,
-            room_pickup_p95_secs: Some(3600),
-            ..Default::default()
-        };
-        assert_eq!(room.effective_p95(), (3600, "room"));
     }
 
     #[test]

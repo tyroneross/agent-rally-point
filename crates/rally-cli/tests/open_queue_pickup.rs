@@ -437,3 +437,47 @@ fn a_full_evidence_list_reports_unrecorded_base_markers() {
         "{said}"
     );
 }
+
+/// The revalidation age threshold blends this room's pickup history with the
+/// cross-room prior, and `rally next` says how: no history -> `cross_room`
+/// (208 h); two quick pickups -> `room_blend` with weight 2/7, well below 208 h.
+#[test]
+fn next_reports_the_room_blend_threshold() {
+    const CROSS_ROOM_SECS: i64 = 208 * 3600;
+    let sandbox = ChannelSandbox::spawn();
+    say_handoff(&sandbox, &["--subject", "anyone: triage the flaky test"]);
+    let fresh = next(&sandbox);
+    let item = &fresh["inbox"]["open_queue"]["items"][0];
+    assert_eq!(item["pickup_p95_source"], "cross_room", "{item}");
+    assert_eq!(item["pickup_p95_secs"], CROSS_ROOM_SECS);
+    assert_eq!(item["pickup_room_weight"], 0.0);
+
+    for subject in ["anyone: rotate the logs", "anyone: bump the toolchain"] {
+        let posted = say_handoff(&sandbox, &["--subject", subject]);
+        let id = posted["data"]["say"]["fact"]["event_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        sandbox.rally_json(&[
+            "say",
+            "resolve",
+            "--json",
+            "--tool",
+            "worker:02",
+            "--ref",
+            &id,
+            "--subject",
+            "picked up and done",
+            "--evidence",
+            "done in test",
+        ]);
+    }
+    let blended = next(&sandbox);
+    let item = &blended["inbox"]["open_queue"]["items"][0];
+    assert_eq!(item["pickup_p95_source"], "room_blend", "{item}");
+    assert_eq!(item["pickup_room_sample"], 2);
+    let w = item["pickup_room_weight"].as_f64().unwrap();
+    assert!((w - 2.0 / 7.0).abs() < 1e-9, "{w}");
+    let secs = item["pickup_p95_secs"].as_i64().unwrap();
+    assert!(secs > 60 && secs < CROSS_ROOM_SECS / 4, "{secs}");
+}
