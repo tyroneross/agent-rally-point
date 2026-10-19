@@ -2,6 +2,12 @@
 # SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 # SPDX-License-Identifier: Apache-2.0
 #
+# Hermetic: hosts such as Easy Terminal export RALLY_* settings into every pane
+# (e.g. RALLY_NOTICE_VERBOSITY=brief). Those change what the hook renders, so
+# drop every inherited RALLY_* variable; each case sets what it needs.
+for _rally_var in $(compgen -e | grep '^RALLY_'); do unset "$_rally_var"; done
+unset _rally_var
+#
 # test_room_message_contract.sh — goldens for the C6 BRIEF lifecycle room
 # message (SessionStart / UserPromptSubmit / Stop).
 #
