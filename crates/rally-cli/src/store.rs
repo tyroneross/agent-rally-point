@@ -21614,6 +21614,122 @@ mod sec001_takeover_guard_tests {
         fs::remove_dir_all(&r).ok();
     }
 
+    fn leased_claim(r: &Path, lease: &str) -> (RoomStore, Fact) {
+        let store = RoomStore::open_at(r.to_path_buf()).unwrap();
+        let mut claim = fact_at(
+            "claim-leased",
+            FactKind::Claim,
+            "shared-tool",
+            "file:src/a.rs",
+            &iso_ago(5),
+        );
+        claim.from_session_id = Some("session-owner".to_string());
+        claim.evidence = vec![format!("lease_expires_at:{lease}")];
+        store.append_fact(&claim).unwrap();
+        (store, claim)
+    }
+
+    fn close_by(kind: FactKind, tool: &str, session: Option<&str>, claim: &Fact) -> Fact {
+        let mut close = fact_at("close", kind, tool, "file:src/a.rs", &iso_ago(0));
+        close.from_session_id = session.map(str::to_string);
+        close.ref_id = Some(claim.event_id.clone());
+        close
+    }
+
+    fn still_active(store: &RoomStore, claim: &Fact) -> bool {
+        store
+            .snapshot()
+            .unwrap()
+            .active_claims
+            .iter()
+            .any(|active| active.event_id == claim.event_id)
+    }
+
+    /// AGEN-RALLY-NEXT acceptance 4: a later session of the SAME tool can
+    /// release its tool's claim once the lease has run out, without a
+    /// room-wide `doctor --reap-stale --apply`.
+    #[test]
+    fn later_same_tool_session_can_release_a_lease_expired_claim() {
+        let r = root("later-session-expired-release");
+        let (store, claim) = leased_claim(&r, &iso_ago(60));
+        let release = close_by(
+            FactKind::Release,
+            "shared-tool",
+            Some("session-later"),
+            &claim,
+        );
+        store
+            .append_fact(&release)
+            .expect("a later same-tool session may release an expired lease");
+        assert!(!still_active(&store, &claim));
+        fs::remove_dir_all(&r).ok();
+    }
+
+    /// ARP-R-02 still holds for an UNEXPIRED claim: a session wearing the same
+    /// tool label cannot take it, by release or by any other closing kind.
+    #[test]
+    fn same_label_session_cannot_take_an_unexpired_claim() {
+        let r = root("same-label-unexpired");
+        let lease = (chrono::Utc::now() + chrono::Duration::minutes(30))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let (store, claim) = leased_claim(&r, &lease);
+        for kind in [FactKind::Release, FactKind::Receipt, FactKind::Resolve] {
+            let err = store
+                .append_fact(&close_by(
+                    kind.clone(),
+                    "shared-tool",
+                    Some("session-rogue"),
+                    &claim,
+                ))
+                .expect_err("an unexpired claim is not takeable by a label-sharing session")
+                .to_string();
+            assert!(
+                err.contains("another shared-tool session"),
+                "{kind:?}: {err}"
+            );
+        }
+        assert!(still_active(&store, &claim));
+        fs::remove_dir_all(&r).ok();
+    }
+
+    /// The successor arm is narrow: lease expiry does not let a DIFFERENT tool,
+    /// a sessionless writer, or a non-release kind take the claim.
+    #[test]
+    fn expired_lease_alone_does_not_open_the_claim_to_others() {
+        let r = root("expired-not-open");
+        let (store, claim) = leased_claim(&r, &iso_ago(60));
+        let rogue = store
+            .append_fact(&close_by(
+                FactKind::Release,
+                "rogue:01",
+                Some("session-rogue"),
+                &claim,
+            ))
+            .expect_err("a different tool still needs the stale-owner window")
+            .to_string();
+        assert!(rogue.contains("not the owner"), "{rogue}");
+        let sessionless = store
+            .append_fact(&close_by(FactKind::Release, "shared-tool", None, &claim))
+            .expect_err("a sessionless writer is not a later session")
+            .to_string();
+        assert!(
+            sessionless.contains("another shared-tool session"),
+            "{sessionless}"
+        );
+        let receipt = store
+            .append_fact(&close_by(
+                FactKind::Receipt,
+                "shared-tool",
+                Some("session-later"),
+                &claim,
+            ))
+            .expect_err("only release/claim.expired end an expired claim via this arm")
+            .to_string();
+        assert!(receipt.contains("another shared-tool session"), "{receipt}");
+        assert!(still_active(&store, &claim));
+        fs::remove_dir_all(&r).ok();
+    }
+
     #[test]
     fn sessionless_caller_cannot_release_a_sessionful_claim() {
         let r = root("sessionful-claim-sessionless-release");

@@ -466,8 +466,37 @@ fn authorize_claim_removal(
     ) {
         return Ok(());
     }
-    let typed_lease_expiry =
-        is_typed_reaper_lease_expiry(fact, claim) && claim_lease_expired(claim);
+    let lease_expired = claim_lease_expired(claim);
+    let typed_lease_expiry = is_typed_reaper_lease_expiry(fact, claim) && lease_expired;
+    // 1b. Same-tool successor, lease already run out. A later session of the
+    // tool that took the claim may release or expire it once the lease has
+    // passed with no renewal, so a crashed or finished session's claim does not
+    // need a room-wide `doctor --reap-stale --apply` to clear.
+    //
+    // This mirrors a coordination.k8s.io Lease: a holder keeps the lock only by
+    // renewing before `renewTime + leaseDurationSeconds`; once that passes the
+    // lease is takeover-eligible. Renewal is self-only (`latest_renewed_lease`
+    // requires the owning session), so a live owner that still wants the claim
+    // has kept it renewed and this arm never fires against it.
+    //
+    // Deliberately narrow, so ARP-R-02 still holds for every UNEXPIRED claim:
+    // * lease must have passed on the EFFECTIVE claim (renewals folded in,
+    //   fail-closed on a missing or unparseable marker);
+    // * same nonblank tool label only, so a different agent still needs the
+    //   stale-owner window or the typed reaper path;
+    // * the caller must itself be a stamped session (a "later session"), not a
+    //   sessionless legacy writer;
+    // * only `Release` and `ClaimExpired`, the two kinds whose meaning is
+    //   "this claim is over". `Resolve`, `Receipt` and retraction keep the old
+    //   refusal.
+    if lease_expired
+        && matches!(fact.kind, FactKind::Release | FactKind::ClaimExpired)
+        && claim.from_session_id.is_some()
+        && fact.from_session_id.is_some()
+        && claim_authority::same_nonblank_tool(claim.tool.as_deref(), fact.tool.as_deref())
+    {
+        return Ok(());
+    }
     // 2. Stale-owner takeover.
     let (takeover_eligible, size) = snapshot.claim_reclaim_eligible(claim, coord);
     // A sibling process sharing the same tool label is not an external peer.
@@ -563,13 +592,7 @@ fn is_typed_reaper_close(fact: &Fact, claim: &Fact, reasons: &[&str]) -> bool {
 /// must not mean "the lease is over". A claim with no lease marker is never
 /// closable by this arm — self-close and stale-owner takeover still apply.
 fn claim_lease_expired(claim: &Fact) -> bool {
-    const PREFIX: &str = "lease_expires_at:";
-    claim
-        .evidence
-        .iter()
-        .find_map(|item| item.strip_prefix(PREFIX))
-        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw.trim()).ok())
-        .is_some_and(|expires| expires <= chrono::Utc::now())
+    claim_authority::lease_expired_at(claim, chrono::Utc::now())
 }
 
 /// ARP-R-01. Who may take, hand off, or vacate the lead seat.
