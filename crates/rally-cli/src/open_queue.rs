@@ -253,7 +253,13 @@ pub(crate) fn project_signals(facts: &[Fact], open_handoffs: &[Fact]) -> OpenQue
     }
 }
 
-/// Open named handoffs their addressee declined with a typed rejection.
+/// Open named handoffs whose addressee's LATEST typed response is a rejection.
+///
+/// Only the newest receiver-authored `handoff.acked` / `.accepted` / `.rejected`
+/// reply per handoff counts (highest seq): the bound receiver may reject and
+/// then accept, and that accepted work must stay ranked. Targets are trimmed the
+/// same way [`handoff_address`] trims them, so both paths agree on who the
+/// addressee is.
 fn rejected_named(facts: &[Fact], open_handoffs: &[Fact]) -> BTreeSet<String> {
     let targets = open_handoffs
         .iter()
@@ -261,20 +267,39 @@ fn rejected_named(facts: &[Fact], open_handoffs: &[Fact]) -> BTreeSet<String> {
             fact.kind == FactKind::Handoff
                 && handoff_address(fact, "\0") == HandoffAddress::Elsewhere
         })
-        .filter_map(|fact| Some((fact.event_id.as_str(), fact.target.as_deref()?)))
+        .filter_map(|fact| Some((fact.event_id.as_str(), fact.target.as_deref()?.trim())))
         .collect::<HashMap<_, _>>();
     if targets.is_empty() {
         return BTreeSet::new();
     }
-    facts
+    // ref id -> (seq, is_rejection) of the newest receiver-authored response.
+    let mut latest: HashMap<&str, (i64, bool)> = HashMap::new();
+    for fact in facts
         .iter()
-        .filter(|fact| crate::store::handoff_response_is_rejection(fact))
-        .filter_map(|fact| {
-            let ref_id = fact.ref_id.as_deref()?;
-            // Receiver-authored only: a sender or bystander cannot decline
-            // work on the addressee's behalf.
-            (targets.get(ref_id).copied() == fact.tool.as_deref()).then(|| ref_id.to_string())
-        })
+        .filter(|fact| crate::store::handoff_is_protocol_response(fact))
+    {
+        let Some(ref_id) = fact.ref_id.as_deref() else {
+            continue;
+        };
+        // Receiver-authored only: a sender or bystander cannot decline work
+        // on the addressee's behalf.
+        if targets.get(ref_id).copied() != fact.tool.as_deref().map(str::trim) {
+            continue;
+        }
+        let entry = (fact.seq, crate::store::handoff_response_is_rejection(fact));
+        latest
+            .entry(ref_id)
+            .and_modify(|seen| {
+                if entry.0 > seen.0 {
+                    *seen = entry;
+                }
+            })
+            .or_insert(entry);
+    }
+    latest
+        .into_iter()
+        .filter(|(_, (_, rejected))| *rejected)
+        .map(|(ref_id, _)| ref_id.to_string())
         .collect()
 }
 
@@ -599,6 +624,21 @@ fn read_regular(path: &Path, max: u64) -> Option<(Vec<u8>, bool)> {
 pub(crate) fn bounded_hash(path: &Path) -> Option<String> {
     let (bytes, truncated) = read_regular(path, MAX_HASHED_BYTES)?;
     (!truncated).then(|| crate::source_grounding::hash_bytes(&bytes))
+}
+
+/// Split Rally's base markers into the ones that fit the ledger's evidence
+/// bounds and a count of the ones that do not: too long for one item, or past
+/// the free slots. Every dropped marker is reported (`handoff:base_not_recorded`).
+pub(crate) fn fit_base_markers(
+    markers: Vec<String>,
+    room_free: usize,
+    max_item_len: usize,
+) -> (Vec<String>, usize) {
+    let (fits, oversize): (Vec<_>, Vec<_>) = markers
+        .into_iter()
+        .partition(|marker| marker.len() <= max_item_len);
+    let dropped = oversize.len() + fits.len().saturating_sub(room_free);
+    (fits.into_iter().take(room_free).collect(), dropped)
 }
 
 /// `basehash:<rel>=<hash>` markers from a handoff's evidence.
@@ -951,6 +991,80 @@ mod tests {
         );
         assert!(is_reserved_base_marker("basehash:src/a.rs=00"));
         assert!(!is_reserved_base_marker("lease_expires_at:x"));
+    }
+
+    fn typed_reply(id: &str, seq: i64, tool: &str, handoff: &Fact, kind: &str) -> Fact {
+        Fact {
+            schema: crate::FACT_SCHEMA.to_string(),
+            event_id: id.to_string(),
+            seq,
+            thread_id: handoff.thread_id.clone(),
+            kind: FactKind::Handoff,
+            tool: Some(tool.to_string()),
+            from_session_id: Some("session-receiver".to_string()),
+            subject: "reply".to_string(),
+            created_at: at(1),
+            target: handoff.tool.clone(),
+            ref_id: Some(handoff.event_id.clone()),
+            evidence: vec![
+                "protocol:bridge_version=fact-v1".to_string(),
+                format!("protocol:event_kind={kind}"),
+                "protocol:target_policy=ref-author".to_string(),
+                "protocol:to_session_id=session-sender".to_string(),
+                format!("protocol:ref_event_id={}", handoff.event_id),
+                format!("protocol:causation_id={}", handoff.event_id),
+                format!("protocol:correlation_id={}", handoff.thread_id),
+                format!("protocol:handoff_id=h-{id}"),
+                format!("protocol:idempotency_key=op-{id}"),
+            ],
+            ..Fact::default()
+        }
+    }
+
+    /// F2: a whitespace-padded target names the same addressee here as in
+    /// `handoff_address`, so its receiver's rejection still counts.
+    #[test]
+    fn padded_target_rejection_matches_the_trimmed_addressee() {
+        let handoff = handoff("named", 1, Some("  codex:07 "), &at(0));
+        let reject = typed_reply("r1", 2, "codex:07", &handoff, "handoff.rejected");
+        assert!(
+            crate::store::handoff_response_is_rejection(&reject),
+            "fixture is a typed rejection"
+        );
+        let rejected = rejected_named(&[handoff.clone(), reject], std::slice::from_ref(&handoff));
+        assert!(rejected.contains("named"), "{rejected:?}");
+    }
+
+    /// F1, at the projection: the latest receiver reply decides.
+    #[test]
+    fn latest_receiver_reply_wins_over_an_earlier_rejection() {
+        let handoff = handoff("named", 1, Some("codex:07"), &at(0));
+        let reject = typed_reply("r1", 2, "codex:07", &handoff, "handoff.rejected");
+        let accept = typed_reply("a1", 3, "codex:07", &handoff, "handoff.accepted");
+        let open = std::slice::from_ref(&handoff);
+        assert!(
+            rejected_named(&[handoff.clone(), reject.clone(), accept.clone()], open).is_empty()
+        );
+        let mut later_reject = reject;
+        later_reject.seq = 4;
+        assert!(rejected_named(&[handoff.clone(), accept, later_reject], open).contains("named"));
+    }
+
+    #[test]
+    fn oversize_and_overflow_base_markers_both_count_as_dropped() {
+        let long = format!("basehash:{}=00", "x".repeat(50));
+        let markers = vec![
+            "base_commit:abcdef1".to_string(),
+            long,
+            "basehash:a=00".to_string(),
+        ];
+        // Item length 40 rejects the long marker; one free slot keeps one.
+        let (kept, dropped) = fit_base_markers(markers.clone(), 1, 40);
+        assert_eq!(kept, vec!["base_commit:abcdef1".to_string()]);
+        assert_eq!(dropped, 2, "one oversize + one past the free slots");
+        let (kept, dropped) = fit_base_markers(markers, 10, 40);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(dropped, 1, "the oversize marker alone");
     }
 
     #[test]

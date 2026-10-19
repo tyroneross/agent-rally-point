@@ -285,3 +285,155 @@ fn accepted_named_work_stays_ranked_and_rejected_work_drops_out() {
         "both replies answered the inbox obligation"
     );
 }
+
+/// `rally <args>` as one pinned session, so a receiver's replies come from the
+/// same bound session.
+fn as_session(sandbox: &ChannelSandbox, session: &str, args: &[&str]) -> Value {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rally"))
+        .args(args)
+        .current_dir(sandbox.cwd())
+        .env("HOME", sandbox.home())
+        .env("RALLY_SESSION_ID", session)
+        .env_remove("PWD")
+        .output()
+        .expect("spawn rally");
+    assert!(
+        output.status.success(),
+        "rally {args:?} failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("json")
+}
+
+fn reply(sandbox: &ChannelSandbox, id: &str, state: &str) {
+    as_session(
+        sandbox,
+        "receiver-session-1",
+        &[
+            "say",
+            "handoff",
+            "--json",
+            "--tool",
+            PICKER,
+            "--ref",
+            id,
+            "--handoff-state",
+            state,
+            "--subject",
+            "reply",
+            "--summary",
+            "typed receiver response",
+        ],
+    );
+}
+
+fn named_ranking(sandbox: &ChannelSandbox) -> (Vec<(String, String)>, Value) {
+    let ranked = as_session(
+        sandbox,
+        "receiver-session-1",
+        &["next", "--json", "--audit", "--tool", PICKER],
+    )["data"]["next"]
+        .clone();
+    let named = std::iter::once(&ranked)
+        .chain(ranked["alternatives"].as_array().unwrap().iter())
+        .filter(|c| c["action"] == "respond_to_handoff")
+        .map(|c| {
+            (
+                c["target_event_id"].as_str().unwrap().to_string(),
+                c["reason"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    (named, ranked)
+}
+
+/// Only the receiver's LATEST typed reply decides: reject-then-accept is
+/// accepted work and stays ranked; accept-then-reject is handed back.
+#[test]
+fn the_latest_receiver_reply_decides_rejected_versus_accepted() {
+    let sandbox = ChannelSandbox::spawn();
+    let posted = as_session(
+        &sandbox,
+        "sender-session-1",
+        &[
+            "say",
+            "handoff",
+            "--json",
+            "--tool",
+            SENDER,
+            "--target",
+            PICKER,
+            "--subject",
+            "review my PR please",
+        ],
+    );
+    let flipped_in = posted["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let posted = as_session(
+        &sandbox,
+        "sender-session-1",
+        &[
+            "say",
+            "handoff",
+            "--json",
+            "--tool",
+            SENDER,
+            "--target",
+            PICKER,
+            "--subject",
+            "port the build please",
+        ],
+    );
+    let flipped_out = posted["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    reply(&sandbox, &flipped_in, "rejected");
+    reply(&sandbox, &flipped_in, "accepted");
+    reply(&sandbox, &flipped_out, "accepted");
+    reply(&sandbox, &flipped_out, "rejected");
+
+    let (named, ranked) = named_ranking(&sandbox);
+    assert_eq!(
+        named,
+        vec![(
+            flipped_in.clone(),
+            "accepted_handoff_still_open".to_string()
+        )],
+        "{ranked}"
+    );
+    assert_eq!(ranked["inbox"]["accepted_open"], 1, "{ranked}");
+}
+
+/// A handoff whose evidence list is full still commits, and says its base
+/// markers were not recorded.
+#[test]
+fn a_full_evidence_list_reports_unrecorded_base_markers() {
+    let sandbox = ChannelSandbox::spawn();
+    std::fs::write(sandbox.cwd().join("b.rs"), "fn b() {}\n").unwrap();
+    let filler = (0..64).map(|i| format!("note-{i}")).collect::<Vec<_>>();
+    let mut args = vec![
+        "say",
+        "handoff",
+        "--json",
+        "--tool",
+        SENDER,
+        "--subject",
+        "split b.rs please",
+        "--path",
+        "b.rs",
+    ];
+    for item in &filler {
+        args.push("--evidence");
+        args.push(item);
+    }
+    let said = sandbox.rally_json(&args);
+    assert!(
+        said.to_string().contains("handoff:base_not_recorded"),
+        "{said}"
+    );
+}
