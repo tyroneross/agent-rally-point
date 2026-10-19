@@ -164,7 +164,7 @@ Default communication order:
 
 ### Named handoffs and the open queue
 
-A handoff with `--target <agent>` is assigned to that agent by name. It stays in that agent's `rally inbox` until the agent answers, at any age, and `rally next` ranks it above everything except a targeted ack-required artifact.
+A handoff with `--target <agent>` is assigned to that agent by name. It stays in that agent's `rally inbox` until the agent answers, at any age, and `rally next` ranks it above everything except a targeted ack-required artifact. Acking or accepting it (`handoff.acked` / `handoff.accepted`) answers the inbox obligation but does not finish the work. `rally next` keeps ranking it as `accepted_handoff_still_open` until it is resolved, and `rally inbox` counts it as `accepted_open`.
 
 A handoff with no `--target` (or `--target all`) goes to the **open queue**: it is unowned, and any agent may take it when it has no assigned work. `rally next` offers it as `claim_open_queue_item`, below every kind of assigned work, and `rally inbox` lists it under `open_queue`, separate from the named count. The prompt hook words it as "available and unowned; claim it before working", never as a task handed to the reader.
 
@@ -175,11 +175,11 @@ No age limit removes, hides, or reroutes an open-queue item. Instead, `rally nex
 - a plan or coordination file it links (its `--uri`, or a path in its evidence) has a done status line (`linked_plan_marks_done`);
 - it is older than this room's p95 time to pick up open-queue work, recomputed from the ledger (`older_than_room_pickup_p95`). A room with fewer than 20 picked-up items uses the measured cross-room p95 (208 h, 2026-10-18) and says so in `pickup_p95_source`.
 
-Revalidating means reading the item and the current files, then claiming it, resolving it as done, or rewriting it.
+Revalidating means reading the item and the current files, then claiming it, resolving it as done, or rewriting it. File checks read only regular files inside the room root, skip `.rally/` and `.git/`, and stop after a 16 MiB budget per call. These signals are advisory: any peer's later "landed" fact on the same scope can trigger a revalidation, which costs one read and closes nothing.
 
 Two write-time aids support this:
 
-- `say handoff` records `base_commit:<sha>` and `basehash:<path>=<hash>` for the files in its scope. `rally check before-write --path <file>` adds a `handoff_base_behind` **warning** when an open handoff you could be working from was written against an older version of that file. It never blocks, and it stops once you hold a claim on the file taken after the handoff.
+- `say handoff` records `base_commit:<sha>` and `basehash:<path>=<hash>` for the files in its scope. `rally check before-write --path <file>` adds a `handoff_base_behind` **warning** when an open handoff you could be working from was written against an older version of that file. It never blocks, and it stops once you hold a claim on the file taken after the handoff. The native `rally hook before-write` path does not run this check, because that path surfaces only blocking findings. You see the warning when you run the `rally check before-write` commands that `rally next` suggests. If the evidence list is too full to record the base, `say handoff` warns `handoff:base_not_recorded`.
 - `say handoff` warns `handoff:status_report` when the subject reports finished work ("shipped", "landed", "done", "correction") and asks for nothing. Post reports with `rally say artifact` instead; nobody owes a reply to a report, so as a handoff it would sit in the open queue unanswered.
 
 A claim whose lease has run out without renewal is reported by `rally next` as `release_or_renew_claim`, a low-rank prompt, not as active work. A later session of the same tool may `rally say release --ref <claim>` such a claim without a room-wide reap. An unexpired claim still cannot be released by another session that only shares the tool label.

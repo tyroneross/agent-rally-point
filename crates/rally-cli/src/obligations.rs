@@ -74,6 +74,10 @@ pub(crate) struct InboxResult {
     pub(crate) oldest_age_secs: i64,
     pub(crate) stale_window_secs: i64,
     pub(crate) items: Vec<InboxItem>,
+    /// Named handoffs this tool acked or accepted but nobody has resolved:
+    /// no longer an unanswered obligation, still assigned work. Omitted at 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) accepted_open: usize,
     /// The OPEN QUEUE: unowned handoffs any agent may claim. Separate from the
     /// counts above, which are work assigned to this tool by name, so a reader
     /// can never mistake an available item for one handed to it. Built by
@@ -94,23 +98,59 @@ pub(crate) struct OpenQueueSummary {
     pub(crate) items: Vec<crate::open_queue::OpenQueueItem>,
 }
 
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 impl OpenQueueSummary {
     pub(crate) fn is_empty(&self) -> bool {
         self.count == 0
     }
 }
 
-/// Named handoffs addressed to `tool` and still unanswered — the handoff half of
-/// [`build_inbox`]'s bucket, oldest first. `next` ranks from THIS, so a named
-/// handoff `next` offers is always one `inbox` counts.
-pub(crate) fn named_handoffs<'a>(snapshot: &'a RoomSnapshot, tool: &str) -> Vec<&'a Fact> {
-    let mut mine = snapshot
+/// Where a handoff addressed to this tool BY NAME stands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NamedState {
+    /// No receiver-authored ack yet: an inbox obligation.
+    Unanswered,
+    /// The receiver acked or accepted it (`handoff.acked` / `handoff.accepted`),
+    /// which closes the obligation, but nothing resolved the handoff itself.
+    /// An ack is not completion (AGEN-COORDINATION-kzt037p65xg01), so this is
+    /// still assigned work and still outranks the open queue.
+    AcceptedOpen,
+}
+
+/// Every handoff assigned to `tool` by name that is still open, oldest first.
+///
+/// The ONE named-work projection: `next` ranks from it and `inbox` counts from
+/// it (`count`/`handoffs` for [`NamedState::Unanswered`], `accepted_open` for
+/// the rest), so the two cannot disagree on a snapshot.
+pub(crate) fn named_work<'a>(
+    snapshot: &'a RoomSnapshot,
+    tool: &str,
+) -> Vec<(&'a Fact, NamedState)> {
+    let mut work = snapshot
         .open_obligations
         .iter()
         .filter(|fact| fact.kind == FactKind::Handoff && fact.target.as_deref() == Some(tool))
+        .map(|fact| (fact, NamedState::Unanswered))
         .collect::<Vec<_>>();
-    mine.sort_by_key(|fact| fact.seq);
-    mine
+    let owed = work
+        .iter()
+        .map(|(fact, _)| fact.event_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    work.extend(
+        snapshot
+            .open_handoffs
+            .iter()
+            .filter(|fact| {
+                crate::next::handoff_address(fact, tool) == crate::next::HandoffAddress::Named
+                    && !owed.contains(fact.event_id.as_str())
+            })
+            .map(|fact| (fact, NamedState::AcceptedOpen)),
+    );
+    work.sort_by_key(|(fact, _)| fact.seq);
+    work
 }
 
 /// Project the open obligations addressed to `tool`, oldest first.
@@ -198,7 +238,13 @@ pub(crate) fn build_inbox(
         items: open_queue.into_iter().take(limit).collect(),
     };
 
+    let accepted_open = named_work(snapshot, tool)
+        .iter()
+        .filter(|(_, state)| *state == NamedState::AcceptedOpen)
+        .count();
+
     InboxResult {
+        accepted_open,
         count,
         handoffs,
         artifacts,

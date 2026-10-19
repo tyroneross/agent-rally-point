@@ -564,11 +564,10 @@ fn next_candidates(
 ) -> Vec<NextCandidate> {
     let mut candidates = Vec::new();
 
-    // Work assigned to this tool BY NAME. Read from `open_obligations`, the same
-    // bucket `rally inbox` renders, so `next` can never rank a named handoff the
-    // inbox does not hold (or miss one it does). See
-    // `crate::obligations::build_obligation_view`.
-    for handoff in crate::obligations::named_handoffs(snapshot, tool) {
+    // Work assigned to this tool BY NAME, from `obligations::named_work` — the
+    // same projection `rally inbox` counts — so `next` can never rank a named
+    // handoff the inbox does not account for, or miss one it does.
+    for (handoff, state) in crate::obligations::named_work(snapshot, tool) {
         // Under `Surface`, age is not a reason to stop offering an obligation
         // addressed to this agent. Under `Ignore`, the pre-existing drop stands
         // so `command_self_exit_check` can still reach a non-actionable cycle —
@@ -576,9 +575,13 @@ fn next_candidates(
         let aged_out = stale_targeted == StaleTargetedPolicy::Ignore
             && stale_targeted_handoff(handoff, tool, stale_wait_secs);
         if !aged_out {
+            let reason = match state {
+                crate::obligations::NamedState::Unanswered => "open_handoff_targeted_to_this_tool",
+                crate::obligations::NamedState::AcceptedOpen => "accepted_handoff_still_open",
+            };
             candidates.push(NextCandidate::from_fact(
                 "respond_to_handoff",
-                "open_handoff_targeted_to_this_tool",
+                reason,
                 boost_score(NAMED_HANDOFF_SCORE, handoff, role, paths),
                 handoff,
             ));
@@ -1816,12 +1819,16 @@ mod tests {
         let named_b = named_handoff("named-b", 3);
         // Closed by its sender but never acked by the receiver: still owed.
         let sender_closed = named_handoff("named-sender-closed", 4);
+        // Accepted by the receiver (obligation closed) but never resolved:
+        // still assigned work, so it must still outrank the open queue.
+        let accepted = named_handoff("named-accepted", 7);
         let snapshot = RoomSnapshot {
             open_handoffs: vec![
                 named_a.clone(),
                 named_b.clone(),
                 open_queue_handoff("pool-1", 5, &fresh),
                 open_queue_handoff("pool-old", 6, "2000-01-01T00:00:00Z"),
+                accepted,
             ],
             open_obligations: vec![named_a, named_b, sender_closed],
             ..RoomSnapshot::default()
@@ -1871,8 +1878,22 @@ mod tests {
             .collect::<Vec<_>>();
         inbox_pool.sort();
 
-        assert_eq!(ids_for("respond_to_handoff"), inbox_named);
+        let mut named_work = crate::obligations::named_work(&snapshot, "codex")
+            .into_iter()
+            .map(|(fact, _)| fact.event_id.clone())
+            .collect::<Vec<_>>();
+        named_work.sort();
+        assert_eq!(ids_for("respond_to_handoff"), named_work);
         assert_eq!(inbox_named.len(), 3, "sender-closed handoff is still owed");
+        assert_eq!(
+            inbox.accepted_open, 1,
+            "accepted-but-open is counted, not dropped"
+        );
+        assert_eq!(named_work.len(), inbox_named.len() + inbox.accepted_open);
+        assert_eq!(
+            next.action, "respond_to_handoff",
+            "named work outranks the pool"
+        );
         assert_eq!(ids_for("claim_open_queue_item"), inbox_pool);
         assert_eq!(next.inbox.count, inbox.count);
         assert_eq!(next.inbox.open_queue.count, inbox.open_queue.count);

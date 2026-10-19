@@ -3504,6 +3504,15 @@ fn command_say(args: SayArgs) -> Result<Output> {
             "ack_by_evidence_reserved: evidence entries beginning with `ack-by:` are written by Rally; use `say handoff --ack-within` instead".to_string(),
         ));
     }
+    if kind == FactKind::Handoff
+        && evidence
+            .iter()
+            .any(|entry| open_queue::is_reserved_base_marker(entry))
+    {
+        return Err(RallyError::Usage(
+            "handoff_base_evidence_reserved: evidence entries beginning with `basehash:` or `base_commit:` are written by Rally from the files in the handoff's scope; remove them and retry".to_string(),
+        ));
+    }
     if kind == FactKind::Handoff && evidence.iter().any(|entry| entry.starts_with("protocol:")) {
         return Err(RallyError::Usage(
             "handoff_protocol_evidence_reserved: evidence entries beginning with `protocol:` are written by Rally; remove the caller-supplied marker and retry".to_string(),
@@ -3572,6 +3581,7 @@ fn command_say(args: SayArgs) -> Result<Output> {
         }
     }
 
+    let mut handoff_base_dropped = 0usize;
     // Overwrite guard: a handoff records the base it was written against — the
     // room's git HEAD and a content hash per file in its scope — so
     // `check before-write` can warn an agent working from it once those files
@@ -3582,12 +3592,16 @@ fn command_say(args: SayArgs) -> Result<Output> {
         && let Some(ref root) = repo_root_for_grounding
     {
         let room_free = rally_protocol::ledger::MAX_EVIDENCE_ITEMS.saturating_sub(evidence.len());
-        evidence.extend(
-            open_queue::base_markers(root, &scope)
-                .into_iter()
-                .filter(|marker| marker.len() <= rally_protocol::ledger::MAX_EVIDENCE_ITEM_LEN)
-                .take(room_free),
-        );
+        let markers = open_queue::base_markers(root, &scope)
+            .into_iter()
+            .filter(|marker| marker.len() <= rally_protocol::ledger::MAX_EVIDENCE_ITEM_LEN)
+            .collect::<Vec<_>>();
+        if markers.len() > room_free {
+            // Recording a base must never fail the write, but a silently
+            // missing base would also silence the overwrite guard (SEC-004).
+            handoff_base_dropped = markers.len() - room_free;
+        }
+        evidence.extend(markers.into_iter().take(room_free));
     }
 
     // #6 source-grounding (artifact): look up claim-open hashes from the ref'd claim fact.
@@ -3837,6 +3851,17 @@ fn command_say(args: SayArgs) -> Result<Output> {
         eprintln!("rally: warning: {message}");
         say_warnings.push(SayWarning {
             code: "text:glued_words".to_string(),
+            message,
+        });
+    }
+
+    if handoff_base_dropped > 0 {
+        let message = format!(
+            "{handoff_base_dropped} base marker(s) for this handoff's scope were not recorded because the evidence list is full; `check before-write` cannot warn about overwrites for those files. Send fewer --evidence entries to record them."
+        );
+        eprintln!("rally: warning: {message}");
+        say_warnings.push(SayWarning {
+            code: "handoff:base_not_recorded".to_string(),
             message,
         });
     }
@@ -5009,7 +5034,7 @@ fn command_inbox(args: cli::InboxArgs) -> Result<Output> {
 }
 
 /// One tool's inbox: named obligations plus the open queue, through the same
-/// two projections `next` reads (`obligations::named_handoffs` /
+/// two projections `next` reads (`obligations::named_work` /
 /// `open_queue::open_queue_items`), with the same filesystem probe.
 fn inbox_for(
     snapshot: &store::RoomSnapshot,
@@ -5087,6 +5112,7 @@ mod inbox_render_fixture_tests {
             artifacts: 1,
             oldest_age_secs: 700,
             stale_window_secs: 600,
+            accepted_open: 0,
             open_queue: Default::default(),
             items: vec![
                 InboxItem {

