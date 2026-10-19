@@ -142,6 +142,7 @@ mod log_watch;
 mod next;
 mod obligations;
 mod observed_liveness;
+mod open_queue;
 mod output;
 pub mod rallyd_core;
 mod reaper;
@@ -1760,6 +1761,9 @@ fn command_self_exit_check(args: cli::SelfExitCheckArgs) -> Result<Output> {
         backlog_items,
         coord.stale_wait_secs,
         StaleTargetedPolicy::Ignore,
+        // Revalidation only changes an open-queue item's rank, never whether it
+        // is actionable, so self-exit needs no filesystem probe.
+        &crate::open_queue::FsSignals::default(),
     );
     let next_actionable = next.actionable;
 
@@ -3568,6 +3572,24 @@ fn command_say(args: SayArgs) -> Result<Output> {
         }
     }
 
+    // Overwrite guard: a handoff records the base it was written against — the
+    // room's git HEAD and a content hash per file in its scope — so
+    // `check before-write` can warn an agent working from it once those files
+    // have moved on. Rally-written markers go LAST so they win over any
+    // caller-supplied entry with the same prefix, and only as many as fit the
+    // ledger's evidence bound, so recording a base can never fail the write.
+    if kind == FactKind::Handoff
+        && let Some(ref root) = repo_root_for_grounding
+    {
+        let room_free = rally_protocol::ledger::MAX_EVIDENCE_ITEMS.saturating_sub(evidence.len());
+        evidence.extend(
+            open_queue::base_markers(root, &scope)
+                .into_iter()
+                .filter(|marker| marker.len() <= rally_protocol::ledger::MAX_EVIDENCE_ITEM_LEN)
+                .take(room_free),
+        );
+    }
+
     // #6 source-grounding (artifact): look up claim-open hashes from the ref'd claim fact.
     let grounding_claim_evidence: Vec<String> = if kind == FactKind::Artifact {
         args.ref_id
@@ -3815,6 +3837,21 @@ fn command_say(args: SayArgs) -> Result<Output> {
         eprintln!("rally: warning: {message}");
         say_warnings.push(SayWarning {
             code: "text:glued_words".to_string(),
+            message,
+        });
+    }
+
+    // Advisory: a NEW handoff whose subject reads as a status report with no
+    // ask. Nobody owes a reply to "D1/D2/D3 shipped", so as a handoff it sits in
+    // the open queue forever; as an artifact it is recorded and reviewable.
+    if fact.kind == FactKind::Handoff
+        && fact.ref_id.is_none()
+        && let Some(message) =
+            open_queue::status_report_warning(&fact.subject, fact.summary.as_deref())
+    {
+        eprintln!("rally: warning: {message}");
+        say_warnings.push(SayWarning {
+            code: "handoff:status_report".to_string(),
             message,
         });
     }
@@ -4798,6 +4835,7 @@ fn command_next(args: NextArgs) -> Result<Output> {
         backlog_items,
         coord.stale_wait_secs,
         StaleTargetedPolicy::Surface,
+        &crate::open_queue::probe_fs(&snapshot, &tool, room.repo_root()),
     );
     let action = next.action;
     let target_event_id = next
@@ -4923,7 +4961,13 @@ fn command_inbox(args: cli::InboxArgs) -> Result<Output> {
     if args.tools.len() == 1 {
         let tool = args.tools.into_iter().next().unwrap_or_default();
         let snapshot = room.snapshot_for_obligation_target(&tool, row_limit)?;
-        let inbox = build_inbox(&snapshot, &tool, item_limit, coord.stale_wait_secs);
+        let inbox = inbox_for(
+            &snapshot,
+            &tool,
+            item_limit,
+            coord.stale_wait_secs,
+            room.repo_root(),
+        );
         let text = inbox_text(&tool, &inbox);
         let body = envelope("inbox", SCHEMA_INBOX, InboxData { tool, inbox })?;
         return Ok(Output::new(args.json, text, body));
@@ -4946,7 +4990,13 @@ fn command_inbox(args: cli::InboxArgs) -> Result<Output> {
             Some(base) => base.clone().for_obligation_target(&tool, row_limit),
             None => room.snapshot_for_obligation_target(&tool, row_limit)?,
         };
-        let inbox = build_inbox(&snapshot, &tool, item_limit, coord.stale_wait_secs);
+        let inbox = inbox_for(
+            &snapshot,
+            &tool,
+            item_limit,
+            coord.stale_wait_secs,
+            room.repo_root(),
+        );
         inboxes.insert(tool, inbox);
     }
     let text = inboxes
@@ -4956,6 +5006,22 @@ fn command_inbox(args: cli::InboxArgs) -> Result<Output> {
         .join("\n");
     let body = envelope("inbox", SCHEMA_INBOX, InboxManyData { inboxes })?;
     Ok(Output::new(args.json, text, body))
+}
+
+/// One tool's inbox: named obligations plus the open queue, through the same
+/// two projections `next` reads (`obligations::named_handoffs` /
+/// `open_queue::open_queue_items`), with the same filesystem probe.
+fn inbox_for(
+    snapshot: &store::RoomSnapshot,
+    tool: &str,
+    item_limit: usize,
+    stale_wait_secs: i64,
+    repo_root: &Path,
+) -> InboxResult {
+    let fs = crate::open_queue::probe_fs(snapshot, tool, repo_root);
+    let open_queue =
+        crate::open_queue::open_queue_items(snapshot, tool, &fs, chrono::Utc::now().timestamp());
+    build_inbox(snapshot, tool, item_limit, stale_wait_secs, open_queue)
 }
 
 /// Most `--tool` values one `rally inbox` call accepts. Bounds the work (and
@@ -5021,6 +5087,7 @@ mod inbox_render_fixture_tests {
             artifacts: 1,
             oldest_age_secs: 700,
             stale_window_secs: 600,
+            open_queue: Default::default(),
             items: vec![
                 InboxItem {
                     event_id: "fact_a".into(),
@@ -7827,6 +7894,7 @@ fn command_check(args: CheckArgs) -> Result<Output> {
             args.strict,
             &cached,
             &crate::hooks_config::resolve_coordination(&repo_root_path).unwrap_or_default(),
+            Some(&repo_root_path),
         )?;
         let body = envelope("check", SCHEMA_CHECK, check.data)?;
         let text = format!("check findings={} (cached)", check.finding_count);
@@ -7854,6 +7922,7 @@ fn command_check(args: CheckArgs) -> Result<Output> {
         args.strict,
         &snapshot,
         &crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default(),
+        Some(room.repo_root()),
     )?;
     let body = envelope("check", SCHEMA_CHECK, check.data)?;
     let text = format!("check findings={}", check.finding_count);

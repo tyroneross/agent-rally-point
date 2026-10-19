@@ -74,6 +74,43 @@ pub(crate) struct InboxResult {
     pub(crate) oldest_age_secs: i64,
     pub(crate) stale_window_secs: i64,
     pub(crate) items: Vec<InboxItem>,
+    /// The OPEN QUEUE: unowned handoffs any agent may claim. Separate from the
+    /// counts above, which are work assigned to this tool by name, so a reader
+    /// can never mistake an available item for one handed to it. Built by
+    /// [`crate::open_queue::open_queue_items`] — the same call `next` ranks
+    /// from — so `next` and `inbox` agree on one snapshot. Omitted when the
+    /// open queue is empty, so an inbox with no open-queue items renders
+    /// byte-identically to the pre-open-queue shape.
+    #[serde(default, skip_serializing_if = "OpenQueueSummary::is_empty")]
+    pub(crate) open_queue: OpenQueueSummary,
+}
+
+/// Exact counts over the whole open queue, with a capped item sample.
+#[derive(Clone, Debug, Default, JsonSchema, Serialize)]
+pub(crate) struct OpenQueueSummary {
+    pub(crate) count: usize,
+    /// How many carry at least one "revalidate before claiming" reason.
+    pub(crate) revalidate: usize,
+    pub(crate) items: Vec<crate::open_queue::OpenQueueItem>,
+}
+
+impl OpenQueueSummary {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
+/// Named handoffs addressed to `tool` and still unanswered — the handoff half of
+/// [`build_inbox`]'s bucket, oldest first. `next` ranks from THIS, so a named
+/// handoff `next` offers is always one `inbox` counts.
+pub(crate) fn named_handoffs<'a>(snapshot: &'a RoomSnapshot, tool: &str) -> Vec<&'a Fact> {
+    let mut mine = snapshot
+        .open_obligations
+        .iter()
+        .filter(|fact| fact.kind == FactKind::Handoff && fact.target.as_deref() == Some(tool))
+        .collect::<Vec<_>>();
+    mine.sort_by_key(|fact| fact.seq);
+    mine
 }
 
 /// Project the open obligations addressed to `tool`, oldest first.
@@ -88,6 +125,7 @@ pub(crate) fn build_inbox(
     tool: &str,
     limit: usize,
     stale_wait_secs: i64,
+    open_queue: Vec<crate::open_queue::OpenQueueItem>,
 ) -> InboxResult {
     let mut mine = snapshot
         .open_obligations
@@ -151,6 +189,15 @@ pub(crate) fn build_inbox(
         })
         .collect::<Vec<_>>();
 
+    let open_queue = OpenQueueSummary {
+        count: open_queue.len(),
+        revalidate: open_queue
+            .iter()
+            .filter(|item| item.revalidate_before_claiming)
+            .count(),
+        items: open_queue.into_iter().take(limit).collect(),
+    };
+
     InboxResult {
         count,
         handoffs,
@@ -158,6 +205,7 @@ pub(crate) fn build_inbox(
         oldest_age_secs,
         stale_window_secs: stale_wait_secs,
         items,
+        open_queue,
     }
 }
 
@@ -331,7 +379,7 @@ mod tests {
             ..RoomSnapshot::default()
         };
 
-        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS);
+        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS, Vec::new());
         assert_eq!(inbox.count, 1);
         assert_eq!(inbox.handoffs, 1);
         assert_eq!(inbox.artifacts, 0);
@@ -360,7 +408,7 @@ mod tests {
             ..RoomSnapshot::default()
         };
 
-        let inbox = build_inbox(&snapshot, "codex", 2, DEFAULT_STALE_WAIT_SECS);
+        let inbox = build_inbox(&snapshot, "codex", 2, DEFAULT_STALE_WAIT_SECS, Vec::new());
         assert_eq!(inbox.count, 7, "count covers every obligation");
         assert_eq!(inbox.items.len(), 2, "items are capped");
         assert_eq!(
@@ -388,7 +436,7 @@ mod tests {
             ..RoomSnapshot::default()
         };
 
-        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS);
+        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS, Vec::new());
         assert_eq!(inbox.count, 1);
         assert_eq!(inbox.artifacts, 1);
         assert_eq!(inbox.items[0].age_secs, 0);
@@ -409,7 +457,7 @@ mod tests {
             ..RoomSnapshot::default()
         };
 
-        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS);
+        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS, Vec::new());
         assert_eq!(inbox.count, 1);
         assert!(inbox.items[0].stale, "a very old item is annotated stale");
         assert_eq!(inbox.oldest_age_secs, inbox.items[0].age_secs);
@@ -428,8 +476,8 @@ mod tests {
             ..RoomSnapshot::default()
         };
 
-        let short = build_inbox(&snapshot, "codex", 5, 60);
-        let long = build_inbox(&snapshot, "codex", 5, 600);
+        let short = build_inbox(&snapshot, "codex", 5, 60, Vec::new());
+        let long = build_inbox(&snapshot, "codex", 5, 600, Vec::new());
         assert_eq!(short.stale_window_secs, 60);
         assert_eq!(long.stale_window_secs, 600);
         assert!(short.items[0].stale);
@@ -453,7 +501,7 @@ mod tests {
             ..RoomSnapshot::default()
         };
 
-        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS);
+        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS, Vec::new());
         assert_eq!(
             inbox.items[0].ack_by.as_deref(),
             Some("2000-01-01T00:01:30Z")
@@ -479,7 +527,7 @@ mod tests {
             ..RoomSnapshot::default()
         };
 
-        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS);
+        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS, Vec::new());
         assert_eq!(inbox.items[0].ack_by, None);
         assert_eq!(inbox.items[0].ack_by_ms, None);
     }

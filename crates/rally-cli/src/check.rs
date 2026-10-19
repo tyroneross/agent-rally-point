@@ -72,6 +72,10 @@ pub(crate) struct CheckOutcome {
     pub(crate) finding_count: usize,
 }
 
+// One over clippy's default: `repo_root` is the overwrite guard's only input,
+// and a params struct for a crate-private function with three call sites would
+// exist only to satisfy the lint (same reasoning as `next::build_next`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_check(
     phase: String,
     tool: String,
@@ -80,11 +84,15 @@ pub(crate) fn build_check(
     strict: bool,
     snapshot: &RoomSnapshot,
     coord: &crate::hooks_config::CoordinationConfig,
+    repo_root: Option<&std::path::Path>,
 ) -> Result<CheckOutcome> {
     let mut findings = Vec::new();
     match phase.as_str() {
         "before-write" => {
-            check_before_write_with_coord(snapshot, coord, &tool, path.as_deref(), &mut findings)
+            check_before_write_with_coord(snapshot, coord, &tool, path.as_deref(), &mut findings);
+            if let (Some(path), Some(root)) = (path.as_deref(), repo_root) {
+                check_handoff_base(snapshot, &tool, path, root, &mut findings);
+            }
         }
         "before-complete" => check_before_complete(snapshot, &tool, caller_session, &mut findings),
         other => {
@@ -154,6 +162,86 @@ pub(crate) fn humanize_age(secs: i64) -> String {
         format!("{}h", secs / 3_600)
     } else {
         format!("{}d", secs / 86_400)
+    }
+}
+
+/// Overwrite guard: is this tool about to write a file from a handoff whose
+/// recorded base is behind the file's current content?
+///
+/// A handoff records `basehash:<path>=<hash>` (and `base_commit:<sha>`) for the
+/// files in its scope when it is posted (`open_queue::base_markers`). Here, for
+/// every open handoff this tool could be working from — addressed to it by name,
+/// or in the open queue — whose scope covers `path`, compare the recorded hash
+/// with the file now. A mismatch means someone changed the file after the
+/// handoff was written, so acting on the handoff's description could overwrite
+/// newer work.
+///
+/// This is HTTP `If-Match` (RFC 9110 §13.1.1) checked at first touch: once this
+/// tool holds a claim on the path created after the handoff, it has already
+/// taken the item and seen the warning, and its own edits must not re-trigger
+/// it. Severity is `warn`, never `stop` — nothing in this repo blocks a write on
+/// content drift, and a stale description is a reason to re-read, not a lock.
+fn check_handoff_base(
+    snapshot: &RoomSnapshot,
+    tool: &str,
+    path: &str,
+    root: &std::path::Path,
+    findings: &mut Vec<CheckFinding>,
+) {
+    use crate::next::{HandoffAddress, handoff_address};
+    let rel = path.strip_prefix("file:").unwrap_or(path);
+    let Ok(root) = root.canonicalize() else {
+        return;
+    };
+    for handoff in &snapshot.open_handoffs {
+        if handoff_address(handoff, tool) == HandoffAddress::Elsewhere {
+            continue;
+        }
+        let bases = crate::open_queue::base_hashes(&handoff.evidence);
+        let Some(base) = bases.get(rel) else {
+            continue;
+        };
+        let already_taken = snapshot.active_claims.iter().any(|claim| {
+            claim.tool.as_deref() == Some(tool)
+                && claim.seq > handoff.seq
+                && claim
+                    .scope
+                    .iter()
+                    .any(|scope| path_matches_scope(scope, path))
+        });
+        if already_taken {
+            continue;
+        }
+        let Some(file) = crate::open_queue::confined_file(&root, rel) else {
+            continue;
+        };
+        let Some(current) = crate::open_queue::bounded_hash(&file) else {
+            continue;
+        };
+        if &current == base {
+            continue;
+        }
+        let commit = crate::open_queue::base_commit(&handoff.evidence);
+        let diff_hint = commit
+            .map(|sha| format!(" Compare with `git diff {sha} -- {rel}`."))
+            .unwrap_or_default();
+        findings.push(CheckFinding {
+            code: "handoff_base_behind",
+            severity: "warn",
+            message: format!(
+                "handoff {} was written against an older version of {rel}{}; the file has changed since. Re-read the current file and `rally locate {}` before overwriting.{diff_hint}",
+                handoff.event_id,
+                commit
+                    .map(|sha| format!(" (base commit {})", &sha[..sha.len().min(12)]))
+                    .unwrap_or_default(),
+                handoff.event_id,
+            ),
+            fact_id: Some(handoff.event_id.clone()),
+            owner: handoff.tool.clone(),
+            path: Some(path.to_string()),
+            owner_idle_secs: None,
+            scope: handoff.scope.clone(),
+        });
     }
 }
 
@@ -987,6 +1075,7 @@ mod tests {
             false,
             &snapshot,
             &Default::default(),
+            None,
         )
         .expect("check builds");
         let visible = &outcome.data.check.agent_visible;

@@ -2052,6 +2052,12 @@ pub(crate) struct RoomSnapshot {
     /// erasing the timestamp destructive reclaim must inspect.
     #[serde(skip)]
     pub(crate) author_last_seen: BTreeMap<String, String>,
+    /// Ledger-derived open-queue validity signals (room pickup p95, later
+    /// done-ish facts per open-queue item). See `crate::open_queue`. Omitted
+    /// from the public room JSON; carried over the daemon wire and the snapshot
+    /// cache in [`SnapshotInternals`], so routed and direct mode agree.
+    #[serde(skip)]
+    pub(crate) open_queue_signals: crate::open_queue::OpenQueueSignals,
 }
 
 /// Bounded pre-write state used by `rally enter`.
@@ -2132,6 +2138,8 @@ pub(crate) struct SnapshotInternals {
     pub(crate) stale_authors: BTreeSet<String>,
     #[serde(default)]
     pub(crate) author_last_seen: BTreeMap<String, String>,
+    #[serde(default)]
+    pub(crate) open_queue_signals: crate::open_queue::OpenQueueSignals,
 }
 
 /// Hard, fail-loud bounds for the daemon-only snapshot side-channel.
@@ -2216,6 +2224,7 @@ impl RoomSnapshot {
             open_obligations_omitted: self.open_obligations_omitted,
             stale_authors: self.stale_authors.clone(),
             author_last_seen: self.author_last_seen.clone(),
+            open_queue_signals: self.open_queue_signals.clone(),
         }
     }
 
@@ -2232,6 +2241,7 @@ impl RoomSnapshot {
         self.open_obligations_omitted = internals.open_obligations_omitted;
         self.stale_authors = internals.stale_authors;
         self.author_last_seen = internals.author_last_seen;
+        self.open_queue_signals = internals.open_queue_signals;
     }
 }
 
@@ -2554,6 +2564,9 @@ impl RoomSnapshot {
             composition: self.composition,
             stale_authors: self.stale_authors,
             author_last_seen: self.author_last_seen,
+            // Room-level history (pickup p95) and per-item signals keyed by id;
+            // a query narrows which items render, not what is known about them.
+            open_queue_signals: self.open_queue_signals,
         };
         filtered.totals = RoomTotals {
             active_claims: filtered.active_claims.len(),
@@ -9002,6 +9015,7 @@ fn snapshot_from_facts_with_policy_at(
     // the inbox without the hook paying an extra process spawn per fire (the
     // repo's performance agreement counts spawns as an attributed cost).
     let open_obligations = project_open_obligations(facts);
+    let open_queue_signals = crate::open_queue::project_signals(facts, &open_handoffs);
     // Tools that have AUTHORED at least one fact here — the room's evidence that
     // an agent by that name has actually been present.
     //
@@ -9486,6 +9500,7 @@ fn snapshot_from_facts_with_policy_at(
         composition: None,
         stale_authors,
         author_last_seen,
+        open_queue_signals,
     }
 }
 
@@ -12874,7 +12889,11 @@ const SNAPSHOT_CACHE_FILENAME: &str = "snapshot.cache.json";
 /// hands back an EMPTY bucket — the same silent-empty failure, one field over.
 /// Reusing 3 for both shapes would have made the counter unable to tell them
 /// apart, so the integration takes the next number rather than the shared one.
-const SNAPSHOT_CACHE_GENERATION: u32 = 5;
+///
+/// Bumped 5 -> 6 when [`SnapshotInternals`] gained `open_queue_signals`. A
+/// generation-5 cache would deserialize with empty signals and report every
+/// room's open queue as having no pickup history.
+const SNAPSHOT_CACHE_GENERATION: u32 = 6;
 
 /// Snapshot and freshness proof captured while one room mutation lock is held.
 /// This pair is the only value accepted by the cache writer.
