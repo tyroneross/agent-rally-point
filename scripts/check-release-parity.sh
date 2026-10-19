@@ -278,7 +278,13 @@ for host_test in tests/hooks/test_*.sh; do
     continue
   fi
   _host_tests_found=$((_host_tests_found + 1))
-  if ! "$host_test" >&2; then
+  # Run each suite without the pusher's RALLY_* settings. Hosts such as Easy
+  # Terminal export RALLY_BIN, RALLY_NOTICE_VERBOSITY and others into every
+  # pane, and inheriting them made the goldens fail only when pushed from there.
+  if ! (
+    for _rally_var in $(compgen -e | grep '^RALLY_'); do unset "$_rally_var"; done
+    exec "$host_test"
+  ) >&2; then
     echo "check-release-parity: HOST TEST FAILED — $host_test" >&2
     fail=1
   fi
