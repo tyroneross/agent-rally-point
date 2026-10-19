@@ -12905,7 +12905,11 @@ const SNAPSHOT_CACHE_FILENAME: &str = "snapshot.cache.json";
 /// Bumped 6 -> 7 when `room_pickup_p95_secs` started being set for rooms with
 /// fewer than 20 picked-up items (room blend). A generation-6 cache would
 /// report those rooms as having no history and apply the bare prior.
-const SNAPSHOT_CACHE_GENERATION: u32 = 7;
+///
+/// Bumped 7 -> 8 when the room p95 stopped counting a sender's close of its
+/// own posting (per-repo threshold, 2026-10-19). A generation-7 cache would
+/// keep reporting the biased-low value.
+const SNAPSHOT_CACHE_GENERATION: u32 = 8;
 
 /// Snapshot and freshness proof captured while one room mutation lock is held.
 /// This pair is the only value accepted by the cache writer.

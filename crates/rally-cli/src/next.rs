@@ -1796,6 +1796,11 @@ mod tests {
     fn ancient_open_queue_item_is_revalidated_not_hidden() {
         let snapshot = RoomSnapshot {
             open_handoffs: vec![open_queue_handoff("fact_97f3", 1, "2026-06-04T21:35:56Z")],
+            open_queue_signals: crate::open_queue::OpenQueueSignals {
+                pickup_sample: crate::pickup_threshold::MIN_ROOM_SAMPLE,
+                room_pickup_p95_secs: Some(7 * 86_400),
+                ..Default::default()
+            },
             ..RoomSnapshot::default()
         };
         for policy in [StaleTargetedPolicy::Surface, StaleTargetedPolicy::Ignore] {
@@ -1831,6 +1836,12 @@ mod tests {
                 accepted,
             ],
             open_obligations: vec![named_a, named_b, sender_closed],
+            // Enough repo history that the old pool item carries an age label.
+            open_queue_signals: crate::open_queue::OpenQueueSignals {
+                pickup_sample: crate::pickup_threshold::MIN_ROOM_SAMPLE,
+                room_pickup_p95_secs: Some(86_400),
+                ..Default::default()
+            },
             ..RoomSnapshot::default()
         };
         let next = next_for(&snapshot, StaleTargetedPolicy::Surface);

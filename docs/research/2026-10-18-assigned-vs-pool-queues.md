@@ -115,3 +115,5 @@ Source: https://github.com/sidekiq/sidekiq/wiki/Advanced-Options
 | 9 one projection | Yes | `obligations::named_handoffs` + `open_queue::open_queue_items` feed both `next` and `inbox`. A unit test and an end-to-end test assert that they agree. |
 
 Open item resolved: when a room has fewer than 20 picked-up open-queue items, the fallback is the measured cross-room p95 (208 h over 518 items in 37 rooms, 2026-10-18). Output names the source (`room` or `cross_room_fallback`). The alternative, "no age flag", would leave new rooms with no age signal at all.
+
+Superseded 2026-10-19: the cross-room fallback was removed. Each repo uses only its own pickup p95, with no age signal below 8 pickups and a 1 h floor. See `2026-10-19-room-pickup-threshold.md`.

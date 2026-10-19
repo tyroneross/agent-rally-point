@@ -94,7 +94,7 @@ pub(crate) struct OpenQueueSignals {
 impl OpenQueueSignals {
     /// The threshold actually applied, and how it was formed.
     pub(crate) fn effective_p95(&self) -> crate::pickup_threshold::PickupThreshold {
-        crate::pickup_threshold::blended_p95(self.room_pickup_p95_secs, self.pickup_sample)
+        crate::pickup_threshold::room_threshold(self.room_pickup_p95_secs, self.pickup_sample)
     }
 }
 
@@ -118,12 +118,12 @@ pub(crate) struct OpenQueueItem {
     pub(crate) ownership: &'static str,
     pub(crate) revalidate_before_claiming: bool,
     pub(crate) reasons: Vec<RevalidateReason>,
-    pub(crate) pickup_p95_secs: i64,
-    /// `"cross_room"` (no pickup history) or `"room_blend"`.
+    /// This repo's own pickup p95 (floored), or `None` when the age signal is
+    /// off because the repo has too little history.
+    pub(crate) pickup_p95_secs: Option<i64>,
+    /// `"room"` or `"insufficient_history"`.
     pub(crate) pickup_p95_source: &'static str,
-    /// Weight on this room's own p95 in the blend, `n / (n + 5)`.
-    pub(crate) pickup_room_weight: f64,
-    /// Picked-up open-queue items the room p95 came from.
+    /// Picked-up open-queue items in THIS repo the p95 came from.
     pub(crate) pickup_room_sample: usize,
 }
 
@@ -167,13 +167,12 @@ pub(crate) fn open_queue_items(
                     detail: id.clone(),
                 }));
             }
-            if age_secs.is_some_and(|age| age > p95) {
+            if let Some(p95) = p95
+                && age_secs.is_some_and(|age| age > p95)
+            {
                 reasons.push(RevalidateReason {
                     code: "older_than_room_pickup_p95",
-                    detail: format!(
-                        "p95={p95}s source={} room_weight={:.2} n={}",
-                        threshold.source, threshold.room_weight, threshold.room_sample
-                    ),
+                    detail: format!("p95={p95}s source=room n={}", threshold.room_sample),
                 });
             }
             (
@@ -190,7 +189,6 @@ pub(crate) fn open_queue_items(
                     reasons,
                     pickup_p95_secs: p95,
                     pickup_p95_source: threshold.source,
-                    pickup_room_weight: threshold.room_weight,
                     pickup_room_sample: threshold.room_sample,
                 },
             )
@@ -303,6 +301,23 @@ fn rejected_named(facts: &[Fact], open_handoffs: &[Fact]) -> BTreeSet<String> {
 /// System-authored closes (reaper expiry) are not pickups and are excluded.
 /// Returns `(0, None)` when the room has no picked-up item.
 pub(crate) fn room_pickup_p95(facts: &[Fact]) -> (usize, Option<i64>) {
+    // Original open-queue handoffs, with their sender: the sender resolving
+    // its own posting is housekeeping, not a pickup, and would bias the room
+    // p95 low (audit F1, 2026-10-19).
+    let originals = facts
+        .iter()
+        .filter(|fact| {
+            fact.kind == FactKind::Handoff
+                && fact.ref_id.is_none()
+                && handoff_address(fact, "\0") == HandoffAddress::OpenQueue
+        })
+        .filter_map(|fact| {
+            Some((
+                fact.event_id.as_str(),
+                (epoch(&fact.created_at)?, fact.tool.as_deref()),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
     let mut first_close: HashMap<&str, i64> = HashMap::new();
     for fact in facts {
         if !matches!(
@@ -315,22 +330,22 @@ pub(crate) fn room_pickup_p95(facts: &[Fact]) -> (usize, Option<i64>) {
         let (Some(ref_id), Some(at)) = (fact.ref_id.as_deref(), epoch(&fact.created_at)) else {
             continue;
         };
+        let Some((_, sender)) = originals.get(ref_id) else {
+            continue;
+        };
+        if sender.is_some() && *sender == fact.tool.as_deref() {
+            continue;
+        }
         first_close
             .entry(ref_id)
             .and_modify(|seen| *seen = (*seen).min(at))
             .or_insert(at);
     }
-    let mut durations = facts
+    let mut durations = originals
         .iter()
-        .filter(|fact| {
-            fact.kind == FactKind::Handoff
-                && fact.ref_id.is_none()
-                && handoff_address(fact, "\0") == HandoffAddress::OpenQueue
-        })
-        .filter_map(|fact| {
-            let closed = *first_close.get(fact.event_id.as_str())?;
-            let opened = epoch(&fact.created_at)?;
-            (closed >= opened).then_some(closed - opened)
+        .filter_map(|(id, (opened, _))| {
+            let closed = *first_close.get(id)?;
+            (closed >= *opened).then_some(closed - opened)
         })
         .collect::<Vec<_>>();
     let sample = durations.len();
@@ -906,6 +921,89 @@ mod tests {
         assert_eq!(room_pickup_p95(&facts), (20, Some(19 * 3600)));
     }
 
+    /// Audit F1: the sender resolving its own posting is not a pickup.
+    #[test]
+    fn a_sender_closing_its_own_posting_is_not_a_pickup() {
+        let mut facts = Vec::new();
+        for i in 0..3_i64 {
+            facts.push(handoff(&format!("h{i}"), i * 2 + 1, None, &at(0)));
+            let mut own = closer(&format!("c{i}"), i * 2 + 2, &format!("h{i}"), &at(1));
+            own.tool = Some("claude_code".to_string()); // same as handoff() sender
+            facts.push(own);
+        }
+        assert_eq!(room_pickup_p95(&facts), (0, None));
+        facts.push(closer("peer", 100, "h0", &at(5)));
+        assert_eq!(room_pickup_p95(&facts), (1, Some(5 * 3600)));
+    }
+
+    /// Below the minimum sample the AGE signal is off, but every other
+    /// revalidation signal still fires; at the minimum the repo's own p95
+    /// applies.
+    #[test]
+    fn age_signal_needs_history_but_other_signals_do_not() {
+        let mut snapshot = RoomSnapshot::default();
+        snapshot
+            .open_handoffs
+            .push(handoff("ancient", 1, None, "2000-01-01T00:00:00Z"));
+        snapshot
+            .open_queue_signals
+            .later_done
+            .insert("ancient".to_string(), vec!["landed-1".to_string()]);
+        snapshot.open_queue_signals.room_pickup_p95_secs = Some(3 * 3600);
+        snapshot.open_queue_signals.pickup_sample = crate::pickup_threshold::MIN_ROOM_SAMPLE - 1;
+        let now = chrono::Utc::now().timestamp();
+        let items = open_queue_items(&snapshot, "codex", &FsSignals::default(), now);
+        let codes = items[0].reasons.iter().map(|r| r.code).collect::<Vec<_>>();
+        assert_eq!(
+            codes,
+            vec!["later_fact_reports_done"],
+            "no age label below N"
+        );
+        assert_eq!(items[0].pickup_p95_secs, None);
+        assert_eq!(items[0].pickup_p95_source, "insufficient_history");
+
+        snapshot.open_queue_signals.pickup_sample = crate::pickup_threshold::MIN_ROOM_SAMPLE;
+        let items = open_queue_items(&snapshot, "codex", &FsSignals::default(), now);
+        let codes = items[0].reasons.iter().map(|r| r.code).collect::<Vec<_>>();
+        assert_eq!(
+            codes,
+            vec!["later_fact_reports_done", "older_than_room_pickup_p95"]
+        );
+        assert_eq!(
+            items[0].pickup_p95_secs,
+            Some(3 * 3600),
+            "the repo's own p95"
+        );
+        assert_eq!(items[0].pickup_p95_source, "room");
+    }
+
+    /// Two repos, one fast and one slow: each threshold comes from its own
+    /// ledger only. Adding the other repo's history changes nothing.
+    #[test]
+    fn each_repo_threshold_ignores_every_other_repo() {
+        let room = |prefix: &str, hours: i64| {
+            let mut facts = Vec::new();
+            for i in 0..10_i64 {
+                facts.push(handoff(&format!("{prefix}h{i}"), i * 2 + 1, None, &at(0)));
+                facts.push(closer(
+                    &format!("{prefix}c{i}"),
+                    i * 2 + 2,
+                    &format!("{prefix}h{i}"),
+                    &at(hours),
+                ));
+            }
+            facts
+        };
+        let (fast, slow) = (room("f", 2), room("s", 300));
+        let fast_t = project_signals(&fast, &[]).effective_p95();
+        let slow_t = project_signals(&slow, &[]).effective_p95();
+        assert_eq!(fast_t.secs, Some(2 * 3600));
+        assert_eq!(slow_t.secs, Some(300 * 3600));
+        // Re-deriving the fast repo after the slow one exists elsewhere: same.
+        let again = project_signals(&fast, &[]).effective_p95();
+        assert_eq!(again, fast_t);
+    }
+
     #[test]
     fn named_handoffs_and_system_closes_do_not_feed_the_open_queue_p95() {
         let mut facts = Vec::new();
@@ -1056,6 +1154,9 @@ mod tests {
     #[test]
     fn old_items_are_revalidated_never_removed() {
         let mut snapshot = RoomSnapshot::default();
+        // This repo has enough history for an age signal: p95 = 1 day.
+        snapshot.open_queue_signals.pickup_sample = crate::pickup_threshold::MIN_ROOM_SAMPLE;
+        snapshot.open_queue_signals.room_pickup_p95_secs = Some(86_400);
         snapshot
             .open_handoffs
             .push(handoff("ancient", 1, None, "2000-01-01T00:00:00Z"));

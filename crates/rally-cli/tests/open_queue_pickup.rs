@@ -438,22 +438,31 @@ fn a_full_evidence_list_reports_unrecorded_base_markers() {
     );
 }
 
-/// The revalidation age threshold blends this room's pickup history with the
-/// cross-room prior, and `rally next` says how: no history -> `cross_room`
-/// (208 h); two quick pickups -> `room_blend` with weight 2/7, well below 208 h.
+/// The age threshold is this repo's own pickup p95 once it has enough
+/// history; before that the age signal is off and `rally next` says so, while
+/// the scope-change signal still fires.
 #[test]
-fn next_reports_the_room_blend_threshold() {
-    const CROSS_ROOM_SECS: i64 = 208 * 3600;
+fn next_uses_the_repos_own_history_for_the_age_signal() {
     let sandbox = ChannelSandbox::spawn();
-    say_handoff(&sandbox, &["--subject", "anyone: triage the flaky test"]);
-    let fresh = next(&sandbox);
-    let item = &fresh["inbox"]["open_queue"]["items"][0];
-    assert_eq!(item["pickup_p95_source"], "cross_room", "{item}");
-    assert_eq!(item["pickup_p95_secs"], CROSS_ROOM_SECS);
-    assert_eq!(item["pickup_room_weight"], 0.0);
+    std::fs::write(sandbox.cwd().join("c.rs"), "fn c() {}\n").unwrap();
+    say_handoff(
+        &sandbox,
+        &["--subject", "anyone: split c.rs please", "--path", "c.rs"],
+    );
+    std::fs::write(sandbox.cwd().join("c.rs"), "fn c() { changed() }\n").unwrap();
+    let early = next(&sandbox);
+    let item = &early["inbox"]["open_queue"]["items"][0];
+    assert_eq!(item["pickup_p95_source"], "insufficient_history", "{item}");
+    assert!(item["pickup_p95_secs"].is_null());
+    assert_eq!(item["pickup_room_sample"], 0);
+    assert_eq!(
+        reason_codes(item),
+        vec!["scope_changed_since_posted"],
+        "other signals still fire"
+    );
 
-    for subject in ["anyone: rotate the logs", "anyone: bump the toolchain"] {
-        let posted = say_handoff(&sandbox, &["--subject", subject]);
+    for i in 0..8 {
+        let posted = say_handoff(&sandbox, &["--subject", &format!("anyone: chore {i}")]);
         let id = posted["data"]["say"]["fact"]["event_id"]
             .as_str()
             .unwrap()
@@ -472,12 +481,37 @@ fn next_reports_the_room_blend_threshold() {
             "done in test",
         ]);
     }
-    let blended = next(&sandbox);
-    let item = &blended["inbox"]["open_queue"]["items"][0];
-    assert_eq!(item["pickup_p95_source"], "room_blend", "{item}");
-    assert_eq!(item["pickup_room_sample"], 2);
-    let w = item["pickup_room_weight"].as_f64().unwrap();
-    assert!((w - 2.0 / 7.0).abs() < 1e-9, "{w}");
-    let secs = item["pickup_p95_secs"].as_i64().unwrap();
-    assert!(secs > 60 && secs < CROSS_ROOM_SECS / 4, "{secs}");
+    // The sender closing its own posting is not a pickup and must not count.
+    let own = say_handoff(&sandbox, &["--subject", "anyone: one more chore"]);
+    let own_id = own["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    sandbox.rally_json(&[
+        "say",
+        "resolve",
+        "--json",
+        "--tool",
+        SENDER,
+        "--ref",
+        &own_id,
+        "--subject",
+        "never mind",
+        "--evidence",
+        "withdrawn",
+    ]);
+    let later = next(&sandbox);
+    let item = &later["inbox"]["open_queue"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["subject"] == "anyone: split c.rs please")
+        .cloned()
+        .unwrap();
+    assert_eq!(item["pickup_p95_source"], "room", "{item}");
+    assert_eq!(item["pickup_room_sample"], 8, "self-close excluded");
+    assert_eq!(
+        item["pickup_p95_secs"], 3600,
+        "instant pickups floor at 1 h"
+    );
 }
