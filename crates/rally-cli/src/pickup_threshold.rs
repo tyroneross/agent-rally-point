@@ -79,6 +79,13 @@ mod tests {
 
     const HOUR: i64 = 3600;
 
+    /// N = 8 is a measured choice (docs/research/2026-10-19-room-pickup-threshold.md):
+    /// at n = 5 the nearest-rank p95 reads 0.69x the true value. Change it only with new data.
+    #[test]
+    fn minimum_room_sample_is_the_measured_eight() {
+        assert_eq!(MIN_ROOM_SAMPLE, 8);
+    }
+
     #[test]
     fn below_the_minimum_sample_there_is_no_age_signal() {
         for n in 0..MIN_ROOM_SAMPLE {
