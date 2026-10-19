@@ -3592,15 +3592,13 @@ fn command_say(args: SayArgs) -> Result<Output> {
         && let Some(ref root) = repo_root_for_grounding
     {
         let room_free = rally_protocol::ledger::MAX_EVIDENCE_ITEMS.saturating_sub(evidence.len());
-        let markers = open_queue::base_markers(root, &scope)
+        let (markers, oversize): (Vec<_>, Vec<_>) = open_queue::base_markers(root, &scope)
             .into_iter()
-            .filter(|marker| marker.len() <= rally_protocol::ledger::MAX_EVIDENCE_ITEM_LEN)
-            .collect::<Vec<_>>();
-        if markers.len() > room_free {
-            // Recording a base must never fail the write, but a silently
-            // missing base would also silence the overwrite guard (SEC-004).
-            handoff_base_dropped = markers.len() - room_free;
-        }
+            .partition(|marker| marker.len() <= rally_protocol::ledger::MAX_EVIDENCE_ITEM_LEN);
+        // Recording a base must never fail the write, but a silently missing
+        // base would also silence the overwrite guard (SEC-004): count every
+        // marker that does not land, whether too long or out of room.
+        handoff_base_dropped = oversize.len() + markers.len().saturating_sub(room_free);
         evidence.extend(markers.into_iter().take(room_free));
     }
 

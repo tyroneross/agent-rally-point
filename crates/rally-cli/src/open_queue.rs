@@ -98,6 +98,12 @@ pub(crate) struct OpenQueueSignals {
     /// Open-queue item id → later facts that report it done.
     #[serde(default)]
     pub(crate) later_done: BTreeMap<String, Vec<String>>,
+    /// Open NAMED handoffs whose addressee answered with `handoff.rejected`.
+    /// The rejection closes the inbox obligation and hands the work back, so
+    /// `obligations::named_work` must not count it as accepted-but-open.
+    /// Bounded by the open named handoffs in the room.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) rejected_named: BTreeSet<String>,
 }
 
 impl OpenQueueSignals {
@@ -243,7 +249,33 @@ pub(crate) fn project_signals(facts: &[Fact], open_handoffs: &[Fact]) -> OpenQue
         pickup_sample: sample,
         room_pickup_p95_secs: p95,
         later_done,
+        rejected_named: rejected_named(facts, open_handoffs),
     }
+}
+
+/// Open named handoffs their addressee declined with a typed rejection.
+fn rejected_named(facts: &[Fact], open_handoffs: &[Fact]) -> BTreeSet<String> {
+    let targets = open_handoffs
+        .iter()
+        .filter(|fact| {
+            fact.kind == FactKind::Handoff
+                && handoff_address(fact, "\0") == HandoffAddress::Elsewhere
+        })
+        .filter_map(|fact| Some((fact.event_id.as_str(), fact.target.as_deref()?)))
+        .collect::<HashMap<_, _>>();
+    if targets.is_empty() {
+        return BTreeSet::new();
+    }
+    facts
+        .iter()
+        .filter(|fact| crate::store::handoff_response_is_rejection(fact))
+        .filter_map(|fact| {
+            let ref_id = fact.ref_id.as_deref()?;
+            // Receiver-authored only: a sender or bystander cannot decline
+            // work on the addressee's behalf.
+            (targets.get(ref_id).copied() == fact.tool.as_deref()).then(|| ref_id.to_string())
+        })
+        .collect()
 }
 
 /// Nearest-rank p95 of time-to-close over CLOSED original open-queue handoffs.

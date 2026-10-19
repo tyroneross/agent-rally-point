@@ -214,3 +214,74 @@ fn caller_cannot_supply_the_base_markers_rally_records() {
     );
     assert!(said.contains("handoff_base_evidence_reserved"), "{said}");
 }
+
+/// A named handoff the addressee ACCEPTED is still assigned work and keeps
+/// outranking the open queue; one it REJECTED is handed back and drops out.
+#[test]
+fn accepted_named_work_stays_ranked_and_rejected_work_drops_out() {
+    let sandbox = ChannelSandbox::spawn();
+    say_handoff(&sandbox, &["--subject", "anyone: triage the flaky test"]);
+    let accepted = say_handoff(
+        &sandbox,
+        &["--target", PICKER, "--subject", "review my PR please"],
+    );
+    let accepted_id = accepted["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rejected = say_handoff(
+        &sandbox,
+        &["--target", PICKER, "--subject", "port the iOS build please"],
+    );
+    let rejected_id = rejected["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for (id, state) in [(&accepted_id, "accepted"), (&rejected_id, "rejected")] {
+        sandbox.rally_json(&[
+            "say",
+            "handoff",
+            "--json",
+            "--tool",
+            PICKER,
+            "--ref",
+            id,
+            "--handoff-state",
+            state,
+            "--subject",
+            "reply",
+            "--summary",
+            "typed receiver response",
+        ]);
+    }
+
+    let ranked = next(&sandbox);
+    let named = std::iter::once(&ranked)
+        .chain(ranked["alternatives"].as_array().unwrap().iter())
+        .filter(|c| c["action"] == "respond_to_handoff")
+        .map(|c| {
+            (
+                c["target_event_id"].as_str().unwrap().to_string(),
+                c["reason"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        named,
+        vec![(
+            accepted_id.clone(),
+            "accepted_handoff_still_open".to_string()
+        )],
+        "{ranked}"
+    );
+    assert_eq!(
+        ranked["action"], "respond_to_handoff",
+        "accepted work outranks the open queue"
+    );
+    assert_eq!(ranked["inbox"]["accepted_open"], 1);
+    assert_eq!(
+        ranked["inbox"]["count"], 0,
+        "both replies answered the inbox obligation"
+    );
+}

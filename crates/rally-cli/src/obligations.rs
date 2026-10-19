@@ -115,6 +115,7 @@ pub(crate) enum NamedState {
     Unanswered,
     /// The receiver acked or accepted it (`handoff.acked` / `handoff.accepted`),
     /// which closes the obligation, but nothing resolved the handoff itself.
+    /// A `handoff.rejected` reply is excluded: that hands the work back.
     /// An ack is not completion (AGEN-COORDINATION-kzt037p65xg01), so this is
     /// still assigned work and still outranks the open queue.
     AcceptedOpen,
@@ -146,6 +147,10 @@ pub(crate) fn named_work<'a>(
             .filter(|fact| {
                 crate::next::handoff_address(fact, tool) == crate::next::HandoffAddress::Named
                     && !owed.contains(fact.event_id.as_str())
+                    && !snapshot
+                        .open_queue_signals
+                        .rejected_named
+                        .contains(&fact.event_id)
             })
             .map(|fact| (fact, NamedState::AcceptedOpen)),
     );

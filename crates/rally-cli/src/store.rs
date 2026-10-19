@@ -1251,6 +1251,14 @@ pub(crate) fn handoff_is_protocol_response(fact: &Fact) -> bool {
         )
 }
 
+/// A typed receiver response that DECLINES the handoff (`handoff.rejected`).
+/// It closes the receiver's obligation like an ack does, but unlike an
+/// acceptance it hands the work back, so it is not still-assigned work.
+pub(crate) fn handoff_response_is_rejection(fact: &Fact) -> bool {
+    handoff_is_protocol_response(fact)
+        && protocol_marker(fact, "event_kind") == Some("handoff.rejected")
+}
+
 pub(crate) fn strict_handoff_target_session(fact: &Fact) -> Option<&str> {
     (is_fact_v1_handoff_bridge(fact)
         && protocol_marker(fact, "event_kind") == Some("handoff.requested"))
