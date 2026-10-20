@@ -487,21 +487,122 @@ mod imp {
         String::from_utf8(buf).map_err(|e| StoreError::transport(format!("non-utf8 request: {e}")))
     }
 
-    fn write_response(mut stream: &UnixStream, resp: &StoreResponse) -> std::io::Result<()> {
+    fn write_response(stream: &UnixStream, resp: &StoreResponse) -> std::io::Result<()> {
+        write_response_bounded(stream, resp, "reply", MAX_LINE_BYTES)
+    }
+
+    /// Frame `resp` as one newline-terminated line no longer than `cap`. An
+    /// oversized reply is replaced by a typed `reply-too-large` error naming the
+    /// op, so the client always receives a line instead of an empty reply.
+    fn frame_response(resp: &StoreResponse, op_kind: &str, cap: usize) -> std::io::Result<String> {
         let mut line =
             serde_json::to_string(resp).map_err(|e| std::io::Error::other(e.to_string()))?;
         line.push('\n');
-        if line.len() > MAX_LINE_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "serialized daemon reply is {} bytes, exceeding protocol maximum {MAX_LINE_BYTES}",
-                    line.len()
-                ),
-            ));
+        if line.len() <= cap {
+            return Ok(line);
         }
+        let size = line.len();
+        log(&format!(
+            "reply too large: op={op_kind} bytes={size} max={cap}; sent typed error instead"
+        ));
+        let err = StoreResponse::Err(StoreError::new(
+            StoreErrorKind::Command,
+            format!(
+                "reply-too-large: {op_kind} reply is {size} bytes, exceeding protocol maximum {cap}; the request must be bounded or paginated"
+            ),
+        ));
+        let mut line =
+            serde_json::to_string(&err).map_err(|e| std::io::Error::other(e.to_string()))?;
+        line.push('\n');
+        Ok(line)
+    }
+
+    fn write_response_bounded(
+        mut stream: &UnixStream,
+        resp: &StoreResponse,
+        op_kind: &str,
+        cap: usize,
+    ) -> std::io::Result<()> {
+        let line = frame_response(resp, op_kind, cap)?;
         stream.write_all(line.as_bytes())?;
         stream.flush()
+    }
+
+    /// Snake-case op name from the wire `kind` tag, for logs and errors.
+    fn op_kind_name(op: &StoreOp) -> String {
+        serde_json::to_value(op)
+            .ok()
+            .and_then(|v| v.get("kind").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    /// Room kept free of the page payload for the reply envelope.
+    const FACTS_PAGE_HEADROOM: usize = 256 * 1024;
+
+    /// One seq-ordered page of `facts` with `seq > after_seq`. Adds facts while
+    /// the running serialized size stays within the budget, but always includes
+    /// one fact when any remain (a single fact is capped far below the budget).
+    /// `next_after_seq` is the last included seq when more facts remain.
+    fn facts_page(
+        mut facts: Vec<store::Fact>,
+        after_seq: i64,
+        max_bytes: usize,
+    ) -> Result<(Vec<Value>, Option<i64>), StoreError> {
+        let budget = max_bytes.min(MAX_LINE_BYTES - FACTS_PAGE_HEADROOM);
+        facts.retain(|fact| fact.seq > after_seq);
+        facts.sort_by_key(|fact| fact.seq);
+        let mut page = Vec::new();
+        let mut used = 0usize;
+        let mut last_seq = after_seq;
+        let mut more = false;
+        for fact in &facts {
+            let value = to_wire_value(fact)?;
+            let size = serde_json::to_string(&value)
+                .map(|text| text.len() + 1)
+                .map_err(|e| {
+                    StoreError::new(StoreErrorKind::Internal, format!("size fact: {e}"))
+                })?;
+            if !page.is_empty() && used + size > budget {
+                more = true;
+                break;
+            }
+            used += size;
+            last_seq = fact.seq;
+            page.push(value);
+        }
+        Ok((page, more.then_some(last_seq)))
+    }
+
+    /// When an include_archived=false snapshot reply would exceed `cap`, drop
+    /// its `stale_facts` rows (the bulk of the payload). Counts and totals stay
+    /// as computed. Returns whether rows were dropped.
+    fn clear_stale_facts_if_oversized(
+        ok: &mut StoreOk,
+        include_archived: bool,
+        cap: usize,
+    ) -> bool {
+        if include_archived {
+            return false;
+        }
+        // `{"ok":` wrapper plus the closing brace and newline.
+        const ENVELOPE_SLACK: usize = 16;
+        let oversized = serde_json::to_string(&*ok)
+            .map(|text| text.len() + ENVELOPE_SLACK > cap)
+            .unwrap_or(false);
+        if !oversized {
+            return false;
+        }
+        let StoreOk::Snapshot { snapshot, .. } = ok else {
+            return false;
+        };
+        match snapshot.get_mut("stale_facts") {
+            Some(rows) if rows.as_array().is_some_and(|rows| !rows.is_empty()) => {
+                *rows = Value::Array(Vec::new());
+                log("snapshot reply over protocol maximum; dropped stale_facts rows");
+                true
+            }
+            _ => false,
+        }
     }
 
     /// A nonblocking listener may yield an accepted stream with nonblocking
@@ -540,6 +641,7 @@ mod imp {
     ) -> std::io::Result<()> {
         prepare_accepted_stream(&stream)?;
 
+        let mut op_kind = String::from("unparsed");
         let response = match read_request_line(&stream) {
             Err(e) => StoreResponse::Err(e),
             Ok(line) => {
@@ -553,6 +655,7 @@ mod imp {
                             format!("malformed request: {e}"),
                         )),
                         Ok(req) => {
+                            op_kind = op_kind_name(&req.op);
                             let (reply_tx, reply_rx) = mpsc::channel();
                             let job = Job {
                                 request: req,
@@ -590,7 +693,7 @@ mod imp {
         if store::trigger_o26_fault(rally_dir, store::O26FaultPoint::DaemonReplyDrop).is_err() {
             return Ok(());
         }
-        write_response(&stream, &response)
+        write_response_bounded(&stream, &response, &op_kind, MAX_LINE_BYTES)
     }
 
     /// Map an internal [`RallyError`] onto the frozen wire [`StoreError`] with
@@ -957,6 +1060,25 @@ mod imp {
                     facts: to_wire_values(&facts)?,
                 }
             }
+            StoreOp::SessionPresenceFacts { session_id } => {
+                let facts = store
+                    .session_presence_facts(&session_id)
+                    .map_err(rally_to_wire)?;
+                StoreOk::Facts {
+                    facts: to_wire_values(&facts)?,
+                }
+            }
+            StoreOp::FactsPage {
+                after_seq,
+                max_bytes,
+            } => {
+                let facts = store.facts().map_err(rally_to_wire)?;
+                let (facts, next_after_seq) = facts_page(facts, after_seq, max_bytes)?;
+                StoreOk::FactsPage {
+                    facts,
+                    next_after_seq,
+                }
+            }
             StoreOp::RepoWideClaimLifecycleFacts => {
                 let facts = store
                     .repo_wide_claim_lifecycle_facts()
@@ -1017,14 +1139,16 @@ mod imp {
                     .snapshot_cache_capture(include_archived)
                     .map_err(rally_to_wire)?;
                 let snapshot = capture.snapshot.without_caller_scoped_transport();
-                StoreOk::Snapshot {
+                let mut ok = StoreOk::Snapshot {
                     snapshot: snapshot_to_wire(&snapshot)?,
                     fingerprint: capture
                         .fingerprint
                         .as_ref()
                         .map(to_wire_value)
                         .transpose()?,
-                }
+                };
+                clear_stale_facts_if_oversized(&mut ok, include_archived, MAX_LINE_BYTES);
+                ok
             }
             StoreOp::SnapshotForEnter {
                 tool,
@@ -1576,6 +1700,197 @@ mod imp {
             assert_real_socket_response_complete(MAX_LINE_BYTES);
         }
 
+        fn seq_fact(seq: i64, pad: usize) -> store::Fact {
+            store::Fact {
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: format!("evt-{seq}"),
+                seq,
+                subject: "x".repeat(pad),
+                created_at: crate::now_string(),
+                ..store::Fact::default()
+            }
+        }
+
+        fn drain_pages(facts: &[store::Fact], max_bytes: usize) -> (Vec<Vec<Value>>, usize) {
+            let mut pages = Vec::new();
+            let mut after = i64::MIN;
+            loop {
+                let (page, next) = facts_page(facts.to_vec(), after, max_bytes).unwrap();
+                let bytes = page
+                    .iter()
+                    .map(|v| serde_json::to_string(v).unwrap().len() + 1)
+                    .sum::<usize>();
+                assert!(pages.len() <= facts.len() + 1, "paging must terminate");
+                pages.push((page, bytes));
+                match next {
+                    Some(n) => after = n,
+                    None => break,
+                }
+            }
+            let max_page_bytes = pages.iter().map(|(_, b)| *b).max().unwrap_or(0);
+            (pages.into_iter().map(|(p, _)| p).collect(), max_page_bytes)
+        }
+
+        #[test]
+        fn facts_pages_reassemble_to_the_full_ordered_ledger_within_budget() {
+            // Shuffled input order proves the page sorts by seq itself.
+            let mut facts: Vec<store::Fact> = (1..=40)
+                .map(|seq| seq_fact(seq, 200 + (seq as usize % 7) * 300))
+                .collect();
+            facts.reverse();
+            let budget = 6 * 1024;
+            let (pages, max_page_bytes) = drain_pages(&facts, budget);
+            assert!(pages.len() > 1, "fixture must span several pages");
+            assert!(max_page_bytes <= budget, "page exceeded its byte budget");
+            let seqs: Vec<i64> = pages
+                .iter()
+                .flatten()
+                .map(|v| v["seq"].as_i64().unwrap())
+                .collect();
+            assert_eq!(seqs, (1..=40).collect::<Vec<_>>());
+        }
+
+        #[test]
+        fn tiny_facts_page_budget_still_yields_one_fact_per_page_and_terminates() {
+            let facts: Vec<store::Fact> = (1..=5).map(|seq| seq_fact(seq, 500)).collect();
+            let (pages, _) = drain_pages(&facts, 1);
+            assert_eq!(pages.len(), 5);
+            assert!(pages.iter().all(|page| page.len() == 1));
+            let (empty, next) = facts_page(Vec::new(), i64::MIN, 1).unwrap();
+            assert!(empty.is_empty() && next.is_none());
+        }
+
+        #[test]
+        fn facts_page_op_and_session_presence_op_are_served_by_the_daemon() {
+            let repo_root = unique_repo_root("facts-page-ops");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            for (event_id, kind, session) in [
+                ("p-a", store::FactKind::Presence, "sess:a"),
+                ("p-b", store::FactKind::Presence, "sess:b"),
+                ("c-a", store::FactKind::Claim, "sess:a"),
+            ] {
+                store
+                    .append_fact(&store::Fact {
+                        schema: crate::FACT_SCHEMA.to_string(),
+                        event_id: event_id.to_string(),
+                        thread_id: format!("thread-{event_id}"),
+                        kind,
+                        tool: Some("codex:test".to_string()),
+                        from_session_id: Some(session.to_string()),
+                        subject: format!("fact {event_id}"),
+                        created_at: crate::now_string(),
+                        ..store::Fact::default()
+                    })
+                    .unwrap();
+            }
+            let repo = canonical_repo_root(&repo_root);
+            match dispatch_one(
+                &mut store,
+                repo.as_str(),
+                StoreRequest::new(
+                    None,
+                    StoreOp::SessionPresenceFacts {
+                        session_id: "sess:a".to_string(),
+                    },
+                ),
+            ) {
+                StoreResponse::Ok(StoreOk::Facts { facts }) => {
+                    let ids: Vec<&str> = facts
+                        .iter()
+                        .filter_map(|f| f["event_id"].as_str())
+                        .collect();
+                    assert_eq!(ids, vec!["p-a"], "only that session's presence facts");
+                }
+                other => panic!("unexpected session presence reply: {other:?}"),
+            }
+            match dispatch_one(
+                &mut store,
+                repo.as_str(),
+                StoreRequest::new(
+                    None,
+                    StoreOp::FactsPage {
+                        after_seq: i64::MIN,
+                        max_bytes: 1,
+                    },
+                ),
+            ) {
+                StoreResponse::Ok(StoreOk::FactsPage {
+                    facts,
+                    next_after_seq,
+                }) => {
+                    assert_eq!(facts.len(), 1);
+                    assert_eq!(next_after_seq, facts[0]["seq"].as_i64());
+                }
+                other => panic!("unexpected facts page reply: {other:?}"),
+            }
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
+        fn oversized_reply_is_a_typed_error_and_the_daemon_keeps_serving() {
+            let cap = 4 * 1024;
+            let big = facts_response_with_line_len(cap + 1024);
+            let (server, client) = UnixStream::pair().unwrap();
+            write_response_bounded(&server, &big, "facts", cap).unwrap();
+            let mut line = String::new();
+            BufReader::new(&client).read_line(&mut line).unwrap();
+            assert!(!line.is_empty(), "client must never see an empty reply");
+            match serde_json::from_str::<StoreResponse>(line.trim()).unwrap() {
+                StoreResponse::Err(err) => {
+                    assert_eq!(err.kind, StoreErrorKind::Command);
+                    assert!(err.message.starts_with("reply-too-large: facts reply is"));
+                    assert!(err.message.contains(&format!("maximum {cap}")));
+                }
+                other => panic!("expected typed error, got {other:?}"),
+            }
+            // The next connection is served normally.
+            let (server, client) = UnixStream::pair().unwrap();
+            let pong = StoreResponse::Ok(StoreOk::Pong {
+                repo_root: "/r".to_string(),
+                pid: 1,
+                wire_version: WIRE_VERSION,
+            });
+            write_response_bounded(&server, &pong, "ping", cap).unwrap();
+            let mut line = String::new();
+            BufReader::new(&client).read_line(&mut line).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<StoreResponse>(line.trim()).unwrap(),
+                StoreResponse::Ok(StoreOk::Pong { .. })
+            ));
+        }
+
+        #[test]
+        fn oversized_unarchived_snapshot_drops_stale_rows_but_keeps_counts() {
+            let rows: Vec<Value> = (0..200)
+                .map(|i| serde_json::json!({"event_id": format!("e{i}"), "subject": "y".repeat(100)}))
+                .collect();
+            let make = |rows: Vec<Value>| StoreOk::Snapshot {
+                snapshot: serde_json::json!({"stale_facts": rows, "totals": {"stale_facts": 200}}),
+                fingerprint: None,
+            };
+            let cap = 8 * 1024;
+            let mut ok = make(rows.clone());
+            assert!(clear_stale_facts_if_oversized(&mut ok, false, cap));
+            match &ok {
+                StoreOk::Snapshot { snapshot, .. } => {
+                    assert_eq!(snapshot["stale_facts"], serde_json::json!([]));
+                    assert_eq!(snapshot["totals"]["stale_facts"], 200);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+            let line = serde_json::to_string(&StoreResponse::Ok(ok)).unwrap();
+            assert!(line.len() < cap);
+            // include_archived=true and in-budget replies are left alone.
+            let mut archived = make(rows.clone());
+            assert!(!clear_stale_facts_if_oversized(&mut archived, true, cap));
+            let mut small = make(rows);
+            assert!(!clear_stale_facts_if_oversized(
+                &mut small,
+                false,
+                1024 * 1024
+            ));
+        }
+
         #[test]
         fn response_write_reports_a_disconnected_peer() {
             let (server, peer) = UnixStream::pair().unwrap();
@@ -1594,12 +1909,12 @@ mod imp {
         }
 
         #[test]
-        fn daemon_rejects_v7_requests_after_enter_context_cutover() {
-            assert_eq!(WIRE_VERSION, 8, "this control grades the v7 to v8 cutover");
-            let repo_root = unique_repo_root("reject-v7");
+        fn daemon_rejects_v8_requests_after_paged_facts_cutover() {
+            assert_eq!(WIRE_VERSION, 9, "this control grades the v8 to v9 cutover");
+            let repo_root = unique_repo_root("reject-v8");
             let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
             let request = StoreRequest {
-                wire_version: 7,
+                wire_version: 8,
                 engagement: None,
                 deadline_unix_ms: None,
                 mutation_budget_ms: None,
@@ -1608,8 +1923,8 @@ mod imp {
             match dispatch_one(&mut store, "/expected/repo", request) {
                 StoreResponse::Err(error) => {
                     assert_eq!(error.kind, StoreErrorKind::IncompatibleWire);
-                    assert!(error.message.contains("daemon speaks 8"));
-                    assert!(error.message.contains("client sent 7"));
+                    assert!(error.message.contains("daemon speaks 9"));
+                    assert!(error.message.contains("client sent 8"));
                 }
                 other => panic!("v7 request was not rejected: {other:?}"),
             }

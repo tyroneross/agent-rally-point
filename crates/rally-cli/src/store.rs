@@ -4627,18 +4627,11 @@ impl RoomStore {
     }
 
     /// Presence facts stamped with `session_id` (Stage 0 implicit-presence
-    /// guard). Routed stores filter the full fact list as before.
+    /// guard). Routed stores ask the daemon for the scoped read.
     pub(crate) fn session_presence_facts(&self, session_id: &str) -> Result<Vec<Fact>> {
         match self {
             RoomStore::Direct(d) => d.session_presence_facts(session_id),
-            RoomStore::Routed(r) => Ok(r
-                .facts()?
-                .into_iter()
-                .filter(|fact| {
-                    fact.kind == FactKind::Presence
-                        && fact.from_session_id.as_deref() == Some(session_id)
-                })
-                .collect()),
+            RoomStore::Routed(r) => r.session_presence_facts(session_id),
         }
     }
 

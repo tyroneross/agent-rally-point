@@ -62,7 +62,9 @@ use serde_json::Value;
 /// reply carries this; a client seeing an incompatible version fails
 /// immediately with typed `IncompatibleWire` and never falls back to direct.
 // v8: enter collision diagnostics carry caller evidence and a session-aware guard.
-pub const WIRE_VERSION: u32 = 8;
+// v9: bounded `SessionPresenceFacts` and `FactsPage` ops (the routed client no longer
+// asks for the whole ledger in one reply).
+pub const WIRE_VERSION: u32 = 9;
 
 /// Hard cap on a single request/response line. A longer line is a framing
 /// error (or an abuse) and maps to the transport-error class (R7): the daemon
@@ -141,6 +143,14 @@ pub enum StoreOp {
     },
     /// `RoomStore::facts()` → `Vec<Fact>`.
     Facts,
+    /// Presence facts stamped with one session id, answered as
+    /// [`StoreOk::Facts`]. Scoped so a large ledger cannot overflow one reply.
+    SessionPresenceFacts { session_id: String },
+    /// One bounded page of the ledger: facts with `seq > after_seq` in seq
+    /// order, sized to fit `max_bytes` (clamped below [`MAX_LINE_BYTES`]).
+    /// Always carries at least one fact when any remain. Reply is
+    /// [`StoreOk::FactsPage`].
+    FactsPage { after_seq: i64, max_bytes: usize },
     /// Repository-wide claim lifecycle facts across every engagement. Used by
     /// exact-session close so its effect and reported released claims agree.
     RepoWideClaimLifecycleFacts,
@@ -240,6 +250,8 @@ impl StoreOp {
             | Self::RenewClaimLease { .. }
             | Self::MaybeAppendReadCheckpoint { .. } => true,
             Self::Facts
+            | Self::SessionPresenceFacts { .. }
+            | Self::FactsPage { .. }
             | Self::RepoWideClaimLifecycleFacts
             | Self::SessionFactsWithContextVersion
             | Self::ActiveSessionFact { .. }
@@ -284,6 +296,12 @@ pub enum StoreOk {
     AppendSessionFactIfContext { result: Value },
     /// `Vec<Fact>`.
     Facts { facts: Vec<Value> },
+    /// One page of facts in seq order. `next_after_seq` is the last seq in the
+    /// page when more facts remain, `None` on the final page.
+    FactsPage {
+        facts: Vec<Value>,
+        next_after_seq: Option<i64>,
+    },
     /// `()`.
     RebuildClaimIndex,
     /// Typed `RenewClaimLeaseOutcome`.
@@ -463,8 +481,8 @@ mod tests {
     }
 
     #[test]
-    fn o26_wire_v8_round_trips_all_query_controls() {
-        assert_eq!(WIRE_VERSION, 8);
+    fn o26_wire_v9_round_trips_all_query_controls() {
+        assert_eq!(WIRE_VERSION, 9);
         let req = StoreRequest::new(
             Some("engagement-alpha".to_string()),
             StoreOp::SnapshotScoped {
@@ -678,6 +696,19 @@ mod tests {
         );
         assert!(StoreOp::RebuildClaimIndex.is_mutating());
         assert!(!StoreOp::Facts.is_mutating());
+        assert!(
+            !StoreOp::SessionPresenceFacts {
+                session_id: "s".into()
+            }
+            .is_mutating()
+        );
+        assert!(
+            !StoreOp::FactsPage {
+                after_seq: 0,
+                max_bytes: 1
+            }
+            .is_mutating()
+        );
         assert!(!StoreOp::Ping.is_mutating());
     }
 }

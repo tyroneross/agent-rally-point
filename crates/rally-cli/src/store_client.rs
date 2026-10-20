@@ -50,6 +50,10 @@ use crate::store::{
     RenewClaimLeaseOutcome, RoomSnapshot, SnapshotCacheCapture, SnapshotCacheFingerprint,
 };
 
+/// Byte budget for one `FactsPage` reply the routed client asks for. Well under
+/// the protocol line cap so a page never nears it.
+const FACTS_PAGE_BYTES: usize = 4 * 1024 * 1024;
+
 /// Discovery pointer filename inside `.rally/` (L7/ADR-02) — the daemon's
 /// SOLE discovery mechanism; clients never guess or hardcode the socket path.
 /// Duplicated as a literal rather than imported from `rallyd_core.rs`
@@ -466,6 +470,8 @@ fn mutation_query(op: &StoreOp) -> Option<MutationQuery> {
             })
         }
         StoreOp::Facts
+        | StoreOp::SessionPresenceFacts { .. }
+        | StoreOp::FactsPage { .. }
         | StoreOp::RepoWideClaimLifecycleFacts
         | StoreOp::SessionFactsWithContextVersion
         | StoreOp::ActiveSessionFact { .. }
@@ -663,10 +669,45 @@ impl RoutedRoomStore {
         }
     }
 
+    /// The whole ledger, fetched as bounded pages so no single daemon reply can
+    /// exceed the protocol line cap however large the room grows.
     pub(crate) fn facts(&self) -> Result<Vec<Fact>> {
-        match self.dispatch(StoreOp::Facts)? {
+        let mut all = Vec::new();
+        let mut after_seq = i64::MIN;
+        loop {
+            match self.dispatch(StoreOp::FactsPage {
+                after_seq,
+                max_bytes: FACTS_PAGE_BYTES,
+            })? {
+                StoreOk::FactsPage {
+                    facts,
+                    next_after_seq,
+                } => {
+                    for fact in facts {
+                        all.push(from_value(fact)?);
+                    }
+                    match next_after_seq {
+                        None => return Ok(all),
+                        Some(next) if next > after_seq => after_seq = next,
+                        Some(next) => {
+                            return Err(RallyError::Command(format!(
+                                "daemon facts_page cursor did not advance (after_seq {after_seq}, next {next})"
+                            )));
+                        }
+                    }
+                }
+                _ => return Err(unexpected_reply("facts_page")),
+            }
+        }
+    }
+
+    /// Presence facts stamped with `session_id`, scoped by the daemon.
+    pub(crate) fn session_presence_facts(&self, session_id: &str) -> Result<Vec<Fact>> {
+        match self.dispatch(StoreOp::SessionPresenceFacts {
+            session_id: session_id.to_string(),
+        })? {
             StoreOk::Facts { facts } => facts.into_iter().map(from_value).collect(),
-            _ => Err(unexpected_reply("facts")),
+            _ => Err(unexpected_reply("session_presence_facts")),
         }
     }
 
@@ -1096,8 +1137,18 @@ mod tests {
     }
 
     #[test]
-    fn probe_rejects_a_v7_daemon_after_enter_context_cutover() {
-        assert_eq!(WIRE_VERSION, 8, "this control grades the v7 to v8 cutover");
+    fn reply_too_large_error_becomes_a_normal_command_error() {
+        let err = store_error_to_rally_error(StoreError::new(
+            StoreErrorKind::Command,
+            "reply-too-large: facts reply is 9 bytes, exceeding protocol maximum 8; \
+             the request must be bounded or paginated",
+        ));
+        assert!(matches!(&err, RallyError::Command(m) if m.contains("reply-too-large")));
+    }
+
+    #[test]
+    fn probe_rejects_a_v8_daemon_after_paged_facts_cutover() {
+        assert_eq!(WIRE_VERSION, 9, "this control grades the v8 to v9 cutover");
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1118,21 +1169,21 @@ mod tests {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             let request: StoreRequest = serde_json::from_str(line.trim()).unwrap();
-            assert_eq!(request.wire_version, 8);
+            assert_eq!(request.wire_version, 9);
             let response = StoreResponse::Ok(StoreOk::Pong {
                 repo_root: "/expected/repo".to_string(),
                 pid: 42,
-                wire_version: 7,
+                wire_version: 8,
             });
             let mut writer = &stream;
             writeln!(writer, "{}", serde_json::to_string(&response).unwrap()).unwrap();
         });
 
         let error = probe_identity(&rally_dir, "/expected/repo")
-            .expect_err("a v7 daemon must fail a v8 client immediately");
+            .expect_err("a v8 daemon must fail a v9 client immediately");
         assert!(matches!(error, RallyError::IncompatibleWire { .. }));
-        assert!(error.to_string().contains("client speaks 8"));
-        assert!(error.to_string().contains("daemon speaks 7"));
+        assert!(error.to_string().contains("client speaks 9"));
+        assert!(error.to_string().contains("daemon speaks 8"));
         server.join().unwrap();
         std::fs::remove_file(&socket).ok();
         std::fs::remove_dir_all(&rally_dir).ok();
