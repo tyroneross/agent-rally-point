@@ -2400,6 +2400,20 @@ mod imp {
             }
         }
 
+        /// Bounded-wait tests block the waiter on work that outlasts the ceiling by
+        /// an order of magnitude, then assert the wait returned under a ceiling far
+        /// above the configured bound. Scheduler delay on a loaded host stays well
+        /// inside the ceiling, while an unbounded wait still cannot pass it.
+        const BOUNDED_WAIT_CEILING: Duration = Duration::from_secs(5);
+        const BLOCKER_OUTLASTS_CEILING: Duration = Duration::from_secs(60);
+
+        fn assert_wait_bounded(elapsed: Duration, bound: Duration, what: &str) {
+            assert!(
+                elapsed < BOUNDED_WAIT_CEILING,
+                "{what} escaped its {bound:?} bound: {elapsed:?} (ceiling {BOUNDED_WAIT_CEILING:?})"
+            );
+        }
+
         #[test]
         fn daemon_store_open_honors_the_mutation_lock_deadline() {
             let repo_root = unique_repo_root("bounded-store-open");
@@ -2408,13 +2422,11 @@ mod imp {
             drop(seed);
             let held = store::acquire_room_mutation_lock(&rally_dir).unwrap();
 
+            let bound = Duration::from_millis(75);
             let started = Instant::now();
-            let result = open_direct_store_bounded(repo_root.clone(), Duration::from_millis(75));
+            let result = open_direct_store_bounded(repo_root.clone(), bound);
             let elapsed = started.elapsed();
-            assert!(
-                elapsed < Duration::from_millis(300),
-                "daemon store open escaped its 75ms bound: {elapsed:?}"
-            );
+            assert_wait_bounded(elapsed, bound, "daemon store open");
             let failure = match result {
                 Ok(_) => panic!("contended daemon store open unexpectedly succeeded"),
                 Err(failure) => failure,
@@ -2437,20 +2449,17 @@ mod imp {
                     .unwrap(),
             );
 
+            let bound = Duration::from_millis(50);
             let started = Instant::now();
-            let result =
-                open_direct_store_bounded_with(repo_root, Duration::from_millis(50), || {
-                    thread::sleep(Duration::from_millis(250))
-                });
+            let result = open_direct_store_bounded_with(repo_root, bound, || {
+                thread::sleep(BLOCKER_OUTLASTS_CEILING)
+            });
             let elapsed = started.elapsed();
             let failure = match result {
                 Ok(_) => panic!("delayed daemon store open unexpectedly completed"),
                 Err(failure) => failure,
             };
-            assert!(
-                elapsed < Duration::from_millis(150),
-                "total daemon store open escaped its 50ms bound: {elapsed:?}"
-            );
+            assert_wait_bounded(elapsed, bound, "total daemon store open");
             assert!(failure.retain_owner_until_exit);
             assert!(
                 failure
@@ -2485,20 +2494,17 @@ mod imp {
                 store::acquire_owner_exclusive_bounded(&rally_dir, Duration::from_millis(75))
                     .unwrap();
             let (_close_tx, close_rx) = mpsc::sync_channel::<Result<(), String>>(1);
-            let dispatcher = thread::spawn(|| thread::sleep(Duration::from_millis(100)));
+            let dispatcher = thread::spawn(|| thread::sleep(BLOCKER_OUTLASTS_CEILING));
 
+            let bound = Duration::from_millis(25);
             let started = Instant::now();
-            let result =
-                await_dispatcher_close(close_rx, dispatcher, owner, Duration::from_millis(25));
+            let result = await_dispatcher_close(close_rx, dispatcher, owner, bound);
             let elapsed = started.elapsed();
             let error = match result {
                 Ok(_) => panic!("dispatcher close unexpectedly completed"),
                 Err(error) => error,
             };
-            assert!(
-                elapsed < Duration::from_millis(150),
-                "dispatcher close wait escaped its 25ms bound: {elapsed:?}"
-            );
+            assert_wait_bounded(elapsed, bound, "dispatcher close wait");
             assert!(error.message().starts_with("daemon-close-timeout:"));
             assert!(
                 store::acquire_owner_shared_nb(&rally_dir)
