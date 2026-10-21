@@ -133,7 +133,15 @@ impl TempRoom {
         if apply {
             args.push("--apply");
         }
-        let out = self.run(&args);
+        // These cases grade write integrity, not wall-clock partitioning.
+        // Keep a loaded host from deferring unrelated cleanup mid-fixture;
+        // reaper_scale grades the budget with its own deterministic steps.
+        let out = self
+            .rally()
+            .env("RALLY_TEST_REAP_CLOCK_STEP_MS", "0")
+            .args(&args)
+            .output()
+            .expect("spawn deterministic reap");
         let body = stdout_json(&out);
         let report = body["data"]["doctor"].clone();
         (
