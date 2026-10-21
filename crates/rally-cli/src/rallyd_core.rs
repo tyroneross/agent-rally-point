@@ -1305,6 +1305,7 @@ mod imp {
                     break;
                 }
             }
+            let mut accept_failed = false;
             // Drain every queued connection before waiting for readiness.
             loop {
                 match listener.accept() {
@@ -1350,11 +1351,12 @@ mod imp {
                     }
                     Err(e) => {
                         log(&format!("accept error: {e}"));
+                        accept_failed = true;
                         break;
                     }
                 }
             }
-            if let Err(error) = wait_for_listener(&listener, ACCEPT_POLL) {
+            if let Err(error) = wait_after_accept(&listener, ACCEPT_POLL, accept_failed) {
                 log(&format!("listener readiness error: {error}"));
                 // A persistent descriptor error must not create a busy loop.
                 thread::sleep(ACCEPT_POLL);
@@ -1374,6 +1376,20 @@ mod imp {
         let _owner = owner?;
         log("stopped");
         Ok(())
+    }
+
+    fn wait_after_accept(
+        listener: &UnixListener,
+        timeout: Duration,
+        accept_failed: bool,
+    ) -> std::io::Result<bool> {
+        if accept_failed {
+            // Resource exhaustion can leave POLLIN set while accept keeps failing.
+            // Back off even with a queued connection, then recheck shutdown.
+            thread::sleep(timeout);
+            return Ok(false);
+        }
+        wait_for_listener(listener, timeout)
     }
 
     /// Wait for a queued connection, without delaying one that arrives during
@@ -1522,6 +1538,25 @@ mod imp {
             );
             server.join().unwrap();
             std::fs::remove_file(&socket).ok();
+        }
+
+        #[test]
+        fn failed_accept_backs_off_even_when_listener_stays_ready() {
+            let dir =
+                std::env::temp_dir().join(format!("rally-accept-backoff-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let socket = dir.join("socket");
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let _client = UnixStream::connect(&socket).unwrap();
+            assert!(wait_for_listener(&listener, Duration::ZERO).unwrap());
+            let delay = Duration::from_millis(25);
+            let start = std::time::Instant::now();
+            assert!(!wait_after_accept(&listener, delay, true).unwrap());
+            assert!(start.elapsed() >= delay);
+            assert!(wait_after_accept(&listener, Duration::ZERO, false).unwrap());
+            drop(listener);
+            std::fs::remove_dir_all(dir).unwrap();
         }
 
         #[test]

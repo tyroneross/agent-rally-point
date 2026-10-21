@@ -126,13 +126,16 @@ pub(crate) enum NamedState {
     /// An ack is not completion (AGEN-COORDINATION-kzt037p65xg01), so this is
     /// still assigned work and still outranks the open queue.
     AcceptedOpen,
+    /// A bounded reply omitted unanswered rows, so this handoff's state is unknown.
+    Incomplete,
 }
 
 /// Every handoff assigned to `tool` by name that is still open, oldest first.
 ///
 /// The ONE named-work projection: `next` ranks from it and `inbox` counts from
 /// it (`count`/`handoffs` for [`NamedState::Unanswered`], `accepted_open` for
-/// the rest), so the two cannot disagree on a snapshot.
+/// [`NamedState::AcceptedOpen`]). Bounded replies cannot distinguish omitted
+/// unanswered rows from accepted work; those rows remain explicitly incomplete.
 pub(crate) fn named_work<'a>(
     snapshot: &'a RoomSnapshot,
     tool: &str,
@@ -159,7 +162,16 @@ pub(crate) fn named_work<'a>(
                         .rejected_named
                         .contains(&fact.event_id)
             })
-            .map(|fact| (fact, NamedState::AcceptedOpen)),
+            .map(|fact| {
+                let state = if snapshot.open_obligations_target.as_deref() == Some(tool)
+                    && snapshot.open_obligations_omitted > 0
+                {
+                    NamedState::Incomplete
+                } else {
+                    NamedState::AcceptedOpen
+                };
+                (fact, state)
+            }),
     );
     work.sort_by_key(|(fact, _)| fact.seq);
     work
@@ -443,6 +455,30 @@ mod tests {
             assert_eq!(inbox.count, 1);
             assert_eq!(inbox.accepted_open, 1);
             assert!(!inbox.accepted_open_incomplete);
+            let named = super::named_work(&restored, "receiver");
+            assert_eq!(named.len(), 2);
+            if limit == 0 {
+                assert!(
+                    named
+                        .iter()
+                        .all(|(_, state)| *state == super::NamedState::Incomplete)
+                );
+            } else {
+                assert_eq!(
+                    named
+                        .iter()
+                        .filter(|(_, state)| *state == super::NamedState::Unanswered)
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    named
+                        .iter()
+                        .filter(|(_, state)| *state == super::NamedState::AcceptedOpen)
+                        .count(),
+                    1
+                );
+            }
             wire[crate::store::WIRE_INTERNALS_KEY]
                 .as_object_mut()
                 .unwrap()
