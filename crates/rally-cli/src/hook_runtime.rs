@@ -2075,6 +2075,9 @@ fn judge_path(
         strict,
         snapshot,
         coord,
+        // The native host hook surfaces only `stop` findings, and the overwrite
+        // guard is `warn`-only, so it is not probed on this per-write hot path.
+        None,
     )?;
     let value = serde_json::to_value(&outcome.data).unwrap_or_else(|_| json!({}));
     let check = value.get("check").cloned().unwrap_or_else(|| json!({}));

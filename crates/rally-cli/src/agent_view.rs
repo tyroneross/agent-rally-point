@@ -31,10 +31,23 @@ pub(crate) fn command(args: RoomArgs) -> Result<Output> {
         args.since,
         args.budget_bytes.unwrap_or(6000),
     );
+    let budget = &body["data"]["budget"];
+    let warning = if budget["severe"] == true {
+        let top = &budget["breakdown"]["sections"][0];
+        format!(
+            "WARNING: compact room is {} bytes, over 3x the {}-byte budget; largest section: {} ({} bytes). ",
+            budget["emitted_bytes"],
+            budget["bytes"],
+            top["section"].as_str().unwrap_or("?"),
+            top["bytes"]
+        )
+    } else {
+        String::new()
+    };
     Ok(Output::new(
         args.json,
         format!(
-            "compact room seq={} overflow={} (advisory; check before writing)",
+            "{warning}compact room seq={} overflow={} (advisory; check before writing)",
             snapshot.max_seq, body["data"]["budget"]["over_budget"]
         ),
         body,
@@ -103,7 +116,7 @@ fn compose(
                 "system_health_total":snapshot.system_health.len(),"system_health_included":false
             },
             "expand":{"room":["rally","room","--json"],"inbox":["rally","inbox","--tool",tool,"--json"],"write_check":["rally","check","before-write","--tool",tool,"--path","<path>","--strict","--json"]},
-            "budget":{"bytes":budget,"emitted_bytes":0,"over_budget":false,"reason":null}
+            "budget":{"bytes":budget,"emitted_bytes":0,"over_budget":false,"severe":false,"reason":null}
         }
     });
     // Remove optional roster entries first; never cut safety/task facts. Measure
@@ -119,23 +132,97 @@ fn compose(
             body["data"]["inventory"]["peers_omitted"] = json!(n + 1);
             continue;
         }
-        let overflow = budget != 0 && size > budget;
-        let reason = if overflow {
+        // over_budget/severe only ever flip to true: a 1-byte "false"->"true"
+        // length change at the exact boundary could otherwise oscillate.
+        let data = &body["data"];
+        let overflow = data["budget"]["over_budget"] == true || (budget != 0 && size > budget);
+        let severe = data["budget"]["severe"] == true || (budget != 0 && size > budget * 3);
+        let reason = if severe {
+            json!("critical context exceeds 3x budget; retained in full; see budget.breakdown")
+        } else if overflow {
             json!("critical context exceeds budget; retained in full")
         } else {
             Value::Null
         };
-        if body["data"]["budget"]["emitted_bytes"] == size
-            && body["data"]["budget"]["over_budget"] == overflow
-            && body["data"]["budget"]["reason"] == reason
+        // Peers are already empty once over budget, so the breakdown is final.
+        let breakdown =
+            (overflow && data["budget"].get("breakdown").is_none()).then(|| breakdown(data));
+        let b = &data["budget"];
+        if b["emitted_bytes"] == size
+            && b["over_budget"] == overflow
+            && b["severe"] == severe
+            && b["reason"] == reason
+            && breakdown.is_none()
         {
             break;
         }
-        body["data"]["budget"]["emitted_bytes"] = json!(size);
-        body["data"]["budget"]["over_budget"] = json!(overflow);
-        body["data"]["budget"]["reason"] = reason;
+        let b = &mut body["data"]["budget"];
+        b["emitted_bytes"] = json!(size);
+        b["over_budget"] = json!(overflow);
+        b["severe"] = json!(severe);
+        b["reason"] = reason;
+        if let Some(breakdown) = breakdown {
+            b["breakdown"] = breakdown;
+        }
     }
     body
+}
+
+/// Where the bytes are: per-section sizes and the heaviest critical facts.
+fn breakdown(data: &Value) -> Value {
+    let mut sections: Vec<(&str, Value, usize)> = [
+        "claims",
+        "blockers",
+        "obligations",
+        "decisions",
+        "mission",
+        "peers",
+    ]
+    .into_iter()
+    .map(|name| {
+        let v = &data[name];
+        let count = v.as_array().map_or(Value::Null, |a| json!(a.len()));
+        let bytes = serde_json::to_string_pretty(v)
+            .expect("JSON values serialize")
+            .len();
+        (name, count, bytes)
+    })
+    .collect();
+    sections.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(b.0)));
+    let mut facts: Vec<(usize, String, Value)> = Vec::new();
+    for section in ["claims", "blockers", "obligations", "decisions"] {
+        for row in data[section].as_array().into_iter().flatten() {
+            let bytes = serde_json::to_string(row)
+                .expect("JSON values serialize")
+                .len();
+            let (field, field_bytes) = row
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(k, v)| {
+                    (
+                        k.as_str(),
+                        serde_json::to_string(v)
+                            .expect("JSON values serialize")
+                            .len(),
+                    )
+                })
+                .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0)))
+                .unwrap_or(("", 0));
+            let event_id = row["event_id"].as_str().unwrap_or("").to_string();
+            facts.push((
+                bytes,
+                event_id.clone(),
+                json!({"event_id":event_id,"section":section,"bytes":bytes,"largest_field":field,"largest_field_bytes":field_bytes}),
+            ));
+        }
+    }
+    facts.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let largest: Vec<_> = facts.into_iter().take(5).map(|f| f.2).collect();
+    json!({
+        "sections": sections.iter().map(|(n, c, b)| json!({"section":n,"count":c,"bytes":b})).collect::<Vec<_>>(),
+        "largest_facts": largest
+    })
 }
 
 #[cfg(test)]
@@ -175,5 +262,70 @@ mod tests {
             overflow["data"]["budget"]["emitted_bytes"],
             serde_json::to_string_pretty(&overflow).unwrap().len() + 1
         );
+    }
+
+    fn rendered(v: &Value) -> usize {
+        serde_json::to_string_pretty(v).unwrap().len() + 1
+    }
+
+    fn blocker(id: &str, len: usize) -> crate::Fact {
+        crate::Fact {
+            kind: FactKind::Blocker,
+            event_id: id.into(),
+            subject: "x".repeat(len),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn over_budget_reports_breakdown_without_severe() {
+        let mut snapshot = RoomSnapshot::default();
+        snapshot.active_blockers.push(blocker("big", 7000));
+        let v = compose(&snapshot, "codex:a", &[], None, 6000);
+        let b = &v["data"]["budget"];
+        assert_eq!(b["over_budget"], true);
+        assert_eq!(b["severe"], false);
+        assert_eq!(
+            b["reason"],
+            "critical context exceeds budget; retained in full"
+        );
+        assert_eq!(b["breakdown"]["sections"][0]["section"], "blockers");
+        assert_eq!(b["breakdown"]["sections"][0]["count"], 1);
+        assert_eq!(b["breakdown"]["largest_facts"][0]["event_id"], "big");
+        assert_eq!(
+            b["breakdown"]["largest_facts"][0]["largest_field"],
+            "subject"
+        );
+        assert_eq!(b["emitted_bytes"], rendered(&v));
+    }
+
+    #[test]
+    fn far_over_budget_is_severe() {
+        let mut snapshot = RoomSnapshot::default();
+        for i in 0..4 {
+            snapshot
+                .active_blockers
+                .push(blocker(&format!("b{i}"), 6000));
+        }
+        let v = compose(&snapshot, "codex:a", &[], None, 6000);
+        let b = &v["data"]["budget"];
+        assert!(rendered(&v) > 20_000);
+        assert_eq!(b["severe"], true);
+        assert_eq!(
+            b["reason"],
+            "critical context exceeds 3x budget; retained in full; see budget.breakdown"
+        );
+        assert_eq!(b["breakdown"]["largest_facts"].as_array().unwrap().len(), 4);
+        assert_eq!(b["emitted_bytes"], rendered(&v));
+    }
+
+    #[test]
+    fn in_budget_has_no_breakdown() {
+        let v = compose(&RoomSnapshot::default(), "codex:a", &[], None, 6000);
+        let b = &v["data"]["budget"];
+        assert_eq!(b["over_budget"], false);
+        assert_eq!(b["severe"], false);
+        assert!(b.get("breakdown").is_none());
+        assert_eq!(b["emitted_bytes"], rendered(&v));
     }
 }

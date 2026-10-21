@@ -15,6 +15,15 @@ use crate::{FACT_SCHEMA, normalize_path, path_matches_scope, shell_quote};
 pub(crate) const DEFAULT_STALE_WAIT_SECS: i64 = 24 * 60 * 60;
 pub(crate) const MAX_ENTER_ROWS: usize = 128;
 
+/// Ranking bands. Work assigned to this tool BY NAME (named handoff 100,
+/// targeted plan item 95, own blocker 90, own live claim 75) always outranks
+/// the open queue, so an agent picks open-queue work up when it has nothing
+/// assigned. A lease-expired claim is a housekeeping prompt, not work.
+const NAMED_HANDOFF_SCORE: i64 = 100;
+const OPEN_QUEUE_SCORE: i64 = 70;
+const OPEN_QUEUE_REVALIDATE_SCORE: i64 = 50;
+const EXPIRED_CLAIM_SCORE: i64 = 30;
+
 /// What `build_next` does with an INBOUND targeted handoff older than the stale
 /// window.
 ///
@@ -254,16 +263,21 @@ pub(crate) fn build_entry(
     role: Option<&str>,
     paths: &[String],
 ) -> EntryData {
+    // Named handoffs first, then the open queue under its own reason, so an
+    // entering agent can tell "assigned to you" from "available to anyone".
     let respond_to = snapshot
         .open_handoffs
         .iter()
-        .filter(|f| {
-            f.target
-                .as_deref()
-                .is_none_or(|target| target == tool || target == "all")
-        })
-        .take(MAX_ENTER_ROWS)
+        .filter(|f| handoff_address(f, tool) == HandoffAddress::Named)
         .map(|f| entry_item("respond_to_handoff", f))
+        .chain(
+            snapshot
+                .open_handoffs
+                .iter()
+                .filter(|f| handoff_address(f, tool) == HandoffAddress::OpenQueue)
+                .map(|f| entry_item("open_queue_item", f)),
+        )
+        .take(MAX_ENTER_ROWS)
         .collect::<Vec<_>>();
     let mut do_items = respond_to.clone();
     do_items.extend(
@@ -271,7 +285,13 @@ pub(crate) fn build_entry(
             .active_claims
             .iter()
             .filter(|f| f.tool.as_deref() == Some(tool))
-            .map(|f| entry_item("continue_or_release_claim", f)),
+            .map(|f| {
+                if crate::claim_authority::lease_expired_at(f, chrono::Utc::now()) {
+                    entry_item("release_or_renew_claim", f)
+                } else {
+                    entry_item("continue_or_release_claim", f)
+                }
+            }),
     );
     do_items.truncate(MAX_ENTER_ROWS);
     do_items.extend(
@@ -392,8 +412,18 @@ pub(crate) fn build_next(
     backlog_items: Vec<BacklogItem>,
     stale_wait_secs: i64,
     stale_targeted: StaleTargetedPolicy,
+    fs_signals: &crate::open_queue::FsSignals,
 ) -> NextResult {
     let waiting_on = waiting_on_facts(snapshot, tool, stale_wait_secs);
+    // ONE projection of what this tool is owed and what it may pick up. The
+    // ranking below and the embedded `inbox` are both read off it, so they
+    // cannot disagree on the same snapshot.
+    let open_queue = crate::open_queue::open_queue_items(
+        snapshot,
+        tool,
+        fs_signals,
+        chrono::Utc::now().timestamp(),
+    );
     let waiting = !waiting_on.is_empty();
 
     // #7: filter backlog items to those ready for pickup:
@@ -443,6 +473,7 @@ pub(crate) fn build_next(
         &backlog_items,
         stale_wait_secs,
         stale_targeted,
+        &open_queue,
     );
     candidates.sort_by(compare_next_candidates);
 
@@ -498,6 +529,7 @@ pub(crate) fn build_next(
             tool,
             NEXT_INBOX_ITEMS_LIMIT,
             stale_wait_secs,
+            open_queue,
         ),
     }
 }
@@ -528,23 +560,61 @@ fn next_candidates(
     backlog_items: &[BacklogItem],
     stale_wait_secs: i64,
     stale_targeted: StaleTargetedPolicy,
+    open_queue: &[crate::open_queue::OpenQueueItem],
 ) -> Vec<NextCandidate> {
     let mut candidates = Vec::new();
 
-    for handoff in &snapshot.open_handoffs {
+    // Work assigned to this tool BY NAME, from `obligations::named_work` — the
+    // same projection `rally inbox` counts — so `next` can never rank a named
+    // handoff the inbox does not account for, or miss one it does.
+    for (handoff, state) in crate::obligations::named_work(snapshot, tool) {
         // Under `Surface`, age is not a reason to stop offering an obligation
         // addressed to this agent. Under `Ignore`, the pre-existing drop stands
         // so `command_self_exit_check` can still reach a non-actionable cycle —
         // see [`StaleTargetedPolicy`].
         let aged_out = stale_targeted == StaleTargetedPolicy::Ignore
             && stale_targeted_handoff(handoff, tool, stale_wait_secs);
-        if assigned_to_tool(handoff, tool) && !aged_out {
+        if !aged_out {
+            let reason = match state {
+                crate::obligations::NamedState::Unanswered => "open_handoff_targeted_to_this_tool",
+                crate::obligations::NamedState::AcceptedOpen => "accepted_handoff_still_open",
+                crate::obligations::NamedState::Incomplete => "named_handoff_state_incomplete",
+            };
             candidates.push(NextCandidate::from_fact(
                 "respond_to_handoff",
-                "open_handoff_targeted_to_this_tool",
-                boost_score(100, handoff, role, paths),
+                reason,
+                boost_score(NAMED_HANDOFF_SCORE, handoff, role, paths),
                 handoff,
             ));
+        }
+    }
+    // The OPEN QUEUE: handoffs with no target (or the `all` broadcast). Nobody
+    // owns them; any agent may take one. They rank below every class of work
+    // assigned to this tool, so they surface when the agent has nothing
+    // assigned — the assign-or-pick-up-when-idle model. Age never removes one;
+    // it only marks it "revalidate before claiming" (see `open_queue`).
+    if !open_queue.is_empty() {
+        let mut by_id = std::collections::HashMap::with_capacity(snapshot.open_handoffs.len());
+        for fact in &snapshot.open_handoffs {
+            by_id.entry(fact.event_id.as_str()).or_insert(fact);
+        }
+        for item in open_queue {
+            let (reason, base) = if item.revalidate_before_claiming {
+                (
+                    "open_queue_item_needs_revalidation",
+                    OPEN_QUEUE_REVALIDATE_SCORE,
+                )
+            } else {
+                ("open_queue_item_available", OPEN_QUEUE_SCORE)
+            };
+            if let Some(fact) = by_id.get(item.event_id.as_str()) {
+                candidates.push(NextCandidate::from_fact(
+                    "claim_open_queue_item",
+                    reason,
+                    base,
+                    fact,
+                ));
+            }
         }
     }
     for blocker in &snapshot.active_blockers {
@@ -557,14 +627,28 @@ fn next_candidates(
             ));
         }
     }
+    let now = chrono::Utc::now();
     for claim in &snapshot.active_claims {
         if claim.tool.as_deref() == Some(tool) {
-            candidates.push(NextCandidate::from_fact(
-                "continue_or_release_claim",
-                "owned_claim_is_still_active",
-                boost_score(75, claim, role, paths),
-                claim,
-            ));
+            // `active_claims` holds EFFECTIVE claims (renewals folded in), so a
+            // claim whose lease has passed was not renewed. It is no longer
+            // "still active" work; it is a low-rank prompt to release it, or
+            // renew it if this session still owns the work.
+            if crate::claim_authority::lease_expired_at(claim, now) {
+                candidates.push(NextCandidate::from_fact(
+                    "release_or_renew_claim",
+                    "owned_claim_lease_expired",
+                    EXPIRED_CLAIM_SCORE,
+                    claim,
+                ));
+            } else {
+                candidates.push(NextCandidate::from_fact(
+                    "continue_or_release_claim",
+                    "owned_claim_is_still_active",
+                    boost_score(75, claim, role, paths),
+                    claim,
+                ));
+            }
         }
     }
     for artifact in &snapshot.unconsumed_artifacts {
@@ -716,6 +800,7 @@ fn action_contract(candidate: &NextCandidate, tool: &str) -> ActionContract {
         .filter(|_| {
             actionable
                 && candidate.action != "continue_or_release_claim"
+                && candidate.action != "release_or_renew_claim"
                 && candidate.action != "update_plan_status"
         })
         .map(|fact| suggested_claims(tool, fact))
@@ -768,6 +853,19 @@ fn suggested_commands(tool: &str, candidate: &NextCandidate) -> Vec<String> {
             })
             .unwrap_or_default();
     }
+    if candidate.action == "release_or_renew_claim" {
+        // Release first: it is the completion this prompt exists for, and the
+        // hook selects the command by that prefix. Renewal only works from the
+        // session that took the claim (`latest_renewed_lease` is self-only).
+        let tool_arg = shell_quote(tool);
+        return vec![
+            format!(
+                "rally say release --tool {tool_arg} --ref {} --subject \"lease expired; released\" --json",
+                shell_quote(&fact.event_id)
+            ),
+            format!("rally status post --tool {tool_arg} --state working --json"),
+        ];
+    }
     let mut commands = executable_scopes(fact)
         .into_iter()
         .map(|scope| {
@@ -790,6 +888,19 @@ fn suggested_commands(tool: &str, candidate: &NextCandidate) -> Vec<String> {
             event_arg,
             tool = tool_arg
         )),
+        "claim_open_queue_item" => {
+            // Read the item's current state first (read-only), then claim the
+            // scope before working. Completion is a resolve that names it.
+            commands.insert(
+                0,
+                format!("rally locate {} --json", event_arg),
+            );
+            commands.push(format!(
+                "rally say resolve --tool {tool} --ref {} --subject \"done: <what landed>\" --evidence \"<verification>\" --json",
+                event_arg,
+                tool = tool_arg
+            ));
+        }
         "continue_or_release_claim" => commands.push(format!(
             "rally say release --tool {tool} --ref {} --subject \"done\" --json",
             event_arg,
@@ -822,8 +933,9 @@ fn backlog_id(fact: &Fact) -> Option<String> {
 
 fn completion_contract(action: &str, actionable: bool) -> CompletionContract {
     let record_kind = match action {
-        "respond_to_handoff" | "resolve_owned_blocker" => "resolve",
+        "respond_to_handoff" | "resolve_owned_blocker" | "claim_open_queue_item" => "resolve",
         "continue_or_release_claim" => "artifact_or_release",
+        "release_or_renew_claim" => "release",
         "review_artifact" => "resolve",
         "clarify_handoff" => "handoff",
         "update_plan_status" => "backlog_update",
@@ -857,10 +969,28 @@ fn command_path(scope: &str) -> String {
     scope.strip_prefix("file:").unwrap_or(scope).to_string()
 }
 
-fn assigned_to_tool(fact: &Fact, tool: &str) -> bool {
-    fact.target
-        .as_deref()
-        .is_none_or(|target| target == tool || target == "all")
+/// Who a handoff is addressed to, from one reader's point of view.
+///
+/// The open queue is BY DESIGN: a handoff with no target (or the `all`
+/// broadcast) is unowned work any agent may take. It is not assigned to the
+/// reader, so it must never be ranked or worded as if it were — the defect
+/// `assigned_to_tool`'s `is_none_or` used to encode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HandoffAddress {
+    /// `target == tool`: assigned to this tool by name.
+    Named,
+    /// No target, a blank target, or `all`: the open queue.
+    OpenQueue,
+    /// Addressed to somebody else.
+    Elsewhere,
+}
+
+pub(crate) fn handoff_address(fact: &Fact, tool: &str) -> HandoffAddress {
+    match fact.target.as_deref().map(str::trim) {
+        Some(target) if target == tool => HandoffAddress::Named,
+        None | Some("") | Some("all") => HandoffAddress::OpenQueue,
+        Some(_) => HandoffAddress::Elsewhere,
+    }
 }
 
 fn waiting_on_peer(fact: &Fact, tool: &str) -> bool {
@@ -1000,12 +1130,10 @@ pub(crate) fn build_attention(
             }
         };
         for handoff in &snapshot.open_handoffs {
-            if handoff
-                .target
-                .as_deref()
-                .is_none_or(|target| target == tool || target == "all")
-            {
-                push_fact("handoff_assigned", handoff);
+            match handoff_address(handoff, tool) {
+                HandoffAddress::Named => push_fact("handoff_assigned", handoff),
+                HandoffAddress::OpenQueue => push_fact("open_queue_item", handoff),
+                HandoffAddress::Elsewhere => {}
             }
         }
         for claim in &snapshot.active_claims {
@@ -1110,6 +1238,95 @@ fn entry_item(reason: &'static str, fact: &Fact) -> EntryItem {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bounded_named_candidates_never_invent_acceptance() {
+        let a = handoff("a", "receiver", &chrono::Utc::now().to_rfc3339());
+        let b = Fact {
+            event_id: "b".into(),
+            ..a.clone()
+        };
+        let snapshot = RoomSnapshot {
+            open_handoffs: vec![a.clone(), b.clone()],
+            open_obligations: vec![a, b],
+            ..Default::default()
+        }
+        .for_obligation_target("receiver", 1);
+        let candidates = next_candidates(
+            &snapshot,
+            "receiver",
+            None,
+            &[],
+            false,
+            &[],
+            &[],
+            300,
+            StaleTargetedPolicy::Surface,
+            &[],
+        );
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].reason, "open_handoff_targeted_to_this_tool");
+        assert_eq!(candidates[1].reason, "named_handoff_state_incomplete");
+        assert!(
+            candidates
+                .iter()
+                .all(|c| c.reason != "accepted_handoff_still_open")
+        );
+    }
+
+    #[test]
+    fn large_open_queue_preserves_first_duplicate_and_item_order() {
+        let fresh = chrono::Utc::now().to_rfc3339();
+        let mut handoffs: Vec<_> = (0..1024)
+            .map(|id| open_queue_handoff(&format!("pool-{id}"), id, &fresh))
+            .collect();
+        handoffs[0].subject = "first version".into();
+        let mut duplicate = handoffs[0].clone();
+        duplicate.subject = "later duplicate".into();
+        handoffs.push(duplicate);
+        let snapshot = RoomSnapshot {
+            open_handoffs: handoffs,
+            ..Default::default()
+        };
+        let items = crate::open_queue::open_queue_items(
+            &snapshot,
+            "receiver",
+            &Default::default(),
+            chrono::Utc::now().timestamp(),
+        );
+        let candidates = next_candidates(
+            &snapshot,
+            "receiver",
+            None,
+            &[],
+            false,
+            &[],
+            &[],
+            300,
+            StaleTargetedPolicy::Surface,
+            &items,
+        );
+        let queue: Vec<_> = candidates
+            .iter()
+            .filter(|c| c.action == "claim_open_queue_item")
+            .collect();
+        assert_eq!(queue.len(), items.len());
+        for (candidate, item) in queue.iter().zip(&items) {
+            assert_eq!(
+                candidate.fact.as_ref().map(|f| f.event_id.as_str()),
+                Some(item.event_id.as_str())
+            );
+        }
+        for candidate in queue
+            .iter()
+            .filter(|c| c.fact.as_ref().is_some_and(|f| f.event_id == "pool-0"))
+        {
+            assert_eq!(
+                candidate.fact.as_ref().map(|f| f.subject.as_str()),
+                Some("first version")
+            );
+        }
+    }
+
     use super::*;
     use crate::store::Squad;
 
@@ -1169,6 +1386,7 @@ mod tests {
             Vec::new(),
             DEFAULT_STALE_WAIT_SECS,
             StaleTargetedPolicy::Surface,
+            &crate::open_queue::FsSignals::default(),
         );
 
         assert_eq!(result.action, "proceed_solo");
@@ -1201,6 +1419,7 @@ mod tests {
             Vec::new(),
             DEFAULT_STALE_WAIT_SECS,
             StaleTargetedPolicy::Surface,
+            &crate::open_queue::FsSignals::default(),
         );
 
         assert_eq!(result.action, "wait");
@@ -1221,6 +1440,8 @@ mod tests {
             "codex",
             "2000-01-01T00:00:00Z",
         ));
+        // Named work is read from the obligation bucket, as `rally inbox` does.
+        snapshot.open_obligations = snapshot.open_handoffs.clone();
 
         let result = build_next(
             &snapshot,
@@ -1231,6 +1452,7 @@ mod tests {
             Vec::new(),
             DEFAULT_STALE_WAIT_SECS,
             StaleTargetedPolicy::Surface,
+            &crate::open_queue::FsSignals::default(),
         );
         assert_eq!(result.action, "respond_to_handoff");
         assert!(result.actionable, "age is not a reason to stop offering it");
@@ -1252,6 +1474,8 @@ mod tests {
             "codex",
             "2000-01-01T00:00:00Z",
         ));
+        // Named work is read from the obligation bucket, as `rally inbox` does.
+        snapshot.open_obligations = snapshot.open_handoffs.clone();
 
         let result = build_next(
             &snapshot,
@@ -1262,6 +1486,7 @@ mod tests {
             Vec::new(),
             DEFAULT_STALE_WAIT_SECS,
             StaleTargetedPolicy::Ignore,
+            &crate::open_queue::FsSignals::default(),
         );
         assert_eq!(result.action, "proceed_solo");
         assert!(
@@ -1296,7 +1521,8 @@ mod tests {
         );
 
         let mut snapshot = RoomSnapshot::default();
-        snapshot.open_handoffs.push(malformed);
+        snapshot.open_handoffs.push(malformed.clone());
+        snapshot.open_obligations.push(malformed);
         for policy in [StaleTargetedPolicy::Surface, StaleTargetedPolicy::Ignore] {
             let result = build_next(
                 &snapshot,
@@ -1307,6 +1533,7 @@ mod tests {
                 Vec::new(),
                 DEFAULT_STALE_WAIT_SECS,
                 policy,
+                &crate::open_queue::FsSignals::default(),
             );
             assert_eq!(result.action, "respond_to_handoff", "policy={policy:?}");
         }
@@ -1442,6 +1669,7 @@ mod tests {
             Vec::new(),
             DEFAULT_STALE_WAIT_SECS,
             StaleTargetedPolicy::Surface,
+            &crate::open_queue::FsSignals::default(),
         );
         assert_eq!(result.inbox.count, 1);
         assert_eq!(result.inbox.handoffs, 1);
@@ -1485,6 +1713,7 @@ mod tests {
             vec![item],
             DEFAULT_STALE_WAIT_SECS,
             StaleTargetedPolicy::Surface,
+            &crate::open_queue::FsSignals::default(),
         );
 
         assert_eq!(result.action, "update_plan_status");
@@ -1581,8 +1810,284 @@ mod tests {
             Vec::new(),
             DEFAULT_STALE_WAIT_SECS,
             StaleTargetedPolicy::Surface,
+            &crate::open_queue::FsSignals::default(),
         );
         assert_eq!(result.peer_targets.ranked[0].tool, "fresh-quick");
         assert_eq!(result.peer_targets.stale, 2);
+    }
+
+    fn open_queue_handoff(id: &str, seq: i64, created_at: &str) -> Fact {
+        let mut fact = handoff(id, "unused", created_at);
+        fact.target = None;
+        fact.seq = seq;
+        // Posted by a peer: an agent is never offered its own posting.
+        fact.tool = Some("claude_code:01".to_string());
+        fact
+    }
+
+    fn named_handoff(id: &str, seq: i64) -> Fact {
+        let mut fact = handoff(id, "codex", &chrono::Utc::now().to_rfc3339());
+        fact.seq = seq;
+        fact.tool = Some("claude_code:01".to_string());
+        fact
+    }
+
+    fn next_for(snapshot: &RoomSnapshot, policy: StaleTargetedPolicy) -> NextResult {
+        build_next(
+            snapshot,
+            "codex",
+            None,
+            &[],
+            20,
+            Vec::new(),
+            DEFAULT_STALE_WAIT_SECS,
+            policy,
+            &crate::open_queue::FsSignals::default(),
+        )
+    }
+
+    /// Acceptance 1: work assigned BY NAME outranks the open queue, and the open
+    /// queue surfaces once nothing is assigned.
+    #[test]
+    fn named_assignment_outranks_open_queue_which_surfaces_when_idle() {
+        let fresh = chrono::Utc::now().to_rfc3339();
+        let pool = open_queue_handoff("pool-item", 9, &fresh);
+        let named = named_handoff("named-item", 1);
+        let snapshot = RoomSnapshot {
+            open_handoffs: vec![pool.clone(), named.clone()],
+            open_obligations: vec![named],
+            ..RoomSnapshot::default()
+        };
+        let result = next_for(&snapshot, StaleTargetedPolicy::Surface);
+        assert_eq!(result.action, "respond_to_handoff");
+        assert_eq!(result.target_event_id.as_deref(), Some("named-item"));
+        assert_eq!(result.alternatives[0].action, "claim_open_queue_item");
+
+        let idle = RoomSnapshot {
+            open_handoffs: vec![pool],
+            ..RoomSnapshot::default()
+        };
+        let result = next_for(&idle, StaleTargetedPolicy::Surface);
+        assert_eq!(result.action, "claim_open_queue_item");
+        assert_eq!(result.reason, "open_queue_item_available");
+        assert!(result.actionable);
+        assert!(
+            result.suggested_commands[0].starts_with("rally locate pool-item"),
+            "read current state before claiming: {:?}",
+            result.suggested_commands
+        );
+        assert_ne!(
+            result.reason, "open_handoff_targeted_to_this_tool",
+            "an untargeted item is never reported as targeted"
+        );
+    }
+
+    /// Acceptance: no age limit hides an open-queue item, under either policy;
+    /// age only marks it "revalidate before claiming".
+    #[test]
+    fn ancient_open_queue_item_is_revalidated_not_hidden() {
+        let snapshot = RoomSnapshot {
+            open_handoffs: vec![open_queue_handoff("fact_97f3", 1, "2026-06-04T21:35:56Z")],
+            open_queue_signals: crate::open_queue::OpenQueueSignals {
+                pickup_sample: crate::pickup_threshold::MIN_ROOM_SAMPLE,
+                room_pickup_p95_secs: Some(7 * 86_400),
+                ..Default::default()
+            },
+            ..RoomSnapshot::default()
+        };
+        for policy in [StaleTargetedPolicy::Surface, StaleTargetedPolicy::Ignore] {
+            let result = next_for(&snapshot, policy);
+            assert_eq!(result.action, "claim_open_queue_item", "policy={policy:?}");
+            assert_eq!(result.reason, "open_queue_item_needs_revalidation");
+            assert_eq!(result.inbox.open_queue.count, 1);
+            assert!(result.inbox.open_queue.items[0].revalidate_before_claiming);
+            assert_eq!(result.inbox.count, 0, "not counted as owed by name");
+        }
+    }
+
+    /// Acceptance 5: `next` and `inbox` read one obligation projection. On the
+    /// same snapshot, every named handoff `next` ranks is an inbox item, every
+    /// open-queue item `next` ranks is in the inbox open queue, and the inbox
+    /// `next` embeds equals the standalone inbox.
+    #[test]
+    fn next_and_inbox_agree_on_one_snapshot() {
+        let fresh = chrono::Utc::now().to_rfc3339();
+        let named_a = named_handoff("named-a", 2);
+        let named_b = named_handoff("named-b", 3);
+        // Closed by its sender but never acked by the receiver: still owed.
+        let sender_closed = named_handoff("named-sender-closed", 4);
+        // Accepted by the receiver (obligation closed) but never resolved:
+        // still assigned work, so it must still outrank the open queue.
+        let accepted = named_handoff("named-accepted", 7);
+        let snapshot = RoomSnapshot {
+            open_handoffs: vec![
+                named_a.clone(),
+                named_b.clone(),
+                open_queue_handoff("pool-1", 5, &fresh),
+                open_queue_handoff("pool-old", 6, "2000-01-01T00:00:00Z"),
+                accepted,
+            ],
+            open_obligations: vec![named_a, named_b, sender_closed],
+            // Enough repo history that the old pool item carries an age label.
+            open_queue_signals: crate::open_queue::OpenQueueSignals {
+                pickup_sample: crate::pickup_threshold::MIN_ROOM_SAMPLE,
+                room_pickup_p95_secs: Some(86_400),
+                ..Default::default()
+            },
+            ..RoomSnapshot::default()
+        };
+        let next = next_for(&snapshot, StaleTargetedPolicy::Surface);
+        let ranked = std::iter::once((next.action, next.target_event_id.clone()))
+            .chain(
+                next.alternatives
+                    .iter()
+                    .map(|alt| (alt.action, alt.target_event_id.clone())),
+            )
+            .collect::<Vec<_>>();
+        let ids_for = |action: &str| {
+            let mut ids = ranked
+                .iter()
+                .filter(|(a, _)| *a == action)
+                .filter_map(|(_, id)| id.clone())
+                .collect::<Vec<_>>();
+            ids.sort();
+            ids
+        };
+
+        let inbox = crate::obligations::build_inbox(
+            &snapshot,
+            "codex",
+            20,
+            DEFAULT_STALE_WAIT_SECS,
+            crate::open_queue::open_queue_items(
+                &snapshot,
+                "codex",
+                &crate::open_queue::FsSignals::default(),
+                chrono::Utc::now().timestamp(),
+            ),
+        );
+        let mut inbox_named = inbox
+            .items
+            .iter()
+            .filter(|item| item.kind == FactKind::Handoff)
+            .map(|item| item.event_id.clone())
+            .collect::<Vec<_>>();
+        inbox_named.sort();
+        let mut inbox_pool = inbox
+            .open_queue
+            .items
+            .iter()
+            .map(|item| item.event_id.clone())
+            .collect::<Vec<_>>();
+        inbox_pool.sort();
+
+        let mut named_work = crate::obligations::named_work(&snapshot, "codex")
+            .into_iter()
+            .map(|(fact, _)| fact.event_id.clone())
+            .collect::<Vec<_>>();
+        named_work.sort();
+        assert_eq!(ids_for("respond_to_handoff"), named_work);
+        assert_eq!(inbox_named.len(), 3, "sender-closed handoff is still owed");
+        assert_eq!(
+            inbox.accepted_open, 1,
+            "accepted-but-open is counted, not dropped"
+        );
+        assert_eq!(named_work.len(), inbox_named.len() + inbox.accepted_open);
+        assert_eq!(
+            next.action, "respond_to_handoff",
+            "named work outranks the pool"
+        );
+        assert_eq!(ids_for("claim_open_queue_item"), inbox_pool);
+        assert_eq!(next.inbox.count, inbox.count);
+        assert_eq!(next.inbox.open_queue.count, inbox.open_queue.count);
+        assert_eq!(next.inbox.open_queue.revalidate, 1);
+    }
+
+    fn owned_claim(id: &str, lease: &str) -> Fact {
+        let mut fact = handoff(id, "unused", "2026-10-02T14:27:51Z");
+        fact.kind = FactKind::Claim;
+        fact.target = None;
+        fact.scope = vec!["file:src/a.rs".to_string()];
+        fact.evidence = vec![format!("lease_expires_at:{lease}")];
+        fact
+    }
+
+    /// Acceptance 4: a claim past `lease_expires_at` with no renewal is not
+    /// "still active"; it is a low-rank release-or-renew prompt below the open
+    /// queue. A live lease keeps the old wording.
+    #[test]
+    fn lease_expired_claim_is_a_low_rank_release_or_renew_prompt() {
+        let expired = owned_claim("fact_dc3e", "2026-10-02T14:57:51Z");
+        let live = owned_claim(
+            "live",
+            &(chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+        );
+        let snapshot = RoomSnapshot {
+            active_claims: vec![expired.clone()],
+            ..RoomSnapshot::default()
+        };
+        let result = next_for(&snapshot, StaleTargetedPolicy::Surface);
+        assert_eq!(result.action, "release_or_renew_claim");
+        assert_eq!(result.reason, "owned_claim_lease_expired");
+        assert_ne!(result.reason, "owned_claim_is_still_active");
+        assert!(
+            result.suggested_commands[0]
+                .starts_with("rally say release --tool codex --ref fact_dc3e")
+        );
+        assert!(result.suggested_claims.is_empty());
+
+        let with_pool = RoomSnapshot {
+            active_claims: vec![expired],
+            open_handoffs: vec![open_queue_handoff(
+                "pool",
+                9,
+                &chrono::Utc::now().to_rfc3339(),
+            )],
+            ..RoomSnapshot::default()
+        };
+        assert_eq!(
+            next_for(&with_pool, StaleTargetedPolicy::Surface).action,
+            "claim_open_queue_item"
+        );
+
+        let live_only = RoomSnapshot {
+            active_claims: vec![live],
+            ..RoomSnapshot::default()
+        };
+        let result = next_for(&live_only, StaleTargetedPolicy::Surface);
+        assert_eq!(result.reason, "owned_claim_is_still_active");
+    }
+
+    /// `enter` keeps "assigned to you" and "available to anyone" apart.
+    #[test]
+    fn entry_and_attention_label_open_queue_items_separately() {
+        let fresh = chrono::Utc::now().to_rfc3339();
+        let mut named = named_handoff("named", 2);
+        named.seq = 2;
+        let snapshot = RoomSnapshot {
+            open_handoffs: vec![named, open_queue_handoff("pool", 3, &fresh)],
+            ..RoomSnapshot::default()
+        };
+        let entry = build_entry(&snapshot, "codex", None, &[]);
+        let reasons = entry
+            .respond_to
+            .iter()
+            .map(|item| (item.reason, item.event_id.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reasons,
+            vec![("respond_to_handoff", "named"), ("open_queue_item", "pool")]
+        );
+        let attention = build_attention(&snapshot, "codex", 0, &[]);
+        assert!(
+            attention
+                .iter()
+                .any(|item| item.reason == "open_queue_item" && item.event_id == "pool")
+        );
+        assert!(
+            !attention
+                .iter()
+                .any(|item| item.reason == "handoff_assigned" && item.event_id == "pool")
+        );
     }
 }

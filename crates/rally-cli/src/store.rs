@@ -1251,6 +1251,14 @@ pub(crate) fn handoff_is_protocol_response(fact: &Fact) -> bool {
         )
 }
 
+/// A typed receiver response that DECLINES the handoff (`handoff.rejected`).
+/// It closes the receiver's obligation like an ack does, but unlike an
+/// acceptance it hands the work back, so it is not still-assigned work.
+pub(crate) fn handoff_response_is_rejection(fact: &Fact) -> bool {
+    handoff_is_protocol_response(fact)
+        && protocol_marker(fact, "event_kind") == Some("handoff.rejected")
+}
+
 pub(crate) fn strict_handoff_target_session(fact: &Fact) -> Option<&str> {
     (is_fact_v1_handoff_bridge(fact)
         && protocol_marker(fact, "event_kind") == Some("handoff.requested"))
@@ -1960,6 +1968,8 @@ pub(crate) struct RoomSnapshot {
     pub(crate) open_obligations_artifacts: usize,
     #[serde(skip)]
     pub(crate) open_obligations_omitted: usize,
+    #[serde(skip)]
+    pub(crate) open_obligations_accepted_open: Option<usize>,
     pub(crate) current_decisions: Vec<Fact>,
     pub(crate) current_risks: Vec<Fact>,
     /// System-generated health/telemetry facts (`external-intake`,
@@ -2052,6 +2062,12 @@ pub(crate) struct RoomSnapshot {
     /// erasing the timestamp destructive reclaim must inspect.
     #[serde(skip)]
     pub(crate) author_last_seen: BTreeMap<String, String>,
+    /// Ledger-derived open-queue validity signals (room pickup p95, later
+    /// done-ish facts per open-queue item). See `crate::open_queue`. Omitted
+    /// from the public room JSON; carried over the daemon wire and the snapshot
+    /// cache in [`SnapshotInternals`], so routed and direct mode agree.
+    #[serde(skip)]
+    pub(crate) open_queue_signals: crate::open_queue::OpenQueueSignals,
 }
 
 /// Bounded pre-write state used by `rally enter`.
@@ -2129,9 +2145,13 @@ pub(crate) struct SnapshotInternals {
     #[serde(default)]
     pub(crate) open_obligations_omitted: usize,
     #[serde(default)]
+    pub(crate) open_obligations_accepted_open: Option<usize>,
+    #[serde(default)]
     pub(crate) stale_authors: BTreeSet<String>,
     #[serde(default)]
     pub(crate) author_last_seen: BTreeMap<String, String>,
+    #[serde(default)]
+    pub(crate) open_queue_signals: crate::open_queue::OpenQueueSignals,
 }
 
 /// Hard, fail-loud bounds for the daemon-only snapshot side-channel.
@@ -2214,8 +2234,10 @@ impl RoomSnapshot {
             open_obligations_handoffs: self.open_obligations_handoffs,
             open_obligations_artifacts: self.open_obligations_artifacts,
             open_obligations_omitted: self.open_obligations_omitted,
+            open_obligations_accepted_open: self.open_obligations_accepted_open,
             stale_authors: self.stale_authors.clone(),
             author_last_seen: self.author_last_seen.clone(),
+            open_queue_signals: self.open_queue_signals.clone(),
         }
     }
 
@@ -2230,8 +2252,10 @@ impl RoomSnapshot {
         self.open_obligations_handoffs = internals.open_obligations_handoffs;
         self.open_obligations_artifacts = internals.open_obligations_artifacts;
         self.open_obligations_omitted = internals.open_obligations_omitted;
+        self.open_obligations_accepted_open = internals.open_obligations_accepted_open;
         self.stale_authors = internals.stale_authors;
         self.author_last_seen = internals.author_last_seen;
+        self.open_queue_signals = internals.open_queue_signals;
     }
 }
 
@@ -2311,10 +2335,15 @@ impl RoomSnapshot {
         self.open_obligations_handoffs = 0;
         self.open_obligations_artifacts = 0;
         self.open_obligations_omitted = 0;
+        self.open_obligations_accepted_open = None;
         self
     }
 
     pub(crate) fn for_obligation_target(mut self, tool: &str, row_limit: usize) -> Self {
+        let accepted_open = crate::obligations::named_work(&self, tool)
+            .iter()
+            .filter(|(_, state)| *state == crate::obligations::NamedState::AcceptedOpen)
+            .count();
         let mut mine = self
             .open_obligations
             .into_iter()
@@ -2347,6 +2376,7 @@ impl RoomSnapshot {
         self.open_obligations_omitted = total.saturating_sub(emitted.len());
         self.open_obligations = emitted;
         self.open_obligations_target = Some(tool.to_string());
+        self.open_obligations_accepted_open = Some(accepted_open);
         self.open_obligations_total = total;
         self.open_obligations_handoffs = handoffs;
         self.open_obligations_artifacts = artifacts;
@@ -2536,6 +2566,7 @@ impl RoomSnapshot {
             open_obligations_handoffs: self.open_obligations_handoffs,
             open_obligations_artifacts: self.open_obligations_artifacts,
             open_obligations_omitted: self.open_obligations_omitted,
+            open_obligations_accepted_open: self.open_obligations_accepted_open,
             current_decisions: filter_facts(self.current_decisions, query),
             current_risks: filter_facts(self.current_risks, query),
             recent_artifacts: filter_facts(self.recent_artifacts, query),
@@ -2554,6 +2585,9 @@ impl RoomSnapshot {
             composition: self.composition,
             stale_authors: self.stale_authors,
             author_last_seen: self.author_last_seen,
+            // Room-level history (pickup p95) and per-item signals keyed by id;
+            // a query narrows which items render, not what is known about them.
+            open_queue_signals: self.open_queue_signals,
         };
         filtered.totals = RoomTotals {
             active_claims: filtered.active_claims.len(),
@@ -2949,44 +2983,59 @@ pub(crate) struct RoomMutationLock;
 
 #[cfg(unix)]
 pub(crate) fn acquire_room_mutation_lock(room_dir: &Path) -> Result<RoomMutationLock> {
-    fs::create_dir_all(room_dir)
-        .map_err(RallyError::io(format!("create {}", room_dir.display())))?;
     let path = room_dir.join(ROOM_MUTATION_LOCK_FILENAME);
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&path)
-        .map_err(RallyError::io(format!("open {}", path.display())))?;
-    let deadline = effective_mutation_deadline();
+    let file = open_named_lock_file(room_dir, ROOM_MUTATION_LOCK_FILENAME)?;
+    acquire_exclusive_until(
+        &file,
+        effective_mutation_deadline(),
+        || format!("lock {}", path.display()),
+        pause_after_room_lock_flock_for_test,
+        |provisional| {
+            if provisional {
+                mutation_not_started_after_provisional_lock(&path)
+            } else {
+                mutation_not_started(&path)
+            }
+        },
+    )?;
+    Ok(RoomMutationLock { file })
+}
+
+/// One deadline contract for room mutation and bounded daemon ownership:
+/// retry only while time remains, then recheck after a successful syscall.
+/// Callers retain their diagnostic vocabulary and test-only scheduling seam.
+#[cfg(unix)]
+fn acquire_exclusive_until(
+    file: &fs::File,
+    deadline: Instant,
+    context: impl Fn() -> String,
+    after_acquire: fn(),
+    expired: impl Fn(bool) -> RallyError,
+) -> Result<()> {
     loop {
         if Instant::now() >= deadline {
-            return Err(mutation_not_started(&path));
+            return Err(expired(false));
         }
         let rc =
             unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_EX | unix_lock::LOCK_NB) };
         if rc == 0 {
-            pause_after_room_lock_flock_for_test();
+            after_acquire();
             if Instant::now() >= deadline {
-                // A process can be descheduled between the pre-check and the
-                // successful syscall. Relinquish the just-acquired lock and
-                // preserve the typed no-mutation-started contract.
                 let _ = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_UN) };
-                return Err(mutation_not_started_after_provisional_lock(&path));
+                return Err(expired(true));
             }
-            return Ok(RoomMutationLock { file });
+            return Ok(());
         }
         let source = io::Error::last_os_error();
         if source.kind() != io::ErrorKind::WouldBlock {
             return Err(RallyError::Io {
-                context: format!("lock {}", path.display()),
+                context: context(),
                 source,
             });
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(mutation_not_started(&path));
+            return Err(expired(false));
         }
         thread::sleep(MUTATION_LOCK_RETRY_DELAY.min(remaining));
     }
@@ -3334,43 +3383,27 @@ pub(crate) fn acquire_owner_exclusive_bounded(
     let deadline = now
         .checked_add(budget)
         .unwrap_or(now + MUTATION_LOCK_FALLBACK_BOUND);
-    loop {
-        if Instant::now() >= deadline {
-            return Err(RallyError::NotStarted(format!(
-                "daemon-open-not-started: deadline elapsed before acquiring {}; no daemon runtime state was published",
-                path.display()
-            )));
-        }
-        let rc =
-            unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_EX | unix_lock::LOCK_NB) };
-        if rc == 0 {
-            pause_after_owner_lock_flock_for_test();
-            if Instant::now() >= deadline {
-                let _ = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_UN) };
-                return Err(RallyError::NotStarted(format!(
+    acquire_exclusive_until(
+        &file,
+        deadline,
+        || format!("lock-ex {}", path.display()),
+        pause_after_owner_lock_flock_for_test,
+        |provisional| {
+            if provisional {
+                RallyError::NotStarted(format!(
                     "daemon-open-not-started: deadline elapsed after provisional lock acquisition at {}; lock released before any daemon runtime state was published and retry is safe",
                     path.display()
-                )));
+                ))
+            } else {
+                RallyError::NotStarted(format!(
+                    "daemon-open-not-started: deadline elapsed before acquiring {}; no daemon runtime state was published",
+                    path.display()
+                ))
             }
-            stamp_exclusive_holder(&file, "daemon-owner");
-            return Ok(OwnerGuard { file });
-        }
-        let source = io::Error::last_os_error();
-        if source.kind() != io::ErrorKind::WouldBlock {
-            return Err(RallyError::Io {
-                context: format!("lock-ex {}", path.display()),
-                source,
-            });
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(RallyError::NotStarted(format!(
-                "daemon-open-not-started: deadline elapsed before acquiring {}; no daemon runtime state was published",
-                path.display()
-            )));
-        }
-        thread::sleep(MUTATION_LOCK_RETRY_DELAY.min(remaining));
-    }
+        },
+    )?;
+    stamp_exclusive_holder(&file, "daemon-owner");
+    Ok(OwnerGuard { file })
 }
 
 /// Try to acquire a named exclusive advisory lock without blocking.
@@ -6751,21 +6784,31 @@ impl DirectRoomStore {
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
         trigger_o26_fault(rally_dir, O26FaultPoint::SnapshotPostCommit)
             .map_err(|detail| RallyError::Message(format!("snapshot fault: {detail}")))?;
-        let _guard = acquire_room_mutation_lock(rally_dir)?;
-        let facts = self.facts_under_lock()?;
-        let coord = crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
+        // Capture inputs and their proof in one mutation epoch. Projection
+        // reads owned values, so writers need not wait for its CPU work.
+        // Fingerprinting again afterward could bless stale facts as current.
+        let (facts, coord, fingerprint) = {
+            let _guard = acquire_room_mutation_lock(rally_dir)?;
+            let facts = self.facts_under_lock()?;
+            let coord =
+                crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
+            let fingerprint = snapshot_cache_fingerprint_at(
+                rally_dir,
+                projection_unix_sec,
+                include_archived,
+                &coord,
+            )?;
+            (facts, coord, fingerprint)
+        };
+        #[cfg(test)]
+        pause_snapshot_projection_after_capture(rally_dir);
+
         let snapshot = snapshot_from_facts_with_policy_at(
             &facts,
             &coord,
             include_archived,
             projection_unix_sec,
         );
-        let fingerprint = snapshot_cache_fingerprint_at(
-            rally_dir,
-            projection_unix_sec,
-            include_archived,
-            &coord,
-        )?;
         Ok(SnapshotCacheCapture {
             snapshot,
             fingerprint: Some(fingerprint),
@@ -6915,7 +6958,7 @@ impl DirectRoomStore {
         };
 
         #[cfg(test)]
-        pause_scoped_projection_after_capture(room_dir);
+        pause_snapshot_projection_after_capture(room_dir);
 
         let scoped_facts = select_scoped_facts(
             &engagement_facts,
@@ -7287,38 +7330,33 @@ impl ScopedSelectionStats {
 }
 
 #[cfg(test)]
-struct ScopedCapturePause {
+struct SnapshotCapturePause {
     room_dir: PathBuf,
     captured: std::sync::mpsc::Sender<()>,
     resume: std::sync::mpsc::Receiver<()>,
 }
 
 #[cfg(test)]
-static SCOPED_CAPTURE_PAUSE: Mutex<Option<ScopedCapturePause>> = Mutex::new(None);
+static SNAPSHOT_CAPTURE_PAUSES: Mutex<Vec<SnapshotCapturePause>> = Mutex::new(Vec::new());
 
 /// Test seam at the exact ownership boundary: selected canonical inputs have
 /// been captured, and the mutation lock must already be available to a peer.
 #[cfg(test)]
-fn pause_scoped_projection_after_capture(room_dir: &Path) {
+fn pause_snapshot_projection_after_capture(room_dir: &Path) {
     let pause = {
-        let mut slot = SCOPED_CAPTURE_PAUSE
+        let mut slot = SNAPSHOT_CAPTURE_PAUSES
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if slot
-            .as_ref()
-            .is_some_and(|pause| pause.room_dir == room_dir)
-        {
-            slot.take()
-        } else {
-            None
-        }
+        slot.iter()
+            .position(|pause| pause.room_dir == room_dir)
+            .map(|index| slot.remove(index))
     };
     if let Some(pause) = pause {
         pause.captured.send(()).unwrap();
         pause
             .resume
             .recv_timeout(Duration::from_secs(5))
-            .expect("scoped projection test did not release its capture pause");
+            .expect("snapshot projection test did not release its capture pause");
     }
 }
 
@@ -9002,6 +9040,7 @@ fn snapshot_from_facts_with_policy_at(
     // the inbox without the hook paying an extra process spawn per fire (the
     // repo's performance agreement counts spawns as an attributed cost).
     let open_obligations = project_open_obligations(facts);
+    let open_queue_signals = crate::open_queue::project_signals(facts, &open_handoffs);
     // Tools that have AUTHORED at least one fact here — the room's evidence that
     // an agent by that name has actually been present.
     //
@@ -9470,6 +9509,7 @@ fn snapshot_from_facts_with_policy_at(
         open_obligations_handoffs: 0,
         open_obligations_artifacts: 0,
         open_obligations_omitted: 0,
+        open_obligations_accepted_open: None,
         current_decisions,
         current_risks,
         system_health,
@@ -9486,6 +9526,7 @@ fn snapshot_from_facts_with_policy_at(
         composition: None,
         stale_authors,
         author_last_seen,
+        open_queue_signals,
     }
 }
 
@@ -12874,9 +12915,22 @@ const SNAPSHOT_CACHE_FILENAME: &str = "snapshot.cache.json";
 /// hands back an EMPTY bucket — the same silent-empty failure, one field over.
 /// Reusing 3 for both shapes would have made the counter unable to tell them
 /// apart, so the integration takes the next number rather than the shared one.
-const SNAPSHOT_CACHE_GENERATION: u32 = 5;
+///
+/// Bumped 5 -> 6 when [`SnapshotInternals`] gained `open_queue_signals`. A
+/// generation-5 cache would deserialize with empty signals and report every
+/// room's open queue as having no pickup history.
+///
+/// Bumped 6 -> 7 when `room_pickup_p95_secs` started being set for rooms with
+/// fewer than 20 picked-up items (room blend). A generation-6 cache would
+/// report those rooms as having no history and apply the bare prior.
+///
+/// Bumped 7 -> 8 when the room p95 stopped counting a sender's close of its
+/// own posting (per-repo threshold, 2026-10-19). A generation-7 cache would
+/// keep reporting the biased-low value.
+const SNAPSHOT_CACHE_GENERATION: u32 = 8;
 
-/// Snapshot and freshness proof captured while one room mutation lock is held.
+/// Snapshot projected from inputs and a freshness proof captured together under
+/// one room mutation lock. Pure projection runs after releasing that lock.
 /// This pair is the only value accepted by the cache writer.
 #[derive(Clone, Debug)]
 pub(crate) struct SnapshotCacheCapture {
@@ -14877,6 +14931,60 @@ mod ledger_tests {
     }
 
     #[test]
+    fn full_capture_releases_lock_and_keeps_original_cache_proof() {
+        let root = unique_root("full-snapshot-short-lock");
+        let room_dir = root.join(".rally");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let first = make_fact("capture-first", FactKind::Artifact, "src/", "first");
+        store.append_fact(&first).unwrap();
+        let at = projection_unix_sec();
+        let expected = store.snapshot_cache_capture_at(false, at).unwrap();
+        let (captured_tx, captured_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        SNAPSHOT_CAPTURE_PAUSES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(SnapshotCapturePause {
+                room_dir: room_dir.clone(),
+                captured: captured_tx,
+                resume: resume_rx,
+            });
+        let query = thread::spawn(move || store.snapshot_cache_capture_at(false, at));
+        captured_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // The write must finish while projection remains paused. A deadline
+        // gives the regression a bounded failure instead of a deadlock.
+        let start = Instant::now();
+        let result = with_mutation_deadline(Duration::from_secs(1), || {
+            let writer = DirectRoomStore::open_direct_at(root.clone())?;
+            writer.append_fact(&make_fact(
+                "capture-later",
+                FactKind::Artifact,
+                "src/",
+                "concurrent append",
+            ))
+        });
+        let elapsed = start.elapsed();
+        resume_tx.send(()).unwrap();
+        let capture = query.join().unwrap().unwrap();
+        let appended = result.expect("writer was blocked by CPU-only snapshot projection");
+        println!("FULL_CAPTURE peer_write_us={}", elapsed.as_micros());
+        assert!(appended.fact.seq > capture.snapshot.max_seq);
+        assert_eq!(capture.fingerprint, expected.fingerprint);
+        assert_eq!(
+            snapshot_to_wire_value(&capture.snapshot).unwrap(),
+            snapshot_to_wire_value(&expected.snapshot).unwrap(),
+            "projection must use precisely the captured inputs"
+        );
+        write_snapshot_cache(&room_dir, &capture);
+        assert!(
+            try_load_cached_snapshot_at(&room_dir, at).is_none(),
+            "an append during projection must invalidate the original proof"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn scoped_capture_releases_mutation_lock_before_large_projection() {
         let root = unique_root("scoped-snapshot-short-lock");
         let store = DirectRoomStore::open_direct_at_with_engagement(
@@ -14902,11 +15010,10 @@ mod ledger_tests {
         let (captured_tx, captured_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
         {
-            let mut pause = SCOPED_CAPTURE_PAUSE
+            let mut pause = SNAPSHOT_CAPTURE_PAUSES
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            assert!(pause.is_none(), "another scoped capture test is active");
-            *pause = Some(ScopedCapturePause {
+            pause.push(SnapshotCapturePause {
                 room_dir: room_dir.clone(),
                 captured: captured_tx,
                 resume: resume_rx,
@@ -21611,6 +21718,122 @@ mod sec001_takeover_guard_tests {
         store.append_fact(&release).unwrap();
         let snap = store.snapshot().unwrap();
         assert!(!snap.active_claims.iter().any(|c| c.event_id == "claim-s"));
+        fs::remove_dir_all(&r).ok();
+    }
+
+    fn leased_claim(r: &Path, lease: &str) -> (RoomStore, Fact) {
+        let store = RoomStore::open_at(r.to_path_buf()).unwrap();
+        let mut claim = fact_at(
+            "claim-leased",
+            FactKind::Claim,
+            "shared-tool",
+            "file:src/a.rs",
+            &iso_ago(5),
+        );
+        claim.from_session_id = Some("session-owner".to_string());
+        claim.evidence = vec![format!("lease_expires_at:{lease}")];
+        store.append_fact(&claim).unwrap();
+        (store, claim)
+    }
+
+    fn close_by(kind: FactKind, tool: &str, session: Option<&str>, claim: &Fact) -> Fact {
+        let mut close = fact_at("close", kind, tool, "file:src/a.rs", &iso_ago(0));
+        close.from_session_id = session.map(str::to_string);
+        close.ref_id = Some(claim.event_id.clone());
+        close
+    }
+
+    fn still_active(store: &RoomStore, claim: &Fact) -> bool {
+        store
+            .snapshot()
+            .unwrap()
+            .active_claims
+            .iter()
+            .any(|active| active.event_id == claim.event_id)
+    }
+
+    /// AGEN-RALLY-NEXT acceptance 4: a later session of the SAME tool can
+    /// release its tool's claim once the lease has run out, without a
+    /// room-wide `doctor --reap-stale --apply`.
+    #[test]
+    fn later_same_tool_session_can_release_a_lease_expired_claim() {
+        let r = root("later-session-expired-release");
+        let (store, claim) = leased_claim(&r, &iso_ago(60));
+        let release = close_by(
+            FactKind::Release,
+            "shared-tool",
+            Some("session-later"),
+            &claim,
+        );
+        store
+            .append_fact(&release)
+            .expect("a later same-tool session may release an expired lease");
+        assert!(!still_active(&store, &claim));
+        fs::remove_dir_all(&r).ok();
+    }
+
+    /// ARP-R-02 still holds for an UNEXPIRED claim: a session wearing the same
+    /// tool label cannot take it, by release or by any other closing kind.
+    #[test]
+    fn same_label_session_cannot_take_an_unexpired_claim() {
+        let r = root("same-label-unexpired");
+        let lease = (chrono::Utc::now() + chrono::Duration::minutes(30))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let (store, claim) = leased_claim(&r, &lease);
+        for kind in [FactKind::Release, FactKind::Receipt, FactKind::Resolve] {
+            let err = store
+                .append_fact(&close_by(
+                    kind.clone(),
+                    "shared-tool",
+                    Some("session-rogue"),
+                    &claim,
+                ))
+                .expect_err("an unexpired claim is not takeable by a label-sharing session")
+                .to_string();
+            assert!(
+                err.contains("another shared-tool session"),
+                "{kind:?}: {err}"
+            );
+        }
+        assert!(still_active(&store, &claim));
+        fs::remove_dir_all(&r).ok();
+    }
+
+    /// The successor arm is narrow: lease expiry does not let a DIFFERENT tool,
+    /// a sessionless writer, or a non-release kind take the claim.
+    #[test]
+    fn expired_lease_alone_does_not_open_the_claim_to_others() {
+        let r = root("expired-not-open");
+        let (store, claim) = leased_claim(&r, &iso_ago(60));
+        let rogue = store
+            .append_fact(&close_by(
+                FactKind::Release,
+                "rogue:01",
+                Some("session-rogue"),
+                &claim,
+            ))
+            .expect_err("a different tool still needs the stale-owner window")
+            .to_string();
+        assert!(rogue.contains("not the owner"), "{rogue}");
+        let sessionless = store
+            .append_fact(&close_by(FactKind::Release, "shared-tool", None, &claim))
+            .expect_err("a sessionless writer is not a later session")
+            .to_string();
+        assert!(
+            sessionless.contains("another shared-tool session"),
+            "{sessionless}"
+        );
+        let receipt = store
+            .append_fact(&close_by(
+                FactKind::Receipt,
+                "shared-tool",
+                Some("session-later"),
+                &claim,
+            ))
+            .expect_err("only release/claim.expired end an expired claim via this arm")
+            .to_string();
+        assert!(receipt.contains("another shared-tool session"), "{receipt}");
+        assert!(still_active(&store, &claim));
         fs::remove_dir_all(&r).ok();
     }
 

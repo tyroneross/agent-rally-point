@@ -101,6 +101,84 @@ class LifecycleBudgetTests(unittest.TestCase):
                     if posts and reads:
                         self.assertGreater(min(posts), max(reads), lines)
 
+    def test_module_initialization_counts_against_host_deadline(self):
+        import time
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            base = Path(directory)
+            repo = base / "repo"
+            (repo / ".rally").mkdir(parents=True)
+            # POSIX is loaded before the old stopwatch started. Simulate
+            # startup contention beyond the host limit, then stall the renderer.
+            real_posix = subprocess.check_output(
+                ["perl", "-MPOSIX", "-e", 'print $INC{"POSIX.pm"}'], text=True)
+            modules = base / "modules"
+            modules.mkdir()
+            (modules / "POSIX.pm").write_text(
+                'select undef, undef, undef, 6;\nrequire ' + json.dumps(real_posix) + ';\n1;\n')
+            shim = base / "shim"
+            shim.mkdir()
+            (shim / "node").write_text("#!/bin/bash\nsleep 10\n")
+            (shim / "node").chmod(0o700)
+            env = {k: v for k, v in os.environ.items() if not k.startswith("RALLY_")}
+            env.update(RALLY_HOOKS="on", RALLY_NATIVE_HOOK="off", PERL5LIB=str(modules),
+                       PATH=f"{shim}:{env.get('PATH', '')}")
+            began = time.monotonic()
+            result = subprocess.run(["bash", str(HOOK), "start", "claude_code"],
+                                    cwd=repo, env=env, input="{}", text=True,
+                                    capture_output=True, timeout=8)
+            self.assertLess(time.monotonic() - began, 5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), {})
+
+    def test_concurrent_project_and_plugin_startup_stays_within_host_deadline(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import time
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            base = Path(directory)
+            repo = base / "repo"
+            (repo / ".rally").mkdir(parents=True)
+            shim = base / "shim"
+            shim.mkdir()
+            (shim / "node").write_text("#!/bin/bash\nsleep 10\n")
+            (shim / "node").chmod(0o700)
+            env = {k: v for k, v in os.environ.items() if not k.startswith("RALLY_")}
+            env.update(RALLY_HOOKS="on", RALLY_NATIVE_HOOK="off",
+                       PATH=f"{shim}:{env.get('PATH', '')}")
+            def run(source):
+                began = time.monotonic()
+                result = subprocess.run(["bash", str(HOOK), "start", "claude_code"],
+                                        cwd=repo, env=dict(env, RALLY_HOOK_SOURCE=source),
+                                        input='{"session_id":"paired-startup"}', text=True,
+                                        capture_output=True, timeout=5)
+                return result, time.monotonic() - began
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                for result, elapsed in pool.map(run, ["project", "plugin"] * 2):
+                    self.assertLess(elapsed, 5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(result.stdout), {})
+
+    def test_budget_overrides_cannot_exceed_host_deadline(self):
+        import time
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            base = Path(directory)
+            repo = base / "repo"
+            (repo / ".rally").mkdir(parents=True)
+            shim = base / "shim"
+            shim.mkdir()
+            (shim / "node").write_text("#!/bin/bash\nsleep 10\n")
+            (shim / "node").chmod(0o700)
+            env = {k: v for k, v in os.environ.items() if not k.startswith("RALLY_")}
+            env.update(RALLY_HOOKS="on", RALLY_NATIVE_HOOK="off",
+                       RALLY_HOOK_DEADLINE_MS="59999", RALLY_HOOK_MS_BUDGET_SCALE="16",
+                       PATH=f"{shim}:{env.get('PATH', '')}")
+            began = time.monotonic()
+            result = subprocess.run(["bash", str(HOOK), "start", "claude_code"],
+                                    cwd=repo, env=env, input="{}", text=True,
+                                    capture_output=True, timeout=6)
+            self.assertLess(time.monotonic() - began, 5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), {})
+
     def test_supervisor_overrun_fails_open_with_empty_object(self):
         with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
             base = Path(directory)

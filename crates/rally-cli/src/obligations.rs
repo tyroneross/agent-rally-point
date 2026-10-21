@@ -74,6 +74,107 @@ pub(crate) struct InboxResult {
     pub(crate) oldest_age_secs: i64,
     pub(crate) stale_window_secs: i64,
     pub(crate) items: Vec<InboxItem>,
+    /// Named handoffs this tool acked or accepted but nobody has resolved:
+    /// no longer an unanswered obligation, still assigned work. Omitted at 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) accepted_open: usize,
+    /// An older peer omitted unanswered rows without an exact accepted count.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) accepted_open_incomplete: bool,
+    /// The OPEN QUEUE: unowned handoffs any agent may claim. Separate from the
+    /// counts above, which are work assigned to this tool by name, so a reader
+    /// can never mistake an available item for one handed to it. Built by
+    /// [`crate::open_queue::open_queue_items`] — the same call `next` ranks
+    /// from — so `next` and `inbox` agree on one snapshot. Omitted when the
+    /// open queue is empty, so an inbox with no open-queue items renders
+    /// byte-identically to the pre-open-queue shape.
+    #[serde(default, skip_serializing_if = "OpenQueueSummary::is_empty")]
+    pub(crate) open_queue: OpenQueueSummary,
+}
+
+/// Exact counts over the whole open queue, with a capped item sample.
+#[derive(Clone, Debug, Default, JsonSchema, Serialize)]
+pub(crate) struct OpenQueueSummary {
+    pub(crate) count: usize,
+    /// How many carry at least one "revalidate before claiming" reason.
+    pub(crate) revalidate: usize,
+    pub(crate) items: Vec<crate::open_queue::OpenQueueItem>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+impl OpenQueueSummary {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
+/// Where a handoff addressed to this tool BY NAME stands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NamedState {
+    /// No receiver-authored ack yet: an inbox obligation.
+    Unanswered,
+    /// The receiver acked or accepted it (`handoff.acked` / `handoff.accepted`),
+    /// which closes the obligation, but nothing resolved the handoff itself.
+    /// A `handoff.rejected` reply is excluded: that hands the work back.
+    /// An ack is not completion (AGEN-COORDINATION-kzt037p65xg01), so this is
+    /// still assigned work and still outranks the open queue.
+    AcceptedOpen,
+    /// A bounded reply omitted unanswered rows, so this handoff's state is unknown.
+    Incomplete,
+}
+
+/// Every handoff assigned to `tool` by name that is still open, oldest first.
+///
+/// The ONE named-work projection: `next` ranks from it and `inbox` counts from
+/// it (`count`/`handoffs` for [`NamedState::Unanswered`], `accepted_open` for
+/// [`NamedState::AcceptedOpen`]). Bounded replies cannot distinguish omitted
+/// unanswered rows from accepted work; those rows remain explicitly incomplete.
+pub(crate) fn named_work<'a>(
+    snapshot: &'a RoomSnapshot,
+    tool: &str,
+) -> Vec<(&'a Fact, NamedState)> {
+    let mut work = snapshot
+        .open_obligations
+        .iter()
+        .filter(|fact| fact.kind == FactKind::Handoff && fact.target.as_deref() == Some(tool))
+        .map(|fact| (fact, NamedState::Unanswered))
+        .collect::<Vec<_>>();
+    let owed = work
+        .iter()
+        .map(|(fact, _)| fact.event_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    work.extend(
+        snapshot
+            .open_handoffs
+            .iter()
+            .filter(|fact| {
+                crate::next::handoff_address(fact, tool) == crate::next::HandoffAddress::Named
+                    && !owed.contains(fact.event_id.as_str())
+                    && !snapshot
+                        .open_queue_signals
+                        .rejected_named
+                        .contains(&fact.event_id)
+            })
+            .map(|fact| {
+                let state = if snapshot.open_obligations_target.as_deref() == Some(tool)
+                    && snapshot.open_obligations_omitted > 0
+                {
+                    NamedState::Incomplete
+                } else {
+                    NamedState::AcceptedOpen
+                };
+                (fact, state)
+            }),
+    );
+    work.sort_by_key(|(fact, _)| fact.seq);
+    work
 }
 
 /// Project the open obligations addressed to `tool`, oldest first.
@@ -88,6 +189,7 @@ pub(crate) fn build_inbox(
     tool: &str,
     limit: usize,
     stale_wait_secs: i64,
+    open_queue: Vec<crate::open_queue::OpenQueueItem>,
 ) -> InboxResult {
     let mut mine = snapshot
         .open_obligations
@@ -151,13 +253,44 @@ pub(crate) fn build_inbox(
         })
         .collect::<Vec<_>>();
 
+    let open_queue = OpenQueueSummary {
+        count: open_queue.len(),
+        revalidate: open_queue
+            .iter()
+            .filter(|item| item.revalidate_before_claiming)
+            .count(),
+        items: open_queue.into_iter().take(limit).collect(),
+    };
+
+    let accepted_open_incomplete = target_scoped
+        && snapshot.open_obligations_accepted_open.is_none()
+        && snapshot.open_obligations_omitted > 0;
+    let accepted_open = if target_scoped {
+        snapshot.open_obligations_accepted_open
+    } else {
+        None
+    }
+    .unwrap_or_else(|| {
+        if accepted_open_incomplete {
+            0
+        } else {
+            named_work(snapshot, tool)
+                .iter()
+                .filter(|(_, state)| *state == NamedState::AcceptedOpen)
+                .count()
+        }
+    });
+
     InboxResult {
+        accepted_open,
+        accepted_open_incomplete,
         count,
         handoffs,
         artifacts,
         oldest_age_secs,
         stale_window_secs: stale_wait_secs,
         items,
+        open_queue,
     }
 }
 
@@ -297,6 +430,66 @@ fn fact_age_secs(fact: &Fact) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bounded_inbox_preserves_exact_accepted_count_across_wire() {
+        let unanswered = crate::store::Fact {
+            event_id: "unanswered".into(),
+            kind: crate::store::FactKind::Handoff,
+            target: Some("receiver".into()),
+            ..Default::default()
+        };
+        let accepted = crate::store::Fact {
+            event_id: "accepted".into(),
+            ..unanswered.clone()
+        };
+        let full = crate::store::RoomSnapshot {
+            open_handoffs: vec![unanswered.clone(), accepted],
+            open_obligations: vec![unanswered],
+            ..Default::default()
+        };
+        for limit in [0, 1] {
+            let scoped = full.clone().for_obligation_target("receiver", limit);
+            let mut wire = crate::store::snapshot_to_wire_value(&scoped).unwrap();
+            let restored = crate::store::snapshot_from_wire_value(wire.clone()).unwrap();
+            let inbox = super::build_inbox(&restored, "receiver", limit, 300, vec![]);
+            assert_eq!(inbox.count, 1);
+            assert_eq!(inbox.accepted_open, 1);
+            assert!(!inbox.accepted_open_incomplete);
+            let named = super::named_work(&restored, "receiver");
+            assert_eq!(named.len(), 2);
+            if limit == 0 {
+                assert!(
+                    named
+                        .iter()
+                        .all(|(_, state)| *state == super::NamedState::Incomplete)
+                );
+            } else {
+                assert_eq!(
+                    named
+                        .iter()
+                        .filter(|(_, state)| *state == super::NamedState::Unanswered)
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    named
+                        .iter()
+                        .filter(|(_, state)| *state == super::NamedState::AcceptedOpen)
+                        .count(),
+                    1
+                );
+            }
+            wire[crate::store::WIRE_INTERNALS_KEY]
+                .as_object_mut()
+                .unwrap()
+                .remove("open_obligations_accepted_open");
+            let legacy = crate::store::snapshot_from_wire_value(wire).unwrap();
+            let inbox = super::build_inbox(&legacy, "receiver", limit, 300, vec![]);
+            assert_eq!(inbox.accepted_open_incomplete, limit == 0);
+            assert_eq!(inbox.accepted_open, usize::from(limit != 0));
+        }
+    }
+
     use super::*;
 
     fn obligation(event_id: &str, kind: FactKind, target: &str, created_at: &str) -> Fact {
@@ -331,7 +524,7 @@ mod tests {
             ..RoomSnapshot::default()
         };
 
-        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS);
+        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS, Vec::new());
         assert_eq!(inbox.count, 1);
         assert_eq!(inbox.handoffs, 1);
         assert_eq!(inbox.artifacts, 0);
@@ -360,7 +553,7 @@ mod tests {
             ..RoomSnapshot::default()
         };
 
-        let inbox = build_inbox(&snapshot, "codex", 2, DEFAULT_STALE_WAIT_SECS);
+        let inbox = build_inbox(&snapshot, "codex", 2, DEFAULT_STALE_WAIT_SECS, Vec::new());
         assert_eq!(inbox.count, 7, "count covers every obligation");
         assert_eq!(inbox.items.len(), 2, "items are capped");
         assert_eq!(
@@ -388,7 +581,7 @@ mod tests {
             ..RoomSnapshot::default()
         };
 
-        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS);
+        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS, Vec::new());
         assert_eq!(inbox.count, 1);
         assert_eq!(inbox.artifacts, 1);
         assert_eq!(inbox.items[0].age_secs, 0);
@@ -409,7 +602,7 @@ mod tests {
             ..RoomSnapshot::default()
         };
 
-        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS);
+        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS, Vec::new());
         assert_eq!(inbox.count, 1);
         assert!(inbox.items[0].stale, "a very old item is annotated stale");
         assert_eq!(inbox.oldest_age_secs, inbox.items[0].age_secs);
@@ -428,8 +621,8 @@ mod tests {
             ..RoomSnapshot::default()
         };
 
-        let short = build_inbox(&snapshot, "codex", 5, 60);
-        let long = build_inbox(&snapshot, "codex", 5, 600);
+        let short = build_inbox(&snapshot, "codex", 5, 60, Vec::new());
+        let long = build_inbox(&snapshot, "codex", 5, 600, Vec::new());
         assert_eq!(short.stale_window_secs, 60);
         assert_eq!(long.stale_window_secs, 600);
         assert!(short.items[0].stale);
@@ -453,7 +646,7 @@ mod tests {
             ..RoomSnapshot::default()
         };
 
-        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS);
+        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS, Vec::new());
         assert_eq!(
             inbox.items[0].ack_by.as_deref(),
             Some("2000-01-01T00:01:30Z")
@@ -479,7 +672,7 @@ mod tests {
             ..RoomSnapshot::default()
         };
 
-        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS);
+        let inbox = build_inbox(&snapshot, "codex", 5, DEFAULT_STALE_WAIT_SECS, Vec::new());
         assert_eq!(inbox.items[0].ack_by, None);
         assert_eq!(inbox.items[0].ack_by_ms, None);
     }

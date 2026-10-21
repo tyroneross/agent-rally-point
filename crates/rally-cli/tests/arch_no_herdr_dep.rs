@@ -337,8 +337,15 @@ fn detect_host_runtime_no_longer_references_herdr_socket() {
     // "(was herdr.sock, renamed to ptyd.sock)" doesn't trip the gate.
     // Block-comment stripping is not needed — `detect_host_runtime` has none.
     let lib_rs = read_to_string(&rally_cli_root().join("src").join("lib.rs"));
-    let fn_body_raw = extract_function_body(&lib_rs, "fn detect_host_runtime(")
-        .expect("detect_host_runtime function must exist in lib.rs");
+    // ac7a6b8 moved the socket list into `ptyd_socket_candidates()`, so the
+    // host-detection path is both functions; scan them together.
+    let fn_body_raw = [
+        extract_function_body(&lib_rs, "fn detect_host_runtime(")
+            .expect("detect_host_runtime function must exist in lib.rs"),
+        extract_function_body(&lib_rs, "fn ptyd_socket_candidates(")
+            .expect("ptyd_socket_candidates function must exist in lib.rs"),
+    ]
+    .join("\n");
     let code_only: String = fn_body_raw
         .lines()
         .map(|line| match line.find("//") {

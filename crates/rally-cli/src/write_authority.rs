@@ -148,6 +148,7 @@ pub(crate) fn assert_write_authorized(
     assert_claim_close_authorized(fact, snapshot, coord)?;
     assert_release_sweep_authorized(fact, snapshot, coord)?;
     assert_retraction_authorized(fact, snapshot, coord)?;
+    assert_renewal_retraction_authorized(fact, facts_before, snapshot, coord)?;
     assert_lead_retraction_authorized(fact, facts_before, snapshot, coord)?;
     assert_lead_transfer_authorized(fact, facts_before, snapshot, coord)?;
     Ok(())
@@ -402,6 +403,40 @@ fn assert_retraction_authorized(
     authorize_claim_removal(fact, claim, "retract", snapshot, coord)
 }
 
+/// Who may retract a `claim.renewed` fact that keeps a LIVE claim leased.
+///
+/// Withdrawing a renewal rolls the claim's effective lease back to an earlier,
+/// possibly already-passed time, and an expired lease is what lets a later
+/// same-tool session release the claim (`authorize_claim_removal` arm 1b). So
+/// retracting a renewal is a claim removal by another route and gets the same
+/// policy as retracting the claim itself: the owner, or a peer past the
+/// stale-owner window. Found by security review SEC-001 (2026-10-18).
+fn assert_renewal_retraction_authorized(
+    fact: &Fact,
+    facts_before: &[Fact],
+    snapshot: &RoomSnapshot,
+    coord: &CoordinationConfig,
+) -> Result<()> {
+    let Some(target) = crate::retraction::target_of(fact) else {
+        return Ok(());
+    };
+    let Some(claim_id) = facts_before
+        .iter()
+        .find(|f| f.event_id == target && f.kind == FactKind::ClaimRenewed)
+        .and_then(|renewal| renewal.ref_id.as_deref())
+    else {
+        return Ok(());
+    };
+    let Some(claim) = snapshot
+        .active_claims
+        .iter()
+        .find(|c| c.event_id == claim_id)
+    else {
+        return Ok(());
+    };
+    authorize_claim_removal(fact, claim, "retract renewal", snapshot, coord)
+}
+
 /// The three-arm policy itself, shared by every path that removes an active
 /// claim from the room.
 ///
@@ -418,8 +453,10 @@ fn assert_retraction_authorized(
 ///    peer authority. Only a `ClaimExpired` transition shaped by the reaper may
 ///    use it. The transition must carry the claim ref, owner/session, reason,
 ///    and external-observation verdict that the store revalidates under the
-///    mutation lock. An ordinary `Release`, `Resolve`, `Receipt`, or retraction
-///    never gains authority solely because time passed.
+///    mutation lock. A PEER's ordinary `Release`, `Resolve`, `Receipt`, or
+///    retraction never gains authority solely because time passed. The one
+///    time-based exception is arm 1b: a later session of the SAME tool may
+///    `Release` or expire a claim whose lease ran out unrenewed.
 ///
 /// `action` names the act in the refusal, because the caller knows the spelling
 /// and this function should not have to. Keeping the policy in ONE body is the
@@ -466,8 +503,37 @@ fn authorize_claim_removal(
     ) {
         return Ok(());
     }
-    let typed_lease_expiry =
-        is_typed_reaper_lease_expiry(fact, claim) && claim_lease_expired(claim);
+    let lease_expired = claim_lease_expired(claim);
+    let typed_lease_expiry = is_typed_reaper_lease_expiry(fact, claim) && lease_expired;
+    // 1b. Same-tool successor, lease already run out. A later session of the
+    // tool that took the claim may release or expire it once the lease has
+    // passed with no renewal, so a crashed or finished session's claim does not
+    // need a room-wide `doctor --reap-stale --apply` to clear.
+    //
+    // This mirrors a coordination.k8s.io Lease: a holder keeps the lock only by
+    // renewing before `renewTime + leaseDurationSeconds`; once that passes the
+    // lease is takeover-eligible. Renewal is self-only (`latest_renewed_lease`
+    // requires the owning session), so a live owner that still wants the claim
+    // has kept it renewed and this arm never fires against it.
+    //
+    // Deliberately narrow, so ARP-R-02 still holds for every UNEXPIRED claim:
+    // * lease must have passed on the EFFECTIVE claim (renewals folded in,
+    //   fail-closed on a missing or unparseable marker);
+    // * same nonblank tool label only, so a different agent still needs the
+    //   stale-owner window or the typed reaper path;
+    // * the caller must itself be a stamped session (a "later session"), not a
+    //   sessionless legacy writer;
+    // * only `Release` and `ClaimExpired`, the two kinds whose meaning is
+    //   "this claim is over". `Resolve`, `Receipt` and retraction keep the old
+    //   refusal.
+    if lease_expired
+        && matches!(fact.kind, FactKind::Release | FactKind::ClaimExpired)
+        && claim.from_session_id.is_some()
+        && fact.from_session_id.is_some()
+        && claim_authority::same_nonblank_tool(claim.tool.as_deref(), fact.tool.as_deref())
+    {
+        return Ok(());
+    }
     // 2. Stale-owner takeover.
     let (takeover_eligible, size) = snapshot.claim_reclaim_eligible(claim, coord);
     // A sibling process sharing the same tool label is not an external peer.
@@ -563,13 +629,7 @@ fn is_typed_reaper_close(fact: &Fact, claim: &Fact, reasons: &[&str]) -> bool {
 /// must not mean "the lease is over". A claim with no lease marker is never
 /// closable by this arm — self-close and stale-owner takeover still apply.
 fn claim_lease_expired(claim: &Fact) -> bool {
-    const PREFIX: &str = "lease_expires_at:";
-    claim
-        .evidence
-        .iter()
-        .find_map(|item| item.strip_prefix(PREFIX))
-        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw.trim()).ok())
-        .is_some_and(|expires| expires <= chrono::Utc::now())
+    claim_authority::lease_expired_at(claim, chrono::Utc::now())
 }
 
 /// ARP-R-01. Who may take, hand off, or vacate the lead seat.
@@ -916,6 +976,42 @@ mod tests {
 
     fn authorized(fact: &Fact, snapshot: &RoomSnapshot) {
         authorized_with(fact, &[], snapshot)
+    }
+
+    fn renewal_of(claim: &Fact) -> Fact {
+        Fact {
+            event_id: "renew-1".to_string(),
+            kind: FactKind::ClaimRenewed,
+            tool: claim.tool.clone(),
+            from_session_id: claim.from_session_id.clone(),
+            ref_id: Some(claim.event_id.clone()),
+            evidence: vec!["lease_expires_at:2999-01-01T00:00:00Z".to_string()],
+            created_at: iso_ago(0),
+            ..Fact::default()
+        }
+    }
+
+    /// SEC-001: retracting a live claim's renewal would roll its lease back
+    /// and open arm 1b to a label-sharing session, so it is gated like a claim
+    /// removal. The owner may still withdraw its own renewal.
+    #[test]
+    fn a_sibling_cannot_retract_a_live_claims_renewal() {
+        let (claim, snapshot) = room_with_claim("victim:01", 60);
+        let renewal = renewal_of(&claim);
+        let facts_before = vec![claim.clone(), renewal.clone()];
+        let mut sibling = retraction_by("victim:01", &renewal.event_id);
+        sibling.from_session_id = Some("sess:victim:01:OTHER".to_string());
+        let err = refusal_with(&sibling, &facts_before, &snapshot);
+        assert!(err.contains("retract renewal failed"), "{err}");
+
+        let rogue = retraction_by("codex:peer", &renewal.event_id);
+        assert!(refusal_with(&rogue, &facts_before, &snapshot).contains("not the owner"));
+
+        authorized_with(
+            &retraction_by("victim:01", &renewal.event_id),
+            &facts_before,
+            &snapshot,
+        );
     }
 
     fn active_session_presence(tool: &str, session: &str, token: &str) -> Fact {

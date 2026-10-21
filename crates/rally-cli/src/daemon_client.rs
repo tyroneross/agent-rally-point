@@ -606,6 +606,37 @@ pub(crate) fn live_pane_ids(socket: &str) -> Option<Vec<String>> {
     )
 }
 
+/// Reports `(rally_identity, pane_id)` for every live pane the daemon has
+/// bound via `agent.register`, using the same `pane.list` call as
+/// [`live_pane_ids`]. Dormant, exited, orphaned, or restoring panes and panes
+/// without a non-empty identity are dropped. Read-only; returns `None` on any
+/// failure so callers report nothing rather than guess.
+pub(crate) fn live_bound_identities(socket: &str) -> Option<Vec<(String, String)>> {
+    let reply = round_trip(socket, "pane.list", &json!({}), DAEMON_TIMEOUT).ok()?;
+    parse_live_bound_identities(&reply)
+}
+
+/// Pure parse of a `pane.list` reply for [`live_bound_identities`].
+fn parse_live_bound_identities(reply: &serde_json::Value) -> Option<Vec<(String, String)>> {
+    let panes = reply.get("result")?.get("panes")?.as_array()?;
+    Some(
+        panes
+            .iter()
+            .filter_map(|p| {
+                if p.get("liveness").and_then(|v| v.as_str()) != Some("live") {
+                    return None;
+                }
+                let identity = p
+                    .get("rally_identity")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())?;
+                let pane_id = p.get("pane_id").and_then(|v| v.as_str())?;
+                Some((identity.to_string(), pane_id.to_string()))
+            })
+            .collect(),
+    )
+}
+
 /// Autostart the rally-owned ptyd daemon for an explicit `--backend ptyd` run.
 /// Spawns `<bin> server` detached with the rally-owned socket + state dir env,
 /// then waits ≤5s for the socket to become LIVE. The binary is `$RALLY_PTYD_BIN`
@@ -790,6 +821,22 @@ mod tests {
         ));
         // Unix socket paths are length-limited; keep it short.
         format!("{}.sock", dir.display())
+    }
+
+    #[test]
+    fn parse_live_bound_identities_keeps_only_live_bound_panes() {
+        let reply = json!({"result": {"type": "pane_list", "panes": [
+            {"pane_id": "pane-1", "liveness": "live", "rally_identity": "easy-terminal:a"},
+            {"pane_id": "pane-2", "liveness": "dormant", "rally_identity": "easy-terminal:b"},
+            {"pane_id": "pane-3", "liveness": "live"},
+            {"pane_id": "pane-4", "liveness": "live", "rally_identity": ""},
+            {"pane_id": "pane-5", "liveness": "exited", "rally_identity": "easy-terminal:c"}
+        ]}});
+        assert_eq!(
+            parse_live_bound_identities(&reply),
+            Some(vec![("easy-terminal:a".to_string(), "pane-1".to_string())])
+        );
+        assert_eq!(parse_live_bound_identities(&json!({"error": {}})), None);
     }
 
     #[cfg(unix)]

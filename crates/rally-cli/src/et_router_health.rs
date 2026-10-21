@@ -103,47 +103,66 @@ pub fn et_router_owns_delivery(target_identity: &str, now_ms: i64) -> bool {
 /// Path-parameterized core of [`et_router_owns_delivery`], factored out so
 /// tests can point at a fixture file without mutating process env.
 fn et_router_owns_delivery_at(path: &Path, target_identity: &str, now_ms: i64) -> bool {
+    load_trusted_health(path, now_ms).is_some_and(|health| {
+        health
+            .routed_identities
+            .iter()
+            .any(|identity| identity == target_identity)
+    })
+}
+
+/// Identities the ET router currently lists as routed, from the file named by
+/// `RALLY_ET_ROUTER_HEALTH`. Applies the same fail-closed checks as
+/// [`et_router_owns_delivery`]; any failure (env unset, symlink, oversized,
+/// bad JSON, wrong schema, degraded, stale) yields an empty list. Read-only:
+/// used to report routing truthfully, never to change delivery.
+pub fn et_router_routed_identities(now_ms: i64) -> Vec<String> {
+    match std::env::var(HEALTH_ENV_VAR) {
+        Ok(path) if !path.is_empty() => et_router_routed_identities_at(Path::new(&path), now_ms),
+        _ => Vec::new(),
+    }
+}
+
+/// Path-parameterized core of [`et_router_routed_identities`].
+fn et_router_routed_identities_at(path: &Path, now_ms: i64) -> Vec<String> {
+    load_trusted_health(path, now_ms)
+        .map(|health| health.routed_identities)
+        .unwrap_or_default()
+}
+
+/// Shared load + validate step: returns the parsed health file only when it is
+/// a regular (non-symlink) file within the size cap, parses, carries the
+/// expected schema, is not degraded, and is fresh. Everything else is `None`.
+fn load_trusted_health(path: &Path, now_ms: i64) -> Option<HealthFile> {
     // `symlink_metadata` does NOT follow the final component, so a symlink
     // reports `is_symlink() == true` / `is_file() == false` here, and is
     // refused before we ever open it.
-    let meta = match fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(_) => return false,
-    };
-    if !meta.file_type().is_file() {
-        return false;
+    let meta = fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() || meta.len() > MAX_HEALTH_FILE_BYTES {
+        return None;
     }
-    if meta.len() > MAX_HEALTH_FILE_BYTES {
-        return false;
-    }
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(_) => return false,
-    };
-    let health: HealthFile = match serde_json::from_str(&contents) {
-        Ok(health) => health,
-        Err(_) => return false,
-    };
-    evaluate(&health, target_identity, now_ms)
+    let contents = fs::read_to_string(path).ok()?;
+    let health: HealthFile = serde_json::from_str(&contents).ok()?;
+    is_trusted(&health, now_ms).then_some(health)
 }
 
 /// Pure decision over an already-parsed health file. Split from the I/O
 /// wrapper so the schema/degraded/freshness/membership logic is unit
 /// testable without touching the filesystem.
+#[cfg(test)]
 fn evaluate(health: &HealthFile, target_identity: &str, now_ms: i64) -> bool {
-    if health.schema.as_deref() != Some(HEALTH_SCHEMA) {
-        return false;
-    }
-    if health.degraded {
-        return false;
-    }
-    if !is_fresh(health.updated_ms, now_ms) {
-        return false;
-    }
-    health
-        .routed_identities
-        .iter()
-        .any(|identity| identity == target_identity)
+    is_trusted(health, now_ms)
+        && health
+            .routed_identities
+            .iter()
+            .any(|identity| identity == target_identity)
+}
+
+/// Schema, degraded, and freshness checks shared by every consumer of the file.
+fn is_trusted(health: &HealthFile, now_ms: i64) -> bool {
+    health.schema.as_deref() == Some(HEALTH_SCHEMA)
+        && !health.degraded
+        && is_fresh(health.updated_ms, now_ms)
 }
 
 #[cfg(test)]
@@ -379,6 +398,43 @@ mod tests {
         let path = dir.join("health-as-dir");
         fs::create_dir_all(&path).expect("create dir standing in for the health file");
         assert!(!et_router_owns_delivery_at(&path, "claude:01", 1_000));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- et_router_routed_identities_at() ------------------------------
+
+    #[test]
+    fn routed_identities_returns_list_for_fresh_healthy_file() {
+        let dir = scratch_dir("routed-ok");
+        let path = dir.join("health.json");
+        write_health_json(
+            &path,
+            &health_json(1_000, false, &["claude:01", "codex:07"]),
+        );
+        assert_eq!(
+            et_router_routed_identities_at(&path, 1_000),
+            vec!["claude:01".to_string(), "codex:07".to_string()]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn routed_identities_empty_when_degraded_stale_or_symlink() {
+        let dir = scratch_dir("routed-bad");
+        let degraded = dir.join("degraded.json");
+        write_health_json(&degraded, &health_json(1_000, true, &["claude:01"]));
+        assert!(et_router_routed_identities_at(&degraded, 1_000).is_empty());
+
+        let stale = dir.join("stale.json");
+        write_health_json(&stale, &health_json(0, false, &["claude:01"]));
+        assert!(et_router_routed_identities_at(&stale, FRESHNESS_WINDOW_MS + 1).is_empty());
+
+        let real = dir.join("real.json");
+        write_health_json(&real, &health_json(1_000, false, &["claude:01"]));
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink");
+        assert!(et_router_routed_identities_at(&link, 1_000).is_empty());
+        assert!(et_router_routed_identities_at(&dir.join("missing.json"), 1_000).is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

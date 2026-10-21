@@ -776,7 +776,23 @@ fn lease_expires_at(fact: &Fact) -> Option<String> {
         .map(str::to_string)
 }
 
-#[allow(dead_code)]
+/// Has this claim's lease run out at `now`?
+///
+/// Reads the `lease_expires_at:` marker on the fact AS GIVEN. Every
+/// `RoomSnapshot::active_claims` entry is already the effective claim
+/// ([`project_effective_claim`]), so a valid renewal is folded in before this
+/// runs; callers holding a raw claim fact must project it first.
+///
+/// Fail-CLOSED on an absent or unparseable marker: "I could not read the
+/// lease" must never mean "the lease is over". One definition, read by the
+/// `next` ranking and the claim-close write gate, so the two cannot disagree
+/// about whether a claim is still leased.
+pub(crate) fn lease_expired_at(claim: &Fact, now: DateTime<Utc>) -> bool {
+    lease_expires_at(claim)
+        .and_then(|raw| parse_time(raw.trim()))
+        .is_some_and(|expires| expires <= now)
+}
+
 fn parse_time(raw: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(raw)
         .ok()

@@ -398,7 +398,9 @@ esac
 # It re-runs this script as a child in its own process group, buffers the
 # child's stdout, and returns it verbatim when the child finishes inside
 # RALLY_HOOK_DEADLINE_MS (default 4000; 100..59999; scaled by
-# RALLY_HOOK_MS_BUDGET_SCALE like every other budget). On overrun it kills the
+# RALLY_HOOK_MS_BUDGET_SCALE, capped at the 4000ms production limit). A core
+# alarm bounds module initialization before the normal watchdog can run.
+# On overrun it kills the
 # child's group, writes one stderr line (host debug log only) and prints the
 # host-valid no-op `{}` -- the fail-open result a host timeout produced, minus
 # the failure. It also hands the child a call deadline (hard deadline minus a
@@ -424,12 +426,24 @@ case "$phase" in
       case "$_rally_deadline_scale" in
         [1-9]|1[0-6]) _rally_deadline_ms=$(( _rally_deadline_ms * _rally_deadline_scale )) ;;
       esac
+      # Test/load tuning must never outgrow the host's five-second limit.
+      [ "$_rally_deadline_ms" -gt 4000 ] && _rally_deadline_ms=4000
       exec perl -e '
+        # Core alarm works before loading any modules. The cleanup callback
+        # becomes available once a supervised child has been created.
+        our $cleanup;
+        BEGIN {
+          $SIG{ALRM} = sub { $cleanup->() if $cleanup; print STDOUT "{}"; exit 0; };
+          alarm(4);
+        }
         use strict;
-        use POSIX qw(setsid :sys_wait_h);
         use Time::HiRes qw(time);
+        our $started_at;
+        BEGIN { $started_at = time; }
+        # Loading POSIX can stall under startup contention. Count it too.
+        use POSIX qw(setsid :sys_wait_h);
         my ($ms, $phase) = (shift @ARGV, shift @ARGV);
-        my $t0 = time;
+        my $t0 = $started_at;
         my $reserve = $ms >= 2100 ? 700 : int($ms / 3);
         $ENV{RALLY_HOOK_CALL_DEADLINE_AT_MS} = int($t0 * 1000) + $ms - $reserve;
         $ENV{RALLY_HOOK_SUPERVISED_CHILD} = "1";
@@ -447,6 +461,7 @@ case "$phase" in
         }
         close $w;
         my $kill = sub { kill "KILL", -$pid; kill "KILL", $pid; waitpid($pid, 0); };
+        $cleanup = $kill;
         $SIG{TERM} = $SIG{INT} = $SIG{HUP} = sub { $kill->(); exit 0; };
         my $deadline = $t0 + $ms / 1000;
         my ($buf, $eof, $reaped) = ("", 0, 0);
@@ -2555,8 +2570,17 @@ const BRIEF_SELF = hostId(tool, 60);
 const BRIEF_READ_ONLY = "rally next --tool " + BRIEF_SELF + " --audit --json";
 const TEMPLATE_ACTIONS = [
   "respond_to_handoff", "clarify_handoff", "review_artifact",
-  "update_plan_status", "continue_or_release_claim", "resolve_owned_blocker"
+  "update_plan_status", "continue_or_release_claim", "resolve_owned_blocker",
+  "claim_open_queue_item", "release_or_renew_claim"
 ];
+// Why an open-queue item needs revalidation. Keys are next.rs constants; only a
+// key in this table ever renders, as hook-authored text, never the raw value.
+const OPEN_QUEUE_REASON_TEXT = {
+  scope_changed_since_posted: "its files changed after it was posted",
+  later_fact_reports_done: "a later room fact says it landed",
+  linked_plan_marks_done: "its linked plan is marked done",
+  older_than_room_pickup_p95: "it is older than this room usually takes to pick up open work"
+};
 
 // ---- U4: ET rally-router per-item suppression --------------------------
 // (et-native-rally-stage2-plan.md LD-H, LD-I, component U4). Identity: the
@@ -2672,7 +2696,8 @@ function actorBig(raw, capital) {
 const BRIEF_FIXED_QUOTED = [
   "\"responded to handoff\"", "\"resolved blocker\"", "\"done\"",
   "\"reviewed artifact\"", "\"clarify handoff\"", "\"<verification>\"",
-  "\"<needed context>\"", "\"<next checkpoint>\"", "\"act on next\""
+  "\"<needed context>\"", "\"<next checkpoint>\"", "\"act on next\"",
+  "\"lease expired; released\"", "\"done: <what landed>\""
 ];
 // CLI vocabulary next.rs emits as a constant, never from a fact. in_progress
 // carries a 2-character word and would otherwise fail isBareShape().
@@ -2738,6 +2763,7 @@ const ACTION_CMD_PREFIX = {
   respond_to_handoff: "rally say resolve",
   resolve_owned_blocker: "rally say resolve",
   continue_or_release_claim: "rally say release",
+  release_or_renew_claim: "rally say release",
   review_artifact: "rally say resolve",
   clarify_handoff: "rally say handoff",
   update_plan_status: "rally backlog update"
@@ -2973,6 +2999,41 @@ function composeBrief() {
     act = cmdSpan + (picked.fell_back ? " for the details" : " when it\u0027s done");
     if (sender) waitBranch = "not yours? hand it back to " + actorRef(sender);
     escalate = "unclear → ask the human";
+  } else if (sit === "claim_open_queue_item") {
+    // The OPEN QUEUE: no target, so nobody owns it and nothing "sits with" this
+    // agent. Never reuse the named-handoff wording above for it.
+    const oq = (bnext.inbox && bnext.inbox.open_queue && Array.isArray(bnext.inbox.open_queue.items))
+      ? bnext.inbox.open_queue.items.find(it => it && String(it.event_id || "") === factId) || {}
+      : {};
+    const why_codes = (Array.isArray(oq.reasons) ? oq.reasons : [])
+      .map(r => String((r && r.code) || ""))
+      .filter((c, i, a) => OPEN_QUEUE_REASON_TEXT[c] && a.indexOf(c) === i);
+    const revalidate = String(bnext.reason || "") === "open_queue_item_needs_revalidation";
+    big = revalidate
+      ? "An open-queue task from " + actorBig(fact.tool, false)
+        + " may be out of date — revalidate it before claiming"
+      : actorBig(fact.tool, true)
+        + " posted a task to the open queue — it is available and unowned; claim it before working";
+    why = cap => {
+      const p = [];
+      if (fact.subject) p.push(prose(fact.subject, cap));
+      if (factId) p.push(ident(factId, 60) + (fact.tool ? " from " + actorRef(fact.tool) : ""));
+      if (why_codes.length) p.push(why_codes.map(c => OPEN_QUEUE_REASON_TEXT[c]).join("; "));
+      return p.join(" · ");
+    };
+    act = "`rally inbox --tool " + BRIEF_SELF + " --json`"
+      + (revalidate
+        ? " to read its current state, then claim it, resolve it as done, or rewrite it"
+        : " to read it, then claim its paths before you edit");
+    waitBranch = "busy with assigned work? leave it for another agent";
+  } else if (sit === "release_or_renew_claim") {
+    const scopes = Array.isArray(fact.scope) ? fact.scope : [];
+    big = "Your claim\u0027s lease ran out unrenewed — release it so peers can edit, or renew it if you still need it";
+    why = () => factId
+      ? ident(factId, 60) + (scopes.length ? " covers " + ident(scopes[0], 60) + (scopes.length > 1 ? " +" + (scopes.length - 1) + " more" : "") : "")
+      : "";
+    act = cmdSpan + (picked.fell_back ? " for the details" : " if you are finished there");
+    waitBranch = "still working there? `rally status post --tool " + BRIEF_SELF + " --state working --json` renews it";
   } else if (sit === "clarify_handoff") {
     big = "Your handoff to " + actorBig(fact.target || fact.tool, false)
       + " is too thin to act on — they\u0027ll guess or stall until you add context";
@@ -3276,6 +3337,8 @@ if (!briefMode && (!visible || !visible.present) && next?.actionable) {
     respond_to_handoff: "1 handoff needs a reply",
     update_plan_status: "1 plan needs a status update",
     continue_or_release_claim: "1 claim needs continue-or-release",
+    claim_open_queue_item: "1 open-queue task is available (unowned, claim before working)",
+    release_or_renew_claim: "1 expired claim needs release or renewal",
   };
   const actionRaw = String(next?.action || "");
   const what = ACTION_PHRASE[actionRaw] || prose(actionRaw || "coordination work", 60);

@@ -28,6 +28,11 @@ pub(crate) fn hash_file(path: &Path) -> Option<String> {
     Some(format!("{hash:016x}"))
 }
 
+/// [`hash_file`]'s hash over bytes the caller already read (bounded reads).
+pub(crate) fn hash_bytes(data: &[u8]) -> String {
+    format!("{:016x}", fnv1a_64(data))
+}
+
 fn fnv1a_64(data: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for &byte in data {

@@ -38,3 +38,28 @@ constructor.
 Upstreamable as-is: it is additive, preserves the existing default, and a
 library cannot know its caller's deadline. Remove this delta if upstream adopts
 an equivalent constructor.
+
+## Delta: one runtime per store, drained before pool close (rally, 2026-10-20)
+
+`SqliteStore` built a fresh `tokio` current_thread runtime for every operation
+(bootstrap, each `run_async`, the delivery thread, and close). sqlx-core 0.8.6
+returns a dropped `PoolConnection` by spawning `return_to_pool` onto the
+*current* runtime. When the per-operation runtime was dropped, that task was
+cancelled and the connection was dropped without a graceful close. The pool
+then reported size 0, `pool.close()` returned at once, and the sqlx-sqlite
+worker thread ran `sqlite3_close` (WAL checkpoint and `-wal` removal)
+afterwards, so `facts.db` was still being written after the caller believed
+the store was closed.
+
+The delta holds one `Arc<Runtime>` per store and drives bootstrap, every
+operation, delivery, and close on it, so the return tasks outlive the
+operations that queued them. Close first drives that runtime until every live
+connection is idle (`num_idle() == size()`), then calls `pool.close()`. The
+wait is required: `Pool::close` in sqlx 0.8.6 does not wait for a pending
+return task (closing an idle connection releases a permit it never held), and
+a connection closing concurrently with another leaves neither as the last
+handle, so SQLite keeps the `-wal` file. Closing idle connections one at a
+time makes the last `sqlite3_close` delete it.
+
+Public API is unchanged. Upstreamable as-is; remove this delta if upstream
+adopts a shared runtime or a pool close that waits for return tasks.
