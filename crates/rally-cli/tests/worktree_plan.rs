@@ -8,7 +8,9 @@ use std::process::Command;
 use serde_json::Value;
 
 mod common;
+mod support;
 use common::test_git_fixture::fixture_git;
+use support::rally_cmd::rally_command;
 
 struct Fixture {
     root: PathBuf,
@@ -50,7 +52,7 @@ impl Fixture {
     }
 
     fn plan_from(&self, dir: &Path) -> Value {
-        let output = Command::new(env!("CARGO_BIN_EXE_rally"))
+        let output = rally_command()
             .args(["worktree", "plan", "--json"])
             .current_dir(dir)
             .output()
@@ -93,7 +95,7 @@ fn closeout_reports_unavailable_ownership_without_creating_a_room() {
     }
     let fixture = Fixture::new();
     let feature = fixture.worktree("feature");
-    let output = Command::new(env!("CARGO_BIN_EXE_rally"))
+    let output = rally_command()
         .args(["worktree", "closeout", "--json"])
         .current_dir(&feature)
         .output()
@@ -130,7 +132,7 @@ fn closeout_does_not_mutate_an_existing_room() {
         return;
     }
     let fixture = Fixture::new();
-    let entered = Command::new(env!("CARGO_BIN_EXE_rally"))
+    let entered = rally_command()
         .args(["enter", "--tool", "test:closeout-owner", "--json"])
         .current_dir(&fixture.repo)
         .output()
@@ -154,7 +156,7 @@ fn closeout_does_not_mutate_an_existing_room() {
     }
     let mut before = std::collections::BTreeMap::new();
     files(&rally_dir, &mut before);
-    let output = Command::new(env!("CARGO_BIN_EXE_rally"))
+    let output = rally_command()
         .args(["worktree", "closeout", "--json"])
         .current_dir(&fixture.repo)
         .output()
@@ -180,7 +182,7 @@ fn closeout_marks_moved_managed_worktree_ambiguous_at_both_paths() {
         return;
     }
     let fixture = Fixture::new();
-    let run = Command::new(env!("CARGO_BIN_EXE_rally"))
+    let run = rally_command()
         .args([
             "run",
             "codex",
@@ -202,6 +204,9 @@ fn closeout_marks_moved_managed_worktree_ambiguous_at_both_paths() {
         String::from_utf8_lossy(&run.stderr)
     );
     let run: Value = serde_json::from_slice(&run.stdout).unwrap();
+    // This suite tests worktree ownership, not the production watchdog. A
+    // committed-timeout receipt is not evidence that fixture setup finished.
+    assert_eq!(run["command"], "run", "setup must finish: {run}");
     let old_path = PathBuf::from(
         run["data"]["run"]["session"]["worktree_path"]
             .as_str()
@@ -218,7 +223,7 @@ fn closeout_marks_moved_managed_worktree_ambiguous_at_both_paths() {
             moved_path.to_str().unwrap(),
         ],
     );
-    let closeout = Command::new(env!("CARGO_BIN_EXE_rally"))
+    let closeout = rally_command()
         .args(["worktree", "closeout", "--json"])
         .env("HOME", &fixture.root)
         .current_dir(&fixture.repo)
@@ -326,7 +331,7 @@ fn plans_every_branch_and_worktree_without_writing_state() {
     let other = fixture.root.join("other");
     fs::create_dir_all(&other).unwrap();
     fixture_git(&other, &["init", "-q", "-b", "main"]);
-    let inherited_git_dir = Command::new(env!("CARGO_BIN_EXE_rally"))
+    let inherited_git_dir = rally_command()
         .args(["worktree", "plan", "--json"])
         .current_dir(&fixture.repo)
         .env("GIT_DIR", other.join(".git"))
@@ -444,7 +449,7 @@ fn tracks_upstream_changes_and_rejects_an_unknown_base() {
         "merge_into_upstream"
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rally"))
+    let output = rally_command()
         .args(["worktree", "plan", "--base", "missing", "--json"])
         .current_dir(&fixture.repo)
         .output()
