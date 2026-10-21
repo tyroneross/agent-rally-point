@@ -8,6 +8,13 @@
 //! committed but later projection/output work is slow, the timeout may report
 //! success only with an explicit committed signal so callers do not retry and
 //! duplicate the fact.
+//!
+//! Post-commit cases interrupt the worker at canonical readback. The closed
+//! result channel reaches watchdog recovery without a startup/sleep race;
+//! the pre-commit case below separately exercises a real deadline expiry.
+
+#[path = "support/rally_cmd.rs"]
+mod rally_cmd;
 
 use rally_protocol::Inbox;
 use rally_protocol::ledger::FileInbox;
@@ -32,7 +39,7 @@ impl TempRoom {
     }
 
     fn rally(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rally"));
+        let mut cmd = rally_cmd::rally_command();
         cmd.current_dir(&self.cwd).env("HOME", &self.home);
         cmd
     }
@@ -141,7 +148,7 @@ fn uncommitted_mutation_timeout_fails_closed_and_does_not_claim_success() {
 }
 
 #[test]
-fn committed_mutation_timeout_reports_committed_and_survives_replay_once() {
+fn committed_worker_interruption_reports_committed_and_survives_replay_once() {
     let room = TempRoom::new("committed");
     let subject = unique_subject("committed");
 
@@ -155,17 +162,17 @@ fn committed_mutation_timeout_reports_committed_and_survives_replay_once() {
             "--subject",
             &subject,
             "--json",
-            "--timeout-ms",
-            "2000",
         ])
-        .env("RALLY_TEST_BLOCK_AFTER_COMMIT_MS", "5000")
+        // The ordinary harness budget bounds bootstrap. The interruption,
+        // after canonical readback, selects the committed recovery branch.
+        .env("RALLY_TEST_PANIC_AFTER_COMMIT", "1")
         .output()
         .expect("spawn mutating rally command");
 
     assert_eq!(
         output.status.code(),
         Some(0),
-        "committed timeout must preserve success; stderr={}",
+        "committed interruption must preserve success; stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
     let payload = stdout_json(&output);
@@ -178,15 +185,14 @@ fn committed_mutation_timeout_reports_committed_and_survives_replay_once() {
     assert_eq!(
         open_handoff_subject_count(&replay, &subject),
         1,
-        "committed timeout must replay exactly one durable handoff"
+        "committed interruption must replay exactly one durable handoff"
     );
 }
 
 #[test]
-fn inject_timeout_marks_committed_only_after_directive_is_durable() {
+fn inject_worker_interruption_marks_committed_only_after_directive_is_durable() {
     let room = TempRoom::new("inject-committed");
-    // Initialize the room before the timed invocation so only the inject path
-    // participates in the watchdog assertion.
+    // Initialize the room before checking the directive's durable boundary.
     let _ = room.room_json();
 
     let output = room
@@ -199,20 +205,10 @@ fn inject_timeout_marks_committed_only_after_directive_is_durable() {
             "--text",
             "durable directive",
             "--json",
-            "--timeout-ms",
-            // The window between process start and `mark_watchdog_command_commit`
-            // (bootstrap, engagement resolution, ledger append) must complete
-            // before this fires, or the watchdog observes an unarmed commit
-            // signal and reports uncommitted instead of committed. 300ms only
-            // has margin on an idle machine; 2000ms matches the proven-stable
-            // window the sibling `committed_mutation_timeout_...` test already
-            // uses against the same 5000ms post-commit block, while staying
-            // well under it so the watchdog still fires mid-block as intended.
-            "2000",
         ])
-        .env("RALLY_TEST_BLOCK_AFTER_COMMIT_MS", "5000")
+        .env("RALLY_TEST_PANIC_AFTER_COMMIT", "1")
         .output()
-        .expect("spawn timed inject");
+        .expect("spawn interrupted inject");
 
     assert_eq!(output.status.code(), Some(0));
     let payload = stdout_json(&output);
