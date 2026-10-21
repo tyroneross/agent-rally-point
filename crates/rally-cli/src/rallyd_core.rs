@@ -176,7 +176,8 @@ mod imp {
 
     /// Accept-loop poll interval: how often the nonblocking accept loop wakes to
     /// re-check the shutdown flag + idle window. This bounds shutdown latency
-    /// ONLY — accept throughput is bounded by the drain-all-pending inner loop
+    /// while listener readiness wakes requests immediately. Throughput comes
+    /// from the drain-all-pending inner loop
     /// (each wake accepts every queued connection down to `WouldBlock`), not by
     /// this interval.
     const ACCEPT_POLL: Duration = Duration::from_millis(100);
@@ -1275,9 +1276,9 @@ mod imp {
             drop(store);
         });
 
-        // Nonblocking accept loop: poll the shutdown flag + idle window ~every
-        // ACCEPT_POLL; on each wake DRAIN ALL pending connections (accept until
-        // WouldBlock), spawning one reader thread per connection, THEN sleep.
+        // Nonblocking accept loop: readiness wakes requests immediately, with
+        // ACCEPT_POLL bounding shutdown and idle checks. Drain every pending
+        // connection on each wake, spawning one reader per connection.
         // Draining all-per-wake — not one-per-wake — is what makes the accept
         // side keep up with a burst: the kernel backlog holds connections that
         // arrive between wakes and this inner loop empties it fully each time,
@@ -1304,7 +1305,7 @@ mod imp {
                     break;
                 }
             }
-            // Drain every queued connection before going back to the poll sleep.
+            // Drain every queued connection before waiting for readiness.
             loop {
                 match listener.accept() {
                     Ok((stream, _)) => {
@@ -1353,7 +1354,11 @@ mod imp {
                     }
                 }
             }
-            thread::sleep(ACCEPT_POLL);
+            if let Err(error) = wait_for_listener(&listener, ACCEPT_POLL) {
+                log(&format!("listener readiness error: {error}"));
+                // A persistent descriptor error must not create a busy loop.
+                thread::sleep(ACCEPT_POLL);
+            }
         }
 
         // Lifecycle: drop the accept-loop sender so existing bounded reader
@@ -1369,6 +1374,31 @@ mod imp {
         let _owner = owner?;
         log("stopped");
         Ok(())
+    }
+
+    /// Wait for a queued connection, without delaying one that arrives during
+    /// the wait. An interrupted wait returns to the lifecycle checks; it never
+    /// restarts the full timeout and postpones shutdown indefinitely.
+    fn wait_for_listener(listener: &UnixListener, timeout: Duration) -> std::io::Result<bool> {
+        let mut descriptor = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let milliseconds = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        let result = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == std::io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
+        if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(std::io::Error::other("listener is unavailable"));
+        }
+        Ok(descriptor.revents & libc::POLLIN != 0)
     }
 
     #[cfg(test)]
@@ -3525,6 +3555,96 @@ mod imp {
         // asserts the `fact_store_handle` cold-open counter stays ZERO across the
         // two appends + snapshot — proving the hot path reuses the ONE warm pool
         // with no per-op churn, not merely that the appends succeed.
+        #[test]
+        fn listener_readiness_wakes_for_arrivals_and_drains_before_waiting() {
+            let root = unique_repo_root("listener-readiness");
+            let path = resolve_socket_path(&root, &root.join(".rally"));
+            let listener = bind_socket(&path).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            assert!(!wait_for_listener(&listener, Duration::from_millis(10)).unwrap());
+
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let waiter = thread::spawn(move || {
+                ready_tx.send(()).unwrap();
+                let start = Instant::now();
+                let ready = wait_for_listener(&listener, Duration::from_secs(5)).unwrap();
+                (listener, ready, start.elapsed())
+            });
+            ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let first = UnixStream::connect(&path).unwrap();
+            let second = UnixStream::connect(&path).unwrap();
+            let (listener, ready, elapsed) = waiter.join().unwrap();
+            assert!(ready);
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "readiness used the full idle timeout"
+            );
+            assert!(wait_for_listener(&listener, Duration::ZERO).unwrap());
+            let _first = listener.accept().unwrap();
+            let _second = listener.accept().unwrap();
+            assert!(!wait_for_listener(&listener, Duration::from_millis(10)).unwrap());
+            drop((first, second, listener));
+            std::fs::remove_file(path).unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        #[ignore = "manual before/after transport latency measurement"]
+        fn measure_idle_separated_request_latency() {
+            let repo_root = unique_repo_root("ping-latency");
+            let rally_dir = repo_root.join(".rally");
+            let cfg = ServeConfig {
+                repo_root: repo_root.clone(),
+                idle_exit_secs: Some(10),
+                foreground: true,
+            };
+            let stop = Arc::new(AtomicBool::new(false));
+            let serve_stop = stop.clone();
+            let daemon = thread::spawn(move || serve_unix_with_stop(cfg, serve_stop));
+            let socket = wait_for_addr(&rally_dir);
+            assert!(ping_ok(&socket));
+            for kind in ["PING", "FACTS", "APPEND"] {
+                let mut samples = Vec::new();
+                for index in 0..25 {
+                    let op = match kind {
+                        "PING" => StoreOp::Ping,
+                        "FACTS" => StoreOp::Facts,
+                        _ => StoreOp::AppendFact {
+                            fact: serde_json::json!({
+                                "schema": crate::FACT_SCHEMA,
+                                "event_id": format!("latency-{index}"),
+                                "seq": 0,
+                                "thread_id": "latency-measurement",
+                                "kind": "lesson",
+                                "subject": "latency measurement",
+                                "scope": [],
+                                "created_at": "2026-10-21T00:00:00Z",
+                                "evidence": [],
+                            }),
+                        },
+                    };
+                    thread::sleep(Duration::from_millis(5));
+                    let start = Instant::now();
+                    let response = round_trip(&socket, &StoreRequest::new(None, op));
+                    samples.push(start.elapsed().as_micros());
+                    assert!(matches!(
+                        (kind, response),
+                        ("PING", StoreResponse::Ok(StoreOk::Pong { .. }))
+                            | ("FACTS", StoreResponse::Ok(StoreOk::Facts { .. }))
+                            | ("APPEND", StoreResponse::Ok(StoreOk::AppendFact { .. }))
+                    ));
+                }
+                samples.sort_unstable();
+                println!(
+                    "{kind}_LATENCY samples=25 p50_us={} p95_us={}",
+                    samples[12], samples[23]
+                );
+            }
+            stop.store(true, Ordering::SeqCst);
+            daemon.join().unwrap().unwrap();
+            std::fs::remove_dir_all(repo_root).unwrap();
+        }
+
         #[test]
         fn smoke_serve_ping_append_snapshot_and_shutdown() {
             let repo_root = unique_repo_root("smoke");

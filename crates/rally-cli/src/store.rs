@@ -2970,44 +2970,59 @@ pub(crate) struct RoomMutationLock;
 
 #[cfg(unix)]
 pub(crate) fn acquire_room_mutation_lock(room_dir: &Path) -> Result<RoomMutationLock> {
-    fs::create_dir_all(room_dir)
-        .map_err(RallyError::io(format!("create {}", room_dir.display())))?;
     let path = room_dir.join(ROOM_MUTATION_LOCK_FILENAME);
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&path)
-        .map_err(RallyError::io(format!("open {}", path.display())))?;
-    let deadline = effective_mutation_deadline();
+    let file = open_named_lock_file(room_dir, ROOM_MUTATION_LOCK_FILENAME)?;
+    acquire_exclusive_until(
+        &file,
+        effective_mutation_deadline(),
+        || format!("lock {}", path.display()),
+        pause_after_room_lock_flock_for_test,
+        |provisional| {
+            if provisional {
+                mutation_not_started_after_provisional_lock(&path)
+            } else {
+                mutation_not_started(&path)
+            }
+        },
+    )?;
+    Ok(RoomMutationLock { file })
+}
+
+/// One deadline contract for room mutation and bounded daemon ownership:
+/// retry only while time remains, then recheck after a successful syscall.
+/// Callers retain their diagnostic vocabulary and test-only scheduling seam.
+#[cfg(unix)]
+fn acquire_exclusive_until(
+    file: &fs::File,
+    deadline: Instant,
+    context: impl Fn() -> String,
+    after_acquire: fn(),
+    expired: impl Fn(bool) -> RallyError,
+) -> Result<()> {
     loop {
         if Instant::now() >= deadline {
-            return Err(mutation_not_started(&path));
+            return Err(expired(false));
         }
         let rc =
             unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_EX | unix_lock::LOCK_NB) };
         if rc == 0 {
-            pause_after_room_lock_flock_for_test();
+            after_acquire();
             if Instant::now() >= deadline {
-                // A process can be descheduled between the pre-check and the
-                // successful syscall. Relinquish the just-acquired lock and
-                // preserve the typed no-mutation-started contract.
                 let _ = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_UN) };
-                return Err(mutation_not_started_after_provisional_lock(&path));
+                return Err(expired(true));
             }
-            return Ok(RoomMutationLock { file });
+            return Ok(());
         }
         let source = io::Error::last_os_error();
         if source.kind() != io::ErrorKind::WouldBlock {
             return Err(RallyError::Io {
-                context: format!("lock {}", path.display()),
+                context: context(),
                 source,
             });
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(mutation_not_started(&path));
+            return Err(expired(false));
         }
         thread::sleep(MUTATION_LOCK_RETRY_DELAY.min(remaining));
     }
@@ -3355,43 +3370,27 @@ pub(crate) fn acquire_owner_exclusive_bounded(
     let deadline = now
         .checked_add(budget)
         .unwrap_or(now + MUTATION_LOCK_FALLBACK_BOUND);
-    loop {
-        if Instant::now() >= deadline {
-            return Err(RallyError::NotStarted(format!(
-                "daemon-open-not-started: deadline elapsed before acquiring {}; no daemon runtime state was published",
-                path.display()
-            )));
-        }
-        let rc =
-            unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_EX | unix_lock::LOCK_NB) };
-        if rc == 0 {
-            pause_after_owner_lock_flock_for_test();
-            if Instant::now() >= deadline {
-                let _ = unsafe { unix_lock::flock(file.as_raw_fd(), unix_lock::LOCK_UN) };
-                return Err(RallyError::NotStarted(format!(
+    acquire_exclusive_until(
+        &file,
+        deadline,
+        || format!("lock-ex {}", path.display()),
+        pause_after_owner_lock_flock_for_test,
+        |provisional| {
+            if provisional {
+                RallyError::NotStarted(format!(
                     "daemon-open-not-started: deadline elapsed after provisional lock acquisition at {}; lock released before any daemon runtime state was published and retry is safe",
                     path.display()
-                )));
+                ))
+            } else {
+                RallyError::NotStarted(format!(
+                    "daemon-open-not-started: deadline elapsed before acquiring {}; no daemon runtime state was published",
+                    path.display()
+                ))
             }
-            stamp_exclusive_holder(&file, "daemon-owner");
-            return Ok(OwnerGuard { file });
-        }
-        let source = io::Error::last_os_error();
-        if source.kind() != io::ErrorKind::WouldBlock {
-            return Err(RallyError::Io {
-                context: format!("lock-ex {}", path.display()),
-                source,
-            });
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(RallyError::NotStarted(format!(
-                "daemon-open-not-started: deadline elapsed before acquiring {}; no daemon runtime state was published",
-                path.display()
-            )));
-        }
-        thread::sleep(MUTATION_LOCK_RETRY_DELAY.min(remaining));
-    }
+        },
+    )?;
+    stamp_exclusive_holder(&file, "daemon-owner");
+    Ok(OwnerGuard { file })
 }
 
 /// Try to acquire a named exclusive advisory lock without blocking.
@@ -6772,21 +6771,31 @@ impl DirectRoomStore {
             .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
         trigger_o26_fault(rally_dir, O26FaultPoint::SnapshotPostCommit)
             .map_err(|detail| RallyError::Message(format!("snapshot fault: {detail}")))?;
-        let _guard = acquire_room_mutation_lock(rally_dir)?;
-        let facts = self.facts_under_lock()?;
-        let coord = crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
+        // Capture inputs and their proof in one mutation epoch. Projection
+        // reads owned values, so writers need not wait for its CPU work.
+        // Fingerprinting again afterward could bless stale facts as current.
+        let (facts, coord, fingerprint) = {
+            let _guard = acquire_room_mutation_lock(rally_dir)?;
+            let facts = self.facts_under_lock()?;
+            let coord =
+                crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
+            let fingerprint = snapshot_cache_fingerprint_at(
+                rally_dir,
+                projection_unix_sec,
+                include_archived,
+                &coord,
+            )?;
+            (facts, coord, fingerprint)
+        };
+        #[cfg(test)]
+        pause_snapshot_projection_after_capture(rally_dir);
+
         let snapshot = snapshot_from_facts_with_policy_at(
             &facts,
             &coord,
             include_archived,
             projection_unix_sec,
         );
-        let fingerprint = snapshot_cache_fingerprint_at(
-            rally_dir,
-            projection_unix_sec,
-            include_archived,
-            &coord,
-        )?;
         Ok(SnapshotCacheCapture {
             snapshot,
             fingerprint: Some(fingerprint),
@@ -6936,7 +6945,7 @@ impl DirectRoomStore {
         };
 
         #[cfg(test)]
-        pause_scoped_projection_after_capture(room_dir);
+        pause_snapshot_projection_after_capture(room_dir);
 
         let scoped_facts = select_scoped_facts(
             &engagement_facts,
@@ -7308,38 +7317,33 @@ impl ScopedSelectionStats {
 }
 
 #[cfg(test)]
-struct ScopedCapturePause {
+struct SnapshotCapturePause {
     room_dir: PathBuf,
     captured: std::sync::mpsc::Sender<()>,
     resume: std::sync::mpsc::Receiver<()>,
 }
 
 #[cfg(test)]
-static SCOPED_CAPTURE_PAUSE: Mutex<Option<ScopedCapturePause>> = Mutex::new(None);
+static SNAPSHOT_CAPTURE_PAUSES: Mutex<Vec<SnapshotCapturePause>> = Mutex::new(Vec::new());
 
 /// Test seam at the exact ownership boundary: selected canonical inputs have
 /// been captured, and the mutation lock must already be available to a peer.
 #[cfg(test)]
-fn pause_scoped_projection_after_capture(room_dir: &Path) {
+fn pause_snapshot_projection_after_capture(room_dir: &Path) {
     let pause = {
-        let mut slot = SCOPED_CAPTURE_PAUSE
+        let mut slot = SNAPSHOT_CAPTURE_PAUSES
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if slot
-            .as_ref()
-            .is_some_and(|pause| pause.room_dir == room_dir)
-        {
-            slot.take()
-        } else {
-            None
-        }
+        slot.iter()
+            .position(|pause| pause.room_dir == room_dir)
+            .map(|index| slot.remove(index))
     };
     if let Some(pause) = pause {
         pause.captured.send(()).unwrap();
         pause
             .resume
             .recv_timeout(Duration::from_secs(5))
-            .expect("scoped projection test did not release its capture pause");
+            .expect("snapshot projection test did not release its capture pause");
     }
 }
 
@@ -12911,7 +12915,8 @@ const SNAPSHOT_CACHE_FILENAME: &str = "snapshot.cache.json";
 /// keep reporting the biased-low value.
 const SNAPSHOT_CACHE_GENERATION: u32 = 8;
 
-/// Snapshot and freshness proof captured while one room mutation lock is held.
+/// Snapshot projected from inputs and a freshness proof captured together under
+/// one room mutation lock. Pure projection runs after releasing that lock.
 /// This pair is the only value accepted by the cache writer.
 #[derive(Clone, Debug)]
 pub(crate) struct SnapshotCacheCapture {
@@ -14912,6 +14917,60 @@ mod ledger_tests {
     }
 
     #[test]
+    fn full_capture_releases_lock_and_keeps_original_cache_proof() {
+        let root = unique_root("full-snapshot-short-lock");
+        let room_dir = root.join(".rally");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let first = make_fact("capture-first", FactKind::Artifact, "src/", "first");
+        store.append_fact(&first).unwrap();
+        let at = projection_unix_sec();
+        let expected = store.snapshot_cache_capture_at(false, at).unwrap();
+        let (captured_tx, captured_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        SNAPSHOT_CAPTURE_PAUSES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(SnapshotCapturePause {
+                room_dir: room_dir.clone(),
+                captured: captured_tx,
+                resume: resume_rx,
+            });
+        let query = thread::spawn(move || store.snapshot_cache_capture_at(false, at));
+        captured_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // The write must finish while projection remains paused. A deadline
+        // gives the regression a bounded failure instead of a deadlock.
+        let start = Instant::now();
+        let result = with_mutation_deadline(Duration::from_secs(1), || {
+            let writer = DirectRoomStore::open_direct_at(root.clone())?;
+            writer.append_fact(&make_fact(
+                "capture-later",
+                FactKind::Artifact,
+                "src/",
+                "concurrent append",
+            ))
+        });
+        let elapsed = start.elapsed();
+        resume_tx.send(()).unwrap();
+        let capture = query.join().unwrap().unwrap();
+        let appended = result.expect("writer was blocked by CPU-only snapshot projection");
+        println!("FULL_CAPTURE peer_write_us={}", elapsed.as_micros());
+        assert!(appended.fact.seq > capture.snapshot.max_seq);
+        assert_eq!(capture.fingerprint, expected.fingerprint);
+        assert_eq!(
+            snapshot_to_wire_value(&capture.snapshot).unwrap(),
+            snapshot_to_wire_value(&expected.snapshot).unwrap(),
+            "projection must use precisely the captured inputs"
+        );
+        write_snapshot_cache(&room_dir, &capture);
+        assert!(
+            try_load_cached_snapshot_at(&room_dir, at).is_none(),
+            "an append during projection must invalidate the original proof"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn scoped_capture_releases_mutation_lock_before_large_projection() {
         let root = unique_root("scoped-snapshot-short-lock");
         let store = DirectRoomStore::open_direct_at_with_engagement(
@@ -14937,11 +14996,10 @@ mod ledger_tests {
         let (captured_tx, captured_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
         {
-            let mut pause = SCOPED_CAPTURE_PAUSE
+            let mut pause = SNAPSHOT_CAPTURE_PAUSES
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            assert!(pause.is_none(), "another scoped capture test is active");
-            *pause = Some(ScopedCapturePause {
+            pause.push(SnapshotCapturePause {
                 room_dir: room_dir.clone(),
                 captured: captured_tx,
                 resume: resume_rx,
