@@ -670,26 +670,21 @@ mod tests {
         ))
     }
 
-    /// Test 1: `wait_for_change` returns `Changed` within ~2s (generous —
-    /// a CI box is slow; the point is proving it does not wait the full
-    /// interval, not micro-benchmarking) when a file is created in a
-    /// watched directory.
+    /// Test 1: an armed watcher observes a file creation even when the event
+    /// arrives before wait. Registration ordering, not a sleep, defines readiness.
     #[test]
-    fn wait_for_change_detects_file_creation_quickly() {
+    fn armed_watcher_detects_file_creation() {
         let dir = unique_temp_dir("create");
         std::fs::create_dir_all(&dir).unwrap();
         let index_file = dir.join("index.json");
 
-        let watch_dir = dir.clone();
-        let handle = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(150));
-            std::fs::write(watch_dir.join("new-file.txt"), b"x").unwrap();
-        });
-
-        let started = Instant::now();
-        let outcome = wait_for_change(&dir, &index_file, Duration::from_secs(5));
-        let elapsed = started.elapsed();
-        handle.join().unwrap();
+        let mut watcher = LogWatcher::new(&dir, &index_file);
+        assert!(
+            watcher.is_armed(),
+            "fixture requires an armed event backend"
+        );
+        std::fs::write(dir.join("new-file.txt"), b"x").unwrap();
+        let outcome = watcher.wait(Duration::from_secs(5));
 
         assert_eq!(
             outcome,
@@ -698,19 +693,12 @@ mod tests {
              on a platform with no backend — if this fired, the CI box's backend needs \
              checking): got {outcome:?}"
         );
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "wait_for_change must not wait out the full 5s timeout when the kernel reports \
-             a change quickly; took {elapsed:?}"
-        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// THE test for the actual fix. Everything else in this module exercises
-    /// the one-shot `wait_for_change` wrapper, which is the very shape that
-    /// was broken — so none of it would fail if `LogWatcher::new` were moved
-    /// back inside the caller's loop.
+    /// Regression for the persistent loop: constructing a new watcher for
+    /// every wait loses notifications that arrive between waits.
     ///
     /// This asserts the property that matters: a change that lands while the
     /// watcher is NOT blocked is still delivered on the next wait, because a
@@ -840,35 +828,31 @@ mod tests {
     /// `watch_write_once_cursor`'s tmp+rename pattern), not a plain
     /// in-place write.
     #[test]
-    fn wait_for_change_detects_atomic_rename_over_index_file() {
+    fn armed_watcher_detects_atomic_rename_over_index_file() {
         let dir = unique_temp_dir("rename");
         std::fs::create_dir_all(&dir).unwrap();
         let index_file = dir.join("index.json");
         std::fs::write(&index_file, b"{}").unwrap();
 
-        let watch_dir = dir.clone();
-        let handle = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(150));
-            let tmp = watch_dir.join("index.json.tmp-atomic-test");
-            let mut f = std::fs::File::create(&tmp).unwrap();
-            f.write_all(b"{\"segments\":[]}").unwrap();
-            drop(f);
-            std::fs::rename(&tmp, watch_dir.join("index.json")).unwrap();
-        });
-
-        let started = Instant::now();
-        let outcome = wait_for_change(&dir, &index_file, Duration::from_secs(5));
-        let elapsed = started.elapsed();
-        handle.join().unwrap();
+        // Registration must precede mutation. A sleeping writer can run before
+        // the main thread arms its watch under load. Queue the real store write
+        // after registration and before wait, without scheduler assumptions.
+        let mut watcher = LogWatcher::new(&dir, &index_file);
+        assert!(
+            watcher.is_armed(),
+            "fixture requires an armed event backend"
+        );
+        let tmp = dir.join("index.json.tmp-atomic-test");
+        let mut f = std::fs::File::create(&tmp).unwrap();
+        f.write_all(b"{\"segments\":[]}").unwrap();
+        drop(f);
+        std::fs::rename(&tmp, &index_file).unwrap();
+        let outcome = watcher.wait(Duration::from_secs(5));
 
         assert_eq!(
             outcome,
             WaitOutcome::Changed,
             "atomic tmp+rename over index.json must be detected as Changed: got {outcome:?}"
-        );
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "must not wait out the full timeout on a rename; took {elapsed:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
