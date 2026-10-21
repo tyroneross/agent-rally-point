@@ -515,3 +515,66 @@ fn next_uses_the_repos_own_history_for_the_age_signal() {
         "instant pickups floor at 1 h"
     );
 }
+
+#[test]
+fn limited_inbox_does_not_invent_accepted_work() {
+    let sandbox = ChannelSandbox::spawn();
+    for subject in ["unanswered first", "unanswered second"] {
+        say_handoff(
+            &sandbox,
+            &[
+                "--timeout-ms",
+                "10000",
+                "--subject",
+                subject,
+                "--target",
+                PICKER,
+                "--deliver",
+                "record",
+            ],
+        );
+    }
+    let posted = say_handoff(
+        &sandbox,
+        &[
+            "--timeout-ms",
+            "10000",
+            "--subject",
+            "accepted third",
+            "--target",
+            PICKER,
+            "--deliver",
+            "record",
+        ],
+    );
+    let id = posted["data"]["say"]["fact"]["event_id"].as_str().unwrap();
+    as_session(
+        &sandbox,
+        "limited-inbox-receiver",
+        &[
+            "say",
+            "handoff",
+            "--json",
+            "--tool",
+            PICKER,
+            "--ref",
+            id,
+            "--handoff-state",
+            "accepted",
+            "--timeout-ms",
+            "10000",
+            "--subject",
+            "accepted work",
+        ],
+    );
+    for limit in ["1", "10"] {
+        let output = sandbox.rally_json(&["inbox", "--json", "--tool", PICKER, "--limit", limit]);
+        let result = &output["data"]["inbox"];
+        assert_eq!(result["count"], 2, "{output}");
+        assert_eq!(result["accepted_open"], 1, "limit {limit}: {output}");
+        assert_eq!(
+            result["items"].as_array().unwrap().len(),
+            limit.parse::<usize>().unwrap().min(2)
+        );
+    }
+}

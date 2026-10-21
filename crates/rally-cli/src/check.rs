@@ -165,6 +165,9 @@ pub(crate) fn humanize_age(secs: i64) -> String {
     }
 }
 
+#[cfg(test)]
+thread_local! { static BASE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 /// Overwrite guard: is this tool about to write a file from a handoff whose
 /// recorded base is behind the file's current content?
 ///
@@ -193,6 +196,12 @@ fn check_handoff_base(
     let Ok(root) = root.canonicalize() else {
         return;
     };
+    let current = std::cell::LazyCell::new(|| {
+        #[cfg(test)]
+        BASE_PROBES.with(|count| count.set(count.get() + 1));
+        crate::open_queue::confined_file(&root, rel)
+            .and_then(|file| crate::open_queue::bounded_hash(&file))
+    });
     for handoff in &snapshot.open_handoffs {
         if handoff_address(handoff, tool) == HandoffAddress::Elsewhere {
             continue;
@@ -212,13 +221,10 @@ fn check_handoff_base(
         if already_taken {
             continue;
         }
-        let Some(file) = crate::open_queue::confined_file(&root, rel) else {
+        let Some(current) = &*current else {
             continue;
         };
-        let Some(current) = crate::open_queue::bounded_hash(&file) else {
-            continue;
-        };
-        if &current == base {
+        if current == base {
             continue;
         }
         let commit = crate::open_queue::base_commit(&handoff.evidence);
@@ -605,6 +611,40 @@ pub(crate) fn check_before_write_for_test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn handoff_base_probes_once_and_retains_every_warning() {
+        let root = std::env::temp_dir().join(format!("rally-base-probes-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "changed").unwrap();
+        let mut snapshot = RoomSnapshot {
+            open_handoffs: (0..64)
+                .map(|id| crate::store::Fact {
+                    event_id: format!("h{id}"),
+                    kind: crate::store::FactKind::Handoff,
+                    evidence: vec!["basehash:a.rs=0000000000000000".into()],
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        for expected in [64, 0] {
+            BASE_PROBES.with(|count| count.set(0));
+            let mut findings = vec![];
+            check_handoff_base(&snapshot, "receiver", "file:a.rs", &root, &mut findings);
+            assert_eq!(findings.len(), expected);
+            assert_eq!(BASE_PROBES.with(|count| count.get()), 1);
+            std::fs::remove_file(root.join("a.rs")).ok();
+        }
+        snapshot
+            .open_handoffs
+            .iter_mut()
+            .for_each(|f| f.target = Some("elsewhere".into()));
+        BASE_PROBES.with(|count| count.set(0));
+        check_handoff_base(&snapshot, "receiver", "file:a.rs", &root, &mut vec![]);
+        assert_eq!(BASE_PROBES.with(|count| count.get()), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
     use crate::store::{Fact, RoomSnapshot, Squad};
 

@@ -78,6 +78,9 @@ pub(crate) struct InboxResult {
     /// no longer an unanswered obligation, still assigned work. Omitted at 0.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) accepted_open: usize,
+    /// An older peer omitted unanswered rows without an exact accepted count.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) accepted_open_incomplete: bool,
     /// The OPEN QUEUE: unowned handoffs any agent may claim. Separate from the
     /// counts above, which are work assigned to this tool by name, so a reader
     /// can never mistake an available item for one handed to it. Built by
@@ -96,6 +99,10 @@ pub(crate) struct OpenQueueSummary {
     /// How many carry at least one "revalidate before claiming" reason.
     pub(crate) revalidate: usize,
     pub(crate) items: Vec<crate::open_queue::OpenQueueItem>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn is_zero(value: &usize) -> bool {
@@ -243,13 +250,28 @@ pub(crate) fn build_inbox(
         items: open_queue.into_iter().take(limit).collect(),
     };
 
-    let accepted_open = named_work(snapshot, tool)
-        .iter()
-        .filter(|(_, state)| *state == NamedState::AcceptedOpen)
-        .count();
+    let accepted_open_incomplete = target_scoped
+        && snapshot.open_obligations_accepted_open.is_none()
+        && snapshot.open_obligations_omitted > 0;
+    let accepted_open = if target_scoped {
+        snapshot.open_obligations_accepted_open
+    } else {
+        None
+    }
+    .unwrap_or_else(|| {
+        if accepted_open_incomplete {
+            0
+        } else {
+            named_work(snapshot, tool)
+                .iter()
+                .filter(|(_, state)| *state == NamedState::AcceptedOpen)
+                .count()
+        }
+    });
 
     InboxResult {
         accepted_open,
+        accepted_open_incomplete,
         count,
         handoffs,
         artifacts,
@@ -396,6 +418,42 @@ fn fact_age_secs(fact: &Fact) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bounded_inbox_preserves_exact_accepted_count_across_wire() {
+        let unanswered = crate::store::Fact {
+            event_id: "unanswered".into(),
+            kind: crate::store::FactKind::Handoff,
+            target: Some("receiver".into()),
+            ..Default::default()
+        };
+        let accepted = crate::store::Fact {
+            event_id: "accepted".into(),
+            ..unanswered.clone()
+        };
+        let full = crate::store::RoomSnapshot {
+            open_handoffs: vec![unanswered.clone(), accepted],
+            open_obligations: vec![unanswered],
+            ..Default::default()
+        };
+        for limit in [0, 1] {
+            let scoped = full.clone().for_obligation_target("receiver", limit);
+            let mut wire = crate::store::snapshot_to_wire_value(&scoped).unwrap();
+            let restored = crate::store::snapshot_from_wire_value(wire.clone()).unwrap();
+            let inbox = super::build_inbox(&restored, "receiver", limit, 300, vec![]);
+            assert_eq!(inbox.count, 1);
+            assert_eq!(inbox.accepted_open, 1);
+            assert!(!inbox.accepted_open_incomplete);
+            wire[crate::store::WIRE_INTERNALS_KEY]
+                .as_object_mut()
+                .unwrap()
+                .remove("open_obligations_accepted_open");
+            let legacy = crate::store::snapshot_from_wire_value(wire).unwrap();
+            let inbox = super::build_inbox(&legacy, "receiver", limit, 300, vec![]);
+            assert_eq!(inbox.accepted_open_incomplete, limit == 0);
+            assert_eq!(inbox.accepted_open, usize::from(limit != 0));
+        }
+    }
+
     use super::*;
 
     fn obligation(event_id: &str, kind: FactKind, target: &str, created_at: &str) -> Fact {

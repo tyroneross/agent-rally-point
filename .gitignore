@@ -158,3 +158,6 @@ scripts/bench_*.py
 # Vendored [patch] crates resolve through the workspace's root Cargo.lock, so a
 # lock generated inside the vendored dir governs nothing and only churns.
 vendor/*/Cargo.lock
+
+# Internal queue option study is preserved in private project memory.
+/docs/research/2026-10-18-assigned-vs-pool-queues.md

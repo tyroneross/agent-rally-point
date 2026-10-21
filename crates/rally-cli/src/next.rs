@@ -592,26 +592,28 @@ fn next_candidates(
     // assigned to this tool, so they surface when the agent has nothing
     // assigned — the assign-or-pick-up-when-idle model. Age never removes one;
     // it only marks it "revalidate before claiming" (see `open_queue`).
-    for item in open_queue {
-        let (reason, base) = if item.revalidate_before_claiming {
-            (
-                "open_queue_item_needs_revalidation",
-                OPEN_QUEUE_REVALIDATE_SCORE,
-            )
-        } else {
-            ("open_queue_item_available", OPEN_QUEUE_SCORE)
-        };
-        if let Some(fact) = snapshot
-            .open_handoffs
-            .iter()
-            .find(|fact| fact.event_id == item.event_id)
-        {
-            candidates.push(NextCandidate::from_fact(
-                "claim_open_queue_item",
-                reason,
-                base,
-                fact,
-            ));
+    if !open_queue.is_empty() {
+        let mut by_id = std::collections::HashMap::with_capacity(snapshot.open_handoffs.len());
+        for fact in &snapshot.open_handoffs {
+            by_id.entry(fact.event_id.as_str()).or_insert(fact);
+        }
+        for item in open_queue {
+            let (reason, base) = if item.revalidate_before_claiming {
+                (
+                    "open_queue_item_needs_revalidation",
+                    OPEN_QUEUE_REVALIDATE_SCORE,
+                )
+            } else {
+                ("open_queue_item_available", OPEN_QUEUE_SCORE)
+            };
+            if let Some(fact) = by_id.get(item.event_id.as_str()) {
+                candidates.push(NextCandidate::from_fact(
+                    "claim_open_queue_item",
+                    reason,
+                    base,
+                    fact,
+                ));
+            }
         }
     }
     for blocker in &snapshot.active_blockers {
@@ -1235,6 +1237,60 @@ fn entry_item(reason: &'static str, fact: &Fact) -> EntryItem {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn large_open_queue_preserves_first_duplicate_and_item_order() {
+        let fresh = chrono::Utc::now().to_rfc3339();
+        let mut handoffs: Vec<_> = (0..1024)
+            .map(|id| open_queue_handoff(&format!("pool-{id}"), id, &fresh))
+            .collect();
+        handoffs[0].subject = "first version".into();
+        let mut duplicate = handoffs[0].clone();
+        duplicate.subject = "later duplicate".into();
+        handoffs.push(duplicate);
+        let snapshot = RoomSnapshot {
+            open_handoffs: handoffs,
+            ..Default::default()
+        };
+        let items = crate::open_queue::open_queue_items(
+            &snapshot,
+            "receiver",
+            &Default::default(),
+            chrono::Utc::now().timestamp(),
+        );
+        let candidates = next_candidates(
+            &snapshot,
+            "receiver",
+            None,
+            &[],
+            false,
+            &[],
+            &[],
+            300,
+            StaleTargetedPolicy::Surface,
+            &items,
+        );
+        let queue: Vec<_> = candidates
+            .iter()
+            .filter(|c| c.action == "claim_open_queue_item")
+            .collect();
+        assert_eq!(queue.len(), items.len());
+        for (candidate, item) in queue.iter().zip(&items) {
+            assert_eq!(
+                candidate.fact.as_ref().map(|f| f.event_id.as_str()),
+                Some(item.event_id.as_str())
+            );
+        }
+        for candidate in queue
+            .iter()
+            .filter(|c| c.fact.as_ref().is_some_and(|f| f.event_id == "pool-0"))
+        {
+            assert_eq!(
+                candidate.fact.as_ref().map(|f| f.subject.as_str()),
+                Some("first version")
+            );
+        }
+    }
+
     use super::*;
     use crate::store::Squad;
 
