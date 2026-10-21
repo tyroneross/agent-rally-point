@@ -166,6 +166,8 @@ Default communication order:
 
 A handoff with `--target <agent>` is assigned to that agent by name. It stays in that agent's `rally inbox` until the agent answers, at any age, and `rally next` ranks it above everything except a targeted ack-required artifact. Acking or accepting it (`handoff.acked` / `handoff.accepted`) answers the inbox obligation but does not finish the work. `rally next` keeps ranking it as `accepted_handoff_still_open` until it is resolved, and `rally inbox` counts it as `accepted_open`.
 
+When a bounded reply omits unanswered rows, `rally next` reports `named_handoff_state_incomplete` instead of guessing whether an omitted handoff was accepted. Read the handoff with `rally locate <event-id> --json`; `rally inbox --tool <agent> --json` still reports the exact `accepted_open` count from a current daemon.
+
 A handoff with no `--target` (or `--target all`) goes to the **open queue**: it is unowned, and any agent may take it when it has no assigned work. `rally next` offers it as `claim_open_queue_item`, below every kind of assigned work, and `rally inbox` lists it under `open_queue`, separate from the named count. The prompt hook words it as "available and unowned; claim it before working", never as a task handed to the reader.
 
 No age limit removes, hides, or reroutes an open-queue item. Instead, `rally next` and `rally inbox` mark it **revalidate before claiming** when any of these hold, and nothing is ever closed automatically:
