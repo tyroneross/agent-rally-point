@@ -578,6 +578,7 @@ fn next_candidates(
             let reason = match state {
                 crate::obligations::NamedState::Unanswered => "open_handoff_targeted_to_this_tool",
                 crate::obligations::NamedState::AcceptedOpen => "accepted_handoff_still_open",
+                crate::obligations::NamedState::Incomplete => "named_handoff_state_incomplete",
             };
             candidates.push(NextCandidate::from_fact(
                 "respond_to_handoff",
@@ -1237,6 +1238,41 @@ fn entry_item(reason: &'static str, fact: &Fact) -> EntryItem {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bounded_named_candidates_never_invent_acceptance() {
+        let a = handoff("a", "receiver", &chrono::Utc::now().to_rfc3339());
+        let b = Fact {
+            event_id: "b".into(),
+            ..a.clone()
+        };
+        let snapshot = RoomSnapshot {
+            open_handoffs: vec![a.clone(), b.clone()],
+            open_obligations: vec![a, b],
+            ..Default::default()
+        }
+        .for_obligation_target("receiver", 1);
+        let candidates = next_candidates(
+            &snapshot,
+            "receiver",
+            None,
+            &[],
+            false,
+            &[],
+            &[],
+            300,
+            StaleTargetedPolicy::Surface,
+            &[],
+        );
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].reason, "open_handoff_targeted_to_this_tool");
+        assert_eq!(candidates[1].reason, "named_handoff_state_incomplete");
+        assert!(
+            candidates
+                .iter()
+                .all(|c| c.reason != "accepted_handoff_still_open")
+        );
+    }
+
     #[test]
     fn large_open_queue_preserves_first_duplicate_and_item_order() {
         let fresh = chrono::Utc::now().to_rfc3339();
