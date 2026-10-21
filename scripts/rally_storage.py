@@ -15,9 +15,12 @@ from pathlib import Path
 import re
 import stat
 import tempfile
+import time
 
-QUARANTINE = re.compile(r"facts\.db\.corrupt\.\d+(?:-db-(?:wal|shm))?$")
+QUARANTINE = re.compile(r"facts\.db\.corrupt\.\d+(?:-(?:db-)?(?:wal|shm))?$")
 BLOCK = 1024 * 1024
+# Five u64 counters/timestamps, separators, and one u64 retention metadata line.
+MARKER_BYTES = 5 * 20 + 5 + len('retention_secs=') + 20 + 1
 
 def fingerprint(st):
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
@@ -49,12 +52,18 @@ def inventory(root):
             rel = path.relative_to(root)
             category = ('quarantine' if QUARANTINE.fullmatch(name) and len(rel.parts) == 1 else
                         'compressed_quarantine' if name.endswith('.gz') and QUARANTINE.fullmatch(name[:-3]) else
+                        'build_cache' if rel.parts[0] == 'worktrees' and 'target' in rel.parts else
+                        'worktree_source' if rel.parts[0] == 'worktrees' and not name.endswith('.bundle') else
+                        'hook_cache' if rel.parts[0] in ('.hook-events', '.hook-seen') else
+                        'task_capture' if rel.parts[0] in ('task-input', 'task-results') else
+                        'inbox' if rel.parts[0] == 'inbox' else
                         'ledger' if rel.parts[0] in ('log', 'archive') and name.endswith('.jsonl') else
                         'database' if name in ('facts.db', 'facts.db-wal', 'facts.db-shm') else
                         'recovery' if name.endswith('.bundle') else 'other')
-            group = groups.setdefault(category, {'files': 0, 'bytes': 0})
+            group = groups.setdefault(category, {'files': 0, 'bytes': 0, 'allocated_bytes': 0})
             group['files'] += 1
             group['bytes'] += st.st_size
+            group['allocated_bytes'] += getattr(st, 'st_blocks', 0) * 512
     return {'schema': 'agent-rally.storage.inventory.v1', 'root': str(root.resolve()), 'groups': groups,
             'note': 'Live size snapshot; only quarantined DB snapshots are compression candidates.'}
 
@@ -87,7 +96,9 @@ def compress_quarantine(root, name):
             raise ValueError('source changed during compression')
         saved = original.st_size - Path(temp).stat().st_size
         if saved <= 0:
-            return {'source': name, 'state': 'retained_not_smaller', 'saved_bytes': 0}
+            return {'source': name, 'state': 'retained_not_smaller', 'saved_bytes': 0,
+                    'original_bytes': original.st_size, 'source_mtime_ns': original.st_mtime_ns,
+                    'sha256': recovered_hash}
         # No-clobber publication. If a crash left the durable gzip in place,
         # verify it and finish the interrupted source unlink on retry.
         try:
@@ -103,7 +114,8 @@ def compress_quarantine(root, name):
         source.unlink()
         sync_dir(root)
         return {'source': name, 'archive': str(dest), 'state': 'compressed_verified',
-                'sha256': recovered_hash, 'original_bytes': recovered_size, 'saved_bytes': saved}
+                'sha256': recovered_hash, 'original_bytes': recovered_size, 'saved_bytes': saved,
+                'archive_bytes': dest.stat().st_size, 'source_mtime_ns': original.st_mtime_ns}
     finally:
         os.close(fd)
         if temp is not None:
@@ -131,6 +143,73 @@ def restore_archive(archive, destination):
         Path(temp).unlink(missing_ok=True)
     return {'restored': str(destination)}
 
+def marker_expired(path, now):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as inp:
+        st = os.fstat(inp.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            return False
+        data = inp.read(MARKER_BYTES + 1)
+    if len(data) > MARKER_BYTES:
+        return False
+    lines = data.splitlines()
+    if len(lines) != 2 or not lines[1].startswith(b'retention_secs='):
+        return False
+    fields = lines[0].split()
+    retention = lines[1].removeprefix(b'retention_secs=')
+    if len(fields) != 5 or not all(v.isdigit() for v in fields + [retention]):
+        return False
+    values = [int(v) for v in fields + [retention]]
+    if any(v > (1 << 64) - 1 for v in values) or values[-1] == 0:
+        return False
+    return now >= values[0] and now - values[0] > values[-1]
+
+def reclaim_hook_events(root, now=None):
+    """Explicit maintenance; never add directory scans to a tool-call deadline."""
+    root = root.resolve(strict=True)
+    now = int(time.time()) if now is None else now
+    result = {'root': str(root), 'scanned': 0, 'removed': 0, 'busy': 0,
+              'retained': 0, 'stale_locks_removed': 0, 'errors': []}
+    for path in root.glob('*.state'):
+        result['scanned'] += 1
+        lock = path.with_name(path.name + '.lock')
+        acquired = False
+        try:
+            if path.is_symlink() or not marker_expired(path, now):
+                result['retained'] += 1
+                continue
+            try:
+                lock.mkdir(mode=0o700)
+                acquired = True
+            except FileExistsError:
+                result['busy'] += 1
+                continue
+            # A writer may have refreshed after the first read; grade again
+            # while holding the same per-record lock used by every writer.
+            if marker_expired(path, now):
+                path.unlink()
+                result['removed'] += 1
+            else:
+                result['retained'] += 1
+        except FileNotFoundError:
+            pass  # another maintenance process already reclaimed the record
+        except OSError as error:
+            result['errors'].append({'file': path.name, 'error': str(error)})
+        finally:
+            if acquired:
+                lock.rmdir()
+    # Preserve the existing conservative crash-lock allowance, outside hooks.
+    for lock in root.glob('*.state.lock'):
+        if lock.is_symlink() or not lock.is_dir():
+            continue
+        try:
+            if now - lock.stat().st_mtime > 600:
+                lock.rmdir()  # nonempty or busy locks are never recursively removed
+                result['stale_locks_removed'] += 1
+        except (FileNotFoundError, OSError):
+            pass
+    return result
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest='command', required=True)
@@ -142,14 +221,19 @@ def main():
     q = sub.add_parser('restore')
     q.add_argument('archive', type=Path)
     q.add_argument('destination', type=Path)
+    q = sub.add_parser('reclaim-hook-events')
+    q.add_argument('--hook-dir', type=Path, required=True)
     args = p.parse_args()
     try:
         result = (inventory(args.rally_dir) if args.command == 'inventory' else
                   compress_quarantine(args.rally_dir, args.file) if args.command == 'compress' else
+                  reclaim_hook_events(args.hook_dir) if args.command == 'reclaim-hook-events' else
                   restore_archive(args.archive, args.destination))
         print(json.dumps(result, indent=2))
+        if result.get('errors'):
+            return 2
     except (OSError, ValueError, EOFError) as error:
         p.exit(2, f'{error}\n')
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

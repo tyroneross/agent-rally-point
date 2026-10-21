@@ -109,7 +109,8 @@
 #                            Stop remains advisory.
 #   RALLY_HOOK_DEDUPE_SECS — duplicate registration window (default 5 seconds).
 #   RALLY_HOOK_DEDUPE_DIR  — test/diagnostic override for event markers.
-#                            Distinct markers persist; timestamps expire counts.
+#                            New markers expire by recorded retention; legacy
+#                            markers with unknown retention remain recoverable.
 #   RALLY_NATIVE_HOOK      — before-write native-exec switch. "0", "off",
 #                            "false", "no", or "disabled" forces the legacy
 #                            Node/perl classify-check-claim-render path;
@@ -1619,6 +1620,7 @@ _duplicate_hook_event() {
   local source window now material signature safe_session safe_phase
   local common_dir dedupe_dir state lock tmp acquired attempt
   local stamp plugin_count project_count global_count executed max_count should_run value
+  local retention previous
   source="${RALLY_HOOK_SOURCE:-unknown}"
   case "$source" in
     plugin|project|global) ;;
@@ -1659,8 +1661,23 @@ _duplicate_hook_event() {
   project_count=0
   global_count=0
   executed=0
+  retention="$window"
   if [ -f "$state" ]; then
-    read -r stamp plugin_count project_count global_count executed < "$state" || true
+    previous=""
+    { read -r stamp plugin_count project_count global_count executed
+      IFS= read -r previous
+    } < "$state" || true
+    case "$previous" in
+      retention_secs=*) previous="${previous#retention_secs=}" ;;
+      *) previous=unknown ;;
+    esac
+    case "$previous" in
+      ''|*[!0-9]*) retention=unknown ;;
+      *)
+        if ! [ "$previous" -gt 0 ] 2>/dev/null; then retention=unknown
+        elif [ "$previous" -gt "$window" ] 2>/dev/null; then retention="$previous"
+        fi ;;
+    esac
   fi
   for value in "$stamp" "$plugin_count" "$project_count" "$global_count" "$executed"; do
     case "$value" in
@@ -1694,19 +1711,16 @@ _duplicate_hook_event() {
     should_run=1
   fi
   tmp="$state.$$"
-  if ! printf '%s %s %s %s %s\n' \
-    "$now" "$plugin_count" "$project_count" "$global_count" "$executed" \
+  # First line stays compatible with old shell and native five-number readers.
+  if ! printf '%s %s %s %s %s\nretention_secs=%s\n' \
+    "$now" "$plugin_count" "$project_count" "$global_count" "$executed" "$retention" \
     > "$tmp" 2>/dev/null || ! mv "$tmp" "$state" 2>/dev/null; then
     rm -f "$tmp" 2>/dev/null || true
     rmdir "$lock" 2>/dev/null || true
     return 1
   fi
   rmdir "$lock" 2>/dev/null || true
-  # Markers carry no creator-window metadata. Another actor may use a longer
-  # window, so caller-local age cannot authorize deleting its event record.
-  # Expired counters reset above; distinct markers remain on disk. Lock cleanup
-  # keeps its existing conservative ten-minute crash-recovery allowance.
-  find "$dedupe_dir" -type d -name '*.lock' -mmin +10 -exec rmdir {} \; 2>/dev/null || true
+  # Reclamation runs in rally_storage.py maintenance, outside the hook deadline.
   [ "$should_run" = "1" ] && return 1
   return 0
 }

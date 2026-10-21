@@ -78,3 +78,23 @@ Checkpoint hashes detect corruption, not authenticity of peer content. Evidence
 URIs remain references to verify. Compression applies only to explicitly selected
 quarantine snapshots; it adds no automatic memory eviction, retention deletion or
 database migration. Existing durability settings remain intact.
+
+## Capture only what supports coordination or recovery
+
+| Stored data | Purpose and disposition |
+| --- | --- |
+| Canonical ledger, active inbox, task inputs/results and recovery bundles | Preserve replay, pending delivery and unfinished work. Use supported lifecycle/archive operations; age alone does not establish that the data is unnecessary. Compressing live `.jsonl` files ad hoc breaks replay discovery. |
+| Hook dedupe markers | Store a payload signature, timestamp, source counts and maximum declared retention, without raw tool inputs. Explicit maintenance reclaims expired markers under the writer lock; hooks never scan other markers on the coordination deadline. A nonnumeric second line preserves compatibility with old five-number readers. Legacy/unknown retention stays recoverable; do not invent its expiry. |
+| Quarantined database and WAL/SHM groups | Preserve forensic bytes with verified lossless compression. Include historical `-wal`/`-shm` and newer `-db-wal`/`-db-shm` siblings. Record original names, hashes, sizes and timestamps; never substitute a quarantine file for the live database. Empty files stay uncompressed when gzip would increase size. |
+| Worktree build output | Regenerable, unlike the checkout and Git index. Reclaim only after checking exact-path processes and open files; preserve staged/uncommitted source and recovery bundles. |
+| Maintenance receipts and diagnostic output | Keep compact identity, hash, size, outcome and recovery-path receipts. Retain raw output for failures or unresolved diagnoses, rather than copying complete successful room snapshots into another permanent log. |
+
+The storage inventory distinguishes these categories and reports logical and
+allocated bytes. Neither those totals nor a compression ratio guarantees equal
+APFS free-space recovery. Measure directory growth and cleanup latency before
+adding a new retention quota or background collector.
+
+Run marker maintenance with `python3 scripts/rally_storage.py reclaim-hook-events
+--hook-dir <repo>/.rally/.hook-events`, and separately for the shell marker
+directory `<git-common-dir>/rally-hook-events`. Run it during storage maintenance,
+outside host hook deadlines. It adds no timer, per-event process or raw-payload log.

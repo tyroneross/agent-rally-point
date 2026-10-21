@@ -1096,7 +1096,10 @@ pub(crate) fn dedupe_event(
     }
 
     let mut values = [0u64; 5];
+    let mut retention = Some(window);
     if let Ok(text) = fs::read_to_string(&state) {
+        // Unknown legacy retention cannot authorize age-based reclamation.
+        retention = dedupe_retention(&text).map(|previous| previous.max(window));
         let parsed: Vec<u64> = text
             .split_whitespace()
             .filter_map(|value| value.parse::<u64>().ok())
@@ -1104,6 +1107,8 @@ pub(crate) fn dedupe_event(
         if parsed.len() == values.len() {
             values.copy_from_slice(&parsed);
         }
+    } else if state.exists() {
+        retention = None;
     }
     if now_epoch < values[0] || now_epoch.saturating_sub(values[0]) > window {
         values = [0; 5];
@@ -1117,8 +1122,15 @@ pub(crate) fn dedupe_event(
     }
 
     let rendered = format!(
-        "{} {} {} {} {}\n",
-        values[0], values[1], values[2], values[3], values[4]
+        "{} {} {} {} {}\nretention_secs={}\n",
+        values[0],
+        values[1],
+        values[2],
+        values[3],
+        values[4],
+        retention
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".into())
     );
     let tmp = PathBuf::from(format!("{}.{}", state.display(), std::process::id()));
     let written = fs::write(&tmp, rendered).and_then(|_| fs::rename(&tmp, &state));
@@ -1128,7 +1140,6 @@ pub(crate) fn dedupe_event(
         return DedupeVerdict::Run;
     }
     let _ = fs::remove_dir(&lock);
-    sweep_stale_dedupe_locks(state_dir, now_epoch);
 
     if should_run {
         DedupeVerdict::Run
@@ -1137,27 +1148,13 @@ pub(crate) fn dedupe_event(
     }
 }
 
-fn sweep_stale_dedupe_locks(dir: &Path, now_epoch: u64) {
-    // Markers omit their creator's window, so neither a fixed age nor this
-    // caller's window can safely reclaim another actor's record. Counters
-    // expire lazily in dedupe_event; distinct markers remain on disk.
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else { continue };
-        if !meta.is_dir() || !entry.file_name().to_string_lossy().ends_with(".lock") {
-            continue;
-        }
-        let age = meta
-            .modified()
-            .ok()
-            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|value| now_epoch.saturating_sub(value.as_secs()));
-        if age.map(|value| value > 600).unwrap_or(false) {
-            let _ = fs::remove_dir(entry.path());
-        }
-    }
+fn dedupe_retention(text: &str) -> Option<u64> {
+    text.lines()
+        .nth(1)?
+        .strip_prefix("retention_secs=")?
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
 }
 
 /// Deterministic across processes of one build (FNV-1a). The dedupe window is
@@ -2887,6 +2884,19 @@ mod tests {
             dedupe_event(&dir, "project", "s", "before-write", material, 3600, now),
             DedupeVerdict::Suppress
         );
+        dedupe_event(
+            &dir,
+            "plugin",
+            "s",
+            "before-write",
+            "cleanup",
+            5,
+            now + 3601,
+        );
+        assert!(
+            state.exists(),
+            "reclamation belongs to maintenance, outside the hook deadline"
+        );
         assert_eq!(
             dedupe_event(
                 &dir,
@@ -2899,6 +2909,37 @@ mod tests {
             ),
             DedupeVerdict::Run,
             "retaining a marker must not extend its logical suppression window"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dedupe_metadata_is_compatible_and_retention_never_shrinks() {
+        let dir = std::env::temp_dir().join(format!("rally-dedupe-compat-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dedupe_event(&dir, "plugin", "s", "before-write", "same", 3600, 1000);
+        assert_eq!(
+            dedupe_event(&dir, "project", "s", "before-write", "same", 5, 1000),
+            DedupeVerdict::Suppress
+        );
+        let state = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+        let text = fs::read_to_string(&state).unwrap();
+        assert_eq!(dedupe_retention(&text), Some(3600));
+        let old_reader: Vec<u64> = text
+            .split_whitespace()
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        assert_eq!(
+            old_reader.len(),
+            5,
+            "old native readers must still see five values"
+        );
+        fs::write(&state, "1000 1 0 0 1\n").unwrap();
+        dedupe_event(&dir, "project", "s", "before-write", "same", 5, 1000);
+        assert_eq!(
+            dedupe_retention(&fs::read_to_string(&state).unwrap()),
+            None,
+            "a refresh cannot invent a legacy creator's retention"
         );
         let _ = fs::remove_dir_all(&dir);
     }
