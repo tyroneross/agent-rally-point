@@ -75,9 +75,12 @@
 #     hatch.
 #
 # Env:
-#   RALLY_HOOK_TIMEOUT_MS  — default wall-clock budget for lifecycle and legacy
-#                            Rally calls (default 5000). Classified mutations use
-#                            fixed documented sub-budgets under the host timeout.
+#   RALLY_HOOK_TIMEOUT_MS  — Rally call budget (default 3000), including the
+#                            native before-write transaction. Legacy mutations
+#                            use documented stage sub-budgets. Custom values
+#                            must leave startup/cleanup time below the registering
+#                            host's timeout; the CLI's accepted range is not a
+#                            promise that a host grants that much time.
 #   RALLY_HOOK_DEADLINE_MS — whole-hook deadline for start/idle/after-write
 #                            (default 4000, under the host's 5s; 100..59999).
 #                            On overrun the hook prints `{}` and exits 0. See
@@ -106,6 +109,7 @@
 #                            Stop remains advisory.
 #   RALLY_HOOK_DEDUPE_SECS — duplicate registration window (default 5 seconds).
 #   RALLY_HOOK_DEDUPE_DIR  — test/diagnostic override for event markers.
+#                            Distinct markers persist; timestamps expire counts.
 #   RALLY_NATIVE_HOOK      — before-write native-exec switch. "0", "off",
 #                            "false", "no", or "disabled" forces the legacy
 #                            Node/perl classify-check-claim-render path;
@@ -1698,7 +1702,10 @@ _duplicate_hook_event() {
     return 1
   fi
   rmdir "$lock" 2>/dev/null || true
-  find "$dedupe_dir" -type f -mmin +10 -delete 2>/dev/null || true
+  # Markers carry no creator-window metadata. Another actor may use a longer
+  # window, so caller-local age cannot authorize deleting its event record.
+  # Expired counters reset above; distinct markers remain on disk. Lock cleanup
+  # keeps its existing conservative ten-minute crash-recovery allowance.
   find "$dedupe_dir" -type d -name '*.lock' -mmin +10 -exec rmdir {} \; 2>/dev/null || true
   [ "$should_run" = "1" ] && return 1
   return 0

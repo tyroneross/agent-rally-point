@@ -1128,7 +1128,7 @@ pub(crate) fn dedupe_event(
         return DedupeVerdict::Run;
     }
     let _ = fs::remove_dir(&lock);
-    sweep_stale_dedupe_state(state_dir, now_epoch);
+    sweep_stale_dedupe_locks(state_dir, now_epoch);
 
     if should_run {
         DedupeVerdict::Run
@@ -1137,23 +1137,25 @@ pub(crate) fn dedupe_event(
     }
 }
 
-fn sweep_stale_dedupe_state(dir: &Path, now_epoch: u64) {
+fn sweep_stale_dedupe_locks(dir: &Path, now_epoch: u64) {
+    // Markers omit their creator's window, so neither a fixed age nor this
+    // caller's window can safely reclaim another actor's record. Counters
+    // expire lazily in dedupe_event; distinct markers remain on disk.
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_dir() || !entry.file_name().to_string_lossy().ends_with(".lock") {
+            continue;
+        }
         let age = meta
             .modified()
             .ok()
             .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|value| now_epoch.saturating_sub(value.as_secs()));
         if age.map(|value| value > 600).unwrap_or(false) {
-            if meta.is_dir() {
-                let _ = fs::remove_dir(entry.path());
-            } else {
-                let _ = fs::remove_file(entry.path());
-            }
+            let _ = fs::remove_dir(entry.path());
         }
     }
 }
@@ -2845,6 +2847,58 @@ mod tests {
             dedupe_event(&dir, "unregistered", "s", "before-write", material, 5, now),
             DedupeVerdict::Run,
             "an unknown source is never suppressed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dedupe_retention_covers_a_configured_window_longer_than_ten_minutes() {
+        let dir =
+            std::env::temp_dir().join(format!("rally-dedupe-retention-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let material = r#"{"tool_name":"Write"}"#;
+        assert_eq!(
+            dedupe_event(
+                &dir,
+                "plugin",
+                "s",
+                "before-write",
+                material,
+                3600,
+                now - 700
+            ),
+            DedupeVerdict::Run
+        );
+        let state = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+        fs::File::open(&state)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(now - 700)),
+            )
+            .unwrap();
+        // Another envelope triggers housekeeping before the second registration.
+        dedupe_event(&dir, "plugin", "s", "before-write", "other", 5, now);
+        assert_eq!(
+            dedupe_event(&dir, "project", "s", "before-write", material, 3600, now),
+            DedupeVerdict::Suppress
+        );
+        assert_eq!(
+            dedupe_event(
+                &dir,
+                "plugin",
+                "s",
+                "before-write",
+                material,
+                3600,
+                now + 3601
+            ),
+            DedupeVerdict::Run,
+            "retaining a marker must not extend its logical suppression window"
         );
         let _ = fs::remove_dir_all(&dir);
     }
