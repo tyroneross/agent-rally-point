@@ -224,9 +224,11 @@ mod imp {
     /// store fails to open (R3 "never hang"), before exiting non-zero.
     const STORE_OPEN_FAIL_DRAIN: Duration = Duration::from_secs(2);
 
-    /// Process-global shutdown flag set by the SIGTERM/SIGINT handler and (in
-    /// tests) by [`request_shutdown_for_test`]. Reset at the top of every
-    /// [`serve_unix`] so a prior run's signal cannot pre-empt a fresh serve.
+    /// Process-global shutdown flag set by the SIGTERM/SIGINT handler. Reset at
+    /// the top of every [`serve_unix`] so a prior run's signal cannot pre-empt a
+    /// fresh serve. Tests must stop a serve with a per-serve stop flag
+    /// (`serve_unix_with_stop`), never this global: it is shared by every
+    /// in-process daemon in the test binary.
     static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
     const SIGINT: i32 = 2;
@@ -1147,8 +1149,15 @@ mod imp {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(super) fn serve_unix(config: ServeConfig) -> Result<(), ServeError> {
+        serve_unix_with_stop(config, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// [`serve_unix`] with a per-serve stop flag. The accept loop exits when
+    /// either the process-global signal flag or `stop` is set, so in-process
+    /// daemons (tests) can be stopped independently of each other.
+    #[allow(clippy::too_many_lines)]
+    fn serve_unix_with_stop(config: ServeConfig, stop: Arc<AtomicBool>) -> Result<(), ServeError> {
         // `daemon serve` is a lifetime process, not a bounded command. Both the
         // CLI dispatcher and standalone rallyd must reach this function with no
         // watchdog installed; otherwise a short SQLite budget would be derived
@@ -1284,7 +1293,7 @@ mod imp {
         // counter.
         let reader_threads = Arc::new(AtomicUsize::new(0));
         loop {
-            if SHUTDOWN.load(Ordering::SeqCst) {
+            if SHUTDOWN.load(Ordering::SeqCst) || stop.load(Ordering::SeqCst) {
                 log("shutdown signal received; draining");
                 break;
             }
@@ -1360,11 +1369,6 @@ mod imp {
         let _owner = owner?;
         log("stopped");
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub(super) fn request_shutdown_for_test() {
-        SHUTDOWN.store(true, Ordering::SeqCst);
     }
 
     #[cfg(test)]
@@ -1912,7 +1916,9 @@ mod imp {
                 idle_exit_secs: Some(20),
                 foreground: true,
             };
-            let handle = thread::spawn(move || super::serve_unix(cfg));
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_for_serve = Arc::clone(&stop);
+            let handle = thread::spawn(move || super::serve_unix_with_stop(cfg, stop_for_serve));
             let socket = wait_for_addr(&rally_dir);
             let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline && !ping_ok(&socket) {
@@ -1943,7 +1949,7 @@ mod imp {
             assert_eq!(active.session.unwrap().tool, "worker-01");
             drop(room);
 
-            super::request_shutdown_for_test();
+            stop.store(true, Ordering::SeqCst);
             handle.join().unwrap().unwrap();
             std::fs::remove_dir_all(repo_root).ok();
         }
@@ -3531,8 +3537,10 @@ mod imp {
                 idle_exit_secs: Some(8),
                 foreground: true,
             };
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_for_serve = Arc::clone(&stop);
             let handle = thread::spawn(move || {
-                let _ = super::serve_unix(cfg);
+                let _ = super::serve_unix_with_stop(cfg, stop_for_serve);
             });
 
             let socket = wait_for_addr(&rally_dir);
@@ -3666,7 +3674,7 @@ mod imp {
             }
 
             // Graceful shutdown: request stop, join, assert runtime files gone.
-            super::request_shutdown_for_test();
+            stop.store(true, Ordering::SeqCst);
             handle.join().expect("serve thread joined");
 
             assert!(
