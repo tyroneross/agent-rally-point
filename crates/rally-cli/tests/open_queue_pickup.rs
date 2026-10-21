@@ -18,15 +18,25 @@ const PICKER: &str = "codex:07";
 fn say_handoff(sandbox: &ChannelSandbox, extra: &[&str]) -> Value {
     let mut args = vec!["say", "handoff", "--json", "--tool", SENDER];
     args.extend_from_slice(extra);
-    sandbox.rally_json(&args)
+    as_session(sandbox, "sender-session-1", &args)
 }
 
 fn next(sandbox: &ChannelSandbox) -> Value {
-    sandbox.rally_json(&["next", "--json", "--audit", "--tool", PICKER])["data"]["next"].clone()
+    as_session(
+        sandbox,
+        "receiver-session-1",
+        &["next", "--json", "--audit", "--tool", PICKER],
+    )["data"]["next"]
+        .clone()
 }
 
 fn inbox(sandbox: &ChannelSandbox) -> Value {
-    sandbox.rally_json(&["inbox", "--json", "--tool", PICKER])["data"]["inbox"].clone()
+    as_session(
+        sandbox,
+        "receiver-session-1",
+        &["inbox", "--json", "--tool", PICKER],
+    )["data"]["inbox"]
+        .clone()
 }
 
 fn reason_codes(item: &Value) -> Vec<String> {
@@ -239,21 +249,25 @@ fn accepted_named_work_stays_ranked_and_rejected_work_drops_out() {
         .to_string();
 
     for (id, state) in [(&accepted_id, "accepted"), (&rejected_id, "rejected")] {
-        sandbox.rally_json(&[
-            "say",
-            "handoff",
-            "--json",
-            "--tool",
-            PICKER,
-            "--ref",
-            id,
-            "--handoff-state",
-            state,
-            "--subject",
-            "reply",
-            "--summary",
-            "typed receiver response",
-        ]);
+        as_session(
+            &sandbox,
+            "receiver-session-1",
+            &[
+                "say",
+                "handoff",
+                "--json",
+                "--tool",
+                PICKER,
+                "--ref",
+                id,
+                "--handoff-state",
+                state,
+                "--subject",
+                "reply",
+                "--summary",
+                "typed receiver response",
+            ],
+        );
     }
 
     let ranked = next(&sandbox);
@@ -294,6 +308,11 @@ fn as_session(sandbox: &ChannelSandbox, session: &str, args: &[&str]) -> Value {
         .current_dir(sandbox.cwd())
         .env("HOME", sandbox.home())
         .env("RALLY_SESSION_ID", session)
+        // Cloud identity outranks parent leases. This fixture models distinct
+        // local sender/receiver sessions, not two actors in one Actions job.
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("GITHUB_RUN_ID")
+        .env_remove("RALLY_MANAGED_SESSION_MODE")
         .env_remove("PWD")
         .output()
         .expect("spawn rally");
