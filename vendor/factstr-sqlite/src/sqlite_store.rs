@@ -52,6 +52,13 @@ enum CloseFailureForTest {
 pub struct SqliteStore {
     database_path: PathBuf,
     pool: SqlitePool,
+    /// One runtime shared by every operation on this store. sqlx returns a
+    /// dropped `PoolConnection` by spawning onto the *current* runtime; a
+    /// per-operation runtime would cancel that task and drop the connection
+    /// without a graceful close, leaving SQLite's close (WAL checkpoint and
+    /// `-wal` deletion) to run asynchronously after `close` returns. Declared
+    /// after `pool` so it is dropped after the pool handle.
+    runtime: Arc<Runtime>,
     subscription_registry: Arc<Mutex<SubscriptionRegistry>>,
     delivery_sender: Sender<DeliveryCommand>,
     delivery_thread: Mutex<Option<JoinHandle<()>>>,
@@ -134,26 +141,24 @@ impl SqliteStore {
         let database_path = database_path.as_ref().to_path_buf();
         ensure_parent_directory(&database_path).map_err(sqlx_io_error)?;
 
+        let runtime = Arc::new(
+            Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(sqlx_io_error)?,
+        );
         let (result_sender, result_receiver) = mpsc::sync_channel(1);
         let bootstrap_path = database_path.clone();
+        let bootstrap_runtime = Arc::clone(&runtime);
 
         let bootstrap_thread = thread::Builder::new()
             .name("factstr-sqlite-bootstrap".to_owned())
             .spawn(move || {
-                let runtime = Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(sqlx_io_error);
-
-                let result = match runtime {
-                    Ok(runtime) => runtime.block_on(async {
-                        let pool =
-                            open_pool(&bootstrap_path, busy_timeout, acquire_timeout).await?;
-                        initialize_schema(&pool).await?;
-                        Ok::<_, sqlx::Error>(pool)
-                    }),
-                    Err(error) => Err(error),
-                };
+                let result = bootstrap_runtime.block_on(async {
+                    let pool = open_pool(&bootstrap_path, busy_timeout, acquire_timeout).await?;
+                    initialize_schema(&pool).await?;
+                    Ok::<_, sqlx::Error>(pool)
+                });
 
                 let _ = result_sender.send(result);
             })
@@ -175,15 +180,24 @@ impl SqliteStore {
         let subscription_registry = Arc::new(Mutex::new(SubscriptionRegistry::default()));
         let (delivery_sender, delivery_receiver) = mpsc::channel();
         let delivery_pool = pool.clone();
+        let delivery_runtime = Arc::clone(&runtime);
         let delivery_registry = Arc::clone(&subscription_registry);
         let delivery_thread = thread::Builder::new()
             .name("factstr-sqlite-delivery".to_owned())
-            .spawn(move || run_delivery_thread(delivery_pool, delivery_registry, delivery_receiver))
+            .spawn(move || {
+                run_delivery_thread(
+                    delivery_runtime,
+                    delivery_pool,
+                    delivery_registry,
+                    delivery_receiver,
+                )
+            })
             .map_err(sqlx_io_error)?;
 
         Ok(Self {
             database_path,
             pool,
+            runtime,
             subscription_registry,
             delivery_sender,
             delivery_thread: Mutex::new(Some(delivery_thread)),
@@ -234,6 +248,7 @@ impl SqliteStore {
         }
 
         let pool = self.pool.clone();
+        let close_runtime = Arc::clone(&self.runtime);
         #[cfg(test)]
         let close_failure = self.close_failure_for_test.take();
         #[cfg(test)]
@@ -258,13 +273,23 @@ impl SqliteStore {
                         }
                         Some(CloseFailureForTest::Spawn) | None => {}
                     }
-                    let runtime = Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|error| {
-                            format!("build factstr-sqlite synchronous close runtime: {error}")
-                        })?;
-                    runtime.block_on(pool.close());
+                    close_runtime.block_on(async {
+                        // A dropped connection is returned to the pool by a
+                        // task sqlx spawned on this runtime; it only runs
+                        // while the runtime is driven. Let those tasks finish
+                        // first so every live connection is idle. Closing then
+                        // happens one idle connection at a time, which makes
+                        // the last `sqlite3_close` the sole remaining handle
+                        // and lets SQLite checkpoint and delete the `-wal`
+                        // file. Closing concurrently with a pending return
+                        // task (and sqlx 0.8.6's `Pool::close` does not wait
+                        // for it) leaves two handles closing at once, and
+                        // neither is last.
+                        while pool.num_idle() != pool.size() as usize && !pool.is_closed() {
+                            tokio::task::yield_now().await;
+                        }
+                        pool.close().await;
+                    });
                     Ok(())
                 })
         };
@@ -312,21 +337,13 @@ impl SqliteStore {
         F: FnOnce(SqlitePool) -> Fut + Send + 'static,
     {
         let pool = self.pool.clone();
+        let runtime = Arc::clone(&self.runtime);
         let (result_sender, result_receiver) = mpsc::sync_channel(1);
 
         let worker_thread = thread::Builder::new()
             .name(format!("factstr-sqlite-{operation}"))
             .spawn(move || {
-                let runtime = Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(sqlx_io_error)
-                    .map_err(sqlx_backend_failure);
-
-                let result = match runtime {
-                    Ok(runtime) => runtime.block_on(work(pool)),
-                    Err(error) => Err(error),
-                };
+                let result = runtime.block_on(work(pool));
 
                 let _ = result_sender.send(result);
             })
@@ -507,7 +524,7 @@ impl SqliteStore {
                 return Err(error);
             }
         };
-        let delivery_runtime = build_delivery_runtime("factstr-sqlite durable replay")?;
+        let delivery_runtime = Arc::clone(&self.runtime);
 
         for replay_batch in replay_batches {
             let pending_delivery = PendingDelivery {
@@ -851,7 +868,10 @@ mod timeout_composition_tests {
                 .as_nanos()
         ));
         let store = Arc::new(SqliteStore::open_with_busy_timeout(&path, BUSY).unwrap());
-        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        // Hold connections on the store's own runtime: sqlx return-to-pool
+        // tasks for earlier connection drops live there and only run while it
+        // is being driven.
+        let runtime = Arc::clone(&store.runtime);
 
         // Warm and hold all four slots before append begins.
         let mut held = runtime.block_on(async {
@@ -915,6 +935,48 @@ mod timeout_composition_tests {
             elapsed >= BUSY + Duration::from_millis(50),
             "elapsed {elapsed:?} did not include both the delayed pool checkout and SQLite busy wait"
         );
+    }
+
+    /// A pool connection must survive an operation (not be dropped with a
+    /// per-operation runtime) so that `close_synchronously` can close it
+    /// gracefully and finish SQLite's WAL teardown before returning.
+    #[test]
+    fn pool_connection_survives_operation_and_close_finishes_sqlite_teardown() {
+        let path = std::env::temp_dir().join(format!(
+            "factstr-pool-survives-{}-{}.db",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let wal_path = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        let shm_path = std::path::PathBuf::from(format!("{}-shm", path.display()));
+        let mut store = SqliteStore::open(&path).unwrap();
+        store
+            .append(vec![NewEvent::new(
+                "pool-survives",
+                serde_json::json!({"n": 1}),
+            )])
+            .unwrap();
+        store.query(&EventQuery::all()).unwrap();
+
+        assert!(
+            store.pool.size() >= 1,
+            "pool connection was dropped without graceful close after an operation"
+        );
+
+        store.close_synchronously().unwrap();
+        assert_eq!(store.pool.size(), 0, "close left connections in the pool");
+        assert!(
+            !wal_path.exists(),
+            "WAL file still present after close: sqlite teardown not finished"
+        );
+
+        drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&wal_path).ok();
+        std::fs::remove_file(&shm_path).ok();
     }
 
     #[test]
@@ -1234,20 +1296,6 @@ fn subscription_registry_backend_failure(message: String) -> EventStoreError {
     EventStoreError::BackendFailure { message }
 }
 
-fn build_delivery_runtime(operation: &'static str) -> Result<Runtime, EventStoreError> {
-    Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(sqlx_io_error)
-        .map_err(sqlx_backend_failure)
-        .map_err(|error| match error {
-            EventStoreError::BackendFailure { message } => EventStoreError::BackendFailure {
-                message: format!("{operation}: {message}"),
-            },
-            other => other,
-        })
-}
-
 async fn load_or_create_subscriber_cursor(
     connection: &mut sqlx::SqliteConnection,
     subscriber_id: &str,
@@ -1497,18 +1545,11 @@ fn serialize_event_query(event_query: &EventQuery) -> Result<String, EventStoreE
 }
 
 fn run_delivery_thread(
+    runtime: Arc<Runtime>,
     pool: SqlitePool,
     subscription_registry: Arc<Mutex<SubscriptionRegistry>>,
     delivery_receiver: Receiver<DeliveryCommand>,
 ) {
-    let runtime = match Builder::new_current_thread().enable_all().build() {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            eprintln!("factstr-sqlite delivery runtime could not start: {}", error);
-            return;
-        }
-    };
-
     while let Ok(delivery_command) = delivery_receiver.recv() {
         match delivery_command {
             #[cfg(test)]
