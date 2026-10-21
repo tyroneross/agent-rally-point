@@ -856,7 +856,7 @@ mod timeout_composition_tests {
     /// the release-budget invariant must count both.
     #[test]
     fn delayed_pool_acquire_then_sqlite_busy_consumes_both_boundaries() {
-        const BUSY: Duration = Duration::from_millis(500);
+        const BUSY: Duration = Duration::from_millis(1000);
         const RELEASE_AFTER: Duration = Duration::from_millis(75);
 
         let path = std::env::temp_dir().join(format!(
@@ -900,14 +900,21 @@ mod timeout_composition_tests {
         before_acquire_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("append reached pool acquisition");
-        std::thread::sleep(RELEASE_AFTER);
-        // Release one idle slot before the 125ms acquire timeout. Append now
-        // proceeds to BEGIN IMMEDIATE and waits independently on the 500ms
+        let probe_seen = Instant::now();
+        // Spin instead of sleeping: macOS timer coalescing stretched a 75ms
+        // thread::sleep to 112-147ms, pushing the release past the acquire
+        // timeout.
+        while probe_seen.elapsed() < RELEASE_AFTER {
+            std::thread::yield_now();
+        }
+        // Release one idle slot before the 250ms acquire timeout. Append now
+        // proceeds to BEGIN IMMEDIATE and waits independently on the 1000ms
         // SQLite busy handler held by connection zero.
         runtime.block_on(async {
             let mut released = held.pop().unwrap();
             released.return_to_pool().await;
         });
+        let pool_wait = probe_seen.elapsed();
 
         let (elapsed, result) = append.join().expect("append thread joins");
         let error = result
@@ -927,6 +934,11 @@ mod timeout_composition_tests {
         drop(store);
         std::fs::remove_file(path).ok();
 
+        assert!(
+            pool_wait < crate::connection::acquire_timeout_for(BUSY),
+            "test released the pool slot after {pool_wait:?}, past the {:?} acquire timeout; the harness, not the store, missed the window",
+            crate::connection::acquire_timeout_for(BUSY)
+        );
         assert!(
             error.to_ascii_lowercase().contains("locked"),
             "append must reach SQLite after pool checkout, not time out acquiring: {error}"
