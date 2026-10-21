@@ -34,11 +34,9 @@ static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn assert_command_completed(value: &Value, context: &str) {
     assert_ne!(
-        value["data"]["watchdog_timeout"],
-        Value::Bool(true),
-        "{context} hit the rally watchdog after {}ms: {}",
-        value["data"]["elapsed_ms"],
-        value["data"]["reason"]
+        value["command"], "watchdog",
+        "{context} did not complete; recovery observed after {}ms: {}",
+        value["data"]["elapsed_ms"], value["data"]["reason"]
     );
 }
 

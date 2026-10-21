@@ -545,7 +545,7 @@ mod tests {
 
     #[test]
     fn read_only_watchdog_timeout_is_an_actionable_error() {
-        let value = json!({
+        let mut value = json!({
             "ok": false,
             "product": "rally",
             "command": "watchdog",
@@ -561,6 +561,13 @@ mod tests {
         assert_eq!(issue.health, "error");
         assert!(issue.reason.contains("Retry this room refresh"));
         assert!(issue.reason.contains("rally doctor --reap-stale"));
+        value["data"]["watchdog_timeout"] = json!(false);
+        value["data"]["reason"] =
+            json!("worker stopped before returning a result; coordination failed open");
+        value["data"]["elapsed_ms"] = json!(1);
+        let interrupted = response_health_issue(&value).expect("worker stop must remain an error");
+        assert_eq!(interrupted.health, "error");
+        assert!(interrupted.reason.contains("worker stopped"));
     }
 
     #[test]

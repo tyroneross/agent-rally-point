@@ -31,10 +31,15 @@ host hook is never gated, but `ok` is false because the requested command did no
 }
 ```
 
-Callers must test `data.watchdog_timeout` before reading `data[command]`. The elapsed value is
-measured wall time, not the configured budget. This replaces the former neutral
+Callers must test `command == "watchdog"` before reading `data[command]`.
+`data.watchdog_timeout` records whether the measured elapsed time reached the configured
+budget. It is false when a worker stops early without returning a result; `ok` remains false.
+The elapsed value is measured wall time. This replaces the former neutral
 `{"ok":true,"product":"rally"}` response, which made a watchdog timeout indistinguishable from a
 successful command with missing data.
+
+Mutation recovery uses `data.watchdog` instead. Read its committed or unknown outcome
+before deciding whether to retry; a committed write must not be posted again.
 
 ## Error envelope
 
@@ -71,7 +76,7 @@ if proc.returncode != 0 and not proc.stdout.strip():
     raise RuntimeError(f"rally {error['error']} (exit {error['exit_code']})")
 
 envelope = json.loads(proc.stdout)
-if envelope.get("data", {}).get("watchdog_timeout"):
+if envelope.get("command") == "watchdog" and "reason" in envelope["data"]:
     raise RuntimeError(envelope["data"]["reason"])
 if not envelope["ok"]:
     # Command ran, but reports a failure outcome (partial_commit, a failed
@@ -90,7 +95,7 @@ fi
 python3 -c "
 import json
 d = json.load(open('/tmp/rally_out.json'))
-if d.get('data', {}).get('watchdog_timeout'):
+if d.get('command') == 'watchdog' and 'reason' in d['data']:
     raise SystemExit(d['data']['reason'])
 print(d['data'][d['command']])
 "
@@ -150,7 +155,7 @@ is a derived cache rather than a canonical store.
 | `room` | `room: RoomSnapshot` | `query`, `readers?`, `mission?` |
 | `next` | `next: NextResult` | `tool`, `role`, `paths`, `wake_intent?`, `room` |
 | `check` | `check: { phase, tool, path?, allow, mode, findings, agent_visible }` | — |
-| `watchdog` | transport exception: `{ watchdog_timeout: true, reason, elapsed_ms }` | — |
+| `watchdog` | transport exception: `{ watchdog_timeout: boolean, reason, elapsed_ms }` | — |
 | `locate` | `locate: { event_id, located?, warnings }` | — |
 | `recent` | `recent: { all, limit, rows, warnings }` | — |
 | `retrospective` | `retrospective: { output_path, action, engagements, total_facts, total_engagements }` | — |

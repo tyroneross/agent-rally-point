@@ -138,6 +138,12 @@ fn uncommitted_mutation_timeout_fails_closed_and_does_not_claim_success() {
         "watchdog-timeout-uncommitted-mutation"
     );
     assert_eq!(payload["data"]["watchdog"]["committed"], false);
+    assert!(
+        payload["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("watchdog budget 300ms")
+    );
 
     let replay = room.room_json();
     assert_eq!(
@@ -180,6 +186,13 @@ fn committed_worker_interruption_reports_committed_and_survives_replay_once() {
     assert_eq!(payload["command"], "watchdog");
     assert_eq!(payload["data"]["watchdog"]["committed"], true);
     assert_eq!(payload["data"]["watchdog"]["projection_complete"], false);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("injected post-commit worker interruption")
+    );
+    let message = payload["data"]["watchdog"]["message"].as_str().unwrap();
+    assert!(message.contains("watchdog budget 30000ms"));
+    assert!(!message.contains("exceeded"));
 
     let replay = room.room_json();
     assert_eq!(

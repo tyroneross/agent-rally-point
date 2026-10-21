@@ -1129,11 +1129,11 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
                     crate::output::write_line_or_exit_on_broken_pipe(
                         &hook_runtime::abort_envelope_from_args(
                             &posture_args,
-                            "coordination budget exceeded",
+                            "coordination did not complete",
                         ),
                     );
                     eprintln!(
-                        "rally-hook: mutation coordination aborted (coordination budget exceeded after {}ms); no automatic claim was created and the edit is proceeding unclaimed.",
+                        "rally-hook: mutation coordination did not complete (watchdog budget {}ms); no automatic claim was created and the edit is proceeding unclaimed.",
                         timeout.as_millis()
                     );
                     std::process::exit(0);
@@ -1354,15 +1354,20 @@ fn run_inline(args: Vec<String>) -> ExitCode {
     }
 }
 
-fn timeout_fail_open_payload(elapsed: Duration) -> Value {
+fn timeout_fail_open_payload(elapsed: Duration, timeout: Duration) -> Value {
+    let timed_out = elapsed >= timeout;
     json!({
         "ok": false,
         "product": "rally",
         "command": "watchdog",
         "schema": "agent-rally.command.watchdog.v1",
         "data": {
-            "watchdog_timeout": true,
-            "reason": "command did not complete before the watchdog deadline; coordination failed open",
+            "watchdog_timeout": timed_out,
+            "reason": if timed_out {
+                "command did not complete before the watchdog deadline; coordination failed open"
+            } else {
+                "worker stopped before returning a result; coordination failed open"
+            },
             "elapsed_ms": elapsed.as_millis(),
         }
     })
@@ -1375,12 +1380,12 @@ fn timeout_fail_open_payload(elapsed: Duration) -> Value {
 fn emit_timeout_fail_open(wants_json: bool, fail_open: bool, timeout: Duration, elapsed: Duration) {
     if wants_json {
         crate::output::write_line_or_exit_on_broken_pipe(
-            &timeout_fail_open_payload(elapsed).to_string(),
+            &timeout_fail_open_payload(elapsed, timeout).to_string(),
         );
     }
     let _ = fail_open; // semantics identical either way; kept for clarity/logging
     eprintln!(
-        "rally: hook exceeded {}ms wall-clock budget — failing open (no coordination check applied)",
+        "rally: hook did not complete (watchdog budget {}ms); failing open (no coordination check applied)",
         timeout.as_millis()
     );
 }
@@ -1410,14 +1415,14 @@ fn emit_timeout_fail_closed_before_write(wants_json: bool, timeout: Duration) {
                         "code": "watchdog-timeout-fail-closed",
                         "severity": "stop",
                         "message": format!(
-                            "before-write check exceeded {}ms wall-clock budget; failing closed because RALLY_BEFORE_WRITE_FAILCLOSED is opt-in",
+                            "before-write check did not complete (watchdog budget {}ms); failing closed because RALLY_BEFORE_WRITE_FAILCLOSED is opt-in",
                             timeout.as_millis()
                         ),
                     }],
                     "agent_visible": {
                         "present": true,
                         "severity": "stop",
-                        "message": "Rally before-write check timed out; failing closed (RALLY_BEFORE_WRITE_FAILCLOSED) to prevent two agents clobbering one claimed path."
+                        "message": "Rally before-write check did not complete; failing closed (RALLY_BEFORE_WRITE_FAILCLOSED) to prevent two agents clobbering one claimed path."
                     }
                 }
             }
@@ -1425,28 +1430,22 @@ fn emit_timeout_fail_closed_before_write(wants_json: bool, timeout: Duration) {
         crate::output::write_line_or_exit_on_broken_pipe(&payload.to_string());
     }
     eprintln!(
-        "rally: before-write hook exceeded {}ms wall-clock budget — failing CLOSED (RALLY_BEFORE_WRITE_FAILCLOSED is set; blocking write to prevent silent claim collision)",
+        "rally: before-write hook did not complete (watchdog budget {}ms); failing CLOSED (RALLY_BEFORE_WRITE_FAILCLOSED is set; blocking write to prevent silent claim collision)",
         timeout.as_millis()
     );
 }
 
 /// Operator guidance for a mutation the watchdog killed before it committed.
 ///
-/// The old text said "retry after contention clears", which asserted a cause
-/// nothing had observed. Until 2026-08-05 it was usually WRONG twice over: the
-/// retry schedule (2720ms open + 2040ms append) outlasted the 3000ms watchdog on
-/// its own, so the timeout meant "this command's retry budget was mis-sized",
-/// and retrying re-ran the same arithmetic to the same end. That budget is now
-/// derived from this watchdog (see `crate::retry_budget`), so reaching this
-/// message means the command genuinely ran out of wall-clock — and the honest
-/// advice is to find out what held it, not to assume a contender and wait.
-const WATCHDOG_MUTATION_GUIDANCE: &str = "Rally mutation timed out before the durable append committed; the fact was NOT written. \
-This is a wall-clock budget expiry, not evidence of a contender: run `rally doctor --reap-stale` to list live holders and stale presence, \
-and re-run with `--timeout-ms <n>` if the room is simply large. Retrying unchanged will hit the same budget.";
+/// Recovery handles deadline expiry and worker interruption. The configured
+/// budget alone establishes neither elapsed time nor the cause of a failure.
+const WATCHDOG_MUTATION_GUIDANCE: &str = "Rally mutation did not complete before the durable append committed; the fact was NOT written. \
+Inspect the failure and run `rally doctor --reap-stale` to list live holders and stale presence before retrying. \
+Increase `--timeout-ms <n>` only when observed workload requires more time.";
 
 fn emit_timeout_fail_closed_mutation(wants_json: bool, timeout: Duration) {
     let message = format!(
-        "mutating command exceeded {}ms wall-clock budget before its primary durable append committed; failing closed so the caller does not treat a dropped write as success",
+        "mutating command did not complete (watchdog budget {}ms) before its primary durable append committed; failing closed so the caller does not treat a dropped write as success",
         timeout.as_millis()
     );
     if wants_json {
@@ -1478,7 +1477,7 @@ fn emit_timeout_fail_closed_mutation(wants_json: bool, timeout: Duration) {
 
 fn emit_timeout_unknown_mutation(wants_json: bool, timeout: Duration, event_id: &str, phase: &str) {
     let message = format!(
-        "mutating command exceeded {}ms after canonical mutation began but before exact readback; outcome is unknown",
+        "mutating command did not complete (watchdog budget {}ms) after canonical mutation began but before exact readback; outcome is unknown",
         timeout.as_millis()
     );
     let remedy = locate_remedy(event_id);
@@ -1515,7 +1514,7 @@ fn emit_timeout_unknown_db_only_migration(
     retry_command: &str,
 ) {
     let message = format!(
-        "DB-only migration exceeded {}ms after durable recovery state began at phase {phase}; outcome is unknown",
+        "DB-only migration did not complete (watchdog budget {}ms) after durable recovery state began at phase {phase}; outcome is unknown",
         timeout.as_millis()
     );
     if wants_json {
@@ -1554,7 +1553,7 @@ fn emit_timeout_committed_mutation(
     event_id: Option<&str>,
 ) {
     let message = format!(
-        "mutating command exceeded {}ms wall-clock budget after its primary durable append committed; projection/output was abandoned",
+        "mutating command did not complete (watchdog budget {}ms) after its primary durable append committed; projection/output was abandoned",
         timeout.as_millis()
     );
     if wants_json {
@@ -14999,7 +14998,7 @@ mod tests {
             }
         };
         drop(sender);
-        let payload = timeout_fail_open_payload(elapsed);
+        let payload = timeout_fail_open_payload(elapsed, Duration::from_millis(1));
         assert_eq!(payload["ok"], false);
         assert_eq!(payload["product"], "rally");
         assert_eq!(payload["command"], "watchdog");
@@ -15015,6 +15014,18 @@ mod tests {
                 .as_str()
                 .is_some_and(|reason| reason.contains("did not complete"))
         );
+        let interrupted = timeout_fail_open_payload(Duration::ZERO, Duration::from_millis(1));
+        assert_eq!(interrupted["data"]["watchdog_timeout"], false);
+        assert!(
+            interrupted["data"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("worker stopped")
+        );
+        for elapsed in [Duration::from_millis(1), Duration::from_millis(2)] {
+            let at_or_after = timeout_fail_open_payload(elapsed, Duration::from_millis(1));
+            assert_eq!(at_or_after["data"]["watchdog_timeout"], true);
+        }
     }
 
     fn unique_root(label: &str) -> PathBuf {

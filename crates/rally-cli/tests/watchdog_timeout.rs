@@ -128,6 +128,7 @@ fn type_matches(type_schema: &serde_json::Value, value: &serde_json::Value) -> b
         "object" => value.is_object(),
         "string" => value.is_string(),
         "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "boolean" => value.is_boolean(),
         other => panic!("unsupported schema type {other}"),
     }
 }
@@ -177,6 +178,12 @@ fn hook_that_blocks_fails_open_within_budget() {
     let parsed: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON on timeout");
     assert_matches_schema("agent-rally.command.watchdog.v1.json", &parsed);
+    let mut interrupted = parsed.clone();
+    interrupted["data"]["watchdog_timeout"] = serde_json::json!(false);
+    interrupted["data"]["reason"] =
+        serde_json::json!("worker stopped before returning a result; coordination failed open");
+    interrupted["data"]["elapsed_ms"] = serde_json::json!(1);
+    assert_matches_schema("agent-rally.command.watchdog.v1.json", &interrupted);
     assert_eq!(parsed["ok"], serde_json::Value::Bool(false));
     assert_eq!(parsed["product"], "rally");
     assert_eq!(parsed["command"], "watchdog");

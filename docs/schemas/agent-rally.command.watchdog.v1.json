@@ -13,7 +13,7 @@
       "type": "object",
       "required": ["watchdog_timeout", "reason", "elapsed_ms"],
       "properties": {
-        "watchdog_timeout": { "const": true },
+        "watchdog_timeout": { "type": "boolean" },
         "reason": { "type": "string" },
         "elapsed_ms": { "type": "integer" }
       }
