@@ -7,8 +7,8 @@
 //! room. A pinned-low subset is forced to overrun the watchdog budget
 //! (`RALLY_TEST_BLOCK_MS`) before their durable append lands, so they must
 //! fail CLOSED (exit 4, `watchdog-timeout-uncommitted-mutation`) and leave
-//! zero trace. One invocation is forced to overrun AFTER its append commits
-//! (`RALLY_TEST_BLOCK_AFTER_COMMIT_MS`), so it must report success with an
+//! zero trace. One worker is interrupted AFTER its append commits
+//! (`RALLY_TEST_PANIC_AFTER_COMMIT`), so it must report success with an
 //! explicit `committed:true` / `projection_complete:false` signal. The rest
 //! run with a generous budget and no induced block, so they simply succeed.
 //!
@@ -38,23 +38,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 // test runs EXACTLY as today — the no-daemon default path is byte-identical
 // (F2), preserving the accepted known #50 flake by design.
 //
-// RECONCILING THE WATCHDOG-BLOCK SUB-ASSERTIONS (choice (a), strongest form):
-// Both induced-block seams are CLIENT-side and orthogonal to the store path —
-//   * pre-commit block `RALLY_TEST_BLOCK_MS` fires in `run_inner_with`
-//     (lib.rs:772), at the TOP of the command, BEFORE the store is opened or
-//     routed at all; the watchdog (200ms) kills the client before it ever sends
-//     an append over the wire, so it leaves ZERO facts whether direct or routed;
-//   * post-commit block `RALLY_TEST_BLOCK_AFTER_COMMIT_MS` fires in
-//     `mark_watchdog_command_commit` (lib.rs:191), AFTER the append durably
-//     lands (over the wire, the daemon appends segment-then-db before replying
-//     Ok), so `committed:true` / `projection_complete:false` holds identically.
-// Neither seam lives on the DIRECT append path in store.rs, so daemon routing
-// does not change how they fire. We therefore KEEP ALL existing assertions
-// intact (the core #50 invariant AND the watchdog-block sub-parts) — they stay
-// meaningful and falsifiable under routing. The daemon-serving mode's added
-// value is proving the #50 bootstrap race is DISSOLVED: with a single dispatcher
-// owning the only facts.db pool, every success-reporting invocation still leaves
-// EXACTLY ONE fact (no 522 / drop / dup), which is the whole point of F4.
+// Pre-commit blocking occurs before store routing in either mode. The direct
+// append's interruption seam also checks the committed watchdog envelope.
+// Routed mode checks exactly-once replay without requiring a client-side
+// interruption; the daemon owns its append and projection.
 
 const SIGTERM: i32 = 15;
 const SIGKILL: i32 = 9;
@@ -322,21 +309,9 @@ const PINNED_TIMEOUT_MS: &str = "200";
 /// budget, so the overrun margin holds even under scheduler noise on a
 /// loaded CI runner.
 const INDUCED_BLOCK_MS: &str = "800";
-/// The budget for the committed-slow invocation. Its append must be allowed
-/// to actually commit under real flock contention from the other seven
-/// processes sharing this room before the post-commit block below kicks in,
-/// so this needs more headroom than the uncommitted-timeout group's budget.
-const COMMITTED_SLOW_TIMEOUT_MS: &str = "2000";
-/// The post-commit block for the committed-slow invocation: comfortably
-/// longer than its remaining budget after commit, so the watchdog reliably
-/// fires during projection rather than racing the timeout.
-const COMMITTED_SLOW_BLOCK_AFTER_COMMIT_MS: &str = "5000";
 /// A generous budget for invocations that are not meant to race the
-/// watchdog at all. This must absorb the worst-case serialized queueing
-/// behind the seven other processes' induced blocks (up to
-/// 3 * INDUCED_BLOCK_MS + COMMITTED_SLOW_BLOCK_AFTER_COMMIT_MS if the flock
-/// holds across those sleeps) — it is an upper bound the command need not
-/// actually spend, not added wall-clock cost.
+/// watchdog. The committed interruption shares this harness allowance;
+/// reaching an actual commit, rather than a short timer, selects its state.
 const GENEROUS_TIMEOUT_MS: &str = "20000";
 
 enum Expectation {
@@ -363,7 +338,7 @@ fn spawn_say(
     subject: String,
     timeout_ms: &'static str,
     block_ms: Option<&'static str>,
-    block_after_commit_ms: Option<&'static str>,
+    interrupt_after_commit: bool,
 ) -> thread::JoinHandle<Output> {
     thread::spawn(move || {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_rally"));
@@ -381,8 +356,8 @@ fn spawn_say(
         if let Some(block_ms) = block_ms {
             cmd.env("RALLY_TEST_BLOCK_MS", block_ms);
         }
-        if let Some(block_after_commit_ms) = block_after_commit_ms {
-            cmd.env("RALLY_TEST_BLOCK_AFTER_COMMIT_MS", block_after_commit_ms);
+        if interrupt_after_commit {
+            cmd.env("RALLY_TEST_PANIC_AFTER_COMMIT", "1");
         }
         cmd.output().expect("spawn mutating rally command")
     })
@@ -400,7 +375,7 @@ fn parallel_say_invocations_never_drop_or_duplicate_facts() {
     let daemon_mode = daemon_guard.is_some();
 
     // 3 invocations pinned to overrun BEFORE commit -> must fail closed.
-    // 1 invocation pinned to overrun AFTER commit -> must report
+    // 1 invocation interrupted AFTER commit -> must report
     //   committed-but-projection-slow success.
     // 4 invocations with a generous budget and no induced block -> must
     //   simply succeed.
@@ -415,7 +390,7 @@ fn parallel_say_invocations_never_drop_or_duplicate_facts() {
             subject.clone(),
             PINNED_TIMEOUT_MS,
             Some(INDUCED_BLOCK_MS),
-            None,
+            false,
         ));
         invocations.push(Invocation {
             subject,
@@ -429,9 +404,9 @@ fn parallel_say_invocations_never_drop_or_duplicate_facts() {
             room.cwd.clone(),
             room.home.clone(),
             subject.clone(),
-            COMMITTED_SLOW_TIMEOUT_MS,
+            GENEROUS_TIMEOUT_MS,
             None,
-            Some(COMMITTED_SLOW_BLOCK_AFTER_COMMIT_MS),
+            true,
         ));
         invocations.push(Invocation {
             subject,
@@ -447,7 +422,7 @@ fn parallel_say_invocations_never_drop_or_duplicate_facts() {
             subject.clone(),
             GENEROUS_TIMEOUT_MS,
             None,
-            None,
+            false,
         ));
         invocations.push(Invocation {
             subject,
@@ -455,7 +430,7 @@ fn parallel_say_invocations_never_drop_or_duplicate_facts() {
         });
     }
 
-    assert_eq!(handles.len(), 8, "N must sit in the validated 6-8 range");
+    assert_eq!(handles.len(), 8, "fixture needs 3 failures and 5 successes");
     assert_eq!(invocations.len(), handles.len());
 
     let outputs: Vec<Output> = handles
@@ -521,17 +496,9 @@ fn parallel_say_invocations_never_drop_or_duplicate_facts() {
     // The committed-but-slow-projection invocation additionally carries the
     // explicit commit signal so a retrying caller would know not to re-post.
     //
-    // DIRECT-PATH-ONLY (reconciliation, choice (a)): the commit signal +
-    // post-commit block seam live in `mark_watchdog_command_commit`, which is
-    // called from the DIRECT append path (store.rs:1691/2014). Under daemon
-    // routing that call runs INSIDE the daemon process (not the client), so the
-    // client never sets its own watchdog commit signal and the
-    // `RALLY_TEST_BLOCK_AFTER_COMMIT_MS` seam does not fire in the client — the
-    // routed append simply succeeds fast. The `committed:true` /
-    // `projection_complete:false` payload is therefore a DIRECT-path semantic,
-    // not a #50-race semantic, so we assert it only in no-daemon mode. The
-    // committed-slow invocation's CORE guarantee (exactly one fact landed) is
-    // still enforced by the replay invariant below, under BOTH modes.
+    // The direct append interrupts after canonical readback, before projection.
+    // The daemon owns that boundary in routed mode. Both modes must replay
+    // exactly one fact for every successful invocation below.
     if !daemon_mode {
         let committed_slow = invocations
             .iter()

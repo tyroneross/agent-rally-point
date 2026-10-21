@@ -583,6 +583,12 @@ pub(crate) fn block_after_watchdog_commit_for_test() {
     if !armed {
         return;
     }
+    // A worker interruption closes the result channel after a real commit,
+    // exercising recovery without racing startup against an artificial sleep.
+    #[cfg(debug_assertions)]
+    if env::var("RALLY_TEST_PANIC_AFTER_COMMIT").as_deref() == Ok("1") {
+        panic!("injected post-commit worker interruption");
+    }
     #[cfg(debug_assertions)]
     if let Ok(ms) = env::var("RALLY_TEST_BLOCK_AFTER_COMMIT_MS")
         && let Ok(ms) = ms.trim().parse::<u64>()

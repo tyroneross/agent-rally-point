@@ -147,16 +147,16 @@ fn custom_host_argv_is_explicit_and_preserves_literal_arguments() {
 }
 
 #[test]
-fn committed_timeout_includes_exact_fact_locator() {
+fn committed_worker_interruption_includes_exact_fact_locator() {
     if !cfg!(debug_assertions) {
         return;
-    } // test-only delay is absent in release
+    } // test-only interruption is absent in release
     let room = Room::new();
     room.json(&["room", "--json"]);
     let p = rally_cmd::rally_command()
         .current_dir(&room.0)
         .env("RALLY_SESSION_ID", "optimization-contract")
-        .env("RALLY_TEST_BLOCK_AFTER_COMMIT_MS", "5000")
+        .env("RALLY_TEST_PANIC_AFTER_COMMIT", "1")
         .args([
             "say",
             "handoff",
@@ -164,8 +164,6 @@ fn committed_timeout_includes_exact_fact_locator() {
             "cursor:test",
             "--subject",
             "timeout locator",
-            "--timeout-ms",
-            "2000",
             "--json",
         ])
         .output()
