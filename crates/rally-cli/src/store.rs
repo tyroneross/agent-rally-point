@@ -1968,6 +1968,8 @@ pub(crate) struct RoomSnapshot {
     pub(crate) open_obligations_artifacts: usize,
     #[serde(skip)]
     pub(crate) open_obligations_omitted: usize,
+    #[serde(skip)]
+    pub(crate) open_obligations_accepted_open: Option<usize>,
     pub(crate) current_decisions: Vec<Fact>,
     pub(crate) current_risks: Vec<Fact>,
     /// System-generated health/telemetry facts (`external-intake`,
@@ -2143,6 +2145,8 @@ pub(crate) struct SnapshotInternals {
     #[serde(default)]
     pub(crate) open_obligations_omitted: usize,
     #[serde(default)]
+    pub(crate) open_obligations_accepted_open: Option<usize>,
+    #[serde(default)]
     pub(crate) stale_authors: BTreeSet<String>,
     #[serde(default)]
     pub(crate) author_last_seen: BTreeMap<String, String>,
@@ -2230,6 +2234,7 @@ impl RoomSnapshot {
             open_obligations_handoffs: self.open_obligations_handoffs,
             open_obligations_artifacts: self.open_obligations_artifacts,
             open_obligations_omitted: self.open_obligations_omitted,
+            open_obligations_accepted_open: self.open_obligations_accepted_open,
             stale_authors: self.stale_authors.clone(),
             author_last_seen: self.author_last_seen.clone(),
             open_queue_signals: self.open_queue_signals.clone(),
@@ -2247,6 +2252,7 @@ impl RoomSnapshot {
         self.open_obligations_handoffs = internals.open_obligations_handoffs;
         self.open_obligations_artifacts = internals.open_obligations_artifacts;
         self.open_obligations_omitted = internals.open_obligations_omitted;
+        self.open_obligations_accepted_open = internals.open_obligations_accepted_open;
         self.stale_authors = internals.stale_authors;
         self.author_last_seen = internals.author_last_seen;
         self.open_queue_signals = internals.open_queue_signals;
@@ -2329,10 +2335,15 @@ impl RoomSnapshot {
         self.open_obligations_handoffs = 0;
         self.open_obligations_artifacts = 0;
         self.open_obligations_omitted = 0;
+        self.open_obligations_accepted_open = None;
         self
     }
 
     pub(crate) fn for_obligation_target(mut self, tool: &str, row_limit: usize) -> Self {
+        let accepted_open = crate::obligations::named_work(&self, tool)
+            .iter()
+            .filter(|(_, state)| *state == crate::obligations::NamedState::AcceptedOpen)
+            .count();
         let mut mine = self
             .open_obligations
             .into_iter()
@@ -2365,6 +2376,7 @@ impl RoomSnapshot {
         self.open_obligations_omitted = total.saturating_sub(emitted.len());
         self.open_obligations = emitted;
         self.open_obligations_target = Some(tool.to_string());
+        self.open_obligations_accepted_open = Some(accepted_open);
         self.open_obligations_total = total;
         self.open_obligations_handoffs = handoffs;
         self.open_obligations_artifacts = artifacts;
@@ -2554,6 +2566,7 @@ impl RoomSnapshot {
             open_obligations_handoffs: self.open_obligations_handoffs,
             open_obligations_artifacts: self.open_obligations_artifacts,
             open_obligations_omitted: self.open_obligations_omitted,
+            open_obligations_accepted_open: self.open_obligations_accepted_open,
             current_decisions: filter_facts(self.current_decisions, query),
             current_risks: filter_facts(self.current_risks, query),
             recent_artifacts: filter_facts(self.recent_artifacts, query),
@@ -9496,6 +9509,7 @@ fn snapshot_from_facts_with_policy_at(
         open_obligations_handoffs: 0,
         open_obligations_artifacts: 0,
         open_obligations_omitted: 0,
+        open_obligations_accepted_open: None,
         current_decisions,
         current_risks,
         system_health,

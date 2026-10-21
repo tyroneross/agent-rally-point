@@ -5114,6 +5114,7 @@ mod inbox_render_fixture_tests {
             oldest_age_secs: 700,
             stale_window_secs: 600,
             accepted_open: 0,
+            accepted_open_incomplete: false,
             open_queue: Default::default(),
             items: vec![
                 InboxItem {
