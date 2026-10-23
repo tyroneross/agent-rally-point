@@ -8882,7 +8882,9 @@ fn active_session_fact_from_facts(facts: &[Fact], session_id: &str) -> Option<Fa
 
 /// Diagnostic alias only: the same observer PID in the same canonical checkout
 /// explains launcher/hook session spellings. Never use this for lease authority.
-/// Missing stamps cannot prove an alias; session strings alone are not evidence.
+/// Missing stamps cannot prove an alias. The hook/launcher `session_alias` path
+/// trusts the caller's session strings; that is acceptable only because it gates
+/// a warning, never ownership.
 fn enter_observer(evidence: &[String]) -> Option<(i32, &str)> {
     let pid = evidence
         .iter()
