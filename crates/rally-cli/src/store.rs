@@ -2079,6 +2079,7 @@ pub(crate) struct RoomSnapshot {
 pub(crate) struct EnterSnapshotContext {
     pub(crate) snapshot: RoomSnapshot,
     pub(crate) duplicate_squad_recorded: bool,
+    pub(crate) has_other_active_session: bool,
     pub(crate) unmanaged_agent_recorded: bool,
     pub(crate) has_managed_session: bool,
     pub(crate) presence_recorded_for_session: bool,
@@ -4726,10 +4727,24 @@ impl RoomStore {
         tool: &str,
         build_id: &str,
         from_session_id: &str,
+        presence_evidence: &[String],
+        session_alias: Option<&str>,
     ) -> Result<EnterSnapshotContext> {
         match self {
-            RoomStore::Direct(d) => d.snapshot_for_enter(tool, build_id, from_session_id),
-            RoomStore::Routed(r) => r.snapshot_for_enter(tool, build_id, from_session_id),
+            RoomStore::Direct(d) => d.snapshot_for_enter(
+                tool,
+                build_id,
+                from_session_id,
+                presence_evidence,
+                session_alias,
+            ),
+            RoomStore::Routed(r) => r.snapshot_for_enter(
+                tool,
+                build_id,
+                from_session_id,
+                presence_evidence,
+                session_alias,
+            ),
         }
     }
 
@@ -6747,6 +6762,8 @@ impl DirectRoomStore {
         tool: &str,
         build_id: &str,
         from_session_id: &str,
+        presence_evidence: &[String],
+        session_alias: Option<&str>,
     ) -> Result<EnterSnapshotContext> {
         let facts = self.facts()?;
         let coord = crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
@@ -6756,6 +6773,8 @@ impl DirectRoomStore {
             tool,
             build_id,
             from_session_id,
+            presence_evidence,
+            session_alias,
         ))
     }
 
@@ -8861,12 +8880,73 @@ fn active_session_fact_from_facts(facts: &[Fact], session_id: &str) -> Option<Fa
         .cloned()
 }
 
+/// Diagnostic alias only: the same observer PID in the same canonical checkout
+/// explains launcher/hook session spellings. Never use this for lease authority.
+/// Missing stamps cannot prove an alias; session strings alone are not evidence.
+fn enter_observer(evidence: &[String]) -> Option<(i32, &str)> {
+    let pid = evidence
+        .iter()
+        .find_map(|item| item.strip_prefix("observer_pid:"))?
+        .parse::<i32>()
+        .ok()
+        .filter(|pid| *pid > 1)?;
+    let worktree = evidence
+        .iter()
+        .find_map(|item| item.strip_prefix("worktree_path:"))?;
+    Path::new(worktree).is_absolute().then_some((pid, worktree))
+}
+
+fn enter_has_other_active_session(
+    facts: &[Fact],
+    tool: &str,
+    from_session_id: &str,
+    presence_evidence: &[String],
+    session_alias: Option<&str>,
+    now_secs: i64,
+) -> bool {
+    // Presence is once per session, so use newest authored activity for age,
+    // and newest presence for observer stamps. Telemetry without a session
+    // must not create a second author out of the caller's own risk/read facts.
+    let mut sessions = BTreeMap::<Option<&str>, (&Fact, Option<&Fact>)>::new();
+    for fact in facts
+        .iter()
+        .filter(|fact| fact.tool.as_deref() == Some(tool) && !is_system_authored(fact))
+    {
+        let entry = sessions
+            .entry(fact.from_session_id.as_deref())
+            .or_insert((fact, None));
+        if fact.seq > entry.0.seq {
+            entry.0 = fact;
+        }
+        if fact.kind == FactKind::Presence && entry.1.is_none_or(|prior| fact.seq > prior.seq) {
+            entry.1 = Some(fact);
+        }
+    }
+    let caller = enter_observer(presence_evidence);
+    sessions.into_iter().any(|(session, (activity, presence))| {
+        let Some(presence) = presence else {
+            return false;
+        };
+        fact_age_secs(activity, now_secs) <= IDLE_THRESHOLD_SECS
+            && !crate::claim_authority::same_session_owner(
+                Some(tool),
+                session,
+                Some(tool),
+                Some(from_session_id),
+            )
+            && !(session_alias.is_some() && session == session_alias)
+            && !(caller.is_some() && caller == enter_observer(&presence.evidence))
+    })
+}
+
 fn enter_snapshot_context_from_facts(
     facts: &[Fact],
     coord: &crate::hooks_config::CoordinationConfig,
     tool: &str,
     build_id: &str,
     from_session_id: &str,
+    presence_evidence: &[String],
+    session_alias: Option<&str>,
 ) -> EnterSnapshotContext {
     let duplicate_squad_subject = format!("duplicate-active-squad-id: {tool}");
     let unmanaged_agent_subject = format!("unmanaged-agent: {tool}");
@@ -8915,6 +8995,14 @@ fn enter_snapshot_context_from_facts(
 
     EnterSnapshotContext {
         snapshot: snapshot_from_facts_with_policy(facts, coord, false),
+        has_other_active_session: enter_has_other_active_session(
+            facts,
+            tool,
+            from_session_id,
+            presence_evidence,
+            session_alias,
+            projection_unix_sec(),
+        ),
         duplicate_squad_recorded: durable_risk_subject_recorded(
             facts,
             &duplicate_squad_subject,

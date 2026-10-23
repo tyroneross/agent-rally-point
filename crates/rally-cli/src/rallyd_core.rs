@@ -1030,14 +1030,23 @@ mod imp {
                 tool,
                 build_id,
                 from_session_id,
+                presence_evidence,
+                session_alias,
             } => {
                 let context = store
-                    .snapshot_for_enter(&tool, &build_id, &from_session_id)
+                    .snapshot_for_enter(
+                        &tool,
+                        &build_id,
+                        &from_session_id,
+                        &presence_evidence,
+                        session_alias.as_deref(),
+                    )
                     .map_err(rally_to_wire)?;
                 let snapshot = context.snapshot.without_obligation_transport();
                 StoreOk::SnapshotForEnter {
                     snapshot: snapshot_to_wire(&snapshot)?,
                     duplicate_squad_recorded: context.duplicate_squad_recorded,
+                    has_other_active_session: context.has_other_active_session,
                     unmanaged_agent_recorded: context.unmanaged_agent_recorded,
                     has_managed_session: context.has_managed_session,
                     presence_recorded_for_session: context.presence_recorded_for_session,
@@ -1585,12 +1594,12 @@ mod imp {
         }
 
         #[test]
-        fn daemon_rejects_v6_requests_after_enter_context_cutover() {
-            assert_eq!(WIRE_VERSION, 7, "this control grades the v6 to v7 cutover");
-            let repo_root = unique_repo_root("reject-v6");
+        fn daemon_rejects_v7_requests_after_enter_context_cutover() {
+            assert_eq!(WIRE_VERSION, 8, "this control grades the v7 to v8 cutover");
+            let repo_root = unique_repo_root("reject-v7");
             let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
             let request = StoreRequest {
-                wire_version: 6,
+                wire_version: 7,
                 engagement: None,
                 deadline_unix_ms: None,
                 mutation_budget_ms: None,
@@ -1599,10 +1608,10 @@ mod imp {
             match dispatch_one(&mut store, "/expected/repo", request) {
                 StoreResponse::Err(error) => {
                     assert_eq!(error.kind, StoreErrorKind::IncompatibleWire);
-                    assert!(error.message.contains("daemon speaks 7"));
-                    assert!(error.message.contains("client sent 6"));
+                    assert!(error.message.contains("daemon speaks 8"));
+                    assert!(error.message.contains("client sent 7"));
                 }
-                other => panic!("v6 request was not rejected: {other:?}"),
+                other => panic!("v7 request was not rejected: {other:?}"),
             }
             std::fs::remove_dir_all(repo_root).ok();
         }
@@ -1880,6 +1889,101 @@ mod imp {
         }
 
         #[test]
+        fn enter_identity_dispatch_matches_direct_context() {
+            // Exercise the daemon dispatcher and wire serialization without
+            // requiring a Unix socket (some sandboxes forbid bind).
+            let repo_root = unique_repo_root("enter-identity-dispatch");
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let evidence = vec![
+                "observer_pid:4242".to_string(),
+                "worktree_path:/tmp/checkout".to_string(),
+            ];
+            for (session, stamps) in [
+                (
+                    "sess:parent:et-gen-test-pane-1154-15#live",
+                    evidence.clone(),
+                ),
+                ("sess:parent:hook-uuid#live", evidence.clone()),
+                // Same PID in another checkout is not an alias.
+                (
+                    "sess:parent:other-terminal#live",
+                    vec![
+                        "observer_pid:4242".to_string(),
+                        "worktree_path:/tmp/other".to_string(),
+                    ],
+                ),
+            ] {
+                store
+                    .append_fact(&crate::store::Fact {
+                        schema: crate::FACT_SCHEMA.to_string(),
+                        event_id: crate::new_id("fact"),
+                        thread_id: "enter-identity".to_string(),
+                        kind: crate::store::FactKind::Presence,
+                        tool: Some("easy-terminal:test".to_string()),
+                        from_session_id: Some(session.to_string()),
+                        subject: "presence".to_string(),
+                        created_at: crate::now_string(),
+                        evidence: stamps,
+                        ..crate::store::Fact::default()
+                    })
+                    .unwrap();
+                let expected = session.ends_with("other-terminal#live");
+                for (presence_evidence, session_alias) in [
+                    (evidence.as_slice(), None),
+                    (&[][..], Some("sess:parent:et-gen-test-pane-1154-15#live")),
+                ] {
+                    let direct = store
+                        .snapshot_for_enter(
+                            "easy-terminal:test",
+                            "build",
+                            "sess:parent:hook-uuid#live",
+                            presence_evidence,
+                            session_alias,
+                        )
+                        .unwrap();
+                    assert_eq!(direct.has_other_active_session, expected);
+                    let request = StoreRequest::new(
+                        None,
+                        StoreOp::SnapshotForEnter {
+                            tool: "easy-terminal:test".to_string(),
+                            build_id: "build".to_string(),
+                            from_session_id: "sess:parent:hook-uuid#live".to_string(),
+                            presence_evidence: presence_evidence.to_vec(),
+                            session_alias: session_alias.map(str::to_string),
+                        },
+                    );
+                    let request =
+                        serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+                    let response = dispatch_one(
+                        &mut store,
+                        canonical_repo_root(&repo_root).as_str(),
+                        request,
+                    );
+                    let response = serde_json::from_str::<StoreResponse>(
+                        &serde_json::to_string(&response).unwrap(),
+                    )
+                    .unwrap();
+                    match response {
+                        StoreResponse::Ok(StoreOk::SnapshotForEnter {
+                            has_other_active_session,
+                            presence_recorded_for_session,
+                            ..
+                        }) => {
+                            assert_eq!(has_other_active_session, direct.has_other_active_session);
+                            assert_eq!(
+                                presence_recorded_for_session,
+                                direct.presence_recorded_for_session
+                            );
+                        }
+                        other => panic!("unexpected enter context: {other:?}"),
+                    }
+                }
+            }
+            drop(store);
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        #[test]
         fn routed_enter_context_stays_bounded_over_eight_mib_ledger() {
             let repo_root = unique_repo_root("enter-context-wire-flood");
             let rally_dir = repo_root.join(".rally");
@@ -1998,7 +2102,7 @@ mod imp {
             );
             for _ in 0..2 {
                 let context = room
-                    .snapshot_for_enter("worker-01", "new-build", "sess:worker-01#live")
+                    .snapshot_for_enter("worker-01", "new-build", "sess:worker-01#live", &[], None)
                     .unwrap();
                 assert!(context.duplicate_squad_recorded);
                 assert!(context.unmanaged_agent_recorded);

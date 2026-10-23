@@ -754,15 +754,20 @@ impl RoutedRoomStore {
         tool: &str,
         build_id: &str,
         from_session_id: &str,
+        presence_evidence: &[String],
+        session_alias: Option<&str>,
     ) -> Result<EnterSnapshotContext> {
         match self.dispatch(StoreOp::SnapshotForEnter {
             tool: tool.to_string(),
             build_id: build_id.to_string(),
             from_session_id: from_session_id.to_string(),
+            presence_evidence: presence_evidence.to_vec(),
+            session_alias: session_alias.map(str::to_string),
         })? {
             StoreOk::SnapshotForEnter {
                 snapshot,
                 duplicate_squad_recorded,
+                has_other_active_session,
                 unmanaged_agent_recorded,
                 has_managed_session,
                 presence_recorded_for_session,
@@ -771,6 +776,7 @@ impl RoutedRoomStore {
             } => Ok(EnterSnapshotContext {
                 snapshot: snapshot_from_value(snapshot)?,
                 duplicate_squad_recorded,
+                has_other_active_session,
                 unmanaged_agent_recorded,
                 has_managed_session,
                 presence_recorded_for_session,
@@ -1090,8 +1096,8 @@ mod tests {
     }
 
     #[test]
-    fn probe_rejects_a_v6_daemon_after_enter_context_cutover() {
-        assert_eq!(WIRE_VERSION, 7, "this control grades the v6 to v7 cutover");
+    fn probe_rejects_a_v7_daemon_after_enter_context_cutover() {
+        assert_eq!(WIRE_VERSION, 8, "this control grades the v7 to v8 cutover");
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1112,21 +1118,21 @@ mod tests {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             let request: StoreRequest = serde_json::from_str(line.trim()).unwrap();
-            assert_eq!(request.wire_version, 7);
+            assert_eq!(request.wire_version, 8);
             let response = StoreResponse::Ok(StoreOk::Pong {
                 repo_root: "/expected/repo".to_string(),
                 pid: 42,
-                wire_version: 6,
+                wire_version: 7,
             });
             let mut writer = &stream;
             writeln!(writer, "{}", serde_json::to_string(&response).unwrap()).unwrap();
         });
 
         let error = probe_identity(&rally_dir, "/expected/repo")
-            .expect_err("a v6 daemon must fail a v7 client immediately");
+            .expect_err("a v7 daemon must fail a v8 client immediately");
         assert!(matches!(error, RallyError::IncompatibleWire { .. }));
-        assert!(error.to_string().contains("client speaks 7"));
-        assert!(error.to_string().contains("daemon speaks 6"));
+        assert!(error.to_string().contains("client speaks 8"));
+        assert!(error.to_string().contains("daemon speaks 7"));
         server.join().unwrap();
         std::fs::remove_file(&socket).ok();
         std::fs::remove_dir_all(&rally_dir).ok();

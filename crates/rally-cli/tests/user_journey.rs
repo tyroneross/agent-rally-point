@@ -696,28 +696,11 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
             "src/room.rs",
         ],
     );
-    // R10/cursor: second enter's cursor_before = 7 (ledger-derived from the
-    // Read checkpoint written by the first enter, which recorded
-    // content_max_seq=7). The second enter detects codex as already active
-    // (B11) and writes a durable risk fact AFTER ensure_presence runs
-    // (post-f4-order: presence first, then warning-block risk facts so the
-    // squad-membership guard inside ensure_presence is not short-circuited).
-    // Seq breakdown after first enter:
-    //   1: presence(claude), 2: lead(claude), 3: claim, 4: presence(pi), 5: decision
-    //   6: presence(codex) — first enter's ensure_presence (now FIRST)
-    //   7: f4 unmanaged-agent risk(codex) — codex has no managed session
-    //   8: Read checkpoint (first enter's maybe_append_read_checkpoint at content_max=7)
-    //   9: B11 risk fact (second enter's duplicate-active-squad detection;
-    //      the unmanaged-agent risk dedups via already_recorded check)
-    //   10: Read checkpoint (second enter records content_max_seq=9)
-    // cursor_after = snapshot.max_seq = 9. The cursor is the seq this tool has
-    // READ up to, and the snapshot behind it is taken before the checkpoint is
-    // appended — so it is the value the checkpoint RECORDS (9), never the
-    // checkpoint's own seq (10). A cursor that counted its own checkpoint would
-    // claim the tool had read a fact written after it stopped reading. The
-    // first enter above is the same rule: checkpoint at seq 8, cursor 7.
+    // Same-session re-entry writes no duplicate warning. The prior read
+    // checkpoint is seq 8, so the new snapshot advances from 7 to 8 and the
+    // next checkpoint records content_max_seq=8 without counting itself.
     assert_eq!(enter_again["data"]["enter"]["cursor"]["before"], 7);
-    assert_eq!(enter_again["data"]["enter"]["cursor"]["after"], 9);
+    assert_eq!(enter_again["data"]["enter"]["cursor"]["after"], 8);
     assert_eq!(enter_again["data"]["enter"]["cursor"]["advanced"], true);
 
     let (check, check_output) = workspace.json_with_status(&[
@@ -5382,6 +5365,250 @@ fn mission_get_with_no_mission_set() {
 }
 
 // ---------------------------------------------------------------------------
+// Enter collision diagnostics: exercise the actual command in both store modes.
+// Diagnostic aliases need matching observer process + checkout stamps, or an
+// explicit hook session co-observed with the inherited launcher session in
+// this invocation. Neither witness gives a lease the other's claim authority.
+fn enter_identity_command(
+    workspace: &Workspace,
+    session: &str,
+    observer: Option<&str>,
+    args: &[&str],
+) -> Value {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rally"));
+    cmd.current_dir(&workspace.cwd)
+        .env("HOME", &workspace.home)
+        .env("RALLY_DAEMON_AUTOSTART", "0")
+        .env("RALLY_NO_AUTO_REAP", "1")
+        .env("RALLY_SESSION_ID", session)
+        .env_remove("RALLY_MANAGED_SESSION_MODE")
+        .env_remove("RALLY_OBSERVER_PID")
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("GITHUB_RUN_ID");
+    if let Some(pid) = observer {
+        cmd.env("RALLY_OBSERVER_PID", pid);
+    }
+    let output = cmd
+        .args(args)
+        .args(["--timeout-ms", "20000", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+const ENTER_IDENTITY_TOOL: &str = "easy-terminal:9db4bd32-65c1-4f39-8440-830ef75b64de";
+const ENTER_LAUNCHER_SESSION: &str = "et-gen-test-pane-1154-15";
+const ENTER_HOOK_SESSION: &str = "9db4bd32-65c1-4f39-8440-830ef75b64de";
+
+fn enter_identity(workspace: &Workspace, session: &str, observer: Option<&str>) -> Value {
+    enter_identity_command(
+        workspace,
+        session,
+        observer,
+        &["enter", "--tool", ENTER_IDENTITY_TOOL],
+    )
+}
+
+fn enter_identity_risks(workspace: &Workspace) -> Vec<Value> {
+    canonical_fact_rows(&workspace.cwd)
+        .into_iter()
+        .filter_map(|row| {
+            let fact = row["payload"].clone();
+            (fact["kind"] == "risk"
+                && fact["subject"] == format!("duplicate-active-squad-id: {ENTER_IDENTITY_TOOL}"))
+            .then_some(fact)
+        })
+        .collect()
+}
+
+fn assert_no_enter_collision(workspace: &Workspace, entered: &Value) {
+    assert!(
+        !entered["data"]["enter"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "squad-id-active"),
+        "{entered}"
+    );
+    assert!(enter_identity_risks(workspace).is_empty());
+}
+
+#[test]
+fn enter_identity_same_session_has_no_duplicate_warning() {
+    let workspace = Workspace::new("enter-identity-same-session");
+    let daemon = maybe_start_daemon(&workspace.cwd, &workspace.home);
+    enter_identity(&workspace, ENTER_LAUNCHER_SESSION, None);
+    let entered = enter_identity(&workspace, ENTER_LAUNCHER_SESSION, None);
+    assert_no_enter_collision(&workspace, &entered);
+    drop(daemon);
+    workspace.cleanup();
+}
+
+#[test]
+fn enter_identity_launcher_then_hook_alias_has_no_duplicate_warning() {
+    let workspace = Workspace::new("enter-identity-hook-alias");
+    let daemon = maybe_start_daemon(&workspace.cwd, &workspace.home);
+    enter_identity(&workspace, ENTER_LAUNCHER_SESSION, Some("4242"));
+    // Model the hook's presence under its envelope UUID before enter.
+    enter_identity_command(
+        &workspace,
+        ENTER_HOOK_SESSION,
+        Some("4242"),
+        &[
+            "say",
+            "lesson",
+            "--tool",
+            ENTER_IDENTITY_TOOL,
+            "--subject",
+            "hook activity",
+        ],
+    );
+    let entered = enter_identity(&workspace, ENTER_HOOK_SESSION, Some("4242"));
+    assert_no_enter_collision(&workspace, &entered);
+    let sessions: BTreeSet<_> = canonical_fact_rows(&workspace.cwd)
+        .into_iter()
+        .filter(|r| r["payload"]["kind"] == "presence")
+        .map(|r| r["payload"]["from_session_id"].clone().to_string())
+        .collect();
+    assert_eq!(
+        sessions.len(),
+        2,
+        "the two lease identities must remain separate"
+    );
+    drop(daemon);
+    workspace.cleanup();
+}
+
+#[test]
+fn enter_identity_explicit_hook_session_and_exported_launcher_are_aliases() {
+    let workspace = Workspace::new("enter-identity-explicit-hook-alias");
+    let daemon = maybe_start_daemon(&workspace.cwd, &workspace.home);
+    enter_identity(&workspace, ENTER_LAUNCHER_SESSION, None);
+    enter_identity_command(
+        &workspace,
+        ENTER_HOOK_SESSION,
+        None,
+        &[
+            "say",
+            "lesson",
+            "--tool",
+            ENTER_IDENTITY_TOOL,
+            "--subject",
+            "hook activity",
+        ],
+    );
+    // The shell hook supplies its envelope UUID as --session-id while the
+    // launcher export remains inherited. Neither presence needs a PID stamp.
+    let entered = enter_identity_command(
+        &workspace,
+        ENTER_LAUNCHER_SESSION,
+        None,
+        &[
+            "enter",
+            "--tool",
+            ENTER_IDENTITY_TOOL,
+            "--session-id",
+            ENTER_HOOK_SESSION,
+        ],
+    );
+    assert_no_enter_collision(&workspace, &entered);
+    // A foreign terminal has its own export/argument pair. The accepted hook
+    // alias must not hide it, including on a later re-entry of the first agent.
+    for (exported, explicit) in [
+        ("other-terminal", "other-terminal"),
+        (ENTER_LAUNCHER_SESSION, ENTER_HOOK_SESSION),
+    ] {
+        let entered = enter_identity_command(
+            &workspace,
+            exported,
+            None,
+            &[
+                "enter",
+                "--tool",
+                ENTER_IDENTITY_TOOL,
+                "--session-id",
+                explicit,
+            ],
+        );
+        assert_eq!(
+            entered["data"]["enter"]["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|warning| warning["code"] == "squad-id-active")
+                .count(),
+            1
+        );
+    }
+    let risks = enter_identity_risks(&workspace);
+    assert_eq!(risks.len(), 1);
+    assert_eq!(
+        risks[0]["from_session_id"],
+        "sess:parent:other-terminal#live"
+    );
+    drop(daemon);
+    workspace.cleanup();
+}
+
+#[test]
+fn enter_identity_new_alias_uses_caller_observer_evidence() {
+    let workspace = Workspace::new("enter-identity-new-alias");
+    let daemon = maybe_start_daemon(&workspace.cwd, &workspace.home);
+    enter_identity(&workspace, ENTER_LAUNCHER_SESSION, Some("4242"));
+    let entered = enter_identity(&workspace, ENTER_HOOK_SESSION, Some("4242"));
+    assert_no_enter_collision(&workspace, &entered);
+    drop(daemon);
+    workspace.cleanup();
+}
+
+#[test]
+fn enter_identity_distinct_sessions_warn_once_with_caller_session() {
+    let workspace = Workspace::new("enter-identity-second-terminal");
+    let daemon = maybe_start_daemon(&workspace.cwd, &workspace.home);
+    enter_identity(&workspace, ENTER_LAUNCHER_SESSION, Some("4242"));
+    for _ in 0..2 {
+        let entered = enter_identity(&workspace, "another-terminal", Some("4343"));
+        assert_eq!(
+            entered["data"]["enter"]["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|w| w["code"] == "squad-id-active")
+                .count(),
+            1
+        );
+    }
+    let risks = enter_identity_risks(&workspace);
+    assert_eq!(risks.len(), 1, "re-enter must retain durable deduplication");
+    assert_eq!(
+        risks[0]["from_session_id"],
+        "sess:parent:another-terminal#live"
+    );
+    drop(daemon);
+    workspace.cleanup();
+}
+
+#[test]
+fn enter_identity_unproven_alias_still_warns() {
+    let workspace = Workspace::new("enter-identity-unproven-alias");
+    let daemon = maybe_start_daemon(&workspace.cwd, &workspace.home);
+    enter_identity(&workspace, ENTER_LAUNCHER_SESSION, None);
+    let entered = enter_identity(&workspace, ENTER_HOOK_SESSION, None);
+    assert_eq!(
+        entered["data"]["enter"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|w| w["code"] == "squad-id-active")
+            .count(),
+        1
+    );
+    assert_eq!(enter_identity_risks(&workspace).len(), 1);
+    drop(daemon);
+    workspace.cleanup();
+}
+
 // R12: shared-branch / worktree hazard detector integration tests
 // ---------------------------------------------------------------------------
 

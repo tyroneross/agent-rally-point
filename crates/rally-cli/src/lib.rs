@@ -3085,6 +3085,21 @@ fn reject_viewer_relative_role(role: Option<&str>) -> Result<()> {
 
 fn command_enter(args: EnterArgs) -> Result<Output> {
     let tool = args.tool;
+    // The shell hook passes its envelope id explicitly while inheriting the
+    // launcher's RALLY_SESSION_ID. Their co-occurrence explains one spelling
+    // split for this diagnostic only; it never aliases lease/claim authority.
+    let session_alias = args
+        .session_id
+        .as_deref()
+        .filter(|raw| !raw.trim().is_empty())
+        .filter(|_| {
+            env::var("RALLY_SESSION_ID")
+                .ok()
+                .is_some_and(|raw| !raw.trim().is_empty())
+        })
+        .map(|raw| {
+            session_identity::ProtocolSessionIdentity::from_parent_lease(raw, &tool).session_id
+        });
     let session_id = args.session_id.unwrap_or_else(|| format!("session-{tool}"));
     let role = args.role;
     reject_viewer_relative_role(role.as_deref())?;
@@ -3147,12 +3162,19 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     let store::EnterSnapshotContext {
         snapshot: snapshot_before,
         duplicate_squad_recorded,
+        has_other_active_session,
         unmanaged_agent_recorded,
         has_managed_session,
         presence_recorded_for_session,
         last_presence_build_id,
         binary_drift_recorded,
-    } = room.snapshot_for_enter(&tool, BUILD_ID, &enter_from_session_id)?;
+    } = room.snapshot_for_enter(
+        &tool,
+        BUILD_ID,
+        &enter_from_session_id,
+        &presence_signal_evidence(&room),
+        session_alias.as_deref(),
+    )?;
     let cursor_before = args
         .since
         .unwrap_or_else(|| room.cursor_for(&tool).unwrap_or(0));
@@ -3209,7 +3231,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     if let Some(squad) = snapshot_before
         .squads
         .iter()
-        .find(|s| s.tool == tool && s.status == "active")
+        .find(|s| s.tool == tool && s.status == "active" && has_other_active_session)
     {
         warnings.push(EnterWarning {
             code: "squad-id-active".to_string(),
@@ -3225,7 +3247,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
         // the same duplicate id must not append a second identical fact, or the
         // room accumulates one row per re-enter and crowds out real risks.
         if !duplicate_squad_recorded {
-            let risk_fact = build_risk_fact(
+            let mut risk_fact = build_risk_fact(
                 &tool,
                 format!("duplicate-active-squad-id: {tool}"),
                 format!(
@@ -3237,6 +3259,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
                 Vec::new(),
                 None,
             );
+            risk_fact.from_session_id = Some(enter_from_session_id.clone());
             room.append_fact(&risk_fact)?.into_fact_reporting();
         }
     }
@@ -16874,7 +16897,7 @@ mod tests {
         {
             let room = store::RoomStore::open_at(root.clone()).unwrap();
             assert!(
-                room.snapshot_for_enter(stray_tool, BUILD_ID, "")
+                room.snapshot_for_enter(stray_tool, BUILD_ID, "", &[], None)
                     .unwrap()
                     .unmanaged_agent_recorded,
                 "second enter must see the prior risk fact (idempotency gate)"
@@ -16916,7 +16939,7 @@ mod tests {
         }
 
         let first_context = room
-            .snapshot_for_enter(telemetry[0].0, BUILD_ID, "")
+            .snapshot_for_enter(telemetry[0].0, BUILD_ID, "", &[], None)
             .unwrap();
         let projected_subjects = first_context
             .snapshot
@@ -16933,11 +16956,11 @@ mod tests {
 
         assert!(first_context.unmanaged_agent_recorded);
         let second_context = room
-            .snapshot_for_enter(telemetry[1].0, BUILD_ID, "")
+            .snapshot_for_enter(telemetry[1].0, BUILD_ID, "", &[], None)
             .unwrap();
         assert!(second_context.unmanaged_agent_recorded);
         let wrong_tool_context = room
-            .snapshot_for_enter("different-tool", BUILD_ID, "")
+            .snapshot_for_enter("different-tool", BUILD_ID, "", &[], None)
             .unwrap();
         assert!(!wrong_tool_context.unmanaged_agent_recorded);
 

@@ -61,7 +61,8 @@ use serde_json::Value;
 /// Wire protocol version. Bumped only on a breaking envelope change. The ping
 /// reply carries this; a client seeing an incompatible version fails
 /// immediately with typed `IncompatibleWire` and never falls back to direct.
-pub const WIRE_VERSION: u32 = 7;
+// v8: enter collision diagnostics carry caller evidence and a session-aware guard.
+pub const WIRE_VERSION: u32 = 8;
 
 /// Hard cap on a single request/response line. A longer line is a framing
 /// error (or an abuse) and maps to the transport-error class (R7): the daemon
@@ -188,6 +189,8 @@ pub enum StoreOp {
         tool: String,
         build_id: String,
         from_session_id: String,
+        presence_evidence: Vec<String>,
+        session_alias: Option<String>,
     },
     /// Target-scoped obligation projection. Counts remain exact while rows are
     /// caller-bounded, so one peer cannot make every daemon snapshot fail.
@@ -303,6 +306,7 @@ pub enum StoreOk {
     SnapshotForEnter {
         snapshot: Value,
         duplicate_squad_recorded: bool,
+        has_other_active_session: bool,
         unmanaged_agent_recorded: bool,
         has_managed_session: bool,
         presence_recorded_for_session: bool,
@@ -459,8 +463,8 @@ mod tests {
     }
 
     #[test]
-    fn o26_wire_v7_round_trips_all_query_controls() {
-        assert_eq!(WIRE_VERSION, 7);
+    fn o26_wire_v8_round_trips_all_query_controls() {
+        assert_eq!(WIRE_VERSION, 8);
         let req = StoreRequest::new(
             Some("engagement-alpha".to_string()),
             StoreOp::SnapshotScoped {
@@ -547,6 +551,8 @@ mod tests {
                 tool: "codex:01".to_string(),
                 build_id: "0.2.7+candidate".to_string(),
                 from_session_id: "sess:codex:01#live".to_string(),
+                presence_evidence: vec!["observer_pid:42".to_string()],
+                session_alias: Some("sess:parent:hook-uuid#live".to_string()),
             },
         );
         let enter_back: StoreRequest =
@@ -557,14 +563,19 @@ mod tests {
                 ref tool,
                 ref build_id,
                 ref from_session_id,
+                ref presence_evidence,
+                ref session_alias,
             } if tool == "codex:01"
                 && build_id == "0.2.7+candidate"
                 && from_session_id == "sess:codex:01#live"
+                && presence_evidence == &["observer_pid:42"]
+                && session_alias.as_deref() == Some("sess:parent:hook-uuid#live")
         ));
 
         let enter_response = StoreResponse::Ok(StoreOk::SnapshotForEnter {
             snapshot: serde_json::json!({"max_seq": 42}),
             duplicate_squad_recorded: true,
+            has_other_active_session: true,
             unmanaged_agent_recorded: false,
             has_managed_session: true,
             presence_recorded_for_session: true,
