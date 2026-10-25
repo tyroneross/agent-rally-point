@@ -21,7 +21,9 @@
 //!    position never advanced.
 //! 3. **Wake coalescing.** `append_next_wake_intent` looks for a matching entry
 //!    in `pending_wakes` before appending. Empty means the guard never matches,
-//!    so a routed caller appends a DUPLICATE wake intent on every poll.
+//!    so a routed caller appends a DUPLICATE wake intent on every poll. The
+//!    list now rides only the caller-scoped reply `next` fetches; unscoped
+//!    replies clear it on purpose (see the wake-flood test below).
 //! 4. **Global status age.** `status_global` reads `last_activity_ts` from the
 //!    snapshot. Empty over the wire makes an active room look timestamp-less.
 //!
@@ -660,6 +662,101 @@ fn routed_next_coalesces_wake_intents() {
     assert_eq!(
         routed_wakes, 1,
         "two routed polls must coalesce to exactly one wake intent"
+    );
+}
+
+/// A room whose pending wakes exceed the wire bound must still serve routed
+/// calls, because each caller only needs its own wakes.
+///
+/// Before per-caller scoping, every routed snapshot carried the room-wide
+/// pending-wake list and failed loud above `MAX_WIRE_PENDING_WAKES` (1,024).
+/// Easy Terminal's room held 1,495, so every routed `room`/`next` failed. The
+/// seeded wakes here target OTHER tools; the poller's own wake must still
+/// coalesce, which proves the scoped list kept the caller's entries.
+#[test]
+fn routed_calls_survive_more_room_wakes_than_the_wire_bound() {
+    const OTHER_WAKES: usize = 1_100;
+    let room = Room::new("wake-flood");
+    seed_plain(&room);
+    let v = room.json(&[
+        "say", "handoff", "--tool", "peer-one", "--to", "waker-peer", "--subject",
+        "please pick this up", "--json",
+    ]);
+    assert_eq!(v["ok"], Value::Bool(true), "handoff: {v}");
+    let v = room.json(&["next", "--tool", "waker-peer", "--json"]);
+    assert_eq!(v["ok"], Value::Bool(true), "first next: {v}");
+    assert_eq!(room.count_kind_by_tool("wake", "waker-peer"), 1, "premise: one wake");
+
+    // Clone the real wake line into many pending wakes for other targets, each
+    // with a fresh ledger sequence number after the current maximum.
+    let max_seq = room
+        .segments()
+        .iter()
+        .flat_map(|seg| {
+            fs::read_to_string(seg)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .filter_map(|v| v["seq"].as_i64())
+                .collect::<Vec<_>>()
+        })
+        .max()
+        .expect("premise: ledger has lines");
+    let mut seeded = 0usize;
+    for seg in room.segments() {
+        let text = fs::read_to_string(&seg).unwrap();
+        let Some(line) = text.lines().find(|l| {
+            serde_json::from_str::<Value>(l)
+                .is_ok_and(|v| v["payload"]["kind"] == "wake")
+        }) else {
+            continue;
+        };
+        let template: Value = serde_json::from_str(line).unwrap();
+        let mut extra = String::new();
+        for i in 0..OTHER_WAKES {
+            let mut v = template.clone();
+            let seq = max_seq + 1 + i as i64;
+            v["seq"] = Value::from(seq);
+            v["payload"]["seq"] = Value::from(seq);
+            v["payload"]["event_id"] = Value::String(format!("fact_flood_{i:05}"));
+            v["payload"]["target"] = Value::String(format!("other-{i}"));
+            v["payload"]["subject"] = Value::String(format!("wake intent for other-{i}: work"));
+            extra.push_str(&serde_json::to_string(&v).unwrap());
+            extra.push('\n');
+        }
+        let mut f = fs::OpenOptions::new().append(true).open(&seg).unwrap();
+        std::io::Write::write_all(&mut f, extra.as_bytes()).unwrap();
+        seeded = OTHER_WAKES;
+        break;
+    }
+    assert_eq!(seeded, OTHER_WAKES, "premise: wake line found and cloned");
+    room.reimport_segments();
+    let pending_others = room
+        .ledger_facts()
+        .iter()
+        .filter(|f| f["kind"] == "wake" && f["target"] != "waker-peer")
+        .count();
+    assert!(pending_others > 1_024, "premise: room wakes exceed the wire bound");
+
+    let mut daemon = Daemon::start(&room)
+        .unwrap_or_else(|e| panic!("routed wake-flood control requires rallyd: {e}"));
+    let room_v = room.json(&["room", "--json"]);
+    let next_v = room.json(&["next", "--tool", "waker-peer", "--json"]);
+    let inbox_v = room.json(&["inbox", "--tool", "waker-peer", "--json"]);
+    daemon.stop();
+
+    assert_eq!(room_v["ok"], Value::Bool(true), "routed room failed: {room_v}");
+    assert_eq!(next_v["ok"], Value::Bool(true), "routed next failed: {next_v}");
+    assert_eq!(inbox_v["ok"], Value::Bool(true), "routed inbox failed: {inbox_v}");
+    // Cloned wakes keep the template's author, so count by target only.
+    let own_wakes = room
+        .ledger_facts()
+        .iter()
+        .filter(|f| f["kind"] == "wake" && f["target"] == "waker-peer")
+        .count();
+    assert_eq!(
+        own_wakes, 1,
+        "routed next must still coalesce against the caller's own pending wake"
     );
 }
 

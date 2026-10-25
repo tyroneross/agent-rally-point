@@ -2111,6 +2111,11 @@ pub(crate) struct EnterSnapshotContext {
 /// * **Wake coalescing (D6).** `append_next_wake_intent` looks for an existing
 ///   pending wake before appending one. An empty `pending_wakes` means the guard
 ///   never matches, so a routed caller appends a DUPLICATE wake intent.
+///   `pending_wakes` therefore rides ONLY the caller-scoped reply
+///   ([`RoomSnapshot::for_obligation_target`]), holding that caller's wakes;
+///   every unscoped reply clears it on purpose
+///   ([`RoomSnapshot::without_caller_scoped_transport`]). A reader of an
+///   unscoped or cached snapshot must not use it for coalescing.
 ///
 /// # Why a side-channel rather than serializing the fields
 ///
@@ -2329,7 +2334,19 @@ pub(crate) fn snapshot_from_wire_value(
 }
 
 impl RoomSnapshot {
-    pub(crate) fn without_obligation_transport(mut self) -> Self {
+    /// Strip the caller-scoped side-channel fields from a snapshot that is not
+    /// addressed to one caller.
+    ///
+    /// Open obligations and pending wakes are only read for ONE tool: `inbox`
+    /// and `next` scope obligations by addressee, and `next`'s wake coalescing
+    /// matches `wake.target == tool` (`append_next_wake_intent`). Both commands
+    /// fetch [`RoomSnapshot::for_obligation_target`], so an unscoped daemon
+    /// reply has no reader for either list. Shipping every room-wide wake there
+    /// only exposes the fail-loud [`MAX_WIRE_PENDING_WAKES`] bound: a large
+    /// room with more pending wakes than the bound failed every routed
+    /// `room`, `enter`, and scoped call even though no caller needed them.
+    pub(crate) fn without_caller_scoped_transport(mut self) -> Self {
+        self.pending_wakes.clear();
         self.open_obligations.clear();
         self.open_obligations_target = None;
         self.open_obligations_total = 0;
@@ -2341,6 +2358,22 @@ impl RoomSnapshot {
     }
 
     pub(crate) fn for_obligation_target(mut self, tool: &str, row_limit: usize) -> Self {
+        // The only reader of `pending_wakes` is `next`'s coalescing guard, which
+        // matches `wake.target == tool`. Keep exactly the caller's wakes so the
+        // wire carries one target's set, not the room's (largest measured
+        // per-target set on a 1,484-wake room: 526, under the bound).
+        // One target can still accumulate more than the bound, so keep its
+        // newest MAX_WIRE_PENDING_WAKES. Dropping an older wake can at worst
+        // let `next` append one duplicate intent; failing the reply would stop
+        // that caller's every routed `next`/`inbox`/`enter`. Applied in both
+        // store modes, so direct and routed stay identical.
+        self.pending_wakes
+            .retain(|wake| wake.target.as_deref() == Some(tool));
+        if self.pending_wakes.len() > MAX_WIRE_PENDING_WAKES {
+            self.pending_wakes.sort_by_key(|wake| wake.seq);
+            let excess = self.pending_wakes.len() - MAX_WIRE_PENDING_WAKES;
+            self.pending_wakes.drain(..excess);
+        }
         let accepted_open = crate::obligations::named_work(&self, tool)
             .iter()
             .filter(|(_, state)| *state == crate::obligations::NamedState::AcceptedOpen)
@@ -21214,6 +21247,40 @@ mod ledger_tests {
         );
         assert_eq!(snapshot.pending_wakes.len(), 1);
         assert_eq!(snapshot.pending_wakes[0].event_id, "wake-pending");
+    }
+
+    #[test]
+    fn caller_scoped_wakes_keep_only_the_callers_newest_within_the_wire_bound() {
+        let mut wakes = Vec::new();
+        for i in 0..(MAX_WIRE_PENDING_WAKES + 6) {
+            let mut w = make_fact(&format!("mine-{i}"), FactKind::Wake, "", "pending");
+            w.status = Some("pending".to_string());
+            w.target = Some("codex".to_string());
+            w.seq = (i + 1) as i64;
+            wakes.push(w);
+        }
+        let mut other = make_fact("theirs", FactKind::Wake, "", "pending");
+        other.status = Some("pending".to_string());
+        other.target = Some("claude".to_string());
+        other.seq = 99_999;
+        wakes.push(other);
+        let snapshot = RoomSnapshot {
+            pending_wakes: wakes,
+            ..RoomSnapshot::default()
+        };
+
+        let scoped = snapshot.clone().for_obligation_target("codex", 16);
+        assert_eq!(scoped.pending_wakes.len(), MAX_WIRE_PENDING_WAKES);
+        assert!(scoped
+            .pending_wakes
+            .iter()
+            .all(|w| w.target.as_deref() == Some("codex")));
+        let oldest = scoped.pending_wakes.iter().map(|w| w.seq).min().unwrap();
+        assert_eq!(oldest, 7, "the six oldest caller wakes are the ones dropped");
+        assert!(snapshot_to_wire_value(&scoped).is_ok(), "scoped reply fits the wire");
+
+        let unscoped = snapshot.without_caller_scoped_transport();
+        assert!(unscoped.pending_wakes.is_empty(), "unscoped replies carry no wakes");
     }
 
     // -------------------------------------------------------------------------

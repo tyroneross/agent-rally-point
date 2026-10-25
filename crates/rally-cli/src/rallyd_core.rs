@@ -1016,7 +1016,7 @@ mod imp {
                 let capture = store
                     .snapshot_cache_capture(include_archived)
                     .map_err(rally_to_wire)?;
-                let snapshot = capture.snapshot.without_obligation_transport();
+                let snapshot = capture.snapshot.without_caller_scoped_transport();
                 StoreOk::Snapshot {
                     snapshot: snapshot_to_wire(&snapshot)?,
                     fingerprint: capture
@@ -1042,7 +1042,7 @@ mod imp {
                         session_alias.as_deref(),
                     )
                     .map_err(rally_to_wire)?;
-                let snapshot = context.snapshot.without_obligation_transport();
+                let snapshot = context.snapshot.without_caller_scoped_transport();
                 StoreOk::SnapshotForEnter {
                     snapshot: snapshot_to_wire(&snapshot)?,
                     duplicate_squad_recorded: context.duplicate_squad_recorded,
@@ -1089,7 +1089,7 @@ mod imp {
                         include_presence_only,
                     )
                     .map_err(rally_to_wire)?
-                    .without_obligation_transport();
+                    .without_caller_scoped_transport();
                 StoreOk::Snapshot {
                     snapshot: snapshot_to_wire(&snap)?,
                     fingerprint: None,
@@ -1099,7 +1099,7 @@ mod imp {
                 let snap = store
                     .snapshot_with_readers_archived(include_archived)
                     .map_err(rally_to_wire)?
-                    .without_obligation_transport();
+                    .without_caller_scoped_transport();
                 StoreOk::SnapshotWithReaders {
                     snapshot: snapshot_to_wire(&snap)?,
                 }
