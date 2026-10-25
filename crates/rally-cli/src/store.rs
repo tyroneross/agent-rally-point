@@ -21271,16 +21271,27 @@ mod ledger_tests {
 
         let scoped = snapshot.clone().for_obligation_target("codex", 16);
         assert_eq!(scoped.pending_wakes.len(), MAX_WIRE_PENDING_WAKES);
-        assert!(scoped
-            .pending_wakes
-            .iter()
-            .all(|w| w.target.as_deref() == Some("codex")));
+        assert!(
+            scoped
+                .pending_wakes
+                .iter()
+                .all(|w| w.target.as_deref() == Some("codex"))
+        );
         let oldest = scoped.pending_wakes.iter().map(|w| w.seq).min().unwrap();
-        assert_eq!(oldest, 7, "the six oldest caller wakes are the ones dropped");
-        assert!(snapshot_to_wire_value(&scoped).is_ok(), "scoped reply fits the wire");
+        assert_eq!(
+            oldest, 7,
+            "the six oldest caller wakes are the ones dropped"
+        );
+        assert!(
+            snapshot_to_wire_value(&scoped).is_ok(),
+            "scoped reply fits the wire"
+        );
 
         let unscoped = snapshot.without_caller_scoped_transport();
-        assert!(unscoped.pending_wakes.is_empty(), "unscoped replies carry no wakes");
+        assert!(
+            unscoped.pending_wakes.is_empty(),
+            "unscoped replies carry no wakes"
+        );
     }
 
     // -------------------------------------------------------------------------

@@ -679,13 +679,24 @@ fn routed_calls_survive_more_room_wakes_than_the_wire_bound() {
     let room = Room::new("wake-flood");
     seed_plain(&room);
     let v = room.json(&[
-        "say", "handoff", "--tool", "peer-one", "--to", "waker-peer", "--subject",
-        "please pick this up", "--json",
+        "say",
+        "handoff",
+        "--tool",
+        "peer-one",
+        "--to",
+        "waker-peer",
+        "--subject",
+        "please pick this up",
+        "--json",
     ]);
     assert_eq!(v["ok"], Value::Bool(true), "handoff: {v}");
     let v = room.json(&["next", "--tool", "waker-peer", "--json"]);
     assert_eq!(v["ok"], Value::Bool(true), "first next: {v}");
-    assert_eq!(room.count_kind_by_tool("wake", "waker-peer"), 1, "premise: one wake");
+    assert_eq!(
+        room.count_kind_by_tool("wake", "waker-peer"),
+        1,
+        "premise: one wake"
+    );
 
     // Clone the real wake line into many pending wakes for other targets, each
     // with a fresh ledger sequence number after the current maximum.
@@ -706,8 +717,7 @@ fn routed_calls_survive_more_room_wakes_than_the_wire_bound() {
     for seg in room.segments() {
         let text = fs::read_to_string(&seg).unwrap();
         let Some(line) = text.lines().find(|l| {
-            serde_json::from_str::<Value>(l)
-                .is_ok_and(|v| v["payload"]["kind"] == "wake")
+            serde_json::from_str::<Value>(l).is_ok_and(|v| v["payload"]["kind"] == "wake")
         }) else {
             continue;
         };
@@ -736,7 +746,10 @@ fn routed_calls_survive_more_room_wakes_than_the_wire_bound() {
         .iter()
         .filter(|f| f["kind"] == "wake" && f["target"] != "waker-peer")
         .count();
-    assert!(pending_others > 1_024, "premise: room wakes exceed the wire bound");
+    assert!(
+        pending_others > 1_024,
+        "premise: room wakes exceed the wire bound"
+    );
 
     let mut daemon = Daemon::start(&room)
         .unwrap_or_else(|e| panic!("routed wake-flood control requires rallyd: {e}"));
@@ -745,9 +758,21 @@ fn routed_calls_survive_more_room_wakes_than_the_wire_bound() {
     let inbox_v = room.json(&["inbox", "--tool", "waker-peer", "--json"]);
     daemon.stop();
 
-    assert_eq!(room_v["ok"], Value::Bool(true), "routed room failed: {room_v}");
-    assert_eq!(next_v["ok"], Value::Bool(true), "routed next failed: {next_v}");
-    assert_eq!(inbox_v["ok"], Value::Bool(true), "routed inbox failed: {inbox_v}");
+    assert_eq!(
+        room_v["ok"],
+        Value::Bool(true),
+        "routed room failed: {room_v}"
+    );
+    assert_eq!(
+        next_v["ok"],
+        Value::Bool(true),
+        "routed next failed: {next_v}"
+    );
+    assert_eq!(
+        inbox_v["ok"],
+        Value::Bool(true),
+        "routed inbox failed: {inbox_v}"
+    );
     // Cloned wakes keep the template's author, so count by target only.
     let own_wakes = room
         .ledger_facts()
