@@ -7974,6 +7974,26 @@ mod derived_index {
         )
     }
 
+    /// Register `rally_bad_time(text)`: 1 when chrono cannot parse the value
+    /// as RFC 3339 (or it is NULL), else 0 — the exact rule
+    /// `recent_fact_matches` uses for "unparseable, keep it".
+    pub(super) fn register_bad_time(connection: &Connection) -> Result<()> {
+        connection
+            .create_scalar_function(
+                "rally_bad_time",
+                1,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                    | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+                |ctx| {
+                    let value = ctx.get::<Option<String>>(0)?;
+                    Ok(value
+                        .as_deref()
+                        .is_none_or(|v| chrono::DateTime::parse_from_rfc3339(v).is_err()))
+                },
+            )
+            .map_err(|error| sql_error("register rally_bad_time", error))
+    }
+
     /// WHERE clause and bound values for one `rally recent` page; split out
     /// so tests can assert which SQL narrowing is actually emitted.
     pub(super) fn recent_where(query: &super::RecentQuery) -> (String, Vec<String>) {
@@ -8070,14 +8090,12 @@ mod derived_index {
             ));
         }
         // Archive horizon: a fact older than half_life * log2(1/floor) has
-        // decayed below the floor. Same one-day widening; a `created_at` that
-        // is not RFC 3339-shaped (date, `T`, time, then `Z` or `±hh:mm`),
-        // that SQLite cannot read as a date (month 99), or that SQLite only
-        // reads by normalizing (Feb 30 -> Mar 2, so it does not round-trip)
-        // is always kept here, because the caller keeps a fact with an
-        // unparseable timestamp (decay fails open). An offset timestamp does
-        // not round-trip either (strftime prints UTC), so it is kept too: a
-        // superset, never a drop.
+        // decayed below the floor (same one-day widening). A fact whose
+        // `created_at` chrono cannot parse is always kept, because the
+        // caller keeps it (decay fails open). `rally_bad_time` is chrono's
+        // own parser registered as a SQL function (see `recent_page`), so
+        // this clause and the predicate agree by construction rather than
+        // by imitating RFC 3339 in GLOB patterns.
         if !query.include_archived
             && query.archive_floor > 0.0
             && query.archive_floor < 1.0
@@ -8089,14 +8107,9 @@ mod derived_index {
             if let Some(cutoff) = chrono::DateTime::from_timestamp(query.now_secs - horizon, 0) {
                 values.push(cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
                 clauses.push(format!(
-                    "(json_extract(payload,'$.created_at') >= ?{n} \
-                      OR NOT (coalesce(json_extract(payload,'$.created_at'),'') GLOB '{shape}Z' \
-                           OR coalesce(json_extract(payload,'$.created_at'),'') GLOB '{shape}[+-][0-9][0-9]:[0-9][0-9]') \
-                      OR julianday(json_extract(payload,'$.created_at')) IS NULL \
-                      OR strftime('%Y-%m-%dT%H:%M:%S', json_extract(payload,'$.created_at')) \
-                         IS NOT substr(json_extract(payload,'$.created_at'), 1, 19))",
-                    n = values.len(),
-                    shape = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*"
+                    "(json_extract(payload,'$.created_at') >= ?{} \
+                      OR rally_bad_time(json_extract(payload,'$.created_at')))",
+                    values.len()
                 ));
             }
         }
@@ -8120,6 +8133,7 @@ mod derived_index {
         page: usize,
     ) -> Result<Vec<Fact>> {
         let (filter, values) = recent_where(query);
+        register_bad_time(connection)?;
         let sql = format!(
             "SELECT sequence_number, payload FROM events {filter} \
              ORDER BY json_extract(payload,'$.created_at') DESC, {SEQ_EXPR} DESC \
@@ -22109,6 +22123,15 @@ mod ledger_tests {
         let mut feb30 = make_fact("fact_rc_feb30", FactKind::Decision, "", "s");
         feb30.created_at = "2000-02-30T00:00:00Z".to_string();
         store.append_fact(&feb30).unwrap();
+        // SQLite-only forms chrono rejects (hour 24, space before Z).
+        for (id, raw) in [
+            ("fact_rc_hour24", "2000-01-01T24:00:00Z"),
+            ("fact_rc_spacez", "2000-01-01T00:00:00 Z"),
+        ] {
+            let mut odd = make_fact(id, FactKind::Decision, "", "s");
+            odd.created_at = raw.to_string();
+            store.append_fact(&odd).unwrap();
+        }
         let mut bad = make_fact("fact_rc_malformed", FactKind::Decision, "", "s");
         bad.created_at = "0-not-a-time".to_string(); // sorts below ISO dates
         store.append_fact(&bad).unwrap();
@@ -22198,6 +22221,9 @@ mod ledger_tests {
             indexed[0].contains(&"fact_rc_feb30".to_string()),
             "normalized-only date is kept"
         );
+        for id in ["fact_rc_hour24", "fact_rc_spacez"] {
+            assert!(indexed[0].contains(&id.to_string()), "{id} is kept");
+        }
         assert_eq!(
             indexed[9],
             vec!["fact_rc_backlog".to_string()],

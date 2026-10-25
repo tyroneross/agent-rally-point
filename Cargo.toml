@@ -39,7 +39,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "pr
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 axum = { version = "0.7", features = ["ws"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 anyhow = "1"
 tracing = "0.1"
