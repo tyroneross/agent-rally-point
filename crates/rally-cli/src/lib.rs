@@ -5222,11 +5222,140 @@ struct RecentEnvelope {
 }
 
 fn command_recent(args: RecentArgs) -> Result<Output> {
-    let data = discovery::recent(args.all, args.limit, args.include_archived)?;
-    let count = data.rows.len();
+    let now = chrono::Utc::now();
+    let kinds = args
+        .kinds
+        .iter()
+        .flat_map(|k| k.split(','))
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    // Bookkeeping stays hidden unless asked for, either wholesale or by naming
+    // one of those kinds explicitly.
+    let exclude_kinds = if args.include_bookkeeping {
+        Vec::new()
+    } else {
+        discovery::RECENT_BOOKKEEPING_KINDS
+            .iter()
+            .filter(|k| !kinds.iter().any(|asked| asked == *k))
+            .map(|k| k.to_string())
+            .collect()
+    };
+    let filter = discovery::RecentFilter {
+        kinds,
+        exclude_kinds,
+        tool: args.tool.clone(),
+        target: args.target.clone(),
+        since: args
+            .since
+            .as_deref()
+            .map(|raw| resolve_time_bound("since", raw, now))
+            .transpose()?,
+        until: args
+            .until
+            .as_deref()
+            .map(|raw| resolve_time_bound("until", raw, now))
+            .transpose()?,
+    };
+    let data = discovery::recent(args.all, args.limit, args.include_archived, &filter)?;
+    let text = recent_text(&data);
     let body = envelope("recent", SCHEMA_RECENT, RecentEnvelope { recent: data })?;
-    let text = format!("recent rows={count}");
     Ok(Output::new(args.json, text, body))
+}
+
+/// `--since` / `--until`: an RFC 3339 time, or an age before now written as a
+/// whole number plus `s`, `m`, `h` or `d` (`30m`, `2h`, `7d`). Resolved to an
+/// RFC 3339 UTC instant so every room and the daemon compare the same bound.
+fn resolve_time_bound(flag: &str, raw: &str, now: chrono::DateTime<chrono::Utc>) -> Result<String> {
+    let raw = raw.trim();
+    if let Ok(at) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Ok(at
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    }
+    let (digits, unit) = raw.split_at(raw.len().saturating_sub(1));
+    let secs_per = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        _ => 0,
+    };
+    match digits.parse::<i64>() {
+        Ok(n) if secs_per > 0 && n >= 0 => Ok((now - chrono::Duration::seconds(n * secs_per))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        _ => Err(RallyError::Usage(format!(
+            "--{flag} {raw:?}: expected an RFC 3339 time or an age like 30m, 2h, 7d"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod recent_time_bound_tests {
+    use super::*;
+
+    #[test]
+    fn time_bounds_accept_rfc3339_and_ages_and_reject_junk() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            resolve_time_bound("since", "2h", now).unwrap(),
+            "2026-10-25T10:00:00Z"
+        );
+        assert_eq!(
+            resolve_time_bound("since", "7d", now).unwrap(),
+            "2026-10-18T12:00:00Z"
+        );
+        assert_eq!(
+            resolve_time_bound("since", "90s", now).unwrap(),
+            "2026-10-25T11:58:30Z"
+        );
+        assert_eq!(
+            resolve_time_bound("until", "2026-10-25T14:00:00+02:00", now).unwrap(),
+            "2026-10-25T12:00:00Z"
+        );
+        for junk in ["", "2", "h", "-3h", "2w", "yesterday"] {
+            assert!(
+                matches!(
+                    resolve_time_bound("since", junk, now),
+                    Err(RallyError::Usage(_))
+                ),
+                "{junk:?} must be a usage error"
+            );
+        }
+    }
+}
+
+/// Text form of `rally recent`: the summary line it always printed, then one
+/// readable line per row (time, kind, author → target, subject, id).
+fn recent_text(data: &discovery::RecentData) -> String {
+    let mut lines = vec![format!("recent rows={}", data.rows.len())];
+    for row in &data.rows {
+        let Some(fact) = row.fact.as_ref() else {
+            continue;
+        };
+        let mut subject: String = fact.subject.chars().take(80).collect();
+        if fact.subject.chars().count() > 80 {
+            subject.push('…');
+        }
+        let who = match (&fact.tool, &fact.target) {
+            (Some(tool), Some(target)) => format!("{tool} → {target}"),
+            (Some(tool), None) => tool.clone(),
+            (None, Some(target)) => format!("→ {target}"),
+            (None, None) => "-".to_string(),
+        };
+        lines.push(format!(
+            "{} {} {} · {} · {}",
+            fact.created_at,
+            fact.kind.as_str(),
+            who,
+            subject.replace('\n', " "),
+            fact.event_id
+        ));
+    }
+    lines.join("\n")
 }
 
 // =============================================================================

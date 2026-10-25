@@ -114,6 +114,44 @@ impl StoreRequest {
     }
 }
 
+/// Filter for a bounded "newest facts" read (`rally recent`).
+///
+/// The caller supplies the clock and the decay policy (`now_secs`,
+/// `half_life_secs`, `archive_floor`) so a daemon answers exactly as the
+/// direct path would, whatever its own clock or config.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecentQuery {
+    /// Keep only these kinds (empty = any kind not excluded).
+    #[serde(default)]
+    pub kinds: Vec<String>,
+    /// Drop these kinds (applied after `kinds`).
+    #[serde(default)]
+    pub exclude_kinds: Vec<String>,
+    /// Keep only facts authored by this tool id.
+    #[serde(default)]
+    pub tool: Option<String>,
+    /// Keep only facts addressed to this target.
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Inclusive lower bound on `created_at`, RFC 3339.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Inclusive upper bound on `created_at`, RFC 3339.
+    #[serde(default)]
+    pub until: Option<String>,
+    /// Maximum rows returned.
+    pub limit: usize,
+    /// Re-include facts that decayed below the archive floor.
+    #[serde(default)]
+    pub include_archived: bool,
+    /// Caller's clock (unix seconds) for the archive floor.
+    pub now_secs: i64,
+    /// Recency-decay half-life, seconds.
+    pub half_life_secs: i64,
+    /// Archive floor weight.
+    pub archive_floor: f64,
+}
+
 /// The closed set of ROUTED store operations — exactly one variant per
 /// `RoomStore` `pub(crate)` method classified `routed` (touches `facts.db`).
 /// LOCAL methods (pure accessors + `cursors.json` file ops) are intentionally
@@ -150,6 +188,9 @@ pub enum StoreOp {
     /// (normally zero or one row). Point read for `rally locate`, so a lookup
     /// never ships the whole ledger. v9.
     FactsByEventId { event_id: String },
+    /// The newest facts matching [`RecentQuery`], newest first, at most
+    /// `query.limit` rows. Answered as [`StoreOk::Facts`]. v9.
+    RecentFacts { query: RecentQuery },
     /// One bounded page of the ledger: facts with `seq > after_seq` in seq
     /// order, sized to fit `max_bytes` (clamped below [`MAX_LINE_BYTES`]).
     /// Always carries at least one fact when any remain. Reply is
@@ -256,6 +297,7 @@ impl StoreOp {
             Self::Facts
             | Self::SessionPresenceFacts { .. }
             | Self::FactsByEventId { .. }
+            | Self::RecentFacts { .. }
             | Self::FactsPage { .. }
             | Self::RepoWideClaimLifecycleFacts
             | Self::SessionFactsWithContextVersion
@@ -717,6 +759,12 @@ mod tests {
         assert!(
             !StoreOp::FactsByEventId {
                 event_id: "e".into()
+            }
+            .is_mutating()
+        );
+        assert!(
+            !StoreOp::RecentFacts {
+                query: RecentQuery::default()
             }
             .is_mutating()
         );

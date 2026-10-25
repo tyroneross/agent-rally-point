@@ -3571,12 +3571,27 @@ fn presence_substrate_enter_writes_presence_and_lead() {
         "lead survives ledger replay"
     );
 
-    // Presence facts are readable via `recent` (the main non-room read path).
-    let recent = workspace.json(&["recent", "--json"]);
-    let rows = recent["data"]["recent"]["rows"].as_array().unwrap();
+    // Presence facts are readable via `recent` (the main non-room read path)
+    // when asked for: they are bookkeeping, hidden from the default listing.
+    let has_presence = |args: &[&str]| {
+        let recent = workspace.json(args);
+        recent["data"]["recent"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["fact"]["kind"] == "presence")
+    };
     assert!(
-        rows.iter().any(|r| r["fact"]["kind"] == "presence"),
-        "presence facts appear in recent rows"
+        has_presence(&["recent", "--include-bookkeeping", "--json"]),
+        "presence facts appear in recent rows with --include-bookkeeping"
+    );
+    assert!(
+        has_presence(&["recent", "--kind", "presence", "--json"]),
+        "presence facts appear in recent rows when asked for by kind"
+    );
+    assert!(
+        !has_presence(&["recent", "--json"]),
+        "presence is bookkeeping and hidden from the default recent listing"
     );
 
     workspace.cleanup();

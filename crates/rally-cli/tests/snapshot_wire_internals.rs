@@ -902,6 +902,71 @@ fn locate_is_identical_direct_and_routed_for_hit_and_miss() {
     );
 }
 
+/// `rally recent` filters run in the store (direct) or the daemon (routed,
+/// bounded `RecentFacts` op). Both modes must list the same rows, and the
+/// default must hide bookkeeping kinds.
+#[test]
+fn recent_filters_are_identical_direct_and_routed() {
+    let room = Room::new("recent-parity");
+    seed_plain(&room);
+    let v = room.json(&[
+        "say",
+        "handoff",
+        "--tool",
+        "peer-one",
+        "--to",
+        "peer-two",
+        "--subject",
+        "take this",
+        "--json",
+    ]);
+    assert_eq!(v["ok"], Value::Bool(true), "handoff: {v}");
+    let _ = room.json(&["next", "--tool", "peer-two", "--json"]); // writes presence
+    let queries: [&[&str]; 5] = [
+        &["recent", "--json"],
+        &["recent", "--include-bookkeeping", "--json"],
+        &["recent", "--kind", "handoff", "--json"],
+        &["recent", "--tool", "peer-one", "--since", "1h", "--json"],
+        &["recent", "--kind", "risk,handoff", "--limit", "2", "--json"],
+    ];
+    let rows = |v: &Value| -> Vec<String> {
+        v["data"]["recent"]["rows"]
+            .as_array()
+            .unwrap_or_else(|| panic!("rows: {v}"))
+            .iter()
+            .map(|r| r["fact"]["event_id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let kinds = |v: &Value| -> Vec<String> {
+        v["data"]["recent"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["fact"]["kind"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let direct = queries.iter().map(|q| room.json(q)).collect::<Vec<_>>();
+    assert!(
+        !kinds(&direct[0]).iter().any(|k| k == "presence"),
+        "default hides bookkeeping: {:?}",
+        kinds(&direct[0])
+    );
+    assert!(
+        kinds(&direct[1]).iter().any(|k| k == "presence"),
+        "premise: --include-bookkeeping shows presence"
+    );
+    assert_eq!(kinds(&direct[2]), vec!["handoff"]);
+    assert_eq!(rows(&direct[4]).len(), 2);
+
+    let mut daemon = Daemon::start(&room)
+        .unwrap_or_else(|e| panic!("routed recent control requires rallyd: {e}"));
+    let routed = queries.iter().map(|q| room.json(q)).collect::<Vec<_>>();
+    daemon.stop();
+    for ((q, d), r) in queries.iter().zip(&direct).zip(&routed) {
+        assert_eq!(rows(r), rows(d), "routed {q:?} drifted from direct");
+    }
+}
+
 /// `status --global` consumes `last_activity_ts`; both store modes must report
 /// the timestamp of the ledger's highest-seq fact rather than a default null.
 #[test]

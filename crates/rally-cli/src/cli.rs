@@ -326,6 +326,16 @@ pub(crate) struct RecentArgs {
     pub(crate) limit: i64,
     /// Re-include recency-decayed (archived) facts in the recent listing.
     pub(crate) include_archived: bool,
+    /// Keep only these kinds (repeatable or comma-separated).
+    pub(crate) kinds: Vec<String>,
+    pub(crate) tool: Option<String>,
+    pub(crate) target: Option<String>,
+    /// Lower time bound: RFC 3339, or an age such as `30m`, `2h`, `7d`.
+    pub(crate) since: Option<String>,
+    /// Upper time bound, same forms as `since`.
+    pub(crate) until: Option<String>,
+    /// Include presence / read-cursor / claim-renewal bookkeeping rows.
+    pub(crate) include_bookkeeping: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1842,11 +1852,40 @@ fn recent_parser() -> impl Parser<RecentArgs> {
     let include_archived = long("include-archived")
         .help("re-include recency-decayed (archived) facts in the recent listing")
         .switch();
+    let kinds = long("kind")
+        .help("keep only this kind (repeatable or comma-separated, e.g. handoff,artifact)")
+        .argument::<String>("KIND")
+        .many();
+    let tool = long("tool")
+        .help("keep only facts authored by this tool id")
+        .argument::<String>("TOOL")
+        .optional();
+    let target = long("target")
+        .help("keep only facts addressed to this target")
+        .argument::<String>("TARGET")
+        .optional();
+    let since = long("since")
+        .help("newer than: RFC 3339 time or an age like 30m, 2h, 7d")
+        .argument::<String>("WHEN")
+        .optional();
+    let until = long("until")
+        .help("older than: RFC 3339 time or an age like 30m, 2h, 7d")
+        .argument::<String>("WHEN")
+        .optional();
+    let include_bookkeeping = long("include-bookkeeping")
+        .help("include presence, read-cursor and claim-renewal rows (hidden by default)")
+        .switch();
     construct!(RecentArgs {
         json,
         all,
         limit,
-        include_archived
+        include_archived,
+        kinds,
+        tool,
+        target,
+        since,
+        until,
+        include_bookkeeping
     })
 }
 

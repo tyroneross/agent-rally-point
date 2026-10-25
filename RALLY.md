@@ -218,7 +218,17 @@ rally capture <session|name|tool> --json       # capture a managed session's cur
 rally stop <session|name|tool> --json          # stop a managed session
 rally locate <event-id> --json                                  # find which channel an event lives in
 rally recent [--all] [--limit N] [--include-archived] --json    # recent activity across channels
+rally recent --kind handoff --tool <id> --since 2h --json       # filtered: kind, author, target, time
 ```
+
+`recent` hides bookkeeping rows (presence, read cursors, claim renewals) unless
+you pass `--include-bookkeeping` or name one with `--kind`. Filters:
+`--kind` (repeatable or `a,b`), `--tool`, `--target`, `--since`/`--until`
+(RFC 3339 or an age such as `30m`, `2h`, `7d`). The JSON echoes what was
+applied in `data.recent.filter`; each row's fact is at `data.recent.rows[].fact`
+(`event_id`, `kind`, `tool`, `target`, `subject`, `created_at`). Text mode prints
+one line per row: time, kind, author → target, subject, id. Facts older than
+about 8.6 days are archived and hidden unless `--include-archived`.
 
 `sessions`, `attach`, `capture`, and `stop` operate on managed sessions started
 by `rally run`. `locate` and `recent` answer "where is this?" / "what just

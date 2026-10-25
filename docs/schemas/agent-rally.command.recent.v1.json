@@ -3,24 +3,149 @@
   "$id": "urn:agent-rally:command:recent:v1",
   "title": "Rally Recent Command",
   "type": "object",
-  "required": ["ok", "product", "command", "schema", "data"],
+  "required": [
+    "ok",
+    "product",
+    "command",
+    "schema",
+    "data"
+  ],
   "properties": {
-    "ok": { "const": true },
-    "product": { "const": "rally" },
-    "command": { "const": "recent" },
-    "schema": { "const": "agent-rally.command.recent.v1" },
+    "ok": {
+      "const": true
+    },
+    "product": {
+      "const": "rally"
+    },
+    "command": {
+      "const": "recent"
+    },
+    "schema": {
+      "const": "agent-rally.command.recent.v1"
+    },
     "data": {
       "type": "object",
-      "required": ["recent"],
+      "required": [
+        "recent"
+      ],
       "properties": {
         "recent": {
           "type": "object",
-          "required": ["all", "limit", "rows", "warnings"],
+          "required": [
+            "all",
+            "limit",
+            "filter",
+            "rows",
+            "warnings"
+          ],
           "properties": {
-            "all": { "type": "boolean" },
-            "limit": { "type": "integer" },
-            "rows": { "type": "array" },
-            "warnings": { "type": "array" }
+            "all": {
+              "type": "boolean"
+            },
+            "limit": {
+              "type": "integer"
+            },
+            "rows": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "source",
+                  "seq",
+                  "created_at",
+                  "fact"
+                ],
+                "properties": {
+                  "source": {
+                    "type": "string"
+                  },
+                  "seq": {
+                    "type": "integer"
+                  },
+                  "created_at": {
+                    "type": "string"
+                  },
+                  "repo_root": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "display_name": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "fact": {
+                    "type": "object",
+                    "required": [
+                      "event_id",
+                      "kind",
+                      "created_at",
+                      "subject"
+                    ],
+                    "properties": {
+                      "event_id": {
+                        "type": "string"
+                      },
+                      "kind": {
+                        "type": "string"
+                      },
+                      "created_at": {
+                        "type": "string"
+                      },
+                      "subject": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "warnings": {
+              "type": "array"
+            },
+            "filter": {
+              "type": "object",
+              "description": "Filters applied after defaults: bookkeeping kinds (presence, read, claim.renewed) appear in exclude_kinds unless --include-bookkeeping or --kind names them; since/until are resolved RFC 3339 UTC.",
+              "required": [
+                "kinds",
+                "exclude_kinds"
+              ],
+              "properties": {
+                "kinds": {
+                  "type": "array"
+                },
+                "exclude_kinds": {
+                  "type": "array"
+                },
+                "tool": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "target": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "since": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "until": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
           }
         }
       }

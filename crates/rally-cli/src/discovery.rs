@@ -74,6 +74,8 @@ pub(crate) struct RecentRow {
 pub(crate) struct RecentData {
     pub(crate) all: bool,
     pub(crate) limit: i64,
+    /// The filters this listing applied, after defaults and time resolution.
+    pub(crate) filter: RecentFilter,
     pub(crate) rows: Vec<RecentRow>,
     pub(crate) warnings: Vec<DiscoveryWarning>,
 }
@@ -337,7 +339,32 @@ pub(crate) fn status_global() -> Result<GlobalStatusData> {
     })
 }
 
-pub(crate) fn recent(all: bool, limit: i64, include_archived: bool) -> Result<RecentData> {
+/// Bookkeeping kinds `rally recent` hides unless `--include-bookkeeping` or an
+/// explicit `--kind` asks for them: liveness, read cursors and lease renewals,
+/// ~70% of a busy ledger and never what a reader is looking for.
+pub(crate) const RECENT_BOOKKEEPING_KINDS: [&str; 3] = ["presence", "read", "claim.renewed"];
+
+/// Caller-side filters for `rally recent`.
+#[derive(Clone, Debug, Default, JsonSchema, Serialize)]
+pub(crate) struct RecentFilter {
+    /// Kinds kept (empty = all kinds not excluded).
+    pub(crate) kinds: Vec<String>,
+    /// Kinds dropped (the bookkeeping kinds unless they were asked for).
+    pub(crate) exclude_kinds: Vec<String>,
+    pub(crate) tool: Option<String>,
+    pub(crate) target: Option<String>,
+    /// Resolved RFC 3339 lower bound.
+    pub(crate) since: Option<String>,
+    /// Resolved RFC 3339 upper bound.
+    pub(crate) until: Option<String>,
+}
+
+pub(crate) fn recent(
+    all: bool,
+    limit: i64,
+    include_archived: bool,
+    filter: &RecentFilter,
+) -> Result<RecentData> {
     let current = repo_root()?;
     let mut warnings = Vec::new();
     let mut rows = Vec::new();
@@ -348,7 +375,8 @@ pub(crate) fn recent(all: bool, limit: i64, include_archived: bool) -> Result<Re
     };
     let mut missing_count: usize = 0;
     for room in rooms {
-        let (room_rows, was_missing) = recent_in_room(&room, include_archived, &mut warnings)?;
+        let (room_rows, was_missing) =
+            recent_in_room(&room, limit, include_archived, filter, &mut warnings)?;
         rows.extend(room_rows);
         if was_missing {
             missing_count += 1;
@@ -375,6 +403,7 @@ pub(crate) fn recent(all: bool, limit: i64, include_archived: bool) -> Result<Re
     Ok(RecentData {
         all,
         limit,
+        filter: filter.clone(),
         rows,
         warnings,
     })
@@ -457,42 +486,39 @@ fn locate_in_room(
 
 fn recent_in_room(
     room: &KnownRoom,
+    limit: i64,
     include_archived: bool,
+    filter: &RecentFilter,
     warnings: &mut Vec<DiscoveryWarning>,
 ) -> Result<(Vec<RecentRow>, bool)> {
     let Some(store) = try_open_indexed_room(room)? else {
         return Ok((Vec::new(), true));
     };
     let _ = warnings; // retained for future per-room warnings that are not room_missing
-    // Recency-decay archive floor: drop facts that have decayed below the floor
-    // unless --include-archived was requested. Ordering itself is already
-    // recency-correct via the created_at-DESC comparator in `recent()`.
+    // Recency-decay archive floor and retractions are applied by the store
+    // BEFORE the limit (see `RoomStore::recent_facts`), so each room returns
+    // at most `limit` rows that survive every filter.
     let coord = crate::hooks_config::resolve_coordination(&room.repo_root).unwrap_or_default();
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let half_life_secs = coord.half_life_secs();
-    let floor = coord.archive_floor_weight;
-    let facts = store.facts()?;
-    // Retraction resolution: drop withdrawn facts from the listing; the
-    // retraction fact itself is kept so the correction stays visible.
-    let retracted = crate::retraction::retracted_ids(&facts);
-    let rows = facts
+    let query = crate::store::RecentQuery {
+        kinds: filter.kinds.clone(),
+        exclude_kinds: filter.exclude_kinds.clone(),
+        tool: filter.tool.clone(),
+        target: filter.target.clone(),
+        since: filter.since.clone(),
+        until: filter.until.clone(),
+        limit: limit.max(0) as usize,
+        include_archived,
+        now_secs,
+        half_life_secs: coord.half_life_secs(),
+        archive_floor: coord.archive_floor_weight,
+    };
+    let rows = store
+        .recent_facts(&query)?
         .into_iter()
-        .filter(|fact| !retracted.contains(&fact.event_id))
-        .filter(|fact| {
-            if include_archived {
-                return true;
-            }
-            // Fail-open: a fact with an unparseable created_at is kept (treated
-            // as fresh) — decay never hides a message on a malformed timestamp.
-            let weight = match chrono::DateTime::parse_from_rfc3339(&fact.created_at) {
-                Ok(dt) => crate::decay::recency_weight(now_secs - dt.timestamp(), half_life_secs),
-                Err(_) => 1.0,
-            };
-            !crate::decay::is_archivable(weight, floor)
-        })
         .map(|fact| RecentRow {
             source: "room".to_string(),
             repo_root: Some(room.repo_root.clone()),

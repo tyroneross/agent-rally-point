@@ -4646,6 +4646,18 @@ impl RoomStore {
         }
     }
 
+    /// The newest facts matching `query` (`rally recent`), newest first, at
+    /// most `query.limit`. Retractions and the archive floor are applied
+    /// BEFORE the limit, so a filtered page is never underfilled by rows the
+    /// caller would have dropped. Routed stores ask the daemon for the
+    /// bounded result instead of shipping the ledger.
+    pub(crate) fn recent_facts(&self, query: &RecentQuery) -> Result<Vec<Fact>> {
+        match self {
+            RoomStore::Direct(d) => d.recent_facts(query),
+            RoomStore::Routed(r) => r.recent_facts(query),
+        }
+    }
+
     /// The lead seat as the room snapshot reports it (Stage 0: scoped read in
     /// direct mode; routed stores take the full snapshot as before).
     pub(crate) fn projected_lead(&self) -> Result<Option<String>> {
@@ -6309,6 +6321,72 @@ impl DirectRoomStore {
             .collect())
     }
 
+    /// See [`RoomStore::recent_facts`]. Indexed path while the derived
+    /// database is proven canonical: SQL narrows by kind/tool/target and pages
+    /// newest-first; every row is then re-checked with the same predicate the
+    /// fallback uses. Otherwise the full load is filtered and sorted. Both
+    /// paths order by (`created_at` desc, seq desc), the order `recent` has
+    /// always used.
+    pub(crate) fn recent_facts(&self, query: &RecentQuery) -> Result<Vec<Fact>> {
+        let room_dir = self
+            .facts_db_path
+            .parent()
+            .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
+        let _guard = acquire_room_mutation_lock(room_dir)?;
+        reconcile_segments_and_db(
+            &self.log_dir,
+            &self.archive_dir,
+            &self.facts_db_path,
+            self.warm_fact_store.is_none(),
+        )?;
+        if query.limit == 0 {
+            return Ok(Vec::new());
+        }
+        let indexed = self.derived_db_proof().and_then(|_| {
+            let connection = derived_index::open(&self.facts_db_path).ok()?;
+            if !derived_index::indexes_present(&connection) {
+                return None;
+            }
+            let retracted = crate::retraction::retracted_ids(
+                &derived_index::retraction_facts(&connection).ok()?,
+            );
+            let page = query.limit.clamp(64, 1_024);
+            let mut out = Vec::new();
+            let mut offset = 0usize;
+            loop {
+                let rows = derived_index::recent_page(&connection, query, offset, page).ok()?;
+                let exhausted = rows.len() < page;
+                offset += rows.len();
+                out.extend(
+                    rows.into_iter()
+                        .filter(|fact| recent_fact_matches(fact, query, &retracted)),
+                );
+                if out.len() >= query.limit || exhausted {
+                    break;
+                }
+            }
+            Some(out)
+        });
+        let mut facts = match indexed {
+            Some(facts) => facts,
+            None => {
+                let all = self.facts_under_lock()?;
+                let retracted = crate::retraction::retracted_ids(&all);
+                all.into_iter()
+                    .filter(|fact| recent_fact_matches(fact, query, &retracted))
+                    .collect()
+            }
+        };
+        facts.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.seq.cmp(&left.seq))
+        });
+        facts.truncate(query.limit);
+        Ok(facts)
+    }
+
     /// The lead seat as `RoomSnapshot::lead` reports it, computed from the
     /// lead-family decisions and retractions only (the inputs
     /// `claim_authority::projected_lead` reads) while the proof holds;
@@ -7832,6 +7910,144 @@ mod derived_index {
         )
     }
 
+    /// Every fact whose subject starts with `retract:` (the partial
+    /// retraction index). A superset of `retraction::target_of`'s carriers,
+    /// so `retracted_ids` over this set equals it over the whole ledger.
+    pub(super) fn retraction_facts(connection: &Connection) -> Result<Vec<Fact>> {
+        rows(
+            connection,
+            &format!(
+                "SELECT sequence_number, payload FROM events WHERE {}",
+                retraction_predicate()
+            ),
+            None,
+        )
+    }
+
+    /// One page of `rally recent` candidates, newest first by
+    /// (`created_at` text desc, canonical seq desc) — the same order the
+    /// caller sorts by. Narrows on the payload's `kind`/`tool`/`target` only;
+    /// time bounds, retractions and the archive floor are re-checked by the
+    /// caller. Rows come back in page order (not re-sorted by seq).
+    pub(super) fn recent_page(
+        connection: &Connection,
+        query: &super::RecentQuery,
+        offset: usize,
+        page: usize,
+    ) -> Result<Vec<Fact>> {
+        let mut clauses: Vec<String> = Vec::new();
+        let mut values: Vec<String> = Vec::new();
+        let placeholders = |n: usize, start: usize| {
+            (0..n)
+                .map(|i| format!("?{}", start + i))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        if !query.kinds.is_empty() {
+            clauses.push(format!(
+                "json_extract(payload,'$.kind') IN ({})",
+                placeholders(query.kinds.len(), values.len() + 1)
+            ));
+            values.extend(query.kinds.iter().cloned());
+        }
+        if !query.exclude_kinds.is_empty() {
+            clauses.push(format!(
+                "coalesce(json_extract(payload,'$.kind'),'') NOT IN ({})",
+                placeholders(query.exclude_kinds.len(), values.len() + 1)
+            ));
+            values.extend(query.exclude_kinds.iter().cloned());
+        }
+        if let Some(tool) = &query.tool {
+            values.push(tool.clone());
+            clauses.push(format!(
+                "json_extract(payload,'$.tool') = ?{}",
+                values.len()
+            ));
+        }
+        if let Some(target) = &query.target {
+            values.push(target.clone());
+            clauses.push(format!(
+                "json_extract(payload,'$.target') = ?{}",
+                values.len()
+            ));
+        }
+        // Time bounds as a text prefilter, widened by one day: `created_at`
+        // strings compare as text, which can misorder fractional seconds or
+        // UTC offsets (at most 14 h). The widened bound is a superset; the
+        // caller re-checks the exact instant.
+        let widened = |raw: &Option<String>, days: i64| {
+            raw.as_deref()
+                .and_then(|r| chrono::DateTime::parse_from_rfc3339(r).ok())
+                .map(|d| {
+                    (d.with_timezone(&chrono::Utc) + chrono::Duration::days(days))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                })
+        };
+        if let Some(since) = widened(&query.since, -1) {
+            values.push(since);
+            clauses.push(format!(
+                "json_extract(payload,'$.created_at') >= ?{}",
+                values.len()
+            ));
+        }
+        if let Some(until) = widened(&query.until, 1) {
+            values.push(until);
+            clauses.push(format!(
+                "json_extract(payload,'$.created_at') <= ?{}",
+                values.len()
+            ));
+        }
+        // Archive horizon: a fact older than half_life * log2(1/floor) has
+        // decayed below the floor. Same one-day widening; a `created_at` that
+        // is not ISO-shaped is always kept here, because the caller keeps a
+        // fact with an unparseable timestamp (decay fails open).
+        if !query.include_archived
+            && query.archive_floor > 0.0
+            && query.archive_floor < 1.0
+            && query.half_life_secs > 0
+        {
+            let horizon = (query.half_life_secs as f64 * (1.0 / query.archive_floor).log2()).ceil()
+                as i64
+                + 86_400;
+            if let Some(cutoff) = chrono::DateTime::from_timestamp(query.now_secs - horizon, 0) {
+                values.push(cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+                clauses.push(format!(
+                    "(json_extract(payload,'$.created_at') >= ?{} \
+                      OR coalesce(json_extract(payload,'$.created_at'),'') \
+                         NOT GLOB '[0-9][0-9][0-9][0-9]-*')",
+                    values.len()
+                ));
+            }
+        }
+        let filter = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", clauses.join(" AND "))
+        };
+        let sql = format!(
+            "SELECT sequence_number, payload FROM events {filter} \
+             ORDER BY json_extract(payload,'$.created_at') DESC, {SEQ_EXPR} DESC \
+             LIMIT {page} OFFSET {offset}"
+        );
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|error| sql_error("prepare facts.db recent query", error))?;
+        let collected = statement
+            .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+            .map_err(|error| sql_error("run facts.db recent query", error))?;
+        let mut facts = Vec::with_capacity(collected.len());
+        for (sequence, payload) in collected {
+            let value = serde_json::from_str(&payload)
+                .map_err(RallyError::json("parse facts.db payload"))?;
+            facts.push(Fact::from_value(value, sequence)?);
+        }
+        super::history_probe::note_materialized(facts.len());
+        Ok(facts)
+    }
+
     pub(super) fn facts_by_session(connection: &Connection, session_id: &str) -> Result<Vec<Fact>> {
         rows(
             connection,
@@ -8382,6 +8598,65 @@ fn handoff_is_closed(handoff: &Fact, facts: &[Fact]) -> bool {
     facts
         .iter()
         .any(|closer| fact_closes_handoff(handoff, closer))
+}
+
+pub(crate) use rally_protocol::store_wire::RecentQuery;
+
+/// Does `fact` belong in a `rally recent` listing for `query`? One predicate
+/// for the indexed and the full-load path. Kind/tool/target compare exactly;
+/// `since`/`until` compare parsed instants and drop a fact whose `created_at`
+/// cannot be parsed only when a time bound is set. The archive floor keeps a
+/// fact with an unparseable `created_at` (decay never hides a message on a
+/// malformed timestamp), as `recent` always has.
+pub(crate) fn recent_fact_matches(
+    fact: &Fact,
+    query: &RecentQuery,
+    retracted: &BTreeSet<String>,
+) -> bool {
+    let kind = fact.kind.as_str();
+    if !query.kinds.is_empty() && !query.kinds.iter().any(|k| k == kind) {
+        return false;
+    }
+    if query.exclude_kinds.iter().any(|k| k == kind) {
+        return false;
+    }
+    if query.tool.is_some() && fact.tool != query.tool {
+        return false;
+    }
+    if query.target.is_some() && fact.target != query.target {
+        return false;
+    }
+    if retracted.contains(&fact.event_id) {
+        return false;
+    }
+    let created = chrono::DateTime::parse_from_rfc3339(&fact.created_at).ok();
+    let bound = |raw: &Option<String>| {
+        raw.as_deref()
+            .and_then(|r| chrono::DateTime::parse_from_rfc3339(r).ok())
+            .map(|d| d.timestamp_millis())
+    };
+    if let Some(since) = bound(&query.since)
+        && created.is_none_or(|c| c.timestamp_millis() < since)
+    {
+        return false;
+    }
+    if let Some(until) = bound(&query.until)
+        && created.is_none_or(|c| c.timestamp_millis() > until)
+    {
+        return false;
+    }
+    if !query.include_archived
+        && let Some(created) = created
+    {
+        let weight = crate::decay::recency_weight(
+            query.now_secs - created.timestamp(),
+            query.half_life_secs,
+        );
+        if crate::decay::is_archivable(weight, query.archive_floor) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Default age after which a pending wake intent expires (24 h). See
@@ -21440,6 +21715,134 @@ mod ledger_tests {
         drop(connection);
         for id in ["fact_pt_0", "fact_pt_4", "fact_absent"] {
             assert_eq!(got(id), expect(id), "fallback lookup for {id}");
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// `recent_facts` returns the same rows through the indexed SQL path and
+    /// through the full-load fallback, across kind/tool/target filters, time
+    /// bounds, the archive floor (both sides of the horizon), a malformed
+    /// timestamp and a retraction.
+    #[test]
+    fn recent_facts_indexed_matches_fallback_on_edge_cases() {
+        let root = unique_root("recent-facts");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let at = |ago: i64| {
+            chrono::DateTime::from_timestamp(now - ago, 0)
+                .unwrap()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        };
+        let hour = 3_600;
+        let kinds = [
+            FactKind::Decision,
+            FactKind::Handoff,
+            FactKind::Presence,
+            FactKind::Artifact,
+        ];
+        let mut n = 0;
+        // Ages straddle the default archive horizon (~8.64 days).
+        for ago in [
+            60,
+            5 * hour,
+            30 * hour,
+            200 * hour,
+            207 * hour,
+            208 * hour,
+            240 * hour,
+            600 * hour,
+        ] {
+            for (k, kind) in kinds.iter().enumerate() {
+                let mut f = make_fact(&format!("fact_rc_{n}"), kind.clone(), "", "s");
+                f.tool = Some(format!("tool-{}", n % 3));
+                f.target = (k % 2 == 0).then(|| "codex".to_string());
+                f.created_at = at(ago);
+                store.append_fact(&f).unwrap();
+                n += 1;
+            }
+        }
+        let mut bad = make_fact("fact_rc_malformed", FactKind::Decision, "", "s");
+        bad.created_at = "0-not-a-time".to_string(); // sorts below ISO dates
+        store.append_fact(&bad).unwrap();
+        let mut withdrawn = make_fact("fact_rc_withdrawn", FactKind::Decision, "", "s");
+        withdrawn.created_at = at(120);
+        store.append_fact(&withdrawn).unwrap();
+        let mut retract = make_fact("fact_rc_retract", FactKind::Artifact, "", "s");
+        retract.subject = "retract: fact_rc_withdrawn".to_string();
+        retract.created_at = at(100);
+        store.append_fact(&retract).unwrap();
+
+        let coord = crate::hooks_config::CoordinationConfig::default();
+        let base = RecentQuery {
+            limit: 500,
+            now_secs: now,
+            half_life_secs: coord.half_life_secs(),
+            archive_floor: coord.archive_floor_weight,
+            ..RecentQuery::default()
+        };
+        let queries = vec![
+            base.clone(),
+            RecentQuery {
+                include_archived: true,
+                ..base.clone()
+            },
+            RecentQuery {
+                limit: 3,
+                ..base.clone()
+            },
+            RecentQuery {
+                exclude_kinds: vec!["presence".into()],
+                ..base.clone()
+            },
+            RecentQuery {
+                kinds: vec!["handoff".into(), "artifact".into()],
+                ..base.clone()
+            },
+            RecentQuery {
+                tool: Some("tool-1".into()),
+                include_archived: true,
+                ..base.clone()
+            },
+            RecentQuery {
+                target: Some("codex".into()),
+                ..base.clone()
+            },
+            RecentQuery {
+                since: Some(at(31 * hour)),
+                ..base.clone()
+            },
+            RecentQuery {
+                until: Some(at(29 * hour)),
+                include_archived: true,
+                ..base.clone()
+            },
+        ];
+        let ids = |facts: Vec<Fact>| facts.into_iter().map(|f| f.event_id).collect::<Vec<_>>();
+        let indexed = queries
+            .iter()
+            .map(|q| ids(store.recent_facts(q).unwrap()))
+            .collect::<Vec<_>>();
+        assert!(
+            indexed[0].contains(&"fact_rc_malformed".to_string()),
+            "malformed time is kept"
+        );
+        assert!(
+            !indexed[1].contains(&"fact_rc_withdrawn".to_string()),
+            "retracted is dropped"
+        );
+        assert!(
+            indexed[1].len() > indexed[0].len(),
+            "premise: archive floor hid old rows"
+        );
+        assert_eq!(indexed[2].len(), 3);
+        // Force the fallback by dropping the derived indexes.
+        let connection = derived_index::open(&store.facts_db_path).unwrap();
+        connection
+            .execute_batch("DROP INDEX IF EXISTS rally_events_event_id;")
+            .unwrap();
+        drop(connection);
+        for (q, want) in queries.iter().zip(&indexed) {
+            assert_eq!(&ids(store.recent_facts(q).unwrap()), want, "query {q:?}");
         }
         std::fs::remove_dir_all(root).ok();
     }
