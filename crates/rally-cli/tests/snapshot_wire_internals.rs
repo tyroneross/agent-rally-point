@@ -1004,13 +1004,24 @@ fn recent_filters_are_identical_direct_and_routed() {
     };
     let direct = queries.iter().map(|q| room.json(q)).collect::<Vec<_>>();
     assert!(
-        !kinds(&direct[0]).iter().any(|k| k == "presence"),
-        "default hides bookkeeping: {:?}",
+        kinds(&direct[0]).iter().any(|k| k == "presence"),
+        "plain recent --json keeps presence for existing scripts: {:?}",
         kinds(&direct[0])
     );
     assert!(
         kinds(&direct[1]).iter().any(|k| k == "presence"),
         "premise: --include-bookkeeping shows presence"
+    );
+    assert!(
+        !kinds(&direct[3]).iter().any(|k| k == "presence"),
+        "a filtered listing hides bookkeeping: {:?}",
+        kinds(&direct[3])
+    );
+    let text = String::from_utf8(room.run(&["recent"]).stdout).unwrap();
+    assert!(text.starts_with("recent rows="), "{text}");
+    assert!(
+        !text.lines().skip(1).any(|l| l.contains(" presence ")),
+        "text mode hides bookkeeping: {text}"
     );
     assert_eq!(kinds(&direct[2]), vec!["handoff"]);
     assert_eq!(rows(&direct[4]).len(), 2);

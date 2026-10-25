@@ -6394,7 +6394,16 @@ impl DirectRoomStore {
             let page = query.limit.clamp(64, 1_024);
             let mut out = Vec::new();
             let mut offset = 0usize;
+            // Bound the SQL work done under the room lock: a filter whose rows
+            // are mostly retracted or archived would page through the whole
+            // table with growing OFFSETs. After this many pages the full-load
+            // path (one decode, same predicate) answers instead.
+            let mut pages_left = 8;
             loop {
+                if pages_left == 0 {
+                    return None;
+                }
+                pages_left -= 1;
                 let rows = derived_index::recent_page(&connection, query, offset, page).ok()?;
                 let exhausted = rows.len() < page;
                 offset += rows.len();
@@ -7984,19 +7993,47 @@ mod derived_index {
                 .collect::<Vec<_>>()
                 .join(",")
         };
-        if !query.kinds.is_empty() {
+        // Every on-disk spelling of each requested kind. A kind that does
+        // not parse, or parses to `unknown` (raw rows like `--help` project
+        // to it), gets no SQL clause: the caller's predicate filters it.
+        let spellings = |kinds: &[String]| -> Option<Vec<String>> {
+            let mut out = Vec::new();
+            for k in kinds {
+                let parsed = super::FactKind::parse(k)?;
+                if parsed == super::FactKind::Unknown {
+                    return None;
+                }
+                for name in [k.as_str(), parsed.as_str()] {
+                    for variant in [
+                        name.to_string(),
+                        name.replace('-', "_"),
+                        name.replace('_', "-"),
+                    ] {
+                        if !out.contains(&variant) {
+                            out.push(variant);
+                        }
+                    }
+                }
+            }
+            Some(out)
+        };
+        if !query.kinds.is_empty()
+            && let Some(names) = spellings(&query.kinds)
+        {
             clauses.push(format!(
                 "json_extract(payload,'$.kind') IN ({})",
-                placeholders(query.kinds.len(), values.len() + 1)
+                placeholders(names.len(), values.len() + 1)
             ));
-            values.extend(query.kinds.iter().cloned());
+            values.extend(names);
         }
-        if !query.exclude_kinds.is_empty() {
+        if !query.exclude_kinds.is_empty()
+            && let Some(names) = spellings(&query.exclude_kinds)
+        {
             clauses.push(format!(
                 "coalesce(json_extract(payload,'$.kind'),'') NOT IN ({})",
-                placeholders(query.exclude_kinds.len(), values.len() + 1)
+                placeholders(names.len(), values.len() + 1)
             ));
-            values.extend(query.exclude_kinds.iter().cloned());
+            values.extend(names);
         }
         if let Some(tool) = &query.tool {
             values.push(tool.clone());
@@ -8040,8 +8077,10 @@ mod derived_index {
         }
         // Archive horizon: a fact older than half_life * log2(1/floor) has
         // decayed below the floor. Same one-day widening; a `created_at` that
-        // is not ISO-shaped is always kept here, because the caller keeps a
-        // fact with an unparseable timestamp (decay fails open).
+        // is not RFC 3339-shaped (date, `T`, time, then `Z` or `±hh:mm`), or
+        // that SQLite cannot read as a date (e.g. month 99), is always kept
+        // here, because the caller keeps a fact with an unparseable
+        // timestamp (decay fails open).
         if !query.include_archived
             && query.archive_floor > 0.0
             && query.archive_floor < 1.0
@@ -8053,10 +8092,12 @@ mod derived_index {
             if let Some(cutoff) = chrono::DateTime::from_timestamp(query.now_secs - horizon, 0) {
                 values.push(cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
                 clauses.push(format!(
-                    "(json_extract(payload,'$.created_at') >= ?{} \
-                      OR coalesce(json_extract(payload,'$.created_at'),'') \
-                         NOT GLOB '[0-9][0-9][0-9][0-9]-*')",
-                    values.len()
+                    "(json_extract(payload,'$.created_at') >= ?{n} \
+                      OR NOT (coalesce(json_extract(payload,'$.created_at'),'') GLOB '{shape}Z' \
+                           OR coalesce(json_extract(payload,'$.created_at'),'') GLOB '{shape}[+-][0-9][0-9]:[0-9][0-9]') \
+                      OR julianday(json_extract(payload,'$.created_at')) IS NULL)",
+                    n = values.len(),
+                    shape = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*"
                 ));
             }
         }
@@ -8689,11 +8730,17 @@ pub(crate) fn recent_fact_matches(
     query: &RecentQuery,
     retracted: &BTreeSet<String>,
 ) -> bool {
-    let kind = fact.kind.as_str();
-    if !query.kinds.is_empty() && !query.kinds.iter().any(|k| k == kind) {
+    // Compare canonical kinds: `backlog_item` (ledger) and `backlog-item`
+    // (as_str) are the same kind, as `FactKind::parse` already accepts.
+    let names = |k: &String| {
+        FactKind::parse(k).map_or(k.as_str() == fact.kind.as_str(), |parsed| {
+            parsed == fact.kind
+        })
+    };
+    if !query.kinds.is_empty() && !query.kinds.iter().any(names) {
         return false;
     }
-    if query.exclude_kinds.iter().any(|k| k == kind) {
+    if query.exclude_kinds.iter().any(names) {
         return false;
     }
     if query.tool.is_some() && fact.tool != query.tool {
@@ -9117,6 +9164,12 @@ pub(crate) struct ReplyState {
     /// Every counted reply in ledger order (state it implies, author, time,
     /// id). Withdrawn replies are left out.
     pub(crate) history: Vec<ReplyEvent>,
+    /// For an addressed item: has the ADDRESSEE answered it (the rule
+    /// `rally inbox` uses)? `false` means the item still sits in the
+    /// receiver's inbox even if `state` is `done` — a legacy session-less
+    /// closer can complete a handoff without the receiver answering.
+    /// `None` when the item is not addressed to one agent.
+    pub(crate) receiver_answered: Option<bool>,
 }
 
 /// One counted reply in a [`ReplyState`] history.
@@ -9219,6 +9272,11 @@ pub(crate) fn project_reply_state(
         let idle = if kind == "blocker" { "open" } else { "pending" };
         (idle.to_string(), None, None, None)
     };
+    let receiver_answered = fact_is_addressed_obligation(item).then(|| {
+        ordered
+            .iter()
+            .any(|r| receiver_ack_closes_obligation(item, r))
+    });
     Some(ReplyState {
         kind: kind.to_string(),
         state,
@@ -9227,6 +9285,7 @@ pub(crate) fn project_reply_state(
         at,
         reply_event_id,
         history,
+        receiver_answered,
     })
 }
 
@@ -21974,6 +22033,20 @@ mod ledger_tests {
                 n += 1;
             }
         }
+        // Ledger spelling `backlog_item` vs as_str `backlog-item`.
+        let mut backlog = make_fact("fact_rc_backlog", FactKind::BacklogItem, "", "s");
+        backlog.created_at = at(90);
+        store.append_fact(&backlog).unwrap();
+        // ISO-like but not RFC 3339 (no `T`, no offset), and old: decay fails
+        // open on it, so it must survive the archive prefilter.
+        let mut naive = make_fact("fact_rc_naive", FactKind::Decision, "", "s");
+        naive.created_at = "2020-01-01 00:00:00".to_string();
+        store.append_fact(&naive).unwrap();
+        // RFC 3339-shaped but not a real date: chrono rejects it, so decay
+        // keeps it; the SQL prefilter must keep it too.
+        let mut month99 = make_fact("fact_rc_month99", FactKind::Decision, "", "s");
+        month99.created_at = "2000-99-99T00:00:00Z".to_string();
+        store.append_fact(&month99).unwrap();
         let mut bad = make_fact("fact_rc_malformed", FactKind::Decision, "", "s");
         bad.created_at = "0-not-a-time".to_string(); // sorts below ISO dates
         store.append_fact(&bad).unwrap();
@@ -22029,6 +22102,18 @@ mod ledger_tests {
                 include_archived: true,
                 ..base.clone()
             },
+            RecentQuery {
+                kinds: vec!["backlog-item".into()],
+                ..base.clone()
+            },
+            RecentQuery {
+                kinds: vec!["backlog_item".into()],
+                ..base.clone()
+            },
+            RecentQuery {
+                exclude_kinds: vec!["backlog_item".into()],
+                ..base.clone()
+            },
         ];
         let ids = |facts: Vec<Fact>| facts.into_iter().map(|f| f.event_id).collect::<Vec<_>>();
         let indexed = queries
@@ -22038,6 +22123,28 @@ mod ledger_tests {
         assert!(
             indexed[0].contains(&"fact_rc_malformed".to_string()),
             "malformed time is kept"
+        );
+        assert!(
+            indexed[0].contains(&"fact_rc_naive".to_string()),
+            "ISO-like naive time is kept"
+        );
+        assert!(
+            indexed[0].contains(&"fact_rc_month99".to_string()),
+            "invalid date is kept"
+        );
+        assert_eq!(
+            indexed[9],
+            vec!["fact_rc_backlog".to_string()],
+            "backlog-item spelling"
+        );
+        assert_eq!(
+            indexed[10],
+            vec!["fact_rc_backlog".to_string()],
+            "backlog_item spelling"
+        );
+        assert!(
+            !indexed[11].contains(&"fact_rc_backlog".to_string()),
+            "exclude either spelling"
         );
         assert!(
             !indexed[1].contains(&"fact_rc_withdrawn".to_string()),
@@ -22198,6 +22305,23 @@ mod ledger_tests {
             );
             let ans = reply("r2", FactKind::Receipt, 3, "codex", "a1");
             assert_eq!(state(&a, &[own, ans]).state, "answered");
+        }
+
+        /// A legacy session-less resolve from the SENDER completes the handoff
+        /// (the `open_handoffs` legacy arm) but does not answer the receiver's
+        /// obligation; `receiver_answered` must say so.
+        #[test]
+        fn done_by_legacy_sender_closer_still_reports_receiver_unanswered() {
+            let h = handoff_to("codex");
+            let mut legacy = reply("r1", FactKind::Resolve, 2, "claude", "h1");
+            legacy.from_session_id = None;
+            let s = state(&h, &[legacy.clone()]);
+            assert_eq!(s.state, "done");
+            assert_eq!(s.receiver_answered, Some(false));
+            let answered = reply("r2", FactKind::Receipt, 3, "codex", "h1");
+            assert_eq!(state(&h, &[legacy, answered]).receiver_answered, Some(true));
+            let b = f("b1", FactKind::Blocker, 1, "claude");
+            assert_eq!(state(&b, &[]).receiver_answered, None, "not addressed");
         }
 
         #[test]

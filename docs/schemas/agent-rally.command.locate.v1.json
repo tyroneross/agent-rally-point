@@ -129,6 +129,13 @@
                       }
                     }
                   }
+                },
+                "receiver_answered": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ],
+                  "description": "Addressed items only: has the addressee answered (the rally inbox rule)? false while the item is still in the receiver's inbox, even if state is done."
                 }
               }
             }

@@ -62,8 +62,9 @@ use serde_json::Value;
 /// reply carries this; a client seeing an incompatible version fails
 /// immediately with typed `IncompatibleWire` and never falls back to direct.
 // v8: enter collision diagnostics carry caller evidence and a session-aware guard.
-// v9: bounded `SessionPresenceFacts` and `FactsPage` ops (the routed client no longer
-// asks for the whole ledger in one reply).
+// v9: bounded reads so a routed client never asks for the whole ledger in one
+// reply: `SessionPresenceFacts`, `FactsPage`, `FactsByEventId` (locate),
+// `RecentFacts` (recent) and `ReplyFacts` (locate reply status).
 pub const WIRE_VERSION: u32 = 9;
 
 /// Hard cap on a single request/response line. A longer line is a framing

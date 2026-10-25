@@ -108,7 +108,7 @@
             },
             "filter": {
               "type": "object",
-              "description": "Filters applied after defaults: bookkeeping kinds (presence, read, claim.renewed) appear in exclude_kinds unless --include-bookkeeping or --kind names them; since/until are resolved RFC 3339 UTC.",
+              "description": "Filters applied after defaults: bookkeeping kinds (presence, read, claim.renewed) appear in exclude_kinds in text mode or when any filter flag is set, unless --include-bookkeeping or --kind names them; plain `recent --json` excludes nothing. since/until are resolved RFC 3339 UTC.",
               "required": [
                 "kinds",
                 "exclude_kinds"

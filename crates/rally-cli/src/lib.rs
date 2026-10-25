@@ -5262,9 +5262,17 @@ fn command_recent(args: RecentArgs) -> Result<Output> {
         .filter(|k| !k.is_empty())
         .map(str::to_string)
         .collect::<Vec<_>>();
-    // Bookkeeping stays hidden unless asked for, either wholesale or by naming
-    // one of those kinds explicitly.
-    let exclude_kinds = if args.include_bookkeeping {
+    // Bookkeeping is hidden in text mode and whenever the caller filters,
+    // unless asked for (wholesale, or by naming one of those kinds). Plain
+    // `rally recent --json` with no filter keeps its original rows: scripts
+    // (build-loop's session/presence readers, Easy Terminal tools) read
+    // presence from it.
+    let filtering = !kinds.is_empty()
+        || args.tool.is_some()
+        || args.target.is_some()
+        || args.since.is_some()
+        || args.until.is_some();
+    let exclude_kinds = if args.include_bookkeeping || (args.json && !filtering) {
         Vec::new()
     } else {
         discovery::RECENT_BOOKKEEPING_KINDS
@@ -5301,11 +5309,13 @@ fn command_recent(args: RecentArgs) -> Result<Output> {
 fn resolve_time_bound(flag: &str, raw: &str, now: chrono::DateTime<chrono::Utc>) -> Result<String> {
     let raw = raw.trim();
     if let Ok(at) = chrono::DateTime::parse_from_rfc3339(raw) {
+        // AutoSi keeps any fractional seconds the caller gave.
         return Ok(at
             .with_timezone(&chrono::Utc)
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+            .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true));
     }
-    let (digits, unit) = raw.split_at(raw.len().saturating_sub(1));
+    let split = raw.char_indices().last().map_or(0, |(i, _)| i);
+    let (digits, unit) = raw.split_at(split);
     let secs_per = match unit {
         "s" => 1,
         "m" => 60,
@@ -5347,7 +5357,12 @@ mod recent_time_bound_tests {
             resolve_time_bound("until", "2026-10-25T14:00:00+02:00", now).unwrap(),
             "2026-10-25T12:00:00Z"
         );
-        for junk in ["", "2", "h", "-3h", "2w", "yesterday"] {
+        assert_eq!(
+            resolve_time_bound("until", "2026-10-25T12:00:00.500Z", now).unwrap(),
+            "2026-10-25T12:00:00.500Z",
+            "fractional seconds survive"
+        );
+        for junk in ["", "2", "h", "-3h", "2w", "yesterday", "é", "2é"] {
             assert!(
                 matches!(
                     resolve_time_bound("since", junk, now),

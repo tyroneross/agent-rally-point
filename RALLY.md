@@ -221,8 +221,10 @@ rally recent [--all] [--limit N] [--include-archived] --json    # recent activit
 rally recent --kind handoff --tool <id> --since 2h --json       # filtered: kind, author, target, time
 ```
 
-`recent` hides bookkeeping rows (presence, read cursors, claim renewals) unless
-you pass `--include-bookkeeping` or name one with `--kind`. Filters:
+`recent` hides bookkeeping rows (presence, read cursors, claim renewals) in text
+mode and whenever you filter, unless you pass `--include-bookkeeping` or name one
+with `--kind`. Plain `rally recent --json` with no filter still lists them, so
+existing scripts keep working. Filters:
 `--kind` (repeatable or `a,b`), `--tool`, `--target`, `--since`/`--until`
 (RFC 3339 or an age such as `30m`, `2h`, `7d`). The JSON echoes what was
 applied in `data.recent.filter`; each row's fact is at `data.recent.rows[].fact`
@@ -235,7 +237,9 @@ requires-ack artifact, in `data.locate.reply`: `state` (handoff: `pending`,
 `acked`, `accepted`, `rejected`, `done`, `expired`; blocker: `open`,
 `resolved`; artifact: `pending`, `answered`), with `by`, `at`, the reply's id
 and the full `history`. Only the addressee's replies count, and `done` uses the
-same rule as `rally room`. Text mode adds a `reply:` line.
+same rule as `rally room`. For addressed items, `receiver_answered` says whether
+the addressee has answered (the `rally inbox` rule); an old-style closer can mark
+a handoff `done` while it is still `false`. Text mode adds a `reply:` line.
 
 `sessions`, `attach`, `capture`, and `stop` operate on managed sessions started
 by `rally run`. `locate` and `recent` answer "where is this?" / "what just
