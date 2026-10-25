@@ -191,6 +191,10 @@ pub enum StoreOp {
     /// The newest facts matching [`RecentQuery`], newest first, at most
     /// `query.limit` rows. Answered as [`StoreOk::Facts`]. v9.
     RecentFacts { query: RecentQuery },
+    /// Facts needed to state an item's reply status: the item, every fact
+    /// whose `ref` names it, and any retraction of those. Answered as
+    /// [`StoreOk::Facts`]. v9.
+    ReplyFacts { event_id: String },
     /// One bounded page of the ledger: facts with `seq > after_seq` in seq
     /// order, sized to fit `max_bytes` (clamped below [`MAX_LINE_BYTES`]).
     /// Always carries at least one fact when any remain. Reply is
@@ -298,6 +302,7 @@ impl StoreOp {
             | Self::SessionPresenceFacts { .. }
             | Self::FactsByEventId { .. }
             | Self::RecentFacts { .. }
+            | Self::ReplyFacts { .. }
             | Self::FactsPage { .. }
             | Self::RepoWideClaimLifecycleFacts
             | Self::SessionFactsWithContextVersion
@@ -765,6 +770,12 @@ mod tests {
         assert!(
             !StoreOp::RecentFacts {
                 query: RecentQuery::default()
+            }
+            .is_mutating()
+        );
+        assert!(
+            !StoreOp::ReplyFacts {
+                event_id: "e".into()
             }
             .is_mutating()
         );

@@ -53,6 +53,10 @@ pub(crate) struct LocatedRecord {
 pub(crate) struct LocateData {
     pub(crate) event_id: String,
     pub(crate) located: Option<LocatedRecord>,
+    /// Reply status when the located fact is a handoff, a blocker, or an
+    /// addressed requires-ack artifact: who answered, how, and when.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reply: Option<crate::store::ReplyState>,
     pub(crate) warnings: Vec<DiscoveryWarning>,
 }
 
@@ -210,10 +214,11 @@ pub(crate) fn locate(event_id: &str) -> Result<LocateData> {
     let mut warnings = Vec::new();
     let rooms = known_rooms_with_current(&current, &mut warnings)?;
     for room in rooms {
-        if let Some(record) = locate_in_room(&room, event_id, &mut warnings)? {
+        if let Some((record, reply)) = locate_in_room(&room, event_id, &mut warnings)? {
             return Ok(LocateData {
                 event_id: event_id.to_string(),
                 located: Some(record),
+                reply,
                 warnings,
             });
         }
@@ -221,6 +226,7 @@ pub(crate) fn locate(event_id: &str) -> Result<LocateData> {
     Ok(LocateData {
         event_id: event_id.to_string(),
         located: None,
+        reply: None,
         warnings,
     })
 }
@@ -462,17 +468,29 @@ fn locate_in_room(
     room: &KnownRoom,
     event_id: &str,
     warnings: &mut Vec<DiscoveryWarning>,
-) -> Result<Option<LocatedRecord>> {
+) -> Result<Option<(LocatedRecord, Option<crate::store::ReplyState>)>> {
     let Some(store) = open_indexed_room(room, warnings)? else {
         return Ok(None);
     };
     // Point read through the event-id index (routed: one bounded daemon op),
     // never the whole ledger. First match in seq order, as before.
-    Ok(store
-        .facts_by_event_id(event_id)?
-        .into_iter()
-        .next()
-        .map(|fact| LocatedRecord {
+    let Some(fact) = store.facts_by_event_id(event_id)?.into_iter().next() else {
+        return Ok(None);
+    };
+    let reply = if matches!(
+        fact.kind,
+        crate::store::FactKind::Handoff
+            | crate::store::FactKind::Blocker
+            | crate::store::FactKind::Artifact
+    ) {
+        let related = store.reply_facts(event_id)?;
+        let retracted = crate::retraction::retracted_ids(&related);
+        crate::store::project_reply_state(&fact, &related, &retracted)
+    } else {
+        None
+    };
+    Ok(Some((
+        LocatedRecord {
             source: "room".to_string(),
             repo_root: Some(room.repo_root.clone()),
             display_name: Some(room.display_name.clone()),
@@ -481,7 +499,9 @@ fn locate_in_room(
             local_seq: None,
             fact: Some(fact),
             record: None,
-        }))
+        },
+        reply,
+    )))
 }
 
 fn recent_in_room(

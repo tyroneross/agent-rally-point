@@ -3,23 +3,135 @@
   "$id": "urn:agent-rally:command:locate:v1",
   "title": "Rally Locate Command",
   "type": "object",
-  "required": ["ok", "product", "command", "schema", "data"],
+  "required": [
+    "ok",
+    "product",
+    "command",
+    "schema",
+    "data"
+  ],
   "properties": {
-    "ok": { "const": true },
-    "product": { "const": "rally" },
-    "command": { "const": "locate" },
-    "schema": { "const": "agent-rally.command.locate.v1" },
+    "ok": {
+      "const": true
+    },
+    "product": {
+      "const": "rally"
+    },
+    "command": {
+      "const": "locate"
+    },
+    "schema": {
+      "const": "agent-rally.command.locate.v1"
+    },
     "data": {
       "type": "object",
-      "required": ["locate"],
+      "required": [
+        "locate"
+      ],
       "properties": {
         "locate": {
           "type": "object",
-          "required": ["event_id", "warnings"],
+          "required": [
+            "event_id",
+            "warnings"
+          ],
           "properties": {
-            "event_id": { "type": "string" },
-            "located": { "type": ["object", "null"] },
-            "warnings": { "type": "array" }
+            "event_id": {
+              "type": "string"
+            },
+            "located": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "warnings": {
+              "type": "array"
+            },
+            "reply": {
+              "type": "object",
+              "description": "Present when the located fact is a handoff, a blocker, or an addressed requires-ack artifact. Uses the room projection's own closing rules.",
+              "required": [
+                "kind",
+                "state",
+                "history"
+              ],
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "handoff",
+                    "blocker",
+                    "artifact"
+                  ]
+                },
+                "state": {
+                  "enum": [
+                    "pending",
+                    "acked",
+                    "accepted",
+                    "rejected",
+                    "done",
+                    "expired",
+                    "open",
+                    "resolved",
+                    "answered",
+                    "retracted"
+                  ]
+                },
+                "to": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "by": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "reply_event_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "history": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": [
+                      "state",
+                      "at",
+                      "event_id"
+                    ],
+                    "properties": {
+                      "state": {
+                        "type": "string"
+                      },
+                      "by": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "at": {
+                        "type": "string"
+                      },
+                      "event_id": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }

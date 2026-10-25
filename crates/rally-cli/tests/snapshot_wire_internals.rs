@@ -902,6 +902,63 @@ fn locate_is_identical_direct_and_routed_for_hit_and_miss() {
     );
 }
 
+/// `rally locate` reply status (bounded `ReplyFacts` read) is identical in
+/// both store modes and follows the handoff from pending to done.
+#[test]
+fn locate_reply_state_is_identical_direct_and_routed() {
+    let room = Room::new("reply-parity");
+    seed_plain(&room);
+    let v = room.json(&[
+        "say",
+        "handoff",
+        "--tool",
+        "peer-one",
+        "--to",
+        "peer-two",
+        "--subject",
+        "take this",
+        "--json",
+    ]);
+    let handoff = v["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("handoff: {v}"))
+        .to_string();
+    let pending = room.json(&["locate", &handoff, "--json"]);
+    assert_eq!(
+        pending["data"]["locate"]["reply"]["state"], "pending",
+        "{pending}"
+    );
+    let v = room.json(&[
+        "say",
+        "resolve",
+        "--tool",
+        "peer-two",
+        "--ref",
+        &handoff,
+        "--subject",
+        "done",
+        "--evidence",
+        "test receipt",
+        "--json",
+    ]);
+    assert_eq!(v["ok"], Value::Bool(true), "resolve: {v}");
+    let direct = room.json(&["locate", &handoff, "--json"]);
+    assert_eq!(
+        direct["data"]["locate"]["reply"]["state"], "done",
+        "{direct}"
+    );
+    assert_eq!(
+        direct["data"]["locate"]["reply"]["by"], "peer-two",
+        "{direct}"
+    );
+
+    let mut daemon = Daemon::start(&room)
+        .unwrap_or_else(|e| panic!("routed reply control requires rallyd: {e}"));
+    let routed = room.json(&["locate", &handoff, "--json"]);
+    daemon.stop();
+    assert_eq!(routed, direct, "routed locate reply drifted from direct");
+}
+
 /// `rally recent` filters run in the store (direct) or the daemon (routed,
 /// bounded `RecentFacts` op). Both modes must list the same rows, and the
 /// default must hide bookkeeping kinds.

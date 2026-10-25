@@ -230,6 +230,13 @@ applied in `data.recent.filter`; each row's fact is at `data.recent.rows[].fact`
 one line per row: time, kind, author → target, subject, id. Facts older than
 about 8.6 days are archived and hidden unless `--include-archived`.
 
+`locate` also reports reply status for a handoff, a blocker, or an addressed
+requires-ack artifact, in `data.locate.reply`: `state` (handoff: `pending`,
+`acked`, `accepted`, `rejected`, `done`, `expired`; blocker: `open`,
+`resolved`; artifact: `pending`, `answered`), with `by`, `at`, the reply's id
+and the full `history`. Only the addressee's replies count, and `done` uses the
+same rule as `rally room`. Text mode adds a `reply:` line.
+
 `sessions`, `attach`, `capture`, and `stop` operate on managed sessions started
 by `rally run`. `locate` and `recent` answer "where is this?" / "what just
 happened?" across the rooms-based channels Rally knows about. The legacy

@@ -473,6 +473,7 @@ fn mutation_query(op: &StoreOp) -> Option<MutationQuery> {
         | StoreOp::SessionPresenceFacts { .. }
         | StoreOp::FactsByEventId { .. }
         | StoreOp::RecentFacts { .. }
+        | StoreOp::ReplyFacts { .. }
         | StoreOp::FactsPage { .. }
         | StoreOp::RepoWideClaimLifecycleFacts
         | StoreOp::SessionFactsWithContextVersion
@@ -733,6 +734,16 @@ impl RoutedRoomStore {
         })? {
             StoreOk::Facts { facts } => facts.into_iter().map(from_value).collect(),
             _ => Err(unexpected_reply("recent_facts")),
+        }
+    }
+
+    /// The item, its replies and their retractions, gathered by the daemon.
+    pub(crate) fn reply_facts(&self, event_id: &str) -> Result<Vec<Fact>> {
+        match self.dispatch(StoreOp::ReplyFacts {
+            event_id: event_id.to_string(),
+        })? {
+            StoreOk::Facts { facts } => facts.into_iter().map(from_value).collect(),
+            _ => Err(unexpected_reply("reply_facts")),
         }
     }
 

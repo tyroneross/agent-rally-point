@@ -4651,6 +4651,15 @@ impl RoomStore {
     /// BEFORE the limit, so a filtered page is never underfilled by rows the
     /// caller would have dropped. Routed stores ask the daemon for the
     /// bounded result instead of shipping the ledger.
+    /// The item `event_id`, every fact whose `ref` names it, and every
+    /// retraction of either — the full input of [`project_reply_state`].
+    pub(crate) fn reply_facts(&self, event_id: &str) -> Result<Vec<Fact>> {
+        match self {
+            RoomStore::Direct(d) => d.reply_facts(event_id),
+            RoomStore::Routed(r) => r.reply_facts(event_id),
+        }
+    }
+
     pub(crate) fn recent_facts(&self, query: &RecentQuery) -> Result<Vec<Fact>> {
         match self {
             RoomStore::Direct(d) => d.recent_facts(query),
@@ -6319,6 +6328,38 @@ impl DirectRoomStore {
             .into_iter()
             .filter(|fact| fact.event_id == event_id)
             .collect())
+    }
+
+    /// See [`RoomStore::reply_facts`]. Indexed: the item by the event-id
+    /// index, replies by a `ref` match, retractions by the retraction index.
+    /// Otherwise the full load is filtered. Same set either way.
+    pub(crate) fn reply_facts(&self, event_id: &str) -> Result<Vec<Fact>> {
+        let room_dir = self
+            .facts_db_path
+            .parent()
+            .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
+        let _guard = acquire_room_mutation_lock(room_dir)?;
+        reconcile_segments_and_db(
+            &self.log_dir,
+            &self.archive_dir,
+            &self.facts_db_path,
+            self.warm_fact_store.is_none(),
+        )?;
+        let indexed = self.derived_db_proof().and_then(|_| {
+            let connection = derived_index::open(&self.facts_db_path).ok()?;
+            if !derived_index::indexes_present(&connection) {
+                return None;
+            }
+            let mut facts = derived_index::facts_by_event_id(&connection, event_id).ok()?;
+            facts.extend(derived_index::facts_by_ref(&connection, event_id).ok()?);
+            facts.extend(derived_index::retraction_facts(&connection).ok()?);
+            Some(facts)
+        });
+        let candidates = match indexed {
+            Some(facts) => facts,
+            None => self.facts_under_lock()?,
+        };
+        Ok(select_reply_facts(candidates, event_id))
     }
 
     /// See [`RoomStore::recent_facts`]. Indexed path while the derived
@@ -8048,6 +8089,17 @@ mod derived_index {
         Ok(facts)
     }
 
+    /// Facts whose `ref` is `event_id` (replies to it). No index on `ref`:
+    /// one scan of the payload column, ~tens of ms on a 90k-row room.
+    pub(super) fn facts_by_ref(connection: &Connection, event_id: &str) -> Result<Vec<Fact>> {
+        rows(
+            connection,
+            "SELECT sequence_number, payload FROM events \
+             WHERE json_extract(payload,'$.ref') = ?1",
+            Some(event_id),
+        )
+    }
+
     pub(super) fn facts_by_session(connection: &Connection, session_id: &str) -> Result<Vec<Fact>> {
         rows(
             connection,
@@ -8602,6 +8654,30 @@ fn handoff_is_closed(handoff: &Fact, facts: &[Fact]) -> bool {
 
 pub(crate) use rally_protocol::store_wire::RecentQuery;
 
+/// Keep exactly the input of [`project_reply_state`] for `event_id` from a
+/// candidate set: the item, facts whose `ref` names it, and retractions whose
+/// target is one of those. Deduplicated by (event id, seq) and seq-ordered,
+/// so the indexed and full-load paths return the same list.
+pub(crate) fn select_reply_facts(candidates: Vec<Fact>, event_id: &str) -> Vec<Fact> {
+    let mut wanted: BTreeSet<String> = candidates
+        .iter()
+        .filter(|f| f.event_id == event_id || f.ref_id.as_deref() == Some(event_id))
+        .map(|f| f.event_id.clone())
+        .collect();
+    wanted.insert(event_id.to_string());
+    let mut seen = BTreeSet::new();
+    let mut out = candidates
+        .into_iter()
+        .filter(|f| {
+            wanted.contains(&f.event_id)
+                || crate::retraction::target_of(f).is_some_and(|t| wanted.contains(&t))
+        })
+        .filter(|f| seen.insert((f.event_id.clone(), f.seq)))
+        .collect::<Vec<_>>();
+    out.sort_by_key(|f| f.seq);
+    out
+}
+
 /// Does `fact` belong in a `rally recent` listing for `query`? One predicate
 /// for the indexed and the full-load path. Kind/tool/target compare exactly;
 /// `since`/`until` compare parsed instants and drop a fact whose `created_at`
@@ -9015,6 +9091,143 @@ fn project_open_obligations(facts: &[Fact]) -> Vec<Fact> {
         .collect::<Vec<_>>();
     open.sort_by_key(|fact| fact.seq);
     open
+}
+
+/// Where an addressed item stands with its receiver, for `rally locate`.
+///
+/// Built by [`project_reply_state`] from the item and the facts whose `ref`
+/// names it, using the SAME closing predicates the room projection uses, so
+/// `locate` never says "done" while `room`/`inbox` still show the item open.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+pub(crate) struct ReplyState {
+    /// `handoff`, `blocker` or `artifact` (requires-ack, addressed).
+    pub(crate) kind: String,
+    /// handoff: `pending` | `acked` | `accepted` | `rejected` | `done` |
+    /// `expired`; blocker: `open` | `resolved`; artifact: `pending` |
+    /// `answered`; any: `retracted` when the item itself was withdrawn.
+    pub(crate) state: String,
+    /// Who the item is addressed to, when it is addressed.
+    pub(crate) to: Option<String>,
+    /// Author of the reply that set `state` (none while pending/open).
+    pub(crate) by: Option<String>,
+    /// When that reply was written.
+    pub(crate) at: Option<String>,
+    /// Event id of that reply.
+    pub(crate) reply_event_id: Option<String>,
+    /// Every counted reply in ledger order (state it implies, author, time,
+    /// id). Withdrawn replies are left out.
+    pub(crate) history: Vec<ReplyEvent>,
+}
+
+/// One counted reply in a [`ReplyState`] history.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+pub(crate) struct ReplyEvent {
+    pub(crate) state: String,
+    pub(crate) by: Option<String>,
+    pub(crate) at: String,
+    pub(crate) event_id: String,
+}
+
+/// Reply state of `item` given `replies` (facts whose `ref` names it) and the
+/// set of retracted ids. `None` for kinds with no reply contract (anything but
+/// a handoff, a blocker, or an addressed requires-ack artifact).
+///
+/// Handoff precedence: `done` (the `open_handoffs` closer rule) and
+/// `expired` (reaper expiry) are terminal; otherwise the latest typed
+/// receiver response (`acked` / `accepted` / `rejected`) wins; a receiver
+/// receipt or resolve that does not close the handoff counts as `acked`.
+/// Typed responses count only from the addressee (the obligation rule), so a
+/// third party cannot accept on the receiver's behalf.
+pub(crate) fn project_reply_state(
+    item: &Fact,
+    replies: &[Fact],
+    retracted: &BTreeSet<String>,
+) -> Option<ReplyState> {
+    let kind = match item.kind {
+        FactKind::Handoff if handoff_is_protocol_request(item) => "handoff",
+        FactKind::Blocker => "blocker",
+        FactKind::Artifact if fact_is_addressed_obligation(item) => "artifact",
+        _ => return None,
+    };
+    let mut ordered = replies
+        .iter()
+        .filter(|r| r.ref_id.as_deref() == Some(item.event_id.as_str()))
+        .filter(|r| r.event_id != item.event_id)
+        .filter(|r| !retracted.contains(&r.event_id))
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|r| r.seq);
+    let event = |state: &str, r: &Fact| ReplyEvent {
+        state: state.to_string(),
+        by: r.tool.clone(),
+        at: r.created_at.clone(),
+        event_id: r.event_id.clone(),
+    };
+    let mut history = Vec::new();
+    for r in &ordered {
+        let state = match kind {
+            "handoff" => {
+                if is_reaper_handoff_expiry(item, r) {
+                    Some("expired")
+                } else if fact_closes_handoff(item, r) {
+                    Some("done")
+                } else if handoff_is_protocol_response(r)
+                    && r.seq > item.seq
+                    && match item.target.as_deref() {
+                        Some(t) if t != "all" => receiver_ack_closes_obligation(item, r),
+                        _ => !is_system_authored(r),
+                    }
+                {
+                    match protocol_marker(r, "event_kind") {
+                        Some("handoff.accepted") => Some("accepted"),
+                        Some("handoff.rejected") => Some("rejected"),
+                        _ => Some("acked"),
+                    }
+                } else if receiver_ack_closes_obligation(item, r) {
+                    Some("acked")
+                } else {
+                    None
+                }
+            }
+            "blocker" => matches!(
+                r.kind,
+                FactKind::Resolve | FactKind::Release | FactKind::Receipt | FactKind::ClaimExpired
+            )
+            .then_some("resolved"),
+            _ => receiver_ack_closes_obligation(item, r).then_some("answered"),
+        };
+        if let Some(state) = state {
+            history.push(event(state, r));
+        }
+    }
+    let terminal = history.iter().rev().find(|e| {
+        matches!(
+            e.state.as_str(),
+            "done" | "expired" | "resolved" | "answered"
+        )
+    });
+    let decided = terminal.or_else(|| history.last());
+    let (state, by, at, reply_event_id) = if retracted.contains(&item.event_id) {
+        ("retracted".to_string(), None, None, None)
+    } else if let Some(e) = decided {
+        (
+            e.state.clone(),
+            e.by.clone(),
+            Some(e.at.clone()),
+            Some(e.event_id.clone()),
+        )
+    } else {
+        let idle = if kind == "blocker" { "open" } else { "pending" };
+        (idle.to_string(), None, None, None)
+    };
+    Some(ReplyState {
+        kind: kind.to_string(),
+        state,
+        to: item.target.clone().filter(|t| t != "all"),
+        by,
+        at,
+        reply_event_id,
+        history,
+    })
 }
 
 /// Projected `status` label for a Resolve that closed a targeted or
@@ -21845,6 +22058,155 @@ mod ledger_tests {
             assert_eq!(&ids(store.recent_facts(q).unwrap()), want, "query {q:?}");
         }
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// `project_reply_state` (B3): states, precedence, provenance, and the
+    /// authority rules it borrows from the room projection.
+    mod reply_state {
+        use super::*;
+
+        fn f(id: &str, kind: FactKind, seq: i64, tool: &str) -> Fact {
+            let mut x = make_fact(id, kind, "", "s");
+            x.seq = seq;
+            x.tool = Some(tool.to_string());
+            x.created_at = format!("2026-10-25T00:00:{seq:02}Z");
+            x
+        }
+        fn reply(id: &str, kind: FactKind, seq: i64, tool: &str, to: &str) -> Fact {
+            let mut x = f(id, kind, seq, tool);
+            x.ref_id = Some(to.to_string());
+            x.from_session_id = Some(format!("sess-{tool}"));
+            x
+        }
+        fn typed(id: &str, seq: i64, tool: &str, to: &str, kind: &str) -> Fact {
+            let mut x = reply(id, FactKind::Handoff, seq, tool, to);
+            x.evidence = [
+                ("bridge_version", "fact-v1"),
+                ("event_kind", kind),
+                ("target_policy", "tool"),
+                ("to_session_id", "sess-any"),
+                ("ref_event_id", to),
+                ("causation_id", to),
+                ("correlation_id", to),
+                ("handoff_id", to),
+                ("idempotency_key", id),
+            ]
+            .iter()
+            .map(|(k, v)| format!("protocol:{k}={v}"))
+            .collect();
+            x
+        }
+        fn handoff_to(target: &str) -> Fact {
+            let mut h = f("h1", FactKind::Handoff, 1, "claude");
+            h.target = Some(target.to_string());
+            h
+        }
+        fn state(item: &Fact, replies: &[Fact]) -> ReplyState {
+            project_reply_state(item, replies, &crate::retraction::retracted_ids(replies)).unwrap()
+        }
+
+        #[test]
+        fn handoff_moves_pending_acked_accepted_done_with_provenance() {
+            let h = handoff_to("codex");
+            assert_eq!(state(&h, &[]).state, "pending");
+            let ack = typed("r1", 2, "codex", "h1", "handoff.acked");
+            assert!(
+                handoff_is_protocol_response(&ack),
+                "premise: typed response is valid"
+            );
+            assert_eq!(state(&h, &[ack.clone()]).state, "acked");
+            let acc = typed("r2", 3, "codex", "h1", "handoff.accepted");
+            let s = state(&h, &[ack.clone(), acc.clone()]);
+            assert_eq!(
+                (s.state.as_str(), s.by.as_deref()),
+                ("accepted", Some("codex"))
+            );
+            assert_eq!(s.reply_event_id.as_deref(), Some("r2"));
+            let done = reply("r3", FactKind::Resolve, 4, "codex", "h1");
+            let s = state(&h, &[ack, acc, done]);
+            assert_eq!((s.state.as_str(), s.history.len()), ("done", 3));
+            assert_eq!(s.to.as_deref(), Some("codex"));
+        }
+
+        #[test]
+        fn rejection_after_acceptance_wins_and_done_stays_terminal() {
+            let h = handoff_to("codex");
+            let acc = typed("r1", 2, "codex", "h1", "handoff.accepted");
+            let rej = typed("r2", 3, "codex", "h1", "handoff.rejected");
+            assert_eq!(state(&h, &[acc.clone(), rej.clone()]).state, "rejected");
+            let done = reply("r3", FactKind::Resolve, 4, "codex", "h1");
+            let late = typed("r4", 5, "codex", "h1", "handoff.acked");
+            assert_eq!(state(&h, &[acc, done, late]).state, "done");
+        }
+
+        #[test]
+        fn third_party_cannot_ack_or_close_an_addressed_handoff() {
+            let h = handoff_to("codex");
+            let other = typed("r1", 2, "gemini", "h1", "handoff.accepted");
+            let other_done = reply("r2", FactKind::Resolve, 3, "gemini", "h1");
+            let s = state(&h, &[other, other_done]);
+            assert_eq!((s.state.as_str(), s.history.len()), ("pending", 0));
+        }
+
+        #[test]
+        fn reaper_expiry_reads_expired_not_done() {
+            let h = handoff_to("codex");
+            let mut reap = reply("r1", FactKind::Resolve, 2, "rally", "h1");
+            reap.role = Some(crate::SYSTEM_ROLE.to_string());
+            reap.evidence = vec![
+                "reaper:ref_id=h1".to_string(),
+                "reaper:reason=handoff-expired".to_string(),
+            ];
+            assert!(
+                is_reaper_handoff_expiry(&h, &reap),
+                "premise: valid reaper close"
+            );
+            assert_eq!(state(&h, &[reap]).state, "expired");
+        }
+
+        #[test]
+        fn withdrawn_reply_does_not_count_and_withdrawn_item_reads_retracted() {
+            let h = handoff_to("codex");
+            let done = reply("r1", FactKind::Resolve, 2, "codex", "h1");
+            let mut withdraw = f("x1", FactKind::Artifact, 3, "codex");
+            withdraw.subject = "retract: r1".to_string();
+            assert_eq!(state(&h, &[done.clone(), withdraw]).state, "pending");
+            let mut withdraw_item = f("x2", FactKind::Artifact, 3, "claude");
+            withdraw_item.subject = "retract: h1".to_string();
+            assert_eq!(state(&h, &[done, withdraw_item]).state, "retracted");
+        }
+
+        #[test]
+        fn blocker_and_addressed_artifact_states() {
+            let b = f("b1", FactKind::Blocker, 1, "claude");
+            assert_eq!(state(&b, &[]).state, "open");
+            let r = reply("r1", FactKind::Resolve, 2, "anyone", "b1");
+            let s = state(&b, &[r]);
+            assert_eq!(
+                (s.state.as_str(), s.by.as_deref()),
+                ("resolved", Some("anyone"))
+            );
+
+            let mut a = f("a1", FactKind::Artifact, 1, "claude");
+            a.target = Some("codex".to_string());
+            a.evidence = vec!["requires_ack".to_string()];
+            let own = reply("r1", FactKind::Resolve, 2, "claude", "a1");
+            assert_eq!(
+                state(&a, &[own.clone()]).state,
+                "pending",
+                "sender cannot answer"
+            );
+            let ans = reply("r2", FactKind::Receipt, 3, "codex", "a1");
+            assert_eq!(state(&a, &[own, ans]).state, "answered");
+        }
+
+        #[test]
+        fn items_without_a_reply_contract_return_none() {
+            let d = f("d1", FactKind::Decision, 1, "claude");
+            assert!(project_reply_state(&d, &[], &BTreeSet::new()).is_none());
+            let plain = f("a2", FactKind::Artifact, 1, "claude");
+            assert!(project_reply_state(&plain, &[], &BTreeSet::new()).is_none());
+        }
     }
 
     /// Wake expiry (A2): a pending wake leaves `pending_wakes` when the work it

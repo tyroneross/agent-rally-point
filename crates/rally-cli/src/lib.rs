@@ -5210,8 +5210,39 @@ struct LocateEnvelope {
 fn command_locate(args: LocateArgs) -> Result<Output> {
     let data = discovery::locate(&args.event_id)?;
     let found = data.located.is_some();
+    let mut text = format!("locate event={} found={}", args.event_id, found);
+    if let Some(fact) = data.located.as_ref().and_then(|r| r.fact.as_ref()) {
+        let who = match (&fact.tool, &fact.target) {
+            (Some(tool), Some(target)) => format!("{tool} → {target}"),
+            (Some(tool), None) => tool.clone(),
+            (None, Some(target)) => format!("→ {target}"),
+            (None, None) => "-".to_string(),
+        };
+        text.push_str(&format!(
+            "\n{} {} {} · {}",
+            fact.created_at,
+            fact.kind.as_str(),
+            who,
+            fact.subject
+                .chars()
+                .take(120)
+                .collect::<String>()
+                .replace('\n', " ")
+        ));
+    }
+    if let Some(reply) = &data.reply {
+        text.push_str(&format!("\nreply: {} {}", reply.kind, reply.state));
+        if let Some(by) = &reply.by {
+            text.push_str(&format!(" by {by}"));
+        }
+        if let Some(at) = &reply.at {
+            text.push_str(&format!(" at {at}"));
+        }
+        if let Some(id) = &reply.reply_event_id {
+            text.push_str(&format!(" · {id}"));
+        }
+    }
     let body = envelope("locate", SCHEMA_LOCATE, LocateEnvelope { locate: data })?;
-    let text = format!("locate event={} found={}", args.event_id, found);
     Ok(Output::new(args.json, text, body))
 }
 
