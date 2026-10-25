@@ -4656,14 +4656,28 @@ impl RoomStore {
     pub(crate) fn reply_facts(&self, event_id: &str) -> Result<Vec<Fact>> {
         match self {
             RoomStore::Direct(d) => d.reply_facts(event_id),
-            RoomStore::Routed(r) => r.reply_facts(event_id),
+            // A heavily referenced item could exceed one reply: recover by
+            // computing locally from the paged full load (slow, same answer).
+            RoomStore::Routed(r) => match r.reply_facts(event_id) {
+                Err(error) if is_reply_too_large(&error) => {
+                    Ok(select_reply_facts(r.facts()?, event_id))
+                }
+                other => other,
+            },
         }
     }
 
     pub(crate) fn recent_facts(&self, query: &RecentQuery) -> Result<Vec<Fact>> {
         match self {
             RoomStore::Direct(d) => d.recent_facts(query),
-            RoomStore::Routed(r) => r.recent_facts(query),
+            // Up to 500 large facts could exceed one reply: recover from the
+            // paged full load with the same predicate (slow, same answer).
+            RoomStore::Routed(r) => match r.recent_facts(query) {
+                Err(error) if is_reply_too_large(&error) => {
+                    Ok(recent_from_full_load(r.facts()?, query))
+                }
+                other => other,
+            },
         }
     }
 
@@ -6417,24 +6431,10 @@ impl DirectRoomStore {
             }
             Some(out)
         });
-        let mut facts = match indexed {
-            Some(facts) => facts,
-            None => {
-                let all = self.facts_under_lock()?;
-                let retracted = crate::retraction::retracted_ids(&all);
-                all.into_iter()
-                    .filter(|fact| recent_fact_matches(fact, query, &retracted))
-                    .collect()
-            }
-        };
-        facts.sort_by(|left, right| {
-            right
-                .created_at
-                .cmp(&left.created_at)
-                .then_with(|| right.seq.cmp(&left.seq))
-        });
-        facts.truncate(query.limit);
-        Ok(facts)
+        match indexed {
+            Some(facts) => Ok(finish_recent(facts, query)),
+            None => Ok(recent_from_full_load(self.facts_under_lock()?, query)),
+        }
     }
 
     /// The lead seat as `RoomSnapshot::lead` reports it, computed from the
@@ -8071,10 +8071,13 @@ mod derived_index {
         }
         // Archive horizon: a fact older than half_life * log2(1/floor) has
         // decayed below the floor. Same one-day widening; a `created_at` that
-        // is not RFC 3339-shaped (date, `T`, time, then `Z` or `±hh:mm`), or
-        // that SQLite cannot read as a date (e.g. month 99), is always kept
-        // here, because the caller keeps a fact with an unparseable
-        // timestamp (decay fails open).
+        // is not RFC 3339-shaped (date, `T`, time, then `Z` or `±hh:mm`),
+        // that SQLite cannot read as a date (month 99), or that SQLite only
+        // reads by normalizing (Feb 30 -> Mar 2, so it does not round-trip)
+        // is always kept here, because the caller keeps a fact with an
+        // unparseable timestamp (decay fails open). An offset timestamp does
+        // not round-trip either (strftime prints UTC), so it is kept too: a
+        // superset, never a drop.
         if !query.include_archived
             && query.archive_floor > 0.0
             && query.archive_floor < 1.0
@@ -8089,7 +8092,9 @@ mod derived_index {
                     "(json_extract(payload,'$.created_at') >= ?{n} \
                       OR NOT (coalesce(json_extract(payload,'$.created_at'),'') GLOB '{shape}Z' \
                            OR coalesce(json_extract(payload,'$.created_at'),'') GLOB '{shape}[+-][0-9][0-9]:[0-9][0-9]') \
-                      OR julianday(json_extract(payload,'$.created_at')) IS NULL)",
+                      OR julianday(json_extract(payload,'$.created_at')) IS NULL \
+                      OR strftime('%Y-%m-%dT%H:%M:%S', json_extract(payload,'$.created_at')) \
+                         IS NOT substr(json_extract(payload,'$.created_at'), 1, 19))",
                     n = values.len(),
                     shape = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*"
                 ));
@@ -8704,6 +8709,36 @@ fn handoff_is_closed(handoff: &Fact, facts: &[Fact]) -> bool {
 
 pub(crate) use rally_protocol::store_wire::RecentQuery;
 
+/// `rally recent` over a full fact load: the reference answer every bounded
+/// path must match (also the routed fallback when the daemon's bounded reply
+/// would exceed the line limit).
+pub(crate) fn recent_from_full_load(all: Vec<Fact>, query: &RecentQuery) -> Vec<Fact> {
+    let retracted = crate::retraction::retracted_ids(&all);
+    let kept = all
+        .into_iter()
+        .filter(|fact| recent_fact_matches(fact, query, &retracted))
+        .collect();
+    finish_recent(kept, query)
+}
+
+/// Order (`created_at` desc, seq desc) and cut to `query.limit`.
+fn finish_recent(mut facts: Vec<Fact>, query: &RecentQuery) -> Vec<Fact> {
+    facts.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.seq.cmp(&left.seq))
+    });
+    facts.truncate(query.limit);
+    facts
+}
+
+/// The daemon refused a bounded read because its reply would exceed the
+/// protocol line limit (typed `reply-too-large`, see rallyd_core).
+fn is_reply_too_large(error: &RallyError) -> bool {
+    matches!(error, RallyError::Command(message) if message.contains("reply-too-large"))
+}
+
 /// Keep exactly the input of [`project_reply_state`] for `event_id` from a
 /// candidate set: the item, facts whose `ref` names it, and retractions whose
 /// target is one of those. Deduplicated by (event id, seq) and seq-ordered,
@@ -8775,18 +8810,19 @@ pub(crate) fn recent_fact_matches(
         return false;
     }
     let created = chrono::DateTime::parse_from_rfc3339(&fact.created_at).ok();
+    // Compare instants exactly (DateTime orders by instant, any offset, full
+    // sub-second precision).
     let bound = |raw: &Option<String>| {
         raw.as_deref()
             .and_then(|r| chrono::DateTime::parse_from_rfc3339(r).ok())
-            .map(|d| d.timestamp_millis())
     };
     if let Some(since) = bound(&query.since)
-        && created.is_none_or(|c| c.timestamp_millis() < since)
+        && created.is_none_or(|c| c < since)
     {
         return false;
     }
     if let Some(until) = bound(&query.until)
-        && created.is_none_or(|c| c.timestamp_millis() > until)
+        && created.is_none_or(|c| c > until)
     {
         return false;
     }
@@ -22069,6 +22105,10 @@ mod ledger_tests {
         let mut month99 = make_fact("fact_rc_month99", FactKind::Decision, "", "s");
         month99.created_at = "2000-99-99T00:00:00Z".to_string();
         store.append_fact(&month99).unwrap();
+        // SQLite normalizes Feb 30 to Mar 2; chrono rejects it.
+        let mut feb30 = make_fact("fact_rc_feb30", FactKind::Decision, "", "s");
+        feb30.created_at = "2000-02-30T00:00:00Z".to_string();
+        store.append_fact(&feb30).unwrap();
         let mut bad = make_fact("fact_rc_malformed", FactKind::Decision, "", "s");
         bad.created_at = "0-not-a-time".to_string(); // sorts below ISO dates
         store.append_fact(&bad).unwrap();
@@ -22153,6 +22193,10 @@ mod ledger_tests {
         assert!(
             indexed[0].contains(&"fact_rc_month99".to_string()),
             "invalid date is kept"
+        );
+        assert!(
+            indexed[0].contains(&"fact_rc_feb30".to_string()),
+            "normalized-only date is kept"
         );
         assert_eq!(
             indexed[9],
@@ -22353,6 +22397,56 @@ mod ledger_tests {
             let plain = f("a2", FactKind::Artifact, 1, "claude");
             assert!(project_reply_state(&plain, &[], &BTreeSet::new()).is_none());
         }
+    }
+
+    /// Time bounds compare exact instants: sub-millisecond and offset forms.
+    #[test]
+    fn recent_time_bounds_compare_exact_instants() {
+        let mut fact = make_fact("t1", FactKind::Decision, "", "s");
+        fact.created_at = "2026-10-25T12:00:00.500100Z".to_string();
+        let q = |since: Option<&str>, until: Option<&str>| RecentQuery {
+            since: since.map(str::to_string),
+            until: until.map(str::to_string),
+            include_archived: true,
+            limit: 1,
+            ..RecentQuery::default()
+        };
+        let none = BTreeSet::new();
+        assert!(!recent_fact_matches(
+            &fact,
+            &q(Some("2026-10-25T12:00:00.500900Z"), None),
+            &none
+        ));
+        assert!(recent_fact_matches(
+            &fact,
+            &q(Some("2026-10-25T12:00:00.500100Z"), None),
+            &none
+        ));
+        assert!(!recent_fact_matches(
+            &fact,
+            &q(None, Some("2026-10-25T12:00:00.500000Z")),
+            &none
+        ));
+        assert!(recent_fact_matches(
+            &fact,
+            &q(None, Some("2026-10-25T14:00:00.500100+02:00")),
+            &none
+        ));
+    }
+
+    /// The routed fallback triggers only on the daemon's typed oversize error.
+    #[test]
+    fn reply_too_large_is_recognised_only_for_the_typed_error() {
+        assert!(is_reply_too_large(&RallyError::Command(
+            "reply-too-large: recent_facts reply is 9000000 bytes, exceeding protocol maximum 8388608"
+                .to_string()
+        )));
+        assert!(!is_reply_too_large(&RallyError::Command(
+            "other failure".to_string()
+        )));
+        assert!(!is_reply_too_large(&RallyError::Usage(
+            "reply-too-large".to_string()
+        )));
     }
 
     /// The SQL narrowing `recent` emits: the default bookkeeping exclusion
