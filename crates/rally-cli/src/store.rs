@@ -9713,8 +9713,8 @@ fn enter_has_other_active_session(
                 Some(tool),
                 Some(from_session_id),
             )
-            && !(session_alias.is_some() && session == session_alias)
-            && !(caller.is_some() && caller == enter_observer(&presence.evidence))
+            && (session_alias.is_none() || session != session_alias)
+            && (caller.is_none() || caller != enter_observer(&presence.evidence))
     })
 }
 
@@ -22313,7 +22313,7 @@ mod ledger_tests {
                 handoff_is_protocol_response(&ack),
                 "premise: typed response is valid"
             );
-            assert_eq!(state(&h, &[ack.clone()]).state, "acked");
+            assert_eq!(state(&h, std::slice::from_ref(&ack)).state, "acked");
             let acc = typed("r2", 3, "codex", "h1", "handoff.accepted");
             let s = state(&h, &[ack.clone(), acc.clone()]);
             assert_eq!(
@@ -22391,7 +22391,7 @@ mod ledger_tests {
             a.evidence = vec!["requires_ack".to_string()];
             let own = reply("r1", FactKind::Resolve, 2, "claude", "a1");
             assert_eq!(
-                state(&a, &[own.clone()]).state,
+                state(&a, std::slice::from_ref(&own)).state,
                 "pending",
                 "sender cannot answer"
             );
