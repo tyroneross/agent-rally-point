@@ -1068,6 +1068,12 @@ mod imp {
                     facts: to_wire_values(&facts)?,
                 }
             }
+            StoreOp::FactsByEventId { event_id } => {
+                let facts = store.facts_by_event_id(&event_id).map_err(rally_to_wire)?;
+                StoreOk::Facts {
+                    facts: to_wire_values(&facts)?,
+                }
+            }
             StoreOp::FactsPage {
                 after_seq,
                 max_bytes,

@@ -471,6 +471,7 @@ fn mutation_query(op: &StoreOp) -> Option<MutationQuery> {
         }
         StoreOp::Facts
         | StoreOp::SessionPresenceFacts { .. }
+        | StoreOp::FactsByEventId { .. }
         | StoreOp::FactsPage { .. }
         | StoreOp::RepoWideClaimLifecycleFacts
         | StoreOp::SessionFactsWithContextVersion
@@ -708,6 +709,16 @@ impl RoutedRoomStore {
         })? {
             StoreOk::Facts { facts } => facts.into_iter().map(from_value).collect(),
             _ => Err(unexpected_reply("session_presence_facts")),
+        }
+    }
+
+    /// Facts with exactly this `event_id`, looked up by the daemon.
+    pub(crate) fn facts_by_event_id(&self, event_id: &str) -> Result<Vec<Fact>> {
+        match self.dispatch(StoreOp::FactsByEventId {
+            event_id: event_id.to_string(),
+        })? {
+            StoreOk::Facts { facts } => facts.into_iter().map(from_value).collect(),
+            _ => Err(unexpected_reply("facts_by_event_id")),
         }
     }
 

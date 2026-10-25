@@ -437,21 +437,22 @@ fn locate_in_room(
     let Some(store) = open_indexed_room(room, warnings)? else {
         return Ok(None);
     };
-    for fact in store.facts()? {
-        if fact.event_id == event_id {
-            return Ok(Some(LocatedRecord {
-                source: "room".to_string(),
-                repo_root: Some(room.repo_root.clone()),
-                display_name: Some(room.display_name.clone()),
-                facts_db: Some(room.facts_db.clone()),
-                legacy_channel: None,
-                local_seq: None,
-                fact: Some(fact),
-                record: None,
-            }));
-        }
-    }
-    Ok(None)
+    // Point read through the event-id index (routed: one bounded daemon op),
+    // never the whole ledger. First match in seq order, as before.
+    Ok(store
+        .facts_by_event_id(event_id)?
+        .into_iter()
+        .next()
+        .map(|fact| LocatedRecord {
+            source: "room".to_string(),
+            repo_root: Some(room.repo_root.clone()),
+            display_name: Some(room.display_name.clone()),
+            facts_db: Some(room.facts_db.clone()),
+            legacy_channel: None,
+            local_seq: None,
+            fact: Some(fact),
+            record: None,
+        }))
 }
 
 fn recent_in_room(

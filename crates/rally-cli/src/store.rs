@@ -4635,6 +4635,17 @@ impl RoomStore {
         }
     }
 
+    /// Every fact with exactly this `event_id`, in seq order. A point read:
+    /// direct stores use the derived event-id index while it is proven
+    /// current; routed stores ask the daemon, so `rally locate` never ships
+    /// the whole ledger over the wire.
+    pub(crate) fn facts_by_event_id(&self, event_id: &str) -> Result<Vec<Fact>> {
+        match self {
+            RoomStore::Direct(d) => d.facts_by_event_id(event_id),
+            RoomStore::Routed(r) => r.facts_by_event_id(event_id),
+        }
+    }
+
     /// The lead seat as the room snapshot reports it (Stage 0: scoped read in
     /// direct mode; routed stores take the full snapshot as before).
     pub(crate) fn projected_lead(&self) -> Result<Option<String>> {
@@ -6263,6 +6274,38 @@ impl DirectRoomStore {
                 fact.kind == FactKind::Presence
                     && fact.from_session_id.as_deref() == Some(session_id)
             })
+            .collect())
+    }
+
+    /// Facts with exactly this `event_id`. Reconciles first, like
+    /// [`Self::facts`], then answers from the event-id index while the derived
+    /// database is proven canonical; otherwise filters the full fact load, so
+    /// the answer is identical either way.
+    pub(crate) fn facts_by_event_id(&self, event_id: &str) -> Result<Vec<Fact>> {
+        let room_dir = self
+            .facts_db_path
+            .parent()
+            .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
+        let _guard = acquire_room_mutation_lock(room_dir)?;
+        reconcile_segments_and_db(
+            &self.log_dir,
+            &self.archive_dir,
+            &self.facts_db_path,
+            self.warm_fact_store.is_none(),
+        )?;
+        let indexed = self.derived_db_proof().and_then(|_| {
+            let connection = derived_index::open(&self.facts_db_path).ok()?;
+            derived_index::indexes_present(&connection)
+                .then(|| derived_index::facts_by_event_id(&connection, event_id).ok())
+                .flatten()
+        });
+        let facts = match indexed {
+            Some(facts) => facts,
+            None => self.facts_under_lock()?,
+        };
+        Ok(facts
+            .into_iter()
+            .filter(|fact| fact.event_id == event_id)
             .collect())
     }
 
@@ -21354,6 +21397,51 @@ mod ledger_tests {
         );
         assert_eq!(snapshot.pending_wakes.len(), 1);
         assert_eq!(snapshot.pending_wakes[0].event_id, "wake-pending");
+    }
+
+    /// `facts_by_event_id` (the `rally locate` point read) returns exactly what
+    /// filtering the full load returns, both through the event-id index and
+    /// through the fallback when the index is gone.
+    #[test]
+    fn facts_by_event_id_matches_full_scan_with_and_without_index() {
+        let root = unique_root("facts-by-event-id");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        for i in 0..5 {
+            let mut f = make_fact(&format!("fact_pt_{i}"), FactKind::Decision, "", "s");
+            f.tool = Some("peer:1".to_string());
+            store.append_fact(&f).unwrap();
+        }
+        let expect = |id: &str| -> Vec<String> {
+            store
+                .facts()
+                .unwrap()
+                .into_iter()
+                .filter(|f| f.event_id == id)
+                .map(|f| f.event_id)
+                .collect()
+        };
+        let got = |id: &str| -> Vec<String> {
+            store
+                .facts_by_event_id(id)
+                .unwrap()
+                .into_iter()
+                .map(|f| f.event_id)
+                .collect()
+        };
+        for id in ["fact_pt_0", "fact_pt_4", "fact_absent"] {
+            assert_eq!(got(id), expect(id), "indexed lookup for {id}");
+        }
+        assert_eq!(got("fact_pt_2"), vec!["fact_pt_2".to_string()]);
+        // Drop the derived indexes: the proof fails and the fallback answers.
+        let connection = derived_index::open(&store.facts_db_path).unwrap();
+        connection
+            .execute_batch("DROP INDEX IF EXISTS rally_events_event_id;")
+            .unwrap();
+        drop(connection);
+        for id in ["fact_pt_0", "fact_pt_4", "fact_absent"] {
+            assert_eq!(got(id), expect(id), "fallback lookup for {id}");
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// Wake expiry (A2): a pending wake leaves `pending_wakes` when the work it

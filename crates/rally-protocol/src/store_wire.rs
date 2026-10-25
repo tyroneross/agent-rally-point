@@ -146,6 +146,10 @@ pub enum StoreOp {
     /// Presence facts stamped with one session id, answered as
     /// [`StoreOk::Facts`]. Scoped so a large ledger cannot overflow one reply.
     SessionPresenceFacts { session_id: String },
+    /// Every fact with this exact `event_id`, answered as [`StoreOk::Facts`]
+    /// (normally zero or one row). Point read for `rally locate`, so a lookup
+    /// never ships the whole ledger. v9.
+    FactsByEventId { event_id: String },
     /// One bounded page of the ledger: facts with `seq > after_seq` in seq
     /// order, sized to fit `max_bytes` (clamped below [`MAX_LINE_BYTES`]).
     /// Always carries at least one fact when any remain. Reply is
@@ -251,6 +255,7 @@ impl StoreOp {
             | Self::MaybeAppendReadCheckpoint { .. } => true,
             Self::Facts
             | Self::SessionPresenceFacts { .. }
+            | Self::FactsByEventId { .. }
             | Self::FactsPage { .. }
             | Self::RepoWideClaimLifecycleFacts
             | Self::SessionFactsWithContextVersion
@@ -706,6 +711,12 @@ mod tests {
             !StoreOp::FactsPage {
                 after_seq: 0,
                 max_bytes: 1
+            }
+            .is_mutating()
+        );
+        assert!(
+            !StoreOp::FactsByEventId {
+                event_id: "e".into()
             }
             .is_mutating()
         );

@@ -867,6 +867,41 @@ fn next_does_not_rewake_a_receipt_acked_artifact_every_poll() {
     assert_eq!(routed, 1, "three routed polls must coalesce to one wake");
 }
 
+/// `rally locate` answers from a point read (direct: event-id index; routed:
+/// the bounded `FactsByEventId` op). Both modes must return the same record
+/// for a hit and the same empty answer for a miss.
+#[test]
+fn locate_is_identical_direct_and_routed_for_hit_and_miss() {
+    let room = Room::new("locate-parity");
+    let id = room.say_risk("peer-one", "find me later");
+    seed_plain(&room);
+    let direct_hit = room.json(&["locate", &id, "--json"]);
+    let direct_miss = room.json(&["locate", "fact_absent_0000", "--json"]);
+    assert_eq!(
+        direct_hit["data"]["locate"]["located"]["fact"]["event_id"],
+        id.as_str(),
+        "premise: direct locate finds the fact: {direct_hit}"
+    );
+    assert!(
+        direct_miss["data"]["locate"]["located"].is_null(),
+        "{direct_miss}"
+    );
+
+    let mut daemon = Daemon::start(&room)
+        .unwrap_or_else(|e| panic!("routed locate control requires rallyd: {e}"));
+    let routed_hit = room.json(&["locate", &id, "--json"]);
+    let routed_miss = room.json(&["locate", "fact_absent_0000", "--json"]);
+    daemon.stop();
+    assert_eq!(
+        routed_hit, direct_hit,
+        "routed locate hit drifted from direct"
+    );
+    assert_eq!(
+        routed_miss, direct_miss,
+        "routed locate miss drifted from direct"
+    );
+}
+
 /// `status --global` consumes `last_activity_ts`; both store modes must report
 /// the timestamp of the ledger's highest-seq fact rather than a default null.
 #[test]
