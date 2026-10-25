@@ -7974,17 +7974,9 @@ mod derived_index {
         )
     }
 
-    /// One page of `rally recent` candidates, newest first by
-    /// (`created_at` text desc, canonical seq desc) — the same order the
-    /// caller sorts by. Narrows on the payload's `kind`/`tool`/`target` only;
-    /// time bounds, retractions and the archive floor are re-checked by the
-    /// caller. Rows come back in page order (not re-sorted by seq).
-    pub(super) fn recent_page(
-        connection: &Connection,
-        query: &super::RecentQuery,
-        offset: usize,
-        page: usize,
-    ) -> Result<Vec<Fact>> {
+    /// WHERE clause and bound values for one `rally recent` page; split out
+    /// so tests can assert which SQL narrowing is actually emitted.
+    pub(super) fn recent_where(query: &super::RecentQuery) -> (String, Vec<String>) {
         let mut clauses: Vec<String> = Vec::new();
         let mut values: Vec<String> = Vec::new();
         let placeholders = |n: usize, start: usize| {
@@ -7993,17 +7985,19 @@ mod derived_index {
                 .collect::<Vec<_>>()
                 .join(",")
         };
-        // Every on-disk spelling of each requested kind. A kind that does
-        // not parse, or parses to `unknown` (raw rows like `--help` project
-        // to it), gets no SQL clause: the caller's predicate filters it.
+        // Every on-disk spelling of each requested kind (as typed, plus the
+        // resolved kind's name with `-`/`_` swapped). A name that resolves to
+        // `unknown` gets no SQL clause, because raw rows with unparseable
+        // kinds (e.g. `--help`) project to it: the caller's predicate filters.
         let spellings = |kinds: &[String]| -> Option<Vec<String>> {
             let mut out = Vec::new();
             for k in kinds {
-                let parsed = super::FactKind::parse(k)?;
-                if parsed == super::FactKind::Unknown {
+                let resolved = super::kind_named(k);
+                if resolved == Some(super::FactKind::Unknown) {
                     return None;
                 }
-                for name in [k.as_str(), parsed.as_str()] {
+                let canonical = resolved.as_ref().map_or(k.as_str(), |kind| kind.as_str());
+                for name in [k.as_str(), canonical] {
                     for variant in [
                         name.to_string(),
                         name.replace('-', "_"),
@@ -8106,6 +8100,21 @@ mod derived_index {
         } else {
             format!("WHERE {}", clauses.join(" AND "))
         };
+        (filter, values)
+    }
+
+    /// One page of `rally recent` candidates, newest first by
+    /// (`created_at` text desc, canonical seq desc) — the same order the
+    /// caller sorts by. Narrows on the payload's `kind`/`tool`/`target` only;
+    /// time bounds, retractions and the archive floor are re-checked by the
+    /// caller. Rows come back in page order (not re-sorted by seq).
+    pub(super) fn recent_page(
+        connection: &Connection,
+        query: &super::RecentQuery,
+        offset: usize,
+        page: usize,
+    ) -> Result<Vec<Fact>> {
+        let (filter, values) = recent_where(query);
         let sql = format!(
             "SELECT sequence_number, payload FROM events {filter} \
              ORDER BY json_extract(payload,'$.created_at') DESC, {SEQ_EXPR} DESC \
@@ -8719,6 +8728,21 @@ pub(crate) fn select_reply_facts(candidates: Vec<Fact>, event_id: &str) -> Vec<F
     out
 }
 
+/// The fact kind a `--kind` name means, matching every variant in
+/// [`FactKind::ALL`] while ignoring `-` / `_` / `.` differences, so
+/// `backlog-item`, `backlog_item`, `claim.renewed` all resolve. Deliberately
+/// NOT `FactKind::parse`: that is the write-side parser and rejects kinds a
+/// caller may not author (`claim.renewed`, `session.closed`), which are
+/// exactly the kinds a reader filters on.
+pub(crate) fn kind_named(name: &str) -> Option<FactKind> {
+    let norm = |s: &str| s.replace(['-', '.'], "_").to_ascii_lowercase();
+    let wanted = norm(name);
+    FactKind::ALL
+        .iter()
+        .find(|kind| norm(kind.as_str()) == wanted)
+        .cloned()
+}
+
 /// Does `fact` belong in a `rally recent` listing for `query`? One predicate
 /// for the indexed and the full-load path. Kind/tool/target compare exactly;
 /// `since`/`until` compare parsed instants and drop a fact whose `created_at`
@@ -8731,11 +8755,9 @@ pub(crate) fn recent_fact_matches(
     retracted: &BTreeSet<String>,
 ) -> bool {
     // Compare canonical kinds: `backlog_item` (ledger) and `backlog-item`
-    // (as_str) are the same kind, as `FactKind::parse` already accepts.
+    // (as_str) are the same kind. See [`kind_named`].
     let names = |k: &String| {
-        FactKind::parse(k).map_or(k.as_str() == fact.kind.as_str(), |parsed| {
-            parsed == fact.kind
-        })
+        kind_named(k).map_or(k.as_str() == fact.kind.as_str(), |kind| kind == fact.kind)
     };
     if !query.kinds.is_empty() && !query.kinds.iter().any(names) {
         return false;
@@ -22331,6 +22353,48 @@ mod ledger_tests {
             let plain = f("a2", FactKind::Artifact, 1, "claude");
             assert!(project_reply_state(&plain, &[], &BTreeSet::new()).is_none());
         }
+    }
+
+    /// The SQL narrowing `recent` emits: the default bookkeeping exclusion
+    /// must reach SQL (a row-equality test cannot see this, because the
+    /// predicate filters the same rows either way — only speed changes).
+    #[test]
+    fn recent_where_emits_kind_narrowing_for_read_side_kind_names() {
+        assert_eq!(kind_named("claim.renewed"), Some(FactKind::ClaimRenewed));
+        assert_eq!(kind_named("backlog_item"), Some(FactKind::BacklogItem));
+        assert_eq!(kind_named("Backlog-Item"), Some(FactKind::BacklogItem));
+        assert_eq!(kind_named("no-such-kind"), None);
+        let default_exclude = RecentQuery {
+            exclude_kinds: vec!["presence".into(), "read".into(), "claim.renewed".into()],
+            limit: 20,
+            ..RecentQuery::default()
+        };
+        let (sql, values) = derived_index::recent_where(&default_exclude);
+        assert!(
+            sql.contains("NOT IN"),
+            "bookkeeping exclusion must reach SQL: {sql}"
+        );
+        for name in ["presence", "read", "claim.renewed"] {
+            assert!(values.iter().any(|v| v == name), "{name} in {values:?}");
+        }
+        let backlog = RecentQuery {
+            kinds: vec!["backlog-item".into()],
+            limit: 20,
+            ..RecentQuery::default()
+        };
+        let (sql, values) = derived_index::recent_where(&backlog);
+        assert!(sql.contains(" IN ("), "{sql}");
+        assert!(values.iter().any(|v| v == "backlog_item"), "{values:?}");
+        let unknown = RecentQuery {
+            kinds: vec!["unknown".into()],
+            limit: 20,
+            ..RecentQuery::default()
+        };
+        let (sql, _) = derived_index::recent_where(&unknown);
+        assert!(
+            !sql.contains("$.kind"),
+            "unknown gets no SQL kind clause: {sql}"
+        );
     }
 
     /// Wake expiry (A2): a pending wake leaves `pending_wakes` when the work it
