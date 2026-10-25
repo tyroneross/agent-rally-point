@@ -8348,6 +8348,95 @@ fn handoff_is_closed(handoff: &Fact, facts: &[Fact]) -> bool {
         .any(|closer| fact_closes_handoff(handoff, closer))
 }
 
+/// Default age after which a pending wake intent expires (24 h). See
+/// `CoordinationConfig::wake_ttl_secs`.
+pub(crate) const DEFAULT_WAKE_TTL_SECS: i64 = 24 * 60 * 60;
+
+/// A wake intent older than `ttl_secs` is no longer pending. `0` disables age
+/// expiry. A malformed `created_at` reads as age 0 and a future one as a
+/// negative age (`fact_age_secs`), so neither expires by age: a bad clock
+/// never silently drops a wake. Target-closed expiry still applies to them.
+///
+/// Scope: this changes `pending_wakes` eligibility only — the list `next`
+/// coalesces against. Raw wake facts, their delivery status, and the DAG /
+/// wake-due projections read the ledger directly and are unchanged.
+fn wake_is_expired(wake: &Fact, ttl_secs: i64, now_secs: i64) -> bool {
+    ttl_secs > 0 && fact_age_secs(wake, now_secs) > ttl_secs
+}
+
+/// Is the work a wake points at (`wake.ref`) already closed?
+///
+/// A wake exists so `next` does not append a duplicate intent while it keeps
+/// offering the same item (`append_next_wake_intent`). So the target counts as
+/// closed only when it is absent from EVERY bucket `next` builds candidates
+/// from — `open_handoffs`, `open_obligations`, `unconsumed_artifacts`,
+/// `active_claims`, `active_blockers` — of this same fold. Each bucket keeps its
+/// own existing closing rule; nothing here redefines one. Using one bucket's
+/// rule alone is wrong: a receipt-acked artifact leaves `open_obligations` but
+/// stays in `unconsumed_artifacts`, so `next` keeps offering it, and dropping
+/// its wake would make every poll append a new one.
+///
+/// Guarantees, stated exactly:
+/// * a wake is never dropped by this rule while `next` can still target its
+///   item; it may be KEPT for an item `next` no longer offers (conservative);
+/// * a retracted target closes its wakes;
+/// * a wake with no `ref`, an unknown id, or a target of another kind
+///   (risk, backlog item, ...) is never closed here.
+///
+/// The age limit ([`wake_is_expired`]) is separate and does drop wakes for
+/// items that are still open: `next` then writes one fresh wake per item per
+/// `wake_ttl_secs`, a bounded re-wake rather than a pile-up.
+struct WakeTargetClosure<'a> {
+    targets: std::collections::HashMap<&'a str, &'a Fact>,
+    retracted: &'a BTreeSet<String>,
+    open_ids: BTreeSet<&'a str>,
+}
+
+impl<'a> WakeTargetClosure<'a> {
+    fn new(
+        facts: &'a [Fact],
+        retracted: &'a BTreeSet<String>,
+        next_buckets: [&'a [Fact]; 5],
+    ) -> Self {
+        let wanted = facts
+            .iter()
+            .filter(|f| f.kind == "wake")
+            .filter_map(|f| f.ref_id.as_deref())
+            .collect::<BTreeSet<_>>();
+        let targets = facts
+            .iter()
+            .filter(|f| wanted.contains(f.event_id.as_str()))
+            .map(|f| (f.event_id.as_str(), f))
+            .collect();
+        let open_ids = next_buckets
+            .iter()
+            .flat_map(|bucket| bucket.iter())
+            .map(|f| f.event_id.as_str())
+            .collect();
+        Self {
+            targets,
+            retracted,
+            open_ids,
+        }
+    }
+
+    fn target_is_closed(&self, wake: &Fact) -> bool {
+        let Some(target_id) = wake.ref_id.as_deref().filter(|r| !r.is_empty()) else {
+            return false;
+        };
+        if self.retracted.contains(target_id) {
+            return true;
+        }
+        let Some(target) = self.targets.get(target_id) else {
+            return false;
+        };
+        matches!(
+            target.kind,
+            FactKind::Handoff | FactKind::Claim | FactKind::Blocker | FactKind::Artifact
+        ) && !self.open_ids.contains(target_id)
+    }
+}
+
 /// [`handoff_is_closed`] for every handoff of one fold, in O(facts) instead of
 /// O(handoffs x facts). A closer must name the handoff in `ref`
 /// ([`fact_closes_handoff`]), so candidates are bucketed by `ref` once and each
@@ -9277,13 +9366,6 @@ fn snapshot_from_facts_with_policy_at(
         })
         .collect::<Vec<_>>();
     sort_by_recency(&mut resolved_unverified, now_secs, half_life_secs);
-    let pending_wakes = facts
-        .iter()
-        .filter(|fact| fact.kind == "wake")
-        .filter(|fact| fact.status.as_deref() == Some("pending"))
-        .filter(|fact| !resolved.contains(&fact.event_id))
-        .cloned()
-        .collect::<Vec<_>>();
     // Recency-decay buckets: order by weight (fresh first), drop facts that
     // have decayed below the archive floor into `stale_facts`.
     let mut stale_facts: Vec<Fact> = Vec::new();
@@ -9400,6 +9482,31 @@ fn snapshot_from_facts_with_policy_at(
         .filter(|f| !consumed_refs.contains(&f.event_id))
         .cloned()
         .collect::<Vec<_>>();
+    // Computed after every bucket `next` builds candidates from, because a
+    // wake's target counts as closed only once it is absent from all of them
+    // (see `WakeTargetClosure`).
+    let pending_wakes = {
+        let closed = WakeTargetClosure::new(
+            facts,
+            &retracted,
+            [
+                open_handoffs.as_slice(),
+                open_obligations.as_slice(),
+                unconsumed_artifacts.as_slice(),
+                active_claims.as_slice(),
+                active_blockers.as_slice(),
+            ],
+        );
+        facts
+            .iter()
+            .filter(|fact| fact.kind == "wake")
+            .filter(|fact| fact.status.as_deref() == Some("pending"))
+            .filter(|fact| !resolved.contains(&fact.event_id))
+            .filter(|fact| !closed.target_is_closed(fact))
+            .filter(|fact| !wake_is_expired(fact, coord.wake_ttl_secs, now_secs))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
 
     // --- Presence projection ---
     // Collect the highest-seq fact per tool (any kind counts; presence is
@@ -13050,7 +13157,11 @@ const SNAPSHOT_CACHE_FILENAME: &str = "snapshot.cache.json";
 /// Bumped 7 -> 8 when the room p95 stopped counting a sender's close of its
 /// own posting (per-repo threshold, 2026-10-19). A generation-7 cache would
 /// keep reporting the biased-low value.
-const SNAPSHOT_CACHE_GENERATION: u32 = 8;
+///
+/// Bumped 8 -> 9 when `pending_wakes` started expiring by closed target and
+/// `wake_ttl_secs` age. A generation-8 cache would keep serving every stale
+/// wake the new fold drops.
+const SNAPSHOT_CACHE_GENERATION: u32 = 9;
 
 /// Snapshot projected from inputs and a freshness proof captured together under
 /// one room mutation lock. Pure projection runs after releasing that lock.
@@ -13134,6 +13245,8 @@ struct SnapshotProjectionPolicyFingerprint {
     default_cadence_secs: i64,
     miss_multiplier: i64,
     grace_secs: i64,
+    #[serde(default)]
+    wake_ttl_secs: i64,
 }
 
 impl SnapshotProjectionPolicyFingerprint {
@@ -13144,6 +13257,7 @@ impl SnapshotProjectionPolicyFingerprint {
             default_cadence_secs: coord.default_cadence_secs,
             miss_multiplier: coord.miss_multiplier,
             grace_secs: coord.grace_secs,
+            wake_ttl_secs: coord.wake_ttl_secs,
         }
     }
 }
@@ -21247,6 +21361,218 @@ mod ledger_tests {
         );
         assert_eq!(snapshot.pending_wakes.len(), 1);
         assert_eq!(snapshot.pending_wakes[0].event_id, "wake-pending");
+    }
+
+    /// Wake expiry (A2): a pending wake leaves `pending_wakes` when the work it
+    /// points at is closed by that kind's existing rule, when its target is
+    /// retracted, or when it is older than `wake_ttl_secs`.
+    mod wake_expiry {
+        use super::*;
+
+        const NOW: i64 = 1_800_000_000;
+
+        fn at(secs_ago: i64) -> String {
+            chrono::DateTime::from_timestamp(NOW - secs_ago, 0)
+                .unwrap()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        }
+
+        fn fact(id: &str, kind: FactKind, seq: i64) -> Fact {
+            let mut f = make_fact(id, kind, "", "s");
+            f.seq = seq;
+            f.created_at = at(60);
+            f
+        }
+
+        fn wake(id: &str, target_ref: Option<&str>, seq: i64) -> Fact {
+            let mut w = fact(id, FactKind::Wake, seq);
+            w.status = Some("pending".to_string());
+            w.target = Some("codex".to_string());
+            w.ref_id = target_ref.map(str::to_string);
+            w
+        }
+
+        fn closer(id: &str, kind: FactKind, refs: &str, tool: &str, seq: i64) -> Fact {
+            let mut c = fact(id, kind, seq);
+            c.ref_id = Some(refs.to_string());
+            c.tool = Some(tool.to_string());
+            c
+        }
+
+        fn pending(facts: &[Fact], ttl: i64) -> Vec<String> {
+            let coord = crate::hooks_config::CoordinationConfig {
+                wake_ttl_secs: ttl,
+                ..Default::default()
+            };
+            snapshot_from_facts_with_policy_at(facts, &coord, false, NOW)
+                .pending_wakes
+                .into_iter()
+                .map(|w| w.event_id)
+                .collect()
+        }
+
+        const DAY: i64 = 24 * 60 * 60;
+
+        #[test]
+        fn open_handoff_keeps_wake_and_target_resolve_closes_it() {
+            let mut h = fact("h1", FactKind::Handoff, 1);
+            h.target = Some("codex".to_string());
+            let w = wake("w1", Some("h1"), 2);
+            assert_eq!(pending(&[h.clone(), w.clone()], DAY), vec!["w1"]);
+            let done = closer("r1", FactKind::Resolve, "h1", "codex", 3);
+            assert!(pending(&[h, w, done], DAY).is_empty());
+        }
+
+        /// A broadcast handoff is not an addressed obligation, so only the
+        /// `open_handoffs` predicate decides it. Without this case no test
+        /// reaches the handoff arm (addressed handoffs are settled by the
+        /// obligation check first).
+        #[test]
+        fn broadcast_handoff_wake_follows_the_open_handoffs_rule() {
+            let h = fact("h1", FactKind::Handoff, 1);
+            let w = wake("w1", Some("h1"), 2);
+            assert_eq!(pending(&[h.clone(), w.clone()], DAY), vec!["w1"]);
+            let mut sibling = closer("r0", FactKind::Resolve, "h1", "anyone", 3);
+            sibling.seq = 0; // precedes the handoff: not a closer
+            assert_eq!(pending(&[sibling, h.clone(), w.clone()], DAY), vec!["w1"]);
+            let done = closer("r1", FactKind::Resolve, "h1", "anyone", 3);
+            assert!(pending(&[h, w, done], DAY).is_empty());
+        }
+
+        #[test]
+        fn closer_from_the_wrong_receiver_session_does_not_close_the_wake() {
+            let mut h = fact("h1", FactKind::Handoff, 1);
+            h.target = Some("codex".to_string());
+            let w = wake("w1", Some("h1"), 2);
+            let mut wrong = closer("r1", FactKind::Resolve, "h1", "claude", 3);
+            wrong.from_session_id = Some("sess-claude".to_string());
+            assert_eq!(pending(&[h, w, wrong], DAY), vec!["w1"]);
+        }
+
+        #[test]
+        fn closer_older_than_the_handoff_does_not_close_the_wake() {
+            let mut h = fact("h1", FactKind::Handoff, 5);
+            h.target = Some("codex".to_string());
+            let early = closer("r1", FactKind::Resolve, "h1", "codex", 2);
+            let w = wake("w1", Some("h1"), 6);
+            assert_eq!(pending(&[early, h, w], DAY), vec!["w1"]);
+        }
+
+        #[test]
+        fn claim_wake_follows_claim_activity() {
+            let mut c = fact("c1", FactKind::Claim, 1);
+            c.scope = vec!["file:src/a.rs".to_string()];
+            let w = wake("w1", Some("c1"), 2);
+            assert_eq!(pending(&[c.clone(), w.clone()], DAY), vec!["w1"]);
+            let rel = closer("rel1", FactKind::Release, "c1", "test", 3);
+            assert!(pending(&[c, w, rel], DAY).is_empty());
+        }
+
+        #[test]
+        fn blocker_wake_closes_when_blocker_resolves() {
+            let b = fact("b1", FactKind::Blocker, 1);
+            let w = wake("w1", Some("b1"), 2);
+            assert_eq!(pending(&[b.clone(), w.clone()], DAY), vec!["w1"]);
+            let r = closer("r1", FactKind::Resolve, "b1", "test", 3);
+            assert!(pending(&[b, w, r], DAY).is_empty());
+        }
+
+        #[test]
+        fn unanswered_requires_ack_artifact_keeps_wake_even_if_resolved_by_sender() {
+            let mut a = fact("a1", FactKind::Artifact, 1);
+            a.target = Some("codex".to_string());
+            a.tool = Some("claude".to_string());
+            a.evidence = vec!["requires_ack".to_string()];
+            let w = wake("w1", Some("a1"), 2);
+            // The SENDER resolving its own artifact does not answer the
+            // obligation, so the item stays open and so does its wake.
+            let own = closer("r1", FactKind::Resolve, "a1", "claude", 3);
+            assert_eq!(pending(&[a.clone(), w.clone(), own], DAY), vec!["w1"]);
+        }
+
+        /// Audit finding F1: a receipt answers the obligation but does not
+        /// consume the artifact, so `next` still offers `review_artifact` on it.
+        /// The wake must stay, or every poll appends a fresh one.
+        #[test]
+        fn receipt_acked_artifact_keeps_wake_while_next_still_offers_it() {
+            let mut a = fact("a1", FactKind::Artifact, 1);
+            a.target = Some("codex".to_string());
+            a.tool = Some("claude".to_string());
+            a.evidence = vec!["requires_ack".to_string()];
+            let w = wake("w1", Some("a1"), 2);
+            let receipt = closer("r1", FactKind::Receipt, "a1", "codex", 3);
+            let facts = [a.clone(), w.clone(), receipt.clone()];
+            let coord = crate::hooks_config::CoordinationConfig::default();
+            let snap = snapshot_from_facts_with_policy_at(&facts, &coord, false, NOW);
+            assert!(
+                snap.unconsumed_artifacts.iter().any(|f| f.event_id == "a1"),
+                "premise: a receipt leaves the artifact offerable by next"
+            );
+            assert_eq!(pending(&facts, DAY), vec!["w1"]);
+            // A resolve by the receiver consumes it: next stops offering it.
+            let consumed = closer("r2", FactKind::Resolve, "a1", "codex", 4);
+            assert!(pending(&[a, w, receipt, consumed], DAY).is_empty());
+        }
+
+        #[test]
+        fn retracted_target_closes_wake_and_retracted_closer_restores_it() {
+            let b = fact("b1", FactKind::Blocker, 1);
+            let w = wake("w1", Some("b1"), 2);
+            let mut retract_target = fact("x1", FactKind::Artifact, 3);
+            retract_target.subject = "retract: b1".to_string();
+            assert!(pending(&[b.clone(), w.clone(), retract_target], DAY).is_empty());
+
+            let r = closer("r1", FactKind::Resolve, "b1", "test", 3);
+            let mut retract_closer = fact("x2", FactKind::Artifact, 4);
+            retract_closer.subject = "retract: r1".to_string();
+            assert_eq!(pending(&[b, w, r, retract_closer], DAY), vec!["w1"]);
+        }
+
+        #[test]
+        fn missing_or_unknown_target_is_left_to_the_age_limit() {
+            let no_ref = wake("w1", None, 1);
+            let unknown = wake("w2", Some("fact_not_here"), 2);
+            assert_eq!(pending(&[no_ref, unknown], DAY), vec!["w1", "w2"]);
+        }
+
+        #[test]
+        fn ttl_expires_old_wakes_at_the_boundary_and_zero_disables_it() {
+            let mut at_limit = wake("w1", None, 1);
+            at_limit.created_at = at(DAY);
+            let mut past = wake("w2", None, 2);
+            past.created_at = at(DAY + 1);
+            let facts = [at_limit, past];
+            assert_eq!(pending(&facts, DAY), vec!["w1"], "age == ttl stays pending");
+            assert_eq!(
+                pending(&facts, 0),
+                vec!["w1", "w2"],
+                "ttl 0 disables age expiry"
+            );
+        }
+
+        #[test]
+        fn future_or_malformed_timestamps_never_expire_by_age() {
+            let mut future = wake("w1", None, 1);
+            future.created_at = at(-DAY);
+            let mut garbage = wake("w2", None, 2);
+            garbage.created_at = "not-a-time".to_string();
+            assert_eq!(pending(&[future, garbage], 60), vec!["w1", "w2"]);
+        }
+
+        #[test]
+        fn expiry_needs_no_new_writes_only_a_later_clock() {
+            let mut w = wake("w1", None, 1);
+            w.created_at = at(60);
+            let coord = crate::hooks_config::CoordinationConfig {
+                wake_ttl_secs: DAY,
+                ..Default::default()
+            };
+            let facts = [w];
+            let now_view = snapshot_from_facts_with_policy_at(&facts, &coord, false, NOW);
+            let later_view = snapshot_from_facts_with_policy_at(&facts, &coord, false, NOW + DAY);
+            assert_eq!(now_view.pending_wakes.len(), 1);
+            assert!(later_view.pending_wakes.is_empty());
+        }
     }
 
     #[test]

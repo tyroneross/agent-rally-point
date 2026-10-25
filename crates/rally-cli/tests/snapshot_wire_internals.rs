@@ -785,6 +785,88 @@ fn routed_calls_survive_more_room_wakes_than_the_wire_bound() {
     );
 }
 
+/// Wake expiry must not drop a wake while `next` still offers its item.
+///
+/// A receipt answers a requires-ack artifact's obligation but does not consume
+/// the artifact, so `next` keeps offering `review_artifact` on it. If the wake
+/// expired on the receipt, every poll would append a fresh wake. Runs the real
+/// `next` in both store modes and counts wakes in the ledger.
+#[test]
+fn next_does_not_rewake_a_receipt_acked_artifact_every_poll() {
+    fn run(room: &Room) -> usize {
+        let v = room.json(&[
+            "say",
+            "artifact",
+            "--tool",
+            "peer-one",
+            "--target",
+            "waker-peer",
+            "--evidence",
+            "requires_ack",
+            "--subject",
+            "please review this",
+            "--json",
+        ]);
+        assert_eq!(v["ok"], Value::Bool(true), "artifact: {v}");
+        let artifact = v["data"]["say"]["fact"]["event_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("artifact id: {v}"))
+            .to_string();
+        let v = room.json(&[
+            "say",
+            "receipt",
+            "--tool",
+            "waker-peer",
+            "--ref",
+            &artifact,
+            "--subject",
+            "got it",
+            "--json",
+        ]);
+        assert_eq!(v["ok"], Value::Bool(true), "receipt: {v}");
+        let mut actions = Vec::new();
+        for _ in 0..3 {
+            let v = room.json(&["next", "--tool", "waker-peer", "--json"]);
+            assert_eq!(v["ok"], Value::Bool(true), "next: {v}");
+            actions.push(v["data"]["next"]["action"].clone());
+            // Premise: next is offering THIS artifact, so the wake it writes
+            // (or coalesces into) points at the receipt-acked artifact.
+            assert_eq!(v["data"]["next"]["action"], "review_artifact", "next: {v}");
+            assert_eq!(
+                v["data"]["next"]["target_event_id"],
+                artifact.as_str(),
+                "next: {v}"
+            );
+        }
+        let wakes = room
+            .ledger_facts()
+            .iter()
+            .filter(|f| f["kind"] == "wake" && f["target"] == "waker-peer")
+            .count();
+        assert!(
+            wakes >= 1,
+            "premise: next offered the artifact and woke ({actions:?})"
+        );
+        wakes
+    }
+
+    let direct_room = Room::new("rewake-direct");
+    seed_plain(&direct_room);
+    assert_eq!(
+        run(&direct_room),
+        1,
+        "three direct polls must coalesce to one wake"
+    );
+
+    let routed_room = Room::new("rewake-routed");
+    seed_plain(&routed_room);
+    let mut daemon = Daemon::start(&routed_room)
+        .unwrap_or_else(|e| panic!("routed rewake control requires rallyd: {e}"));
+    let routed = run(&routed_room);
+    daemon.stop();
+    assert_eq!(routed, 1, "three routed polls must coalesce to one wake");
+}
+
 /// `status --global` consumes `last_activity_ts`; both store modes must report
 /// the timestamp of the ledger's highest-seq fact rather than a default null.
 #[test]

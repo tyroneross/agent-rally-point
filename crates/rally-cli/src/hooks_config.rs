@@ -387,6 +387,12 @@ pub(crate) struct CoordinationConfig {
     /// `rally enter`. `0` disables auto-reap, leaving
     /// `rally doctor --reap-stale --apply` as the only caller.
     pub(crate) auto_reap_interval_secs: i64,
+    /// How long a wake intent stays pending before it expires from
+    /// `pending_wakes`. `0` disables age expiry (target-closed expiry still
+    /// applies). Read from the REPO config file only — no user config, no env
+    /// override — so a daemon and the CLI serving the same room project
+    /// identical wakes regardless of their HOME or environment.
+    pub(crate) wake_ttl_secs: i64,
 }
 
 impl Default for CoordinationConfig {
@@ -405,6 +411,7 @@ impl Default for CoordinationConfig {
             stale_wait_secs: crate::next::DEFAULT_STALE_WAIT_SECS,
             handoff_expiry_secs: crate::reaper::DEFAULT_HANDOFF_EXPIRY_SECS,
             auto_reap_interval_secs: crate::reaper::DEFAULT_AUTO_REAP_INTERVAL_SECS,
+            wake_ttl_secs: crate::store::DEFAULT_WAKE_TTL_SECS,
         }
     }
 }
@@ -488,6 +495,12 @@ fn coordination_from_value(value: &Value, into: &mut CoordinationConfig) {
     {
         into.auto_reap_interval_secs = v;
     }
+    // Zero disables wake age expiry.
+    if let Some(v) = coord.get("wake_ttl_secs").and_then(Value::as_i64)
+        && v >= 0
+    {
+        into.wake_ttl_secs = v;
+    }
     let Some(rel) = coord.get("relevance").and_then(Value::as_object) else {
         return;
     };
@@ -540,6 +553,11 @@ pub(crate) fn resolve_coordination(repo_root: &Path) -> Result<CoordinationConfi
         let v = read_config_value(&user_path)?;
         coordination_from_value(&v, &mut cfg);
     }
+    // `wake_ttl_secs` is REPO-scoped only. The user config path follows the
+    // process's HOME, and a daemon and a CLI serving the same room can run with
+    // different HOMEs; a user-level TTL would then project different pending
+    // wakes in direct and routed mode. Both read the same repo file.
+    cfg.wake_ttl_secs = crate::store::DEFAULT_WAKE_TTL_SECS;
     let repo_value = read_config_value(&repo_config_path(repo_root))?;
     coordination_from_value(&repo_value, &mut cfg);
 
@@ -866,5 +884,75 @@ mod coordination_tests {
         let cfg = resolve_coordination(&dir).unwrap();
         assert_eq!(cfg, CoordinationConfig::default());
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod wake_ttl_config_tests {
+    use super::*;
+
+    /// A user-level TTL must be ignored: the daemon and the CLI may run with
+    /// different HOMEs, and only the repo file is guaranteed to be shared.
+    #[test]
+    fn wake_ttl_ignores_user_config_and_reads_the_repo_file() {
+        let _g = crate::PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "rally-wake-ttl-scope-{}-{}",
+            std::process::id(),
+            crate::store::DEFAULT_WAKE_TTL_SECS
+        ));
+        let home = dir.join("home");
+        fs::create_dir_all(home.join(".config/rally")).unwrap();
+        fs::create_dir_all(dir.join(".rally")).unwrap();
+        fs::write(
+            home.join(".config/rally/config.json"),
+            r#"{"coordination":{"wake_ttl_secs":0}}"#,
+        )
+        .unwrap();
+        let prev = env::var("HOME").ok();
+        unsafe { env::set_var("HOME", &home) };
+        let user_only = resolve_coordination(&dir).map(|c| c.wake_ttl_secs);
+        fs::write(
+            dir.join(".rally").join("config.json"),
+            r#"{"coordination":{"wake_ttl_secs":7200}}"#,
+        )
+        .unwrap();
+        let with_repo = resolve_coordination(&dir).map(|c| c.wake_ttl_secs);
+        unsafe {
+            match prev {
+                Some(v) => env::set_var("HOME", v),
+                None => env::remove_var("HOME"),
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            user_only.unwrap(),
+            crate::store::DEFAULT_WAKE_TTL_SECS,
+            "user config must not set the wake TTL"
+        );
+        assert_eq!(with_repo.unwrap(), 7200, "repo config sets the wake TTL");
+    }
+
+    #[test]
+    fn wake_ttl_reads_from_config_with_zero_allowed_and_negative_ignored() {
+        let mut cfg = CoordinationConfig::default();
+        assert_eq!(cfg.wake_ttl_secs, crate::store::DEFAULT_WAKE_TTL_SECS);
+        coordination_from_value(
+            &serde_json::json!({"coordination": {"wake_ttl_secs": 3600}}),
+            &mut cfg,
+        );
+        assert_eq!(cfg.wake_ttl_secs, 3600);
+        coordination_from_value(
+            &serde_json::json!({"coordination": {"wake_ttl_secs": 0}}),
+            &mut cfg,
+        );
+        assert_eq!(cfg.wake_ttl_secs, 0, "0 disables age expiry");
+        coordination_from_value(
+            &serde_json::json!({"coordination": {"wake_ttl_secs": -5}}),
+            &mut cfg,
+        );
+        assert_eq!(cfg.wake_ttl_secs, 0, "a negative value is ignored");
     }
 }
