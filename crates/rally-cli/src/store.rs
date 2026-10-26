@@ -4646,11 +4646,6 @@ impl RoomStore {
         }
     }
 
-    /// The newest facts matching `query` (`rally recent`), newest first, at
-    /// most `query.limit`. Retractions and the archive floor are applied
-    /// BEFORE the limit, so a filtered page is never underfilled by rows the
-    /// caller would have dropped. Routed stores ask the daemon for the
-    /// bounded result instead of shipping the ledger.
     /// Every fact of the named kinds (see [`select_facts_of_kinds`]). Routed
     /// stores ask the daemon; an oversized reply falls back to the paged
     /// full load with the same selection.
@@ -4695,6 +4690,11 @@ impl RoomStore {
         }
     }
 
+    /// The newest facts matching `query` (`rally recent`), newest first, at
+    /// most `query.limit`. Retractions and the archive floor are applied
+    /// BEFORE the limit, so a filtered page is never underfilled by rows the
+    /// caller would have dropped. Routed stores ask the daemon for the
+    /// bounded result instead of shipping the ledger.
     pub(crate) fn recent_facts(&self, query: &RecentQuery) -> Result<Vec<Fact>> {
         match self {
             RoomStore::Direct(d) => d.recent_facts(query),

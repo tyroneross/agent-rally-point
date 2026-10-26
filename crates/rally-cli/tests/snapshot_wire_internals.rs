@@ -1035,6 +1035,62 @@ fn recent_filters_are_identical_direct_and_routed() {
     }
 }
 
+/// Append managed-session facts (and a presence per tool) to the live
+/// segment, cloned from a real ledger line, then rebuild the projection.
+/// Launching real sessions needs tmux; the ledger shape is what the
+/// session list reads.
+fn seed_managed_sessions(room: &Room, tools: &[&str]) {
+    let seg = room
+        .segments()
+        .into_iter()
+        .next()
+        .expect("premise: a live segment");
+    let text = fs::read_to_string(&seg).unwrap();
+    let template: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    let mut seq = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| v["seq"].as_i64())
+        .max()
+        .unwrap();
+    let mut extra = String::new();
+    for (i, tool) in tools.iter().enumerate() {
+        for kind in ["session", "presence"] {
+            seq += 1;
+            let mut v = template.clone();
+            v["seq"] = Value::from(seq);
+            v["event_type"] = Value::from(kind);
+            let p = &mut v["payload"];
+            p["seq"] = Value::from(seq);
+            p["kind"] = Value::from(kind);
+            p["event_id"] = Value::from(format!("fact_seed_{kind}_{i}"));
+            p["tool"] = Value::from(*tool);
+            p["subject"] = Value::from(format!("{kind} for {tool}"));
+            p["ref"] = Value::Null;
+            p["target"] = Value::Null;
+            p["status"] = Value::from("active");
+            p["created_at"] = Value::from(rfc3339_secs_ago(5));
+            if kind == "session" {
+                p["session"] = serde_json::json!({
+                    "session_id": format!("sess-seed-{i}"),
+                    "name": format!("seed-{i}"),
+                    "agent": "claude",
+                    "tool": tool,
+                    "backend": "tmux",
+                    "cwd": "/tmp",
+                    "target": format!("seed:{i}"),
+                    "daemon_registered": false,
+                });
+            }
+            extra.push_str(&serde_json::to_string(&v).unwrap());
+            extra.push('\n');
+        }
+    }
+    let mut f = fs::OpenOptions::new().append(true).open(&seg).unwrap();
+    std::io::Write::write_all(&mut f, extra.as_bytes()).unwrap();
+    room.reimport_segments();
+}
+
 /// D0 narrow reads: `backlog list` (FactsOfKinds) and `sessions`
 /// (SessionViewFacts) must answer the same direct and through the daemon.
 #[test]
@@ -1057,8 +1113,20 @@ fn backlog_and_sessions_are_identical_direct_and_routed() {
         ]);
         assert_eq!(v["ok"], Value::Bool(true), "backlog add: {v}");
     }
+    seed_managed_sessions(&room, &["agent-a:1", "agent-b:1"]);
     let direct_backlog = room.json(&["backlog", "list", "--json"]);
     let direct_sessions = room.json(&["sessions", "--json"]);
+    let session_count = |v: &Value| {
+        v["data"]["sessions"]["sessions"]
+            .as_array()
+            .or_else(|| v["data"]["sessions"].as_array())
+            .map(Vec::len)
+    };
+    assert_eq!(
+        session_count(&direct_sessions),
+        Some(2),
+        "premise: two managed sessions listed: {direct_sessions}"
+    );
     assert_eq!(
         direct_backlog["data"]["backlog"]["items"]
             .as_array()
