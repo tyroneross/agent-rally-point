@@ -11930,10 +11930,11 @@ fn released_claim_ids_for_close(
         .filter(|fact| fact.seq < close_seq)
         .cloned()
         .collect::<Vec<_>>();
+    let closers = crate::claim_authority::ClaimClosers::new(&facts_before_close);
     let mut released = facts_before_close
         .iter()
         .filter(|fact| {
-            crate::claim_authority::is_active_claim_fact(fact, &facts_before_close)
+            closers.is_active(fact)
                 && fact.tool.as_deref() == Some(tool)
                 && fact.from_session_id.as_deref() == Some(session_id)
         })
@@ -12036,8 +12037,9 @@ fn command_session_close(json: bool, args: SessionCloseArgs) -> Result<Output> {
     let facts_after_close = room.repo_wide_claim_lifecycle_facts()?;
     let released_claim_ids =
         released_claim_ids_for_close(&facts_after_close, close_fact.seq, &args.tool, &session_id);
+    let closers_after = crate::claim_authority::ClaimClosers::new(&facts_after_close);
     let still_owned = facts_after_close.iter().any(|fact| {
-        crate::claim_authority::is_active_claim_fact(fact, &facts_after_close)
+        closers_after.is_active(fact)
             && fact.tool.as_deref() == Some(args.tool.as_str())
             && fact.from_session_id.as_deref() == Some(session_id.as_str())
     });

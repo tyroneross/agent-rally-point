@@ -7303,9 +7303,10 @@ impl DirectRoomStore {
                 )
             })?;
             let collision_lifecycle = claim_lifecycle_relevant_to_path(lifecycle, path);
+            let collision_closers = claim_authority::ClaimClosers::new(&collision_lifecycle);
             let mut external_claims = collision_lifecycle
                 .iter()
-                .filter(|fact| claim_authority::is_active_claim_fact(fact, &collision_lifecycle))
+                .filter(|fact| collision_closers.is_active(fact))
                 .map(|fact| claim_authority::project_effective_claim(fact, &collision_lifecycle))
                 .collect::<Vec<_>>();
             external_claims.sort_by_key(|fact| fact.seq);
@@ -10127,9 +10128,10 @@ fn snapshot_from_facts_with_policy_at(
         })
         .filter_map(|f| f.ref_id.clone())
         .collect::<BTreeSet<_>>();
+    let claim_closers = claim_authority::ClaimClosers::new(facts);
     let active_claims = facts
         .iter()
-        .filter(|fact| claim_authority::is_active_claim_fact(fact, facts))
+        .filter(|fact| claim_closers.is_active(fact))
         .map(|fact| claim_authority::project_effective_claim(fact, facts))
         .collect::<Vec<_>>();
     let active_blockers = facts

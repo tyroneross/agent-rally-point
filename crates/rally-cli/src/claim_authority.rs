@@ -142,9 +142,10 @@ pub(crate) fn lease_marker_at(now: DateTime<Utc>, lease_secs: i64) -> String {
 }
 
 pub(crate) fn active_claim_records(facts: &[Fact]) -> Vec<ActiveClaimRecord> {
+    let closers = ClaimClosers::new(facts);
     facts
         .iter()
-        .filter(|fact| is_active_claim_fact(fact, facts))
+        .filter(|fact| closers.is_active(fact))
         .filter_map(|fact| active_claim_record_from_facts(fact, facts))
         .collect()
 }
@@ -153,6 +154,94 @@ pub(crate) fn is_active_claim_fact(fact: &Fact, facts: &[Fact]) -> bool {
     fact.kind == FactKind::Claim
         && !fact.scope.iter().any(|scope| scope == "external-intake")
         && !claim_closed_by_later_fact(fact, facts)
+}
+
+/// [`is_active_claim_fact`] for every claim of one fold, in O(facts) instead of
+/// O(claims x facts).
+///
+/// Each of the three closing rules needs a closer that shares a key with the
+/// claim: `later_fact_refs_claim` needs `ref == claim id`,
+/// `later_release_overlaps_claim_scope` needs a release scope equal to a claim
+/// scope, and `later_session_close_matches_claim` needs the same tool and
+/// session. Candidates are bucketed by those keys once; each claim then tests
+/// only its own buckets with the UNCHANGED rules (and the same
+/// `seq > claim.seq` order check), so the answer is identical to the full scan.
+/// `is_active_claim_fact` stays the reference and the single-claim entry point.
+pub(crate) struct ClaimClosers<'a> {
+    by_ref: std::collections::HashMap<&'a str, Vec<&'a Fact>>,
+    releases_by_scope: std::collections::HashMap<&'a str, Vec<&'a Fact>>,
+    session_closes: std::collections::HashMap<(&'a str, &'a str), Vec<&'a Fact>>,
+}
+
+impl<'a> ClaimClosers<'a> {
+    pub(crate) fn new(facts: &'a [Fact]) -> Self {
+        let mut by_ref: std::collections::HashMap<&'a str, Vec<&'a Fact>> = Default::default();
+        let mut releases_by_scope: std::collections::HashMap<&'a str, Vec<&'a Fact>> =
+            Default::default();
+        let mut session_closes: std::collections::HashMap<(&'a str, &'a str), Vec<&'a Fact>> =
+            Default::default();
+        for fact in facts {
+            if closes_active_claim(&fact.kind)
+                && let Some(ref_id) = fact.ref_id.as_deref()
+            {
+                by_ref.entry(ref_id).or_default().push(fact);
+            }
+            if fact.kind == FactKind::Release {
+                for scope in &fact.scope {
+                    releases_by_scope
+                        .entry(scope.as_str())
+                        .or_default()
+                        .push(fact);
+                }
+            }
+            if crate::store::is_session_close_fact(fact)
+                && let (Some(tool), Some(session)) =
+                    (fact.tool.as_deref(), fact.from_session_id.as_deref())
+            {
+                session_closes
+                    .entry((tool, session))
+                    .or_default()
+                    .push(fact);
+            }
+        }
+        Self {
+            by_ref,
+            releases_by_scope,
+            session_closes,
+        }
+    }
+
+    fn closed(&self, claim: &Fact) -> bool {
+        let refs = self
+            .by_ref
+            .get(claim.event_id.as_str())
+            .into_iter()
+            .flatten();
+        let releases = claim
+            .scope
+            .iter()
+            .filter_map(|scope| self.releases_by_scope.get(scope.as_str()))
+            .flatten();
+        let sessions = match (claim.tool.as_deref(), claim.from_session_id.as_deref()) {
+            (Some(tool), Some(session)) => self.session_closes.get(&(tool, session)),
+            _ => None,
+        }
+        .into_iter()
+        .flatten();
+        refs.chain(releases).chain(sessions).any(|fact| {
+            fact.seq > claim.seq
+                && (later_fact_refs_claim(fact, claim.event_id.as_str())
+                    || later_release_overlaps_claim_scope(fact, claim)
+                    || later_session_close_matches_claim(fact, claim))
+        })
+    }
+
+    /// Same answer as [`is_active_claim_fact`] for a claim of this fold.
+    pub(crate) fn is_active(&self, fact: &Fact) -> bool {
+        fact.kind == FactKind::Claim
+            && !fact.scope.iter().any(|scope| scope == "external-intake")
+            && !self.closed(fact)
+    }
 }
 
 fn claim_closed_by_later_fact(claim: &Fact, facts: &[Fact]) -> bool {
@@ -826,6 +915,102 @@ mod tests {
             uri: None,
             session: None,
         }
+    }
+
+    /// `ClaimClosers::is_active` must equal the reference
+    /// `is_active_claim_fact` for every fact of a ledger. Randomized ledgers
+    /// (deterministic LCG) mix claims with every closer shape: refs from any
+    /// tool, releases by other tools on overlapping and disjoint scopes,
+    /// session closes from same and sibling sessions, closers that precede
+    /// the claim, external-intake claims and non-closing refs.
+    #[test]
+    fn claim_closers_index_matches_full_scan_on_random_ledgers() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = |n: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % n
+        };
+        let tools = ["alpha", "beta", "gamma"];
+        let sessions = ["s1", "s2"];
+        let scopes = ["file:a.rs", "file:b.rs", "dir:src", "external-intake"];
+        let mut compared = 0usize;
+        let mut active_seen = 0usize;
+        for round in 0..200 {
+            let mut facts: Vec<Fact> = Vec::new();
+            let mut claim_ids: Vec<String> = Vec::new();
+            let len = 5 + next(40) as usize;
+            for i in 0..len {
+                let id = format!("f{round}_{i}");
+                let mut f = fact(&id, tools[next(3) as usize], vec![]);
+                f.seq = next(60) as i64; // closers may precede claims
+                f.from_session_id = Some(sessions[next(2) as usize].to_string());
+                let pick_scope = |r: u64| scopes[r as usize].to_string();
+                match next(8) {
+                    0 | 1 | 2 => {
+                        f.kind = FactKind::Claim;
+                        f.scope = vec![pick_scope(next(4))];
+                        if next(3) == 0 {
+                            f.scope.push(pick_scope(next(3)));
+                        }
+                        claim_ids.push(id.clone());
+                    }
+                    3 => {
+                        f.kind = FactKind::Release;
+                        f.scope = vec![pick_scope(next(3))];
+                    }
+                    4 => {
+                        f.kind = [FactKind::Resolve, FactKind::Receipt, FactKind::ClaimExpired]
+                            [next(3) as usize]
+                            .clone();
+                        if !claim_ids.is_empty() {
+                            f.ref_id =
+                                Some(claim_ids[next(claim_ids.len() as u64) as usize].clone());
+                        }
+                    }
+                    5 => {
+                        f.kind = FactKind::Session;
+                        f.evidence = vec!["protocol:session_state=closed".to_string()];
+                        if next(4) == 0 {
+                            f.from_session_id = None;
+                        }
+                    }
+                    6 => {
+                        // a non-closing kind that still references a claim
+                        f.kind = FactKind::Artifact;
+                        if !claim_ids.is_empty() {
+                            f.ref_id =
+                                Some(claim_ids[next(claim_ids.len() as u64) as usize].clone());
+                        }
+                    }
+                    _ => {
+                        f.kind = FactKind::SessionClosed;
+                    }
+                }
+                facts.push(f);
+            }
+            let closers = ClaimClosers::new(&facts);
+            for f in &facts {
+                let want = is_active_claim_fact(f, &facts);
+                assert_eq!(
+                    closers.is_active(f),
+                    want,
+                    "round {round} fact {}",
+                    f.event_id
+                );
+                compared += 1;
+                active_seen += usize::from(want);
+            }
+        }
+        assert!(
+            compared > 4_000,
+            "premise: enough facts compared ({compared})"
+        );
+        assert!(
+            active_seen > 100,
+            "premise: some claims stay active ({active_seen})"
+        );
     }
 
     #[test]
