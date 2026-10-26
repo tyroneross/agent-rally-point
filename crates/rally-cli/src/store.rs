@@ -4651,6 +4651,34 @@ impl RoomStore {
     /// BEFORE the limit, so a filtered page is never underfilled by rows the
     /// caller would have dropped. Routed stores ask the daemon for the
     /// bounded result instead of shipping the ledger.
+    /// Every fact of the named kinds (see [`select_facts_of_kinds`]). Routed
+    /// stores ask the daemon; an oversized reply falls back to the paged
+    /// full load with the same selection.
+    pub(crate) fn facts_of_kinds(&self, kinds: &[String]) -> Result<Vec<Fact>> {
+        match self {
+            RoomStore::Direct(d) => d.facts_of_kinds(kinds),
+            RoomStore::Routed(r) => match r.facts_of_kinds(kinds) {
+                Err(error) if is_reply_too_large(&error) => {
+                    Ok(select_facts_of_kinds(r.facts()?, kinds))
+                }
+                other => other,
+            },
+        }
+    }
+
+    /// Input of the managed-session list (see [`select_session_view_facts`]).
+    pub(crate) fn session_view_facts(&self) -> Result<Vec<Fact>> {
+        match self {
+            RoomStore::Direct(d) => d.session_view_facts(),
+            RoomStore::Routed(r) => match r.session_view_facts() {
+                Err(error) if is_reply_too_large(&error) => {
+                    Ok(select_session_view_facts(r.facts()?))
+                }
+                other => other,
+            },
+        }
+    }
+
     /// The item `event_id`, every fact whose `ref` names it, and every
     /// retraction of either — the full input of [`project_reply_state`].
     pub(crate) fn reply_facts(&self, event_id: &str) -> Result<Vec<Fact>> {
@@ -6342,6 +6370,71 @@ impl DirectRoomStore {
             .into_iter()
             .filter(|fact| fact.event_id == event_id)
             .collect())
+    }
+
+    /// See [`RoomStore::facts_of_kinds`]. Indexed: one SQL pass over the
+    /// payload `kind` (every spelling), then the exact selection; otherwise
+    /// the full load with the same selection.
+    pub(crate) fn facts_of_kinds(&self, kinds: &[String]) -> Result<Vec<Fact>> {
+        let room_dir = self
+            .facts_db_path
+            .parent()
+            .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
+        let _guard = acquire_room_mutation_lock(room_dir)?;
+        reconcile_segments_and_db(
+            &self.log_dir,
+            &self.archive_dir,
+            &self.facts_db_path,
+            self.warm_fact_store.is_none(),
+        )?;
+        let indexed = self.derived_db_proof().and_then(|_| {
+            let connection = derived_index::open(&self.facts_db_path).ok()?;
+            if !derived_index::indexes_present(&connection) {
+                return None;
+            }
+            derived_index::facts_with_kinds(&connection, kinds)
+                .ok()
+                .flatten()
+        });
+        let candidates = match indexed {
+            Some(facts) => facts,
+            None => self.facts_under_lock()?,
+        };
+        Ok(select_facts_of_kinds(candidates, kinds))
+    }
+
+    /// See [`RoomStore::session_view_facts`]. Indexed: `session` facts plus
+    /// the newest non-system `presence` per tool via one window query, then
+    /// the exact selection; otherwise the full load with the same selection.
+    pub(crate) fn session_view_facts(&self) -> Result<Vec<Fact>> {
+        let room_dir = self
+            .facts_db_path
+            .parent()
+            .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
+        let _guard = acquire_room_mutation_lock(room_dir)?;
+        reconcile_segments_and_db(
+            &self.log_dir,
+            &self.archive_dir,
+            &self.facts_db_path,
+            self.warm_fact_store.is_none(),
+        )?;
+        let indexed = self.derived_db_proof().and_then(|_| {
+            let connection = derived_index::open(&self.facts_db_path).ok()?;
+            if !derived_index::indexes_present(&connection) {
+                return None;
+            }
+            let mut facts = derived_index::facts_with_kinds(&connection, &["session".to_string()])
+                .ok()
+                .flatten()?;
+            let tools = session_view_tools(&facts);
+            facts.extend(derived_index::latest_presence_for_tools(&connection, &tools).ok()?);
+            Some(facts)
+        });
+        let candidates = match indexed {
+            Some(facts) => facts,
+            None => self.facts_under_lock()?,
+        };
+        Ok(select_session_view_facts(candidates))
     }
 
     /// See [`RoomStore::reply_facts`]. Indexed: the item by the event-id
@@ -8158,6 +8251,97 @@ mod derived_index {
         Ok(facts)
     }
 
+    /// Every fact whose payload kind is any spelling of `kinds`. `None` when
+    /// a name does not resolve to a known, non-`unknown` kind (the caller
+    /// then filters the full load instead).
+    pub(super) fn facts_with_kinds(
+        connection: &Connection,
+        kinds: &[String],
+    ) -> Result<Option<Vec<Fact>>> {
+        let mut names: Vec<String> = Vec::new();
+        for k in kinds {
+            let Some(kind) = super::kind_named(k) else {
+                return Ok(None);
+            };
+            if kind == super::FactKind::Unknown {
+                return Ok(None);
+            }
+            for name in [k.as_str(), kind.as_str()] {
+                for variant in [
+                    name.to_string(),
+                    name.replace('-', "_"),
+                    name.replace('_', "-"),
+                ] {
+                    if !names.contains(&variant) {
+                        names.push(variant);
+                    }
+                }
+            }
+        }
+        if names.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let placeholders = (1..=names.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT sequence_number, payload FROM events \
+             WHERE json_extract(payload,'$.kind') IN ({placeholders})"
+        );
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|error| sql_error("prepare facts.db kind query", error))?;
+        let collected = statement
+            .query_map(rusqlite::params_from_iter(names.iter()), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+            .map_err(|error| sql_error("run facts.db kind query", error))?;
+        decode(collected).map(Some)
+    }
+
+    /// For each tool in `tools`, its highest-seq `presence` fact that is not
+    /// system-authored (`role` = system, or `tool` = rally: the
+    /// `is_system_authored` rule). Empty when `tools` is empty.
+    pub(super) fn latest_presence_for_tools(
+        connection: &Connection,
+        tools: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<Fact>> {
+        if tools.is_empty() {
+            return Ok(Vec::new());
+        }
+        let names = tools.iter().cloned().collect::<Vec<_>>();
+        let placeholders = (1..=names.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT sequence_number, payload FROM ( \
+               SELECT sequence_number, payload, row_number() OVER ( \
+                 PARTITION BY json_extract(payload,'$.tool') \
+                 ORDER BY {SEQ_EXPR} DESC) AS rn \
+               FROM events \
+               WHERE json_extract(payload,'$.kind') = 'presence' \
+                 AND json_extract(payload,'$.tool') IN ({placeholders}) \
+                 AND coalesce(json_extract(payload,'$.role'),'') != '{role}' \
+                 AND json_extract(payload,'$.tool') != '{tool}') \
+             WHERE rn = 1",
+            role = crate::SYSTEM_ROLE,
+            tool = super::SYSTEM_TOOL,
+        );
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|error| sql_error("prepare facts.db presence query", error))?;
+        let collected = statement
+            .query_map(rusqlite::params_from_iter(names.iter()), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+            .map_err(|error| sql_error("run facts.db presence query", error))?;
+        decode(collected)
+    }
+
     /// Facts whose `ref` is `event_id` (replies to it). No index on `ref`:
     /// one scan of the payload column, ~tens of ms on a 90k-row room.
     pub(super) fn facts_by_ref(connection: &Connection, event_id: &str) -> Result<Vec<Fact>> {
@@ -8745,6 +8929,68 @@ fn finish_recent(mut facts: Vec<Fact>, query: &RecentQuery) -> Vec<Fact> {
     });
     facts.truncate(query.limit);
     facts
+}
+
+/// Facts whose kind is one of `kinds` (resolved by [`kind_named`], so any
+/// spelling), deduplicated by (event id, seq), seq-ordered. No retraction or
+/// decay filtering: the reference selection `list_backlog_items` always used.
+pub(crate) fn select_facts_of_kinds(candidates: Vec<Fact>, kinds: &[String]) -> Vec<Fact> {
+    let wanted = kinds
+        .iter()
+        .filter_map(|k| kind_named(k))
+        .collect::<Vec<_>>();
+    let mut seen = BTreeSet::new();
+    let mut out = candidates
+        .into_iter()
+        .filter(|f| wanted.contains(&f.kind))
+        .filter(|f| seen.insert((f.event_id.clone(), f.seq)))
+        .collect::<Vec<_>>();
+    out.sort_by_key(|f| f.seq);
+    out
+}
+
+/// Exactly what `active_session_views_from_facts` reads: every `session`
+/// fact, plus, for each tool that a session fact names in `session.tool`,
+/// that tool's highest-seq `presence` fact that is not system-authored. The
+/// view looks agent state up only by `session.tool`
+/// (`projected_session_liveness`), and `project_agent_states` keeps only the
+/// newest non-system presence per tool, so this subset yields the same views.
+pub(crate) fn select_session_view_facts(candidates: Vec<Fact>) -> Vec<Fact> {
+    let mut seen = BTreeSet::new();
+    let candidates = candidates
+        .into_iter()
+        .filter(|f| seen.insert((f.event_id.clone(), f.seq)))
+        .collect::<Vec<_>>();
+    let session_tools = session_view_tools(&candidates);
+    let mut latest: BTreeMap<String, Fact> = BTreeMap::new();
+    let mut out = Vec::new();
+    for fact in candidates {
+        if fact.kind == FactKind::Session {
+            out.push(fact);
+        } else if fact.kind == FactKind::Presence && !is_system_authored(&fact) {
+            let Some(tool) = fact.tool.clone().filter(|t| session_tools.contains(t)) else {
+                continue;
+            };
+            match latest.get(&tool) {
+                Some(existing) if existing.seq >= fact.seq => {}
+                _ => {
+                    latest.insert(tool, fact);
+                }
+            }
+        }
+    }
+    out.extend(latest.into_values());
+    out.sort_by_key(|f| f.seq);
+    out
+}
+
+/// Tools named by `session.tool` on any `session` fact.
+fn session_view_tools(facts: &[Fact]) -> BTreeSet<String> {
+    facts
+        .iter()
+        .filter(|f| f.kind == FactKind::Session)
+        .filter_map(|f| f.session.as_ref().map(|s| s.tool.clone()))
+        .collect()
 }
 
 /// The daemon refused a bounded read because its reply would exceed the
@@ -22515,6 +22761,96 @@ mod ledger_tests {
             !sql.contains("$.kind"),
             "unknown gets no SQL kind clause: {sql}"
         );
+    }
+
+    /// D0 narrow reads: the indexed SQL path and the full-load fallback must
+    /// return the same set as the reference selection, including a newer
+    /// system-authored presence (must be skipped), a tool with no session
+    /// (presence not needed), and both backlog kind spellings.
+    #[test]
+    fn narrow_reads_match_reference_with_and_without_index() {
+        let root = unique_root("d0-narrow-reads");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let mut seq = 0;
+        let mut put = |mut f: Fact| {
+            seq += 1;
+            f.created_at = format!("2026-10-25T00:00:{:02}Z", seq % 60);
+            store.append_fact(&f).unwrap();
+        };
+        let session_fact = |id: &str, tool: &str| {
+            let mut f = make_fact(id, FactKind::Session, "", "s");
+            f.tool = Some(tool.to_string());
+            f.session = Some(
+                serde_json::from_value(serde_json::json!({
+                    "session_id": format!("sess-{id}"),
+                    "name": id,
+                    "agent": "claude",
+                    "tool": tool,
+                    "backend": "tmux",
+                    "cwd": "/tmp",
+                    "target": "t",
+                    "daemon_registered": false,
+                }))
+                .unwrap(),
+            );
+            f
+        };
+        let presence = |id: &str, tool: &str, system: bool| {
+            let mut f = make_fact(id, FactKind::Presence, "", "s");
+            f.tool = Some(tool.to_string());
+            if system {
+                f.role = Some(crate::SYSTEM_ROLE.to_string());
+            }
+            f
+        };
+        put(session_fact("s1", "alpha:1"));
+        put(presence("p1", "alpha:1", false));
+        put(presence("p2", "alpha:1", false)); // newest real presence
+        put(presence("p3", "alpha:1", true)); // newer, but system-authored
+        put(presence("p4", "beta:1", false)); // no session for beta
+        put(session_fact("s2", "gamma:1")); // session, no presence
+        let mut b1 = make_fact("b1", FactKind::BacklogItem, "backlog-item", "s");
+        b1.tool = Some("alpha:1".to_string());
+        put(b1);
+
+        let ids = |v: Vec<Fact>| v.into_iter().map(|f| f.event_id).collect::<Vec<_>>();
+        let backlog = vec!["backlog-item".to_string()];
+        let reference_sv = ids(select_session_view_facts(store.facts().unwrap()));
+        let reference_bl = ids(select_facts_of_kinds(store.facts().unwrap(), &backlog));
+        assert_eq!(reference_sv, vec!["s1", "p2", "s2"], "reference selection");
+        assert_eq!(reference_bl, vec!["b1"]);
+        assert_eq!(
+            ids(store.session_view_facts().unwrap()),
+            reference_sv,
+            "indexed"
+        );
+        assert_eq!(
+            ids(store.facts_of_kinds(&backlog).unwrap()),
+            reference_bl,
+            "indexed"
+        );
+        let underscore = vec!["backlog_item".to_string()];
+        assert_eq!(
+            ids(store.facts_of_kinds(&underscore).unwrap()),
+            reference_bl
+        );
+
+        let connection = derived_index::open(&store.facts_db_path).unwrap();
+        connection
+            .execute_batch("DROP INDEX IF EXISTS rally_events_event_id;")
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            ids(store.session_view_facts().unwrap()),
+            reference_sv,
+            "fallback"
+        );
+        assert_eq!(
+            ids(store.facts_of_kinds(&backlog).unwrap()),
+            reference_bl,
+            "fallback"
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// Wake expiry (A2): a pending wake leaves `pending_wakes` when the work it

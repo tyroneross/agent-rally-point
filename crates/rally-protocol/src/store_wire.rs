@@ -64,7 +64,8 @@ use serde_json::Value;
 // v8: enter collision diagnostics carry caller evidence and a session-aware guard.
 // v9: bounded reads so a routed client never asks for the whole ledger in one
 // reply: `SessionPresenceFacts`, `FactsPage`, `FactsByEventId` (locate),
-// `RecentFacts` (recent) and `ReplyFacts` (locate reply status).
+// `RecentFacts` (recent), `ReplyFacts` (locate reply status), `FactsOfKinds`
+// (backlog) and `SessionViewFacts` (managed-session list).
 pub const WIRE_VERSION: u32 = 9;
 
 /// Hard cap on a single request/response line. A longer line is a framing
@@ -196,6 +197,14 @@ pub enum StoreOp {
     /// whose `ref` names it, and any retraction of those. Answered as
     /// [`StoreOk::Facts`]. v9.
     ReplyFacts { event_id: String },
+    /// Every fact of one of `kinds` (any on-disk spelling), unfiltered by
+    /// retraction or decay, in seq order. Answered as [`StoreOk::Facts`].
+    /// Used for the backlog listing. v9.
+    FactsOfKinds { kinds: Vec<String> },
+    /// What the managed-session list needs: every `session` fact plus each
+    /// tool's newest non-system `presence` fact. Answered as
+    /// [`StoreOk::Facts`]. v9.
+    SessionViewFacts,
     /// One bounded page of the ledger: facts with `seq > after_seq` in seq
     /// order, sized to fit `max_bytes` (clamped below [`MAX_LINE_BYTES`]).
     /// Always carries at least one fact when any remain. Reply is
@@ -304,6 +313,8 @@ impl StoreOp {
             | Self::FactsByEventId { .. }
             | Self::RecentFacts { .. }
             | Self::ReplyFacts { .. }
+            | Self::FactsOfKinds { .. }
+            | Self::SessionViewFacts
             | Self::FactsPage { .. }
             | Self::RepoWideClaimLifecycleFacts
             | Self::SessionFactsWithContextVersion
@@ -780,6 +791,8 @@ mod tests {
             }
             .is_mutating()
         );
+        assert!(!StoreOp::FactsOfKinds { kinds: vec![] }.is_mutating());
+        assert!(!StoreOp::SessionViewFacts.is_mutating());
         assert!(!StoreOp::Ping.is_mutating());
     }
 }

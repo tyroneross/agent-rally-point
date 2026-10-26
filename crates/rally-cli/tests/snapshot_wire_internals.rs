@@ -1035,6 +1035,49 @@ fn recent_filters_are_identical_direct_and_routed() {
     }
 }
 
+/// D0 narrow reads: `backlog list` (FactsOfKinds) and `sessions`
+/// (SessionViewFacts) must answer the same direct and through the daemon.
+#[test]
+fn backlog_and_sessions_are_identical_direct_and_routed() {
+    let room = Room::new("narrow-reads");
+    seed_plain(&room);
+    for (id, intent) in [("task-1", "first"), ("task-2", "second")] {
+        let v = room.json(&[
+            "backlog",
+            "add",
+            "--json",
+            "--tool",
+            "peer-one",
+            "--id",
+            id,
+            "--intent",
+            intent,
+            "--owns",
+            "src/lib.rs",
+        ]);
+        assert_eq!(v["ok"], Value::Bool(true), "backlog add: {v}");
+    }
+    let direct_backlog = room.json(&["backlog", "list", "--json"]);
+    let direct_sessions = room.json(&["sessions", "--json"]);
+    assert_eq!(
+        direct_backlog["data"]["backlog"]["items"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "premise: two backlog items: {direct_backlog}"
+    );
+    let mut daemon = Daemon::start(&room)
+        .unwrap_or_else(|e| panic!("routed narrow-read control requires rallyd: {e}"));
+    let routed_backlog = room.json(&["backlog", "list", "--json"]);
+    let routed_sessions = room.json(&["sessions", "--json"]);
+    daemon.stop();
+    assert_eq!(
+        routed_backlog, direct_backlog,
+        "routed backlog list drifted"
+    );
+    assert_eq!(routed_sessions, direct_sessions, "routed sessions drifted");
+}
+
 /// `status --global` consumes `last_activity_ts`; both store modes must report
 /// the timestamp of the ledger's highest-seq fact rather than a default null.
 #[test]

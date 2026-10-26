@@ -306,7 +306,9 @@ pub(crate) fn mark_backlog_done(room: &RoomStore, tool: &str, id: &str) -> Resul
 
 /// Return all backlog items for this room, ordered by seq ascending.
 pub(crate) fn list_backlog_items(room: &RoomStore) -> Result<Vec<BacklogItem>> {
-    let facts = room.facts()?;
+    // Only backlog facts, read by kind (any spelling) instead of decoding the
+    // whole ledger; the selection below is unchanged.
+    let facts = room.facts_of_kinds(&["backlog-item".to_string()])?;
     // The latest status fact per id wins (later seq overrides).
     // We also need to handle status-update facts: a fact with the same `id:`
     // but a different status is a status update. We collect the highest-seq

@@ -1068,6 +1068,18 @@ mod imp {
                     facts: to_wire_values(&facts)?,
                 }
             }
+            StoreOp::FactsOfKinds { kinds } => {
+                let facts = store.facts_of_kinds(&kinds).map_err(rally_to_wire)?;
+                StoreOk::Facts {
+                    facts: to_wire_values(&facts)?,
+                }
+            }
+            StoreOp::SessionViewFacts => {
+                let facts = store.session_view_facts().map_err(rally_to_wire)?;
+                StoreOk::Facts {
+                    facts: to_wire_values(&facts)?,
+                }
+            }
             StoreOp::ReplyFacts { event_id } => {
                 let facts = store.reply_facts(&event_id).map_err(rally_to_wire)?;
                 StoreOk::Facts {

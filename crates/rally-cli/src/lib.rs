@@ -12246,7 +12246,12 @@ fn read_session_views(room: &RoomStore, bins: BackendBins) -> Result<Vec<Session
 }
 
 fn active_session_views(room: &RoomStore, bins: BackendBins) -> Result<Vec<(Fact, SessionView)>> {
-    Ok(active_session_views_from_facts(room.facts()?, bins))
+    // `session` facts plus each tool's newest non-system presence: exactly
+    // what `active_session_views_from_facts` reads, without the whole ledger.
+    Ok(active_session_views_from_facts(
+        room.session_view_facts()?,
+        bins,
+    ))
 }
 
 fn active_session_views_from_facts(

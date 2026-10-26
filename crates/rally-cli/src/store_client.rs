@@ -474,6 +474,8 @@ fn mutation_query(op: &StoreOp) -> Option<MutationQuery> {
         | StoreOp::FactsByEventId { .. }
         | StoreOp::RecentFacts { .. }
         | StoreOp::ReplyFacts { .. }
+        | StoreOp::FactsOfKinds { .. }
+        | StoreOp::SessionViewFacts
         | StoreOp::FactsPage { .. }
         | StoreOp::RepoWideClaimLifecycleFacts
         | StoreOp::SessionFactsWithContextVersion
@@ -744,6 +746,24 @@ impl RoutedRoomStore {
         })? {
             StoreOk::Facts { facts } => facts.into_iter().map(from_value).collect(),
             _ => Err(unexpected_reply("reply_facts")),
+        }
+    }
+
+    /// Every fact of the named kinds, gathered by the daemon.
+    pub(crate) fn facts_of_kinds(&self, kinds: &[String]) -> Result<Vec<Fact>> {
+        match self.dispatch(StoreOp::FactsOfKinds {
+            kinds: kinds.to_vec(),
+        })? {
+            StoreOk::Facts { facts } => facts.into_iter().map(from_value).collect(),
+            _ => Err(unexpected_reply("facts_of_kinds")),
+        }
+    }
+
+    /// Session facts plus each tool's newest non-system presence fact.
+    pub(crate) fn session_view_facts(&self) -> Result<Vec<Fact>> {
+        match self.dispatch(StoreOp::SessionViewFacts)? {
+            StoreOk::Facts { facts } => facts.into_iter().map(from_value).collect(),
+            _ => Err(unexpected_reply("session_view_facts")),
         }
     }
 
