@@ -166,9 +166,12 @@ silence.** `rally say handoff --target <tool>` records the handoff and, by
 default (`--deliver inject`), injects it into the target's pane when the target
 is a live `rally run`-managed session. Read `data.delivery.status`: `injected`
 means the pane write was attempted (not proof of receipt); `queued_pane_inbox`
-means the target has no managed session but a live Easy Terminal pane is bound
-to it, so a wake was queued in that pane's inbox (typed when idle, handed over
-by hook when busy; still not proof of receipt); `record_only` names
+means the target has no managed session but its one bound Easy Terminal pane
+got a wake queued in its inbox (typed when idle, handed over by hook when
+busy; you must be lead or invited by the target); `coalesced_pane_wake` means
+an earlier wake to it is still pending and covers this handoff. Neither is
+proof of receipt: the handoff closes when the target records an artifact or
+receipt against it. `record_only` names
 why it could not inject (unmanaged/stale target, or inject authorization
 refused) — the receiver must then pull it, so use the backup channel now. Add
 `--ack-within 10m` for any handoff you are waiting on. Keep polling

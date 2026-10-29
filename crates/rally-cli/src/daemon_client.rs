@@ -542,7 +542,16 @@ pub(crate) struct PaneInboxReceipt {
     pub(crate) delivery: Option<String>,
     /// True when ptyd matched an earlier enqueue with the same `client_id`.
     pub(crate) duplicate: bool,
+    /// The inbox address ptyd filed the message under (an ET session value
+    /// or `pane:<id>`), when reported.
+    pub(crate) address: Option<String>,
 }
+
+/// ptyd inbox channel for agent-to-agent traffic (as `ez-ptyd inbox send`).
+const PANE_INBOX_CHANNEL: &str = "team";
+/// ptyd routing mode: ACP targets are refused so a PTY inbox is never used
+/// for a session nobody pulls from.
+const PANE_INBOX_ROUTE: &str = "auto";
 
 /// Queue `text` in the Easy Terminal pane inbox that serves the Rally
 /// identity `to` (`inbox.enqueue`, local-only). This is ET's readiness-checked
@@ -563,8 +572,8 @@ pub(crate) fn enqueue_pane_inbox(
     let params = json!({
         "to": to,
         "text": text,
-        "channel": "team",
-        "route": "auto",
+        "channel": PANE_INBOX_CHANNEL,
+        "route": PANE_INBOX_ROUTE,
         "client_id": client_id,
         "ref": ref_id,
     });
@@ -604,6 +613,10 @@ fn parse_enqueue_reply(reply: &serde_json::Value) -> Result<PaneInboxReceipt, St
             .get("duplicate")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        address: result
+            .get("address")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     })
 }
 
@@ -684,18 +697,38 @@ pub(crate) fn live_pane_ids(socket: &str) -> Option<Vec<String>> {
     )
 }
 
-/// Reports `(rally_identity, pane_id)` for every live pane the daemon has
-/// bound via `agent.register`, using the same `pane.list` call as
-/// [`live_pane_ids`]. Dormant, exited, orphaned, or restoring panes and panes
-/// without a non-empty identity are dropped. Read-only; returns `None` on any
-/// failure so callers report nothing rather than guess.
-pub(crate) fn live_bound_identities(socket: &str) -> Option<Vec<(String, String)>> {
-    let reply = round_trip(socket, "pane.list", &json!({}), DAEMON_TIMEOUT).ok()?;
-    parse_live_bound_identities(&reply)
+/// A live ptyd pane bound to a Rally identity, with the working directory the
+/// daemon reports for it (`foreground_cwd`, else `cwd`; both optional in
+/// ptyd's `PaneInfo`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BoundPane {
+    pub(crate) identity: String,
+    pub(crate) pane_id: String,
+    pub(crate) cwd: Option<String>,
 }
 
-/// Pure parse of a `pane.list` reply for [`live_bound_identities`].
+/// Every live pane the daemon has bound via `agent.register`, using the same
+/// `pane.list` call as [`live_pane_ids`]. Dormant, exited, orphaned, or
+/// restoring panes and panes without a non-empty identity are dropped.
+/// Read-only; returns `None` on any failure so callers report nothing rather
+/// than guess.
+pub(crate) fn live_bound_panes(socket: &str) -> Option<Vec<BoundPane>> {
+    let reply = round_trip(socket, "pane.list", &json!({}), DAEMON_TIMEOUT).ok()?;
+    parse_live_bound_panes(&reply)
+}
+
+/// `(identity, pane_id)` view of [`parse_live_bound_panes`] for tests.
+#[cfg(test)]
 fn parse_live_bound_identities(reply: &serde_json::Value) -> Option<Vec<(String, String)>> {
+    parse_live_bound_panes(reply).map(|panes| {
+        panes
+            .into_iter()
+            .map(|pane| (pane.identity, pane.pane_id))
+            .collect()
+    })
+}
+
+fn parse_live_bound_panes(reply: &serde_json::Value) -> Option<Vec<BoundPane>> {
     let panes = reply.get("result")?.get("panes")?.as_array()?;
     Some(
         panes
@@ -709,7 +742,17 @@ fn parse_live_bound_identities(reply: &serde_json::Value) -> Option<Vec<(String,
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())?;
                 let pane_id = p.get("pane_id").and_then(|v| v.as_str())?;
-                Some((identity.to_string(), pane_id.to_string()))
+                let cwd = ["foreground_cwd", "cwd"].iter().find_map(|key| {
+                    p.get(*key)
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                });
+                Some(BoundPane {
+                    identity: identity.to_string(),
+                    pane_id: pane_id.to_string(),
+                    cwd,
+                })
             })
             .collect(),
     )
@@ -918,6 +961,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_live_bound_panes_prefers_foreground_cwd() {
+        let reply = json!({"result": {"panes": [
+            {"pane_id": "p1", "liveness": "live", "rally_identity": "a",
+             "cwd": "/shell", "foreground_cwd": "/agent"},
+            {"pane_id": "p2", "liveness": "live", "rally_identity": "b", "cwd": "/only"},
+            {"pane_id": "p3", "liveness": "live", "rally_identity": "c"}
+        ]}});
+        let panes = parse_live_bound_panes(&reply).unwrap();
+        let cwds: Vec<Option<&str>> = panes.iter().map(|p| p.cwd.as_deref()).collect();
+        assert_eq!(cwds, vec![Some("/agent"), Some("/only"), None]);
+    }
+
+    #[test]
     fn parse_enqueue_reply_reads_queued_receipt_and_refusals() {
         let ok = json!({"result": {"id": "m-1", "state": "queued", "duplicate": false,
             "delivery": "typed_when_idle", "route": "inbox"}});
@@ -928,6 +984,7 @@ mod tests {
                 state: "queued".to_string(),
                 delivery: Some("typed_when_idle".to_string()),
                 duplicate: false,
+                address: None,
             })
         );
         let refused = json!({"error": {"code": "capability_denied", "message": "no"}});

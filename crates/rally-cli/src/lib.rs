@@ -21500,23 +21500,103 @@ fn live_daemon_bindings() -> Vec<(String, String, String)> {
     if let Some(owned) = daemon_client::rally_owned_socket() {
         candidates.push(owned);
     }
+    bound_panes_on(&existing_unique_paths(&candidates))
+        .into_iter()
+        .map(|(socket, pane)| (socket, pane.identity, pane.pane_id))
+        .collect()
+}
+
+fn bound_panes_on(sockets: &[String]) -> Vec<(String, daemon_client::BoundPane)> {
     let mut out = Vec::new();
-    for socket in existing_unique_paths(&candidates) {
-        if let Some(bound) = daemon_client::live_bound_identities(&socket) {
-            for (identity, pane_id) in bound {
-                out.push((socket.clone(), identity, pane_id));
-            }
+    for socket in sockets {
+        if let Some(panes) = daemon_client::live_bound_panes(socket) {
+            out.extend(panes.into_iter().map(|pane| (socket.clone(), pane)));
         }
     }
     out
 }
 
-/// The first live ptyd socket + pane bound to exactly `identity`.
-fn daemon_binding_for(identity: &str) -> Option<(String, String)> {
-    live_daemon_bindings()
+/// Env vars that pin THIS caller to one ptyd socket, in precedence order.
+/// Easy Terminal exports both into its panes.
+const PINNED_PTYD_SOCKET_ENVS: &[&str] = &["PTYD_SOCKET_PATH", "RALLY_PTYD_SOCKET"];
+
+/// Where a pane wake for one identity may go.
+#[derive(Debug, PartialEq, Eq)]
+enum PaneWakeBinding {
+    /// Exactly one live pane, on `socket`.
+    One {
+        socket: String,
+        pane: daemon_client::BoundPane,
+    },
+    /// No live pane is bound to the identity.
+    None,
+    /// More than one distinct (socket, pane) is bound: refuse rather than
+    /// guess which one ptyd's `to`-addressed enqueue would reach.
+    Ambiguous(usize),
+}
+
+/// Resolve the single pane a wake for `identity` may target. A pinned socket
+/// (see [`PINNED_PTYD_SOCKET_ENVS`]) is the only one consulted when set;
+/// otherwise every candidate socket is, and exactly one binding is required.
+fn pane_wake_binding(identity: &str) -> PaneWakeBinding {
+    let pinned = PINNED_PTYD_SOCKET_ENVS
+        .iter()
+        .find_map(|name| env::var(name).ok().filter(|value| !value.is_empty()));
+    let sockets = match pinned {
+        Some(socket) => existing_unique_paths(&[socket]),
+        None => {
+            let mut candidates = ptyd_socket_candidates();
+            if let Some(owned) = daemon_client::rally_owned_socket() {
+                candidates.push(owned);
+            }
+            existing_unique_paths(&candidates)
+        }
+    };
+    select_pane_wake_binding(identity, bound_panes_on(&sockets))
+}
+
+fn select_pane_wake_binding(
+    identity: &str,
+    bound: Vec<(String, daemon_client::BoundPane)>,
+) -> PaneWakeBinding {
+    let mut matches: Vec<(String, daemon_client::BoundPane)> = Vec::new();
+    for (socket, pane) in bound
         .into_iter()
-        .find(|(_, bound, _)| bound == identity)
-        .map(|(socket, _, pane_id)| (socket, pane_id))
+        .filter(|(_, pane)| pane.identity == identity)
+    {
+        if !matches
+            .iter()
+            .any(|(s, p)| *s == socket && p.pane_id == pane.pane_id)
+        {
+            matches.push((socket, pane));
+        }
+    }
+    match matches.len() {
+        0 => PaneWakeBinding::None,
+        1 => {
+            let (socket, pane) = matches.remove(0);
+            PaneWakeBinding::One { socket, pane }
+        }
+        n => PaneWakeBinding::Ambiguous(n),
+    }
+}
+
+/// Is the pane's working directory part of this room's repository: inside the
+/// room root, or a checkout sharing its git common directory (a worktree)?
+fn pane_cwd_in_room(cwd: &str, repo_root: &Path) -> bool {
+    let (Ok(cwd), Ok(root)) = (fs::canonicalize(cwd), fs::canonicalize(repo_root)) else {
+        return false;
+    };
+    if cwd.starts_with(&root) {
+        return true;
+    }
+    match (
+        observed_liveness::git_common_dir(&cwd),
+        observed_liveness::git_common_dir(&root),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Detect resolvable ptyd sockets. Lists every on-disk candidate, then probes
@@ -23130,10 +23210,12 @@ struct HandoffDelivery {
     /// `injected` (pane write attempted through `rally inject --handoff`),
     /// `queued_pane_inbox` (no managed session, but the target is bound to a
     /// live Easy Terminal pane: a wake line is queued in that pane's inbox,
-    /// typed when the pane is idle or handed over by hook when busy), or
-    /// `record_only` (ledger copy only; the receiver must pull it). None of
-    /// these means "acknowledged": only the receiver's own receipt closes the
-    /// handoff.
+    /// typed when the pane is idle or handed over by hook when busy),
+    /// `coalesced_pane_wake` (an earlier pane wake to this target is still
+    /// pending and covers this handoff), or `record_only` (ledger copy only;
+    /// the receiver must pull it). None of these means "acknowledged": the
+    /// handoff stays open until the receiver records an artifact or receipt
+    /// against it.
     status: String,
     /// Why, in one line: the inject delivery reason, or the fallback cause.
     detail: String,
@@ -23188,39 +23270,16 @@ fn deliver_handoff(
     match resolve_inject_target(target_tool, &bins) {
         Ok(InjectTarget::Managed(_)) => {}
         Ok(InjectTarget::LedgerAgent(_)) => {
-            // No managed session. If a live ptyd pane is bound to exactly this
-            // identity, wake it through Easy Terminal's pane inbox: ptyd types
-            // the line when the pane is idle (an idle pane never reaches the
-            // turn boundary the prompt hook surfaces handoffs at) and hands it
-            // over by hook when busy. Queued is not delivered: record that.
-            let Some((socket, pane_id)) = daemon_binding_for(target_tool) else {
-                return record_only(format!(
-                    "{target_tool} is not a live rally-managed session and no live ptyd pane is bound to it; recorded for pull via `rally next`/`rally inbox`"
-                ));
-            };
-            return match wake_bound_pane(&socket, &pane_id, sender_tool, target_tool, handoff_id) {
-                Ok((receipt, wake_event_id)) => HandoffDelivery {
-                    mode: "inject".to_string(),
-                    status: "queued_pane_inbox".to_string(),
-                    detail: format!(
-                        "queued in pane {pane_id}'s Easy Terminal inbox as message {} (state {}, {}{}); not yet acknowledged: the handoff closes only on {target_tool}'s receipt",
-                        receipt.id,
-                        receipt.state,
-                        receipt.delivery.as_deref().unwrap_or("typed_when_idle"),
-                        if receipt.duplicate {
-                            ", duplicate of an earlier enqueue"
-                        } else {
-                            ""
-                        },
-                    ),
-                    ack_by,
-                    pane_message_id: Some(receipt.id),
-                    wake_event_id,
-                },
-                Err(reason) => record_only(format!(
-                    "{target_tool} has no managed session; pane {pane_id} wake failed: {reason}; recorded for pull via `rally next`/`rally inbox`"
-                )),
-            };
+            // No managed session. A live ptyd pane bound to exactly this
+            // identity can still be woken through Easy Terminal's pane inbox
+            // (an idle pane never reaches the turn boundary where its prompt
+            // hook surfaces handoffs). Every refusal degrades to record-only.
+            return pane_wake_delivery(sender_tool, target_tool, handoff_id, ack_by.clone())
+                .unwrap_or_else(|reason| {
+                    record_only(format!(
+                        "{target_tool} is not a live rally-managed session; {reason}; recorded for pull via `rally next`/`rally inbox`"
+                    ))
+                });
         }
         Err(error) => return record_only(format!("not injectable: {error}")),
     }
@@ -23260,6 +23319,118 @@ fn deliver_handoff(
     }
 }
 
+/// Evidence marker on every wake fact written for an Easy Terminal pane-inbox
+/// wake; the coalescing guard keys on it.
+const PANE_WAKE_TRANSPORT_EVIDENCE: &str = "transport:et_pane_inbox";
+
+/// Wake an unmanaged target's bound pane, or say why not (`Err` = record-only
+/// reason). Gates, in order:
+/// 1. Authority: the same who-may-direct-whom rule `rally inject` enforces
+///    (lead, target consent, or self); the reserved system author and an
+///    unverifiable authority basis are refused.
+/// 2. Binding: exactly one live pane (pinned socket first), whose reported
+///    working directory belongs to this room's repository.
+/// 3. Coalescing: while an earlier pane wake to this target is still pending
+///    (its handoff open and unexpired), no second prompt is queued; one
+///    `rally next` lists every open handoff.
+fn pane_wake_delivery(
+    sender_tool: &str,
+    target_tool: &str,
+    handoff_id: &str,
+    ack_by: Option<String>,
+) -> std::result::Result<HandoffDelivery, String> {
+    if sender_tool == SYSTEM_TOOL {
+        return Err(format!(
+            "pane wake refused: {SYSTEM_TOOL} is the reserved machine author"
+        ));
+    }
+    let authorization = inject_authorization(sender_tool, target_tool, MessageIntent::Directive);
+    if let Some(refusal) = authorization.refusal {
+        return Err(format!("pane wake refused: {refusal}"));
+    }
+    if authorization.authority_basis == AuthorityBasis::Unverified {
+        return Err(
+            "pane wake refused: the sender's authority to direct this target could not be verified"
+                .to_string(),
+        );
+    }
+    let (socket, pane) = match pane_wake_binding(target_tool) {
+        PaneWakeBinding::One { socket, pane } => (socket, pane),
+        PaneWakeBinding::None => return Err("no live ptyd pane is bound to it".to_string()),
+        PaneWakeBinding::Ambiguous(n) => {
+            return Err(format!(
+                "ambiguous: {n} live ptyd panes are bound to it; not waking any (pin one with PTYD_SOCKET_PATH)"
+            ));
+        }
+    };
+    let room = RoomStore::open().map_err(|e| format!("room unavailable: {e}"))?;
+    match pane.cwd.as_deref() {
+        Some(cwd) if pane_cwd_in_room(cwd, room.repo_root()) => {}
+        Some(cwd) => {
+            return Err(format!(
+                "pane {} works in {cwd}, outside this room's repository; not waking it",
+                pane.pane_id
+            ));
+        }
+        None => {
+            return Err(format!(
+                "pane {} reports no working directory, so it cannot be tied to this room; not waking it",
+                pane.pane_id
+            ));
+        }
+    }
+    let snapshot = room
+        .snapshot_for_obligation_target(target_tool, 1)
+        .map_err(|e| format!("room snapshot unavailable: {e}"))?;
+    if let Some(earlier) = snapshot.pending_wakes.iter().find(|wake| {
+        wake.target.as_deref() == Some(target_tool)
+            && wake
+                .evidence
+                .iter()
+                .any(|item| item == PANE_WAKE_TRANSPORT_EVIDENCE)
+    }) {
+        return Ok(HandoffDelivery {
+            mode: "inject".to_string(),
+            status: "coalesced_pane_wake".to_string(),
+            detail: format!(
+                "coalesced into {}: an earlier pane wake to {target_tool} is still pending, and the `rally next` it prompts lists this handoff too; not acknowledged until {target_tool} acts on it",
+                earlier.event_id
+            ),
+            ack_by,
+            pane_message_id: None,
+            wake_event_id: Some(earlier.event_id.clone()),
+        });
+    }
+    let (receipt, wake_event_id) = wake_bound_pane(
+        &room,
+        &socket,
+        &pane.pane_id,
+        sender_tool,
+        target_tool,
+        handoff_id,
+    )
+    .map_err(|reason| format!("pane {} wake failed: {reason}", pane.pane_id))?;
+    Ok(HandoffDelivery {
+        mode: "inject".to_string(),
+        status: "queued_pane_inbox".to_string(),
+        detail: format!(
+            "queued in pane {}'s Easy Terminal inbox as message {} (state {}, {}{}); not yet acknowledged: the handoff stays open until {target_tool} records an artifact or receipt against it",
+            pane.pane_id,
+            receipt.id,
+            receipt.state,
+            receipt.delivery.as_deref().unwrap_or("typed_when_idle"),
+            if receipt.duplicate {
+                ", duplicate of an earlier enqueue"
+            } else {
+                ""
+            },
+        ),
+        ack_by,
+        pane_message_id: Some(receipt.id),
+        wake_event_id,
+    })
+}
+
 /// Queue the Rally-rendered handoff prompt in the Easy Terminal pane inbox of
 /// the live ptyd pane bound to `target_tool`, then record a durable wake fact
 /// (`queued_awaiting_receipt`, ref = the handoff) so the room shows that a
@@ -23268,6 +23439,7 @@ fn deliver_handoff(
 /// reported as a failed wake. Its pending-wake entry expires with the handoff
 /// (store `wake_is_expired` / target-closed rules).
 fn wake_bound_pane(
+    room: &RoomStore,
     socket: &str,
     pane_id: &str,
     sender_tool: &str,
@@ -23279,13 +23451,24 @@ fn wake_bound_pane(
     let text = handoff_prompt_ledger(target_tool, handoff_id);
     let receipt =
         daemon_client::enqueue_pane_inbox(socket, target_tool, &text, handoff_id, handoff_id)?;
+    // ptyd addresses by identity; when it files the message under a
+    // `pane:<id>` address, that pane must be the one we resolved.
+    if let Some(address) = receipt.address.as_deref()
+        && let Some(filed_pane) = address.strip_prefix("pane:")
+        && filed_pane != pane_id
+    {
+        return Err(format!(
+            "ptyd filed message {} under pane {filed_pane}, not the resolved pane {pane_id}; not counted as a wake",
+            receipt.id
+        ));
+    }
     let evidence = vec![
         vec![format!("pane_inbox_message:{}", receipt.id)],
         vec![format!("pane:{pane_id}")],
-        vec!["transport:et_pane_inbox".to_string()],
+        vec![PANE_WAKE_TRANSPORT_EVIDENCE.to_string()],
     ];
     let wake_event_id = inject_wake_intent_with_room(
-        None,
+        Some(room),
         sender_tool,
         None,
         target_tool,

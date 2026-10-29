@@ -29,13 +29,23 @@ nothing turned silence into an escalation.
 - `rally say handoff --deliver inject|record` (default `inject`). After the
   durable commit, a targeted handoff is injected through the existing
   `command_inject_inner` path (same safety gates) when the target resolves to a
-  live managed session. A target with no managed session but bound to a live
-  ptyd pane (Easy Terminal, `agent.register`) and not owned by ET's router gets
-  a wake queued in that pane's inbox (`inbox.enqueue`, ref and client_id = the
-  handoff id): ptyd types it when the pane is idle, or a provider hook hands it
-  over when busy. That reports `queued_pane_inbox` with `pane_message_id` and a
-  `wake_event_id` (wake fact, reason `queued_awaiting_receipt`); it is not an
-  ack. Otherwise it degrades to `record_only` with a reason.
+  live managed session. A target with no managed session can still be woken
+  through Easy Terminal's pane inbox (`inbox.enqueue`, ref and client_id = the
+  handoff id) when every gate passes: the sender may direct the target (lead,
+  target consent, or self, the same rule `rally inject` applies); exactly one
+  live ptyd pane is bound to the identity (`PTYD_SOCKET_PATH`, else
+  `RALLY_PTYD_SOCKET`, pins the socket; otherwise two bindings are
+  ambiguous); the pane reports a working directory inside this room's
+  repository; and ET's router does not own the identity. ptyd types the
+  Rally-rendered prompt when the pane is idle, or a provider hook hands it
+  over when busy. That reports `queued_pane_inbox` with `pane_message_id` and
+  a `wake_event_id` (wake fact, reason `queued_awaiting_receipt`). While that
+  wake is pending, later handoffs to the same target report
+  `coalesced_pane_wake` naming it, since the `rally next` it prompts lists
+  every open handoff. None of these is an ack: the prompt asks the target to
+  record an artifact against the handoff (a receipt also closes it), and the
+  handoff stays open until then. Any failed gate or enqueue degrades to
+  `record_only` with the reason.
   Result in `data.delivery {mode,status,detail,ack_by,pane_message_id?,wake_event_id?}`. The `say handoff`
   watchdog gets inject's default budget unless `--deliver record`.
 - `--ack-within 90s|10m|2h` stores an `ack-by:<iso>` evidence marker.

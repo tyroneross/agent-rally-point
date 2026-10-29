@@ -35,9 +35,16 @@ target identity and ET's router does not own delivery, rally now queues the
 Rally-rendered handoff prompt in that pane's inbox (`inbox.enqueue`); ptyd
 types it when the pane is idle and hands it over by hook when busy.
 `data.delivery.status` is `queued_pane_inbox` with the pane message id, and a
-wake fact records the queued wake. Queued is not delivered; the handoff closes
-only on the receiver's receipt. A refused or failed enqueue falls back to
-`record_only` with the reason.
+wake fact records the queued wake. Queued is not delivered; the handoff stays
+open until the receiver records an artifact (which the typed prompt asks for)
+or a receipt against it. A refused or failed enqueue falls back to
+`record_only` with the reason. The wake runs only when the sender may direct
+the target (lead, target consent, or self, as for `rally inject`), exactly one
+live pane is bound to the identity (a pinned `PTYD_SOCKET_PATH` /
+`RALLY_PTYD_SOCKET` wins), that pane works inside this room's repository, and
+ET's router does not own the identity. While a wake is pending, later
+handoffs to the same target report `coalesced_pane_wake` instead of queuing
+another prompt.
 
 ### Fixed — rally never starts a ptyd daemon on a socket it does not own
 
