@@ -8325,7 +8325,7 @@ mod derived_index {
             "SELECT sequence_number, payload FROM ( \
                SELECT sequence_number, payload, row_number() OVER ( \
                  PARTITION BY json_extract(payload,'$.tool') \
-                 ORDER BY {SEQ_EXPR} DESC) AS rn \
+                 ORDER BY {SEQ_EXPR} DESC, sequence_number ASC) AS rn \
                FROM events \
                WHERE json_extract(payload,'$.kind') = 'presence' \
                  AND json_extract(payload,'$.tool') IN ({placeholders}) \
@@ -22726,6 +22726,58 @@ mod ledger_tests {
             &q(None, Some("2026-10-25T14:00:00.500100+02:00")),
             &none
         ));
+    }
+
+    /// P3: two presence facts of one tool tied on `seq` (an imported or
+    /// hand-merged ledger) resolve to the FIRST one, as the Rust selection
+    /// does (`existing.seq >= fact.seq` keeps the earlier fact).
+    #[test]
+    fn latest_presence_sql_keeps_the_first_fact_on_a_seq_tie() {
+        let root = unique_root("presence-tie");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        for id in ["first", "second"] {
+            let mut f = make_fact(id, FactKind::Presence, "", "s");
+            f.tool = Some("alpha:1".to_string());
+            store.append_fact(&f).unwrap();
+        }
+        let connection = derived_index::open(&store.facts_db_path).unwrap();
+        connection
+            .execute(
+                "UPDATE events SET payload = json_set(payload, '$.seq', 7) \
+                 WHERE json_extract(payload, '$.kind') = 'presence'",
+                [],
+            )
+            .unwrap();
+        let tools = std::iter::once("alpha:1".to_string()).collect();
+        let latest = derived_index::latest_presence_for_tools(&connection, &tools).unwrap();
+        let ids: Vec<_> = latest.iter().map(|f| f.event_id.as_str()).collect();
+        assert_eq!(ids, vec!["first"]);
+        let rust: Vec<_> = select_session_view_facts({
+            let mut session = make_fact("s", FactKind::Session, "", "s");
+            session.session = Some(
+                serde_json::from_value(serde_json::json!({
+                    "session_id": "sess", "name": "s", "agent": "claude",
+                    "tool": "alpha:1", "backend": "tmux", "cwd": "/tmp",
+                    "target": "t", "daemon_registered": false,
+                }))
+                .unwrap(),
+            );
+            let mut tied = latest.clone();
+            let mut second = make_fact("second", FactKind::Presence, "", "s");
+            second.tool = Some("alpha:1".to_string());
+            second.seq = 7;
+            tied.push(second);
+            let mut all = vec![session];
+            all.extend(tied);
+            all
+        })
+        .into_iter()
+        .filter(|f| f.kind == FactKind::Presence)
+        .map(|f| f.event_id)
+        .collect();
+        assert_eq!(rust, vec!["first".to_string()], "Rust rule agrees");
+        drop(connection);
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// P1: a running daemon from an older build of the same wire version
