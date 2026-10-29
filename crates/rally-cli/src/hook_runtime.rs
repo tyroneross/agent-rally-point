@@ -2194,6 +2194,11 @@ fn post_working_status(
     Ok(())
 }
 
+/// `summary` marker on every claim the before-write hook takes on the agent's
+/// behalf. Lease renewal reads it to tell an auto-claim from an explicit
+/// `rally say claim` (see `renew_owned_claim_leases_from`).
+pub(crate) const AUTO_CLAIM_SUMMARY: &str = "native-hook:before-write";
+
 /// ONE aggregate claim for every unowned path, with the same lease evidence,
 /// scope shape, and source-grounding hashes the `say claim` branch writes.
 fn append_auto_claim(
@@ -2250,7 +2255,7 @@ fn append_auto_claim(
         subject,
         scope,
         created_at: crate::now_string(),
-        summary: Some("native-hook:before-write".to_string()),
+        summary: Some(AUTO_CLAIM_SUMMARY.to_string()),
         evidence,
         target: None,
         ref_id: None,

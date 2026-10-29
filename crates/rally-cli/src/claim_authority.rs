@@ -865,6 +865,13 @@ fn lease_expires_at(fact: &Fact) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The parsed `lease_expires_at:` instant on the fact AS GIVEN (project a raw
+/// claim first, as for [`lease_expired_at`]). `None` when absent or
+/// unparseable.
+pub(crate) fn lease_expires_at_time(claim: &Fact) -> Option<DateTime<Utc>> {
+    lease_expires_at(claim).and_then(|raw| parse_time(raw.trim()))
+}
+
 /// Has this claim's lease run out at `now`?
 ///
 /// Reads the `lease_expires_at:` marker on the fact AS GIVEN. Every

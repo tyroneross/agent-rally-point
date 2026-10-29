@@ -143,6 +143,14 @@ the corresponding adapter.
 | `PreToolUse` — unknown or malformed | Inside an enabled Rally repo, fails open with exact `{}`, one bounded rate-limited stderr diagnostic, and zero Rally status/check/claim calls. Outside a Rally repo or when hooks are disabled, it is silent. It never treats an arbitrary `path` field as write ownership. |
 | `Stop` | At turn end (hook phase `after-write`), posts `state=idle` with a next check-in, runs `rally next`, and surfaces any pending coordination obligation or peer status change as an advisory `systemMessage`. Parity with Codex's `Stop` hook; never blocks turn completion, including under strict mode. |
 
+**Auto-claim leases follow writes.** A claim the before-write hook takes on
+the agent's behalf (summary `native-hook:before-write`) is renewed by a
+heartbeat only when one of its files was modified since the claim's current
+lease was granted, so it lapses one lease window after the agent's last write
+and the hook re-claims on the next write. Explicit `rally say claim` claims
+keep renewing on every heartbeat. A claim with no readable lease marker or no
+`file:` scope keeps renewing.
+
 **Why the Codex matcher remains unset.** Claude's documented matcher keeps its
 hook edit-scoped. OpenAI's Codex 0.144.3 source proves that `apply_patch` sends
 patch text as `tool_input.command`, and the wrapper replays that exact shape;

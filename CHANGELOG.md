@@ -7,6 +7,14 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Fixed — heartbeats stop renewing auto-claims on untouched files
+
+Every heartbeat renewed every claim a session owned, including claims the
+before-write hook took on files the agent then never wrote (Easy Terminal Team
+Test 1: 228 renewals kept 8 untouched scratch files claimed). An auto-claim is
+now renewed only when one of its files was modified since its current lease
+was granted; explicit claims renew as before.
+
 ### Added — `say receipt` warns when the receipt carries an instruction
 
 A receipt closes an obligation, so an ask inside it is owed by nobody.
