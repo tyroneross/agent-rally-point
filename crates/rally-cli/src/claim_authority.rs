@@ -948,7 +948,7 @@ mod tests {
                 f.from_session_id = Some(sessions[next(2) as usize].to_string());
                 let pick_scope = |r: u64| scopes[r as usize].to_string();
                 match next(8) {
-                    0 | 1 | 2 => {
+                    0..=2 => {
                         f.kind = FactKind::Claim;
                         f.scope = vec![pick_scope(next(4))];
                         if next(3) == 0 {
