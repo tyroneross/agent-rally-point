@@ -44,9 +44,13 @@ or a receipt against it. A refused or failed enqueue falls back to
 the target (lead, target consent, or self, as for `rally inject`), exactly one
 live pane is bound to the identity (a pinned `PTYD_SOCKET_PATH` /
 `RALLY_PTYD_SOCKET` wins), that pane works inside this room's repository, and
-ET's router does not own the identity. While a wake is pending, later
-handoffs to the same target report `coalesced_pane_wake` instead of queuing
-another prompt.
+ET's router does not own the identity. The prompt is addressed to the
+resolved pane id. A later handoff reports `coalesced_pane_wake` instead of
+queuing another prompt only while the earlier wake is under 10 minutes old,
+targets the same pane, came from a sender with at least the new sender's
+authority (a lead is never coalesced under a peer), and ptyd still reports
+its message `queued`. Known limit: a timeout on `inbox.enqueue` (3 s) is
+reported as `record_only` even if ptyd queued the prompt.
 
 ### Fixed — rally never starts a ptyd daemon on a socket it does not own
 

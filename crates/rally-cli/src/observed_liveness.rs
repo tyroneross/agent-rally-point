@@ -255,7 +255,7 @@ fn stamp_from_fact(fact: &Fact) -> Option<ObservationStamp> {
     })
 }
 
-pub(crate) fn git_common_dir(worktree: &Path) -> Option<PathBuf> {
+fn git_common_dir(worktree: &Path) -> Option<PathBuf> {
     let output = Command::new("git")
         .args(["-C", worktree.to_str()?, "rev-parse", "--git-common-dir"])
         .output()

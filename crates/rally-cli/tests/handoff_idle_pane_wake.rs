@@ -116,6 +116,9 @@ fn spawn_daemon(socket: &Path, panes: Vec<Pane>, reply: EnqueueReply) -> Request
                         json!({"id": id, "result": {"id": "late", "state": "queued"}})
                     }
                 },
+                // Every queued message is still waiting in the pane.
+                Some("inbox.show") => json!({"id": id, "result": {
+                    "id": req["params"]["id"], "state": "queued"}}),
                 _ => json!({"id": id, "error": {"code": "unknown_method", "message": "no"}}),
             };
             let mut stream = stream;
@@ -247,7 +250,8 @@ fn handoff_to_unmanaged_bound_pane_queues_a_pane_inbox_wake() {
     let sent = enqueues(&log);
     assert_eq!(sent.len(), 1, "exactly one enqueue: {sent:?}");
     let params = &sent[0]["params"];
-    assert_eq!(params["to"], target);
+    // Addressed to the resolved pane, not the identity (N2).
+    assert_eq!(params["to"], "pane-7");
     assert_eq!(params["ref"], handoff_id.as_str());
     assert_eq!(params["client_id"], handoff_id.as_str());
     let text = params["text"].as_str().unwrap_or_default();
@@ -282,6 +286,7 @@ fn handoff_to_unmanaged_bound_pane_queues_a_pane_inbox_wake() {
         "{wake}"
     );
     assert!(evidence.contains("transport:et_pane_inbox"), "{wake}");
+    assert!(evidence.contains("authority_basis:lead_lease"), "{wake}");
 
     // Still an open obligation: queued is not an ack.
     let room = rally(&sandbox, &socket, &["room", "--json"]);
@@ -395,6 +400,45 @@ fn pending_pane_wake_coalesces_later_handoffs() {
     assert_eq!(
         third["data"]["delivery"]["status"], "queued_pane_inbox",
         "{third}"
+    );
+    assert_eq!(enqueues(&log).len(), 2);
+    let _ = std::fs::remove_file(&socket);
+}
+
+// N1: a lead's handoff is never coalesced under a non-lead's pending wake.
+#[test]
+fn lead_handoff_after_a_non_lead_wake_is_enqueued() {
+    let sandbox = ChannelSandbox::spawn();
+    let socket = short_socket("lead");
+    let target = "easy-terminal:idle-ld";
+    let log = spawn_daemon(
+        &socket,
+        vec![pane(&sandbox, "pane-l", target)],
+        EnqueueReply::Queued,
+    );
+    rally(&sandbox, &socket, &["enter", "--tool", "lead:01", "--json"]);
+    // The target invites peer:02, so peer:02 may wake it (target consent).
+    let mut invite = handoff_args(target, "peer:02", "send me work");
+    invite.extend(["--deliver", "record"]);
+    rally(&sandbox, &socket, &invite);
+    let peer = rally(&sandbox, &socket, &handoff_args("peer:02", target, "a"));
+    assert_eq!(
+        peer["data"]["delivery"]["status"], "queued_pane_inbox",
+        "{peer}"
+    );
+
+    let lead = rally(&sandbox, &socket, &handoff_args("lead:01", target, "b"));
+    assert_eq!(
+        lead["data"]["delivery"]["status"], "queued_pane_inbox",
+        "a lead must not be coalesced under a peer's wake: {lead}"
+    );
+    assert_eq!(enqueues(&log).len(), 2);
+
+    // A second peer handoff IS absorbed by the lead's queued wake.
+    let again = rally(&sandbox, &socket, &handoff_args("peer:02", target, "c"));
+    assert_eq!(
+        again["data"]["delivery"]["status"], "coalesced_pane_wake",
+        "{again}"
     );
     assert_eq!(enqueues(&log).len(), 2);
     let _ = std::fs::remove_file(&socket);

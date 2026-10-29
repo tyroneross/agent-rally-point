@@ -15547,6 +15547,79 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    fn pane_wake_fact(created_at: &str, pane: &str, basis: &str) -> store::Fact {
+        store::Fact {
+            from_session_id: None,
+            schema: FACT_SCHEMA.to_string(),
+            event_id: "wake-earlier".to_string(),
+            seq: 0,
+            thread_id: "wake-t".to_string(),
+            kind: store::FactKind::Wake,
+            tool: Some("peer:02".to_string()),
+            role: Some("system".to_string()),
+            subject: "wake intent pending to t".to_string(),
+            scope: Vec::new(),
+            created_at: created_at.to_string(),
+            summary: None,
+            evidence: vec![
+                "pane_inbox_message:m1".to_string(),
+                format!("pane:{pane}"),
+                PANE_WAKE_TRANSPORT_EVIDENCE.to_string(),
+                format!("{PANE_WAKE_AUTHORITY_EVIDENCE_PREFIX}{basis}"),
+            ],
+            target: Some("t".to_string()),
+            ref_id: Some("h1".to_string()),
+            status: Some("pending".to_string()),
+            severity: None,
+            uri: None,
+            session: None,
+        }
+    }
+
+    #[test]
+    fn pane_wake_coalesces_only_recent_same_pane_equal_authority_still_queued() {
+        let now = chrono::Utc::now();
+        let at = |secs_ago: i64| {
+            (now - chrono::Duration::seconds(secs_ago))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        };
+        let queued = |_: &str| Ok("queued".to_string());
+        let consent = AuthorityBasis::TargetConsent;
+        let recent = [pane_wake_fact(&at(60), "p1", "target_consent")];
+        assert!(coalescible_pane_wake(&recent, "t", "p1", consent, now, queued).is_some());
+
+        // (a) older than the coalescing window: wake again.
+        let old = [pane_wake_fact(
+            &at(PANE_WAKE_COALESCE_WINDOW_SECS + 60),
+            "p1",
+            "target_consent",
+        )];
+        assert!(coalescible_pane_wake(&old, "t", "p1", consent, now, queued).is_none());
+        // (b) a different pane: wake again.
+        assert!(coalescible_pane_wake(&recent, "t", "p2", consent, now, queued).is_none());
+        // (c) a lead is never coalesced under a non-lead's wake...
+        assert!(
+            coalescible_pane_wake(&recent, "t", "p1", AuthorityBasis::LeadLease, now, queued)
+                .is_none()
+        );
+        // ...but a lower authority is coalesced under a lead's wake.
+        let lead = [pane_wake_fact(&at(60), "p1", "lead_lease")];
+        assert!(coalescible_pane_wake(&lead, "t", "p1", consent, now, queued).is_some());
+        // An earlier wake with no authority marker absorbs nothing authorized.
+        let mut unmarked = pane_wake_fact(&at(60), "p1", "x");
+        unmarked
+            .evidence
+            .retain(|e| !e.starts_with(PANE_WAKE_AUTHORITY_EVIDENCE_PREFIX));
+        assert!(coalescible_pane_wake(&[unmarked], "t", "p1", consent, now, queued).is_none());
+        // (d) ptyd no longer reports the message queued, or cannot say.
+        let delivered = |_: &str| Ok("delivered".to_string());
+        let unknown = |_: &str| Err("not_found".to_string());
+        assert!(coalescible_pane_wake(&recent, "t", "p1", consent, now, delivered).is_none());
+        assert!(coalescible_pane_wake(&recent, "t", "p1", consent, now, unknown).is_none());
+        // Other targets never coalesce.
+        assert!(coalescible_pane_wake(&recent, "u", "p1", consent, now, queued).is_none());
+    }
+
     #[test]
     fn empty_scope_renew_heartbeat_extends_effective_lease_and_full_reap_preserves() {
         let root = unique_root("heartbeat-renews-claims");
@@ -21583,6 +21656,8 @@ fn select_pane_wake_binding(
 
 /// Is the pane's working directory part of this room's repository: inside the
 /// room root, or a checkout sharing its git common directory (a worktree)?
+/// Reads `.git` / `.git/commondir` in process; never spawns `git` on a path
+/// another pane reported.
 fn pane_cwd_in_room(cwd: &str, repo_root: &Path) -> bool {
     let (Ok(cwd), Ok(root)) = (fs::canonicalize(cwd), fs::canonicalize(repo_root)) else {
         return false;
@@ -21590,10 +21665,13 @@ fn pane_cwd_in_room(cwd: &str, repo_root: &Path) -> bool {
     if cwd.starts_with(&root) {
         return true;
     }
-    match (
-        observed_liveness::git_common_dir(&cwd),
-        observed_liveness::git_common_dir(&root),
-    ) {
+    let common_dir_above = |start: &Path| {
+        start
+            .ancestors()
+            .find(|dir| dir.join(".git").exists())
+            .and_then(git_common_dir)
+    };
+    match (common_dir_above(&cwd), common_dir_above(&root)) {
         (Some(a), Some(b)) => a == b,
         _ => false,
     }
@@ -23382,19 +23460,20 @@ fn pane_wake_delivery(
     let snapshot = room
         .snapshot_for_obligation_target(target_tool, 1)
         .map_err(|e| format!("room snapshot unavailable: {e}"))?;
-    if let Some(earlier) = snapshot.pending_wakes.iter().find(|wake| {
-        wake.target.as_deref() == Some(target_tool)
-            && wake
-                .evidence
-                .iter()
-                .any(|item| item == PANE_WAKE_TRANSPORT_EVIDENCE)
-    }) {
+    if let Some(earlier) = coalescible_pane_wake(
+        &snapshot.pending_wakes,
+        target_tool,
+        &pane.pane_id,
+        authorization.authority_basis,
+        Utc::now(),
+        |message_id| daemon_client::pane_inbox_message_state(&socket, message_id),
+    ) {
         return Ok(HandoffDelivery {
             mode: "inject".to_string(),
             status: "coalesced_pane_wake".to_string(),
             detail: format!(
-                "coalesced into {}: an earlier pane wake to {target_tool} is still pending, and the `rally next` it prompts lists this handoff too; not acknowledged until {target_tool} acts on it",
-                earlier.event_id
+                "coalesced into {}: an earlier pane wake to {target_tool}'s pane {} is still queued there, and the `rally next` it prompts lists this handoff too; not acknowledged until {target_tool} acts on it",
+                earlier.event_id, pane.pane_id
             ),
             ack_by,
             pane_message_id: None,
@@ -23408,6 +23487,7 @@ fn pane_wake_delivery(
         sender_tool,
         target_tool,
         handoff_id,
+        authorization.authority_basis,
     )
     .map_err(|reason| format!("pane {} wake failed: {reason}", pane.pane_id))?;
     Ok(HandoffDelivery {
@@ -23431,6 +23511,73 @@ fn pane_wake_delivery(
     })
 }
 
+/// How long an earlier pane wake may absorb later handoffs. Long enough to
+/// cover a burst of handoffs sent while the target is waking; far shorter than
+/// the 24 h pending-wake TTL, so a lost or stuck pane message cannot silence
+/// the target for a day.
+const PANE_WAKE_COALESCE_WINDOW_SECS: i64 = 600;
+
+/// Evidence prefix recording the sender's authority basis on a pane wake.
+const PANE_WAKE_AUTHORITY_EVIDENCE_PREFIX: &str = "authority_basis:";
+
+/// Ordering of authority bases for coalescing: a wake may only absorb a later
+/// handoff whose sender holds no more authority than the earlier sender.
+fn pane_wake_authority_rank(basis: &str) -> u8 {
+    match basis {
+        "lead_lease" => 3,
+        "task_assignment" | "principal_grant" | "target_consent" => 2,
+        "self_target" | "leaderless_bootstrap" => 1,
+        _ => 0,
+    }
+}
+
+/// The earlier pane wake a new handoff may coalesce into, if any. All must
+/// hold: same target, written by the pane-inbox transport, within
+/// [`PANE_WAKE_COALESCE_WINDOW_SECS`], for the pane resolved now, by a sender
+/// with at least the new sender's authority, and ptyd still reports its
+/// message `queued` in that pane's inbox (`message_state`; any error or
+/// other state means the target was already prompted or the message is
+/// gone, so the new handoff wakes again).
+fn coalescible_pane_wake<'a>(
+    pending_wakes: &'a [Fact],
+    target_tool: &str,
+    pane_id: &str,
+    authority: AuthorityBasis,
+    now: chrono::DateTime<Utc>,
+    message_state: impl Fn(&str) -> std::result::Result<String, String>,
+) -> Option<&'a Fact> {
+    let pane_marker = format!("pane:{pane_id}");
+    let new_rank = pane_wake_authority_rank(authority.as_str());
+    pending_wakes.iter().find(|wake| {
+        let has = |marker: &str| wake.evidence.iter().any(|item| item == marker);
+        let recent = chrono::DateTime::parse_from_rfc3339(&wake.created_at)
+            .map(|at| {
+                let age = now - at.with_timezone(&Utc);
+                age >= chrono::Duration::zero()
+                    && age <= chrono::Duration::seconds(PANE_WAKE_COALESCE_WINDOW_SECS)
+            })
+            .unwrap_or(false);
+        let earlier_rank = wake
+            .evidence
+            .iter()
+            .find_map(|item| item.strip_prefix(PANE_WAKE_AUTHORITY_EVIDENCE_PREFIX))
+            .map(pane_wake_authority_rank)
+            .unwrap_or(0);
+        let still_queued = || {
+            wake.evidence
+                .iter()
+                .find_map(|item| item.strip_prefix("pane_inbox_message:"))
+                .is_some_and(|id| message_state(id).is_ok_and(|state| state == "queued"))
+        };
+        wake.target.as_deref() == Some(target_tool)
+            && has(PANE_WAKE_TRANSPORT_EVIDENCE)
+            && has(&pane_marker)
+            && recent
+            && earlier_rank >= new_rank
+            && still_queued()
+    })
+}
+
 /// Queue the Rally-rendered handoff prompt in the Easy Terminal pane inbox of
 /// the live ptyd pane bound to `target_tool`, then record a durable wake fact
 /// (`queued_awaiting_receipt`, ref = the handoff) so the room shows that a
@@ -23445,14 +23592,17 @@ fn wake_bound_pane(
     sender_tool: &str,
     target_tool: &str,
     handoff_id: &str,
+    authority: AuthorityBasis,
 ) -> std::result::Result<(daemon_client::PaneInboxReceipt, Option<String>), String> {
     // Fixed Rally text naming only ids: no sender-authored prose is typed
     // into another agent's prompt.
     let text = handoff_prompt_ledger(target_tool, handoff_id);
+    // Address the resolved pane by its id, not the identity, so ptyd cannot
+    // file the prompt in some other pane that also claims the identity.
     let receipt =
-        daemon_client::enqueue_pane_inbox(socket, target_tool, &text, handoff_id, handoff_id)?;
-    // ptyd addresses by identity; when it files the message under a
-    // `pane:<id>` address, that pane must be the one we resolved.
+        daemon_client::enqueue_pane_inbox(socket, pane_id, &text, handoff_id, handoff_id)?;
+    // Defense in depth: a `pane:<id>` address in the reply must still name the
+    // pane we addressed.
     if let Some(address) = receipt.address.as_deref()
         && let Some(filed_pane) = address.strip_prefix("pane:")
         && filed_pane != pane_id
@@ -23466,6 +23616,10 @@ fn wake_bound_pane(
         vec![format!("pane_inbox_message:{}", receipt.id)],
         vec![format!("pane:{pane_id}")],
         vec![PANE_WAKE_TRANSPORT_EVIDENCE.to_string()],
+        vec![format!(
+            "{PANE_WAKE_AUTHORITY_EVIDENCE_PREFIX}{}",
+            authority.as_str()
+        )],
     ];
     let wake_event_id = inject_wake_intent_with_room(
         Some(room),

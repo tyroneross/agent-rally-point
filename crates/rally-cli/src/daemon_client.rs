@@ -582,6 +582,24 @@ pub(crate) fn enqueue_pane_inbox(
     parse_enqueue_reply(&reply)
 }
 
+/// Read-only: ptyd's state for pane-inbox message `id` (`inbox.show`;
+/// `queued`, `delivering`, `delivered`, `read`, ...). ptyd answers only the
+/// app, the addressed pane, or the pane that sent the message; anything else
+/// is `not_found`, reported here as an error.
+pub(crate) fn pane_inbox_message_state(socket: &str, id: &str) -> Result<String, String> {
+    let reply = round_trip(socket, "inbox.show", &json!({ "id": id }), DAEMON_TIMEOUT)
+        .map_err(|e| format!("inbox.show call failed: {e}"))?;
+    if let Some(err) = reply.get("error") {
+        return Err(format!("daemon refused inbox.show: {}", err_message(err)));
+    }
+    reply
+        .get("result")
+        .and_then(|r| r.get("state"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "inbox.show reply had no state".to_string())
+}
+
 fn parse_enqueue_reply(reply: &serde_json::Value) -> Result<PaneInboxReceipt, String> {
     if let Some(err) = reply.get("error") {
         let code = err.get("code").and_then(|c| c.as_str()).unwrap_or("error");

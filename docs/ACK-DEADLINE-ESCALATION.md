@@ -39,10 +39,16 @@ nothing turned silence into an escalation.
   repository; and ET's router does not own the identity. ptyd types the
   Rally-rendered prompt when the pane is idle, or a provider hook hands it
   over when busy. That reports `queued_pane_inbox` with `pane_message_id` and
-  a `wake_event_id` (wake fact, reason `queued_awaiting_receipt`). While that
-  wake is pending, later handoffs to the same target report
-  `coalesced_pane_wake` naming it, since the `rally next` it prompts lists
-  every open handoff. None of these is an ack: the prompt asks the target to
+  a `wake_event_id` (wake fact, reason `queued_awaiting_receipt`). The prompt
+  is addressed to the resolved pane id, so ptyd cannot file it in another
+  pane. A later handoff to the same target reports `coalesced_pane_wake`
+  naming the earlier wake (whose `rally next` lists every open handoff) only
+  when that wake is under 10 minutes old, targets the same pane, came from a
+  sender with at least the new sender's authority (lead > consent/assignment
+  > self/bootstrap; a lead is never coalesced under a peer), and ptyd's
+  `inbox.show` still reports its message `queued`. Known limit: an
+  `inbox.enqueue` that times out (3 s) reports `record_only` even if ptyd did
+  queue the prompt. None of these is an ack: the prompt asks the target to
   record an artifact against the handoff (a receipt also closes it), and the
   handoff stays open until then. Any failed gate or enqueue degrades to
   `record_only` with the reason.
