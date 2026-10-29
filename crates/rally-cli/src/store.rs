@@ -4652,8 +4652,11 @@ impl RoomStore {
     pub(crate) fn facts_of_kinds(&self, kinds: &[String]) -> Result<Vec<Fact>> {
         match self {
             RoomStore::Direct(d) => d.facts_of_kinds(kinds),
+            // An older v9 daemon predates this op and rejects it as an unknown
+            // variant: recover from the paged full load, same as an oversized
+            // reply, instead of failing until the daemon restarts.
             RoomStore::Routed(r) => match r.facts_of_kinds(kinds) {
-                Err(error) if is_reply_too_large(&error) => {
+                Err(error) if is_reply_too_large(&error) || is_unknown_store_op(&error) => {
                     Ok(select_facts_of_kinds(r.facts()?, kinds))
                 }
                 other => other,
@@ -4665,8 +4668,9 @@ impl RoomStore {
     pub(crate) fn session_view_facts(&self) -> Result<Vec<Fact>> {
         match self {
             RoomStore::Direct(d) => d.session_view_facts(),
+            // Same older-daemon fallback as `facts_of_kinds`.
             RoomStore::Routed(r) => match r.session_view_facts() {
-                Err(error) if is_reply_too_large(&error) => {
+                Err(error) if is_reply_too_large(&error) || is_unknown_store_op(&error) => {
                     Ok(select_session_view_facts(r.facts()?))
                 }
                 other => other,
@@ -8998,6 +9002,18 @@ fn session_view_tools(facts: &[Fact]) -> BTreeSet<String> {
 /// protocol line limit (typed `reply-too-large`, see rallyd_core).
 fn is_reply_too_large(error: &RallyError) -> bool {
     matches!(error, RallyError::Command(message) if message.contains("reply-too-large"))
+}
+
+/// A daemon from an older build of the same wire version could not parse the
+/// request because it does not know the op (`malformed request: unknown
+/// variant ...`, rallyd_core). Read ops added within a wire version recover
+/// through the paged full load instead of failing until the daemon restarts.
+fn is_unknown_store_op(error: &RallyError) -> bool {
+    matches!(
+        error,
+        RallyError::Command(message)
+            if message.contains("malformed request") && message.contains("unknown variant")
+    )
 }
 
 /// Keep exactly the input of [`project_reply_state`] for `event_id` from a
@@ -22710,6 +22726,111 @@ mod ledger_tests {
             &q(None, Some("2026-10-25T14:00:00.500100+02:00")),
             &none
         ));
+    }
+
+    /// P1: a running daemon from an older build of the same wire version
+    /// rejects `FactsOfKinds` / `SessionViewFacts` as unknown variants. The
+    /// routed store must recover through the paged full load, not fail.
+    #[test]
+    fn older_daemon_without_narrow_ops_falls_back_to_the_full_load() {
+        use rally_protocol::store_wire::{StoreError, StoreErrorKind, StoreOk, StoreResponse};
+        use std::io::{BufRead, BufReader, Write};
+
+        let nonce = unique_root("older-daemon")
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let socket = std::env::temp_dir().join(format!(
+            "rod-{}.sock",
+            &nonce[nonce.len().saturating_sub(12)..]
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let session = {
+            let mut f = make_fact("s1", FactKind::Session, "", "s");
+            f.seq = 1;
+            f.tool = Some("alpha:1".to_string());
+            f.session = Some(
+                serde_json::from_value(serde_json::json!({
+                    "session_id": "sess-s1", "name": "s1", "agent": "claude",
+                    "tool": "alpha:1", "backend": "tmux", "cwd": "/tmp",
+                    "target": "t", "daemon_registered": false,
+                }))
+                .unwrap(),
+            );
+            f
+        };
+        let mut presence = make_fact("p1", FactKind::Presence, "", "s");
+        presence.seq = 2;
+        presence.tool = Some("alpha:1".to_string());
+        let mut backlog_fact = make_fact("b1", FactKind::BacklogItem, "backlog-item", "s");
+        backlog_fact.seq = 3;
+        let all = vec![session, presence, backlog_fact];
+        let page: Vec<serde_json::Value> = all
+            .iter()
+            .map(|f| serde_json::to_value(f).unwrap())
+            .collect();
+        let rejected = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let rejected_log = std::sync::Arc::clone(&rejected);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let mut line = String::new();
+                if BufReader::new(&stream).read_line(&mut line).is_err() {
+                    continue;
+                }
+                let raw: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                // StoreOp is internally tagged by `kind` (snake_case).
+                let op_name = raw["op"]["kind"].as_str().unwrap_or_default().to_string();
+                let response = if op_name == "facts_of_kinds" || op_name == "session_view_facts" {
+                    rejected_log.lock().unwrap().push(op_name.clone());
+                    // What rallyd_core answers when serde cannot parse the op.
+                    StoreResponse::Err(StoreError::new(
+                        StoreErrorKind::Command,
+                        format!(
+                            "malformed request: unknown variant `{op_name}`, expected one of `Facts`"
+                        ),
+                    ))
+                } else {
+                    StoreResponse::Ok(StoreOk::FactsPage {
+                        facts: page.clone(),
+                        next_after_seq: None,
+                    })
+                };
+                let mut writer = &stream;
+                let _ = writeln!(writer, "{}", serde_json::to_string(&response).unwrap());
+            }
+        });
+
+        let repo = unique_root("older-daemon-repo");
+        let room = RoomStore::Routed(crate::store_client::RoutedRoomStore::for_test(
+            socket.clone(),
+            repo,
+            "test-engagement",
+        ));
+        let ids = |v: Vec<Fact>| v.into_iter().map(|f| f.event_id).collect::<Vec<_>>();
+        let backlog = vec!["backlog-item".to_string()];
+        assert_eq!(
+            ids(room.facts_of_kinds(&backlog).unwrap()),
+            ids(select_facts_of_kinds(all.clone(), &backlog))
+        );
+        assert_eq!(
+            ids(room.session_view_facts().unwrap()),
+            ids(select_session_view_facts(all))
+        );
+        assert_eq!(
+            rejected.lock().unwrap().len(),
+            2,
+            "both narrow ops were tried"
+        );
+        assert!(is_unknown_store_op(&RallyError::Command(
+            "malformed request: unknown variant `X`".to_string()
+        )));
+        assert!(!is_unknown_store_op(&RallyError::Command(
+            "malformed request: missing field `op`".to_string()
+        )));
+        let _ = std::fs::remove_file(&socket);
     }
 
     /// The routed fallback triggers only on the daemon's typed oversize error.
