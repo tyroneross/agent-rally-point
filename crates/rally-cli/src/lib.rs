@@ -15547,6 +15547,96 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Oracle for the narrow reads (peer commit 9e7c7f5): the session views
+    /// and the backlog list must be identical whether built from the narrow
+    /// reads or from the whole ledger, the input they used before.
+    #[test]
+    fn narrow_reads_match_the_whole_ledger_oracle() {
+        let root = unique_root("narrow-read-oracle");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let room = store::RoomStore::open_at(root.clone()).unwrap();
+        for tool in ["alpha:1", "beta:1", "gamma:1"] {
+            ensure_presence(&room, tool).unwrap();
+        }
+        let session = |name: &str, tool: &str| -> ManagedSession {
+            serde_json::from_value(serde_json::json!({
+                "session_id": format!("sess-{name}"),
+                "name": name,
+                "agent": "claude",
+                "tool": tool,
+                "backend": "tmux",
+                "cwd": "/tmp",
+                "target": format!("rally-{name}"),
+                "daemon_registered": false,
+            }))
+            .unwrap()
+        };
+        room.append_fact_verified(&session_fact(&session("a", "alpha:1"), "started", None))
+            .unwrap();
+        room.append_fact_verified(&session_fact(&session("g", "gamma:1"), "started", None))
+            .unwrap();
+        // A newer system-authored presence for alpha must not change the view.
+        let mut system = presence_fact_for_test("alpha:1");
+        system.role = Some(SYSTEM_ROLE.to_string());
+        room.append_fact_verified(&system).unwrap();
+        for (id, status) in [("task-1", None), ("task-2", Some("open"))] {
+            backlog::add_backlog_item(&room, "alpha:1", id, "intent", &[], &[], status, None, None)
+                .unwrap();
+        }
+        backlog::mark_backlog_done(&room, "alpha:1", "task-1").unwrap();
+
+        let views = |facts: Vec<store::Fact>| {
+            serde_json::to_value(
+                active_session_views_from_facts(facts, BackendBins::default())
+                    .into_iter()
+                    .map(|(fact, view)| (fact.event_id, view))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        let narrow = views(room.session_view_facts().unwrap());
+        assert_eq!(
+            narrow,
+            views(room.facts().unwrap()),
+            "session views drifted"
+        );
+        assert_eq!(narrow.as_array().map(Vec::len), Some(2), "{narrow}");
+
+        let items = |list: Vec<backlog::BacklogItem>| serde_json::to_value(list).unwrap();
+        let narrow_backlog = items(backlog::list_backlog_items(&room).unwrap());
+        assert_eq!(
+            narrow_backlog,
+            items(backlog::backlog_items_from_facts(&room.facts().unwrap())),
+            "backlog list drifted"
+        );
+        assert_eq!(narrow_backlog.as_array().map(Vec::len), Some(2));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn presence_fact_for_test(tool: &str) -> store::Fact {
+        store::Fact {
+            from_session_id: None,
+            schema: FACT_SCHEMA.to_string(),
+            event_id: new_id("fact"),
+            seq: 0,
+            thread_id: new_id("room"),
+            kind: store::FactKind::Presence,
+            tool: Some(tool.to_string()),
+            role: None,
+            subject: format!("agent presence: {tool}"),
+            scope: Vec::new(),
+            created_at: now_string(),
+            summary: None,
+            evidence: Vec::new(),
+            target: None,
+            ref_id: None,
+            status: None,
+            severity: None,
+            uri: None,
+            session: None,
+        }
+    }
+
     fn pane_wake_fact(created_at: &str, pane: &str, basis: &str) -> store::Fact {
         store::Fact {
             from_session_id: None,

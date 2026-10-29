@@ -309,12 +309,19 @@ pub(crate) fn list_backlog_items(room: &RoomStore) -> Result<Vec<BacklogItem>> {
     // Only backlog facts, read by kind (any spelling) instead of decoding the
     // whole ledger; the selection below is unchanged.
     let facts = room.facts_of_kinds(&["backlog-item".to_string()])?;
+    Ok(backlog_items_from_facts(&facts))
+}
+
+/// The backlog selection over any fact set containing every backlog fact:
+/// the kind-narrowed read above, or the whole ledger (the pre-narrowing
+/// input, kept as the oracle in tests).
+pub(crate) fn backlog_items_from_facts(facts: &[Fact]) -> Vec<BacklogItem> {
     // The latest status fact per id wins (later seq overrides).
     // We also need to handle status-update facts: a fact with the same `id:`
     // but a different status is a status update. We collect the highest-seq
     // fact per id.
     let mut by_id: std::collections::BTreeMap<String, Fact> = std::collections::BTreeMap::new();
-    for fact in &facts {
+    for fact in facts {
         if fact.kind != "backlog-item" {
             continue;
         }
@@ -329,7 +336,7 @@ pub(crate) fn list_backlog_items(room: &RoomStore) -> Result<Vec<BacklogItem>> {
     }
     let mut items: Vec<BacklogItem> = by_id.values().filter_map(fact_to_backlog_item).collect();
     items.sort_by_key(|i| i.seq);
-    Ok(items)
+    items
 }
 
 /// Return the set of item ids that are considered "satisfied" (done or resolved).
