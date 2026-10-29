@@ -433,6 +433,104 @@ pub(crate) fn status_report_warning(subject: &str, summary: Option<&str>) -> Opt
     })
 }
 
+/// Phrases that address the reader with an ask. Matched case-insensitively
+/// anywhere in the receipt text.
+const RECEIPT_INSTRUCTION_PHRASES: &[&str] = &[
+    "please ",
+    "can you",
+    "could you",
+    "you should",
+    "you must",
+    "you need to",
+    "next step",
+    "next:",
+    "todo:",
+    "action:",
+    "go ahead and",
+    "make sure",
+];
+
+/// Imperative verbs that, opening a clause, read as an order.
+const RECEIPT_IMPERATIVE_VERBS: &[&str] = &[
+    "implement",
+    "fix",
+    "build",
+    "run",
+    "add",
+    "remove",
+    "update",
+    "review",
+    "investigate",
+    "deploy",
+    "merge",
+    "push",
+    "refactor",
+    "write",
+    "create",
+    "delete",
+    "rebase",
+    "test",
+    "ship",
+    "migrate",
+    "start",
+    "take",
+    "pick",
+];
+
+/// Words that make a clause a report of finished or accepted work, even when
+/// it opens with an imperative verb ("review done", "test passed").
+const RECEIPT_DONE_WORDS: &[&str] = &[
+    "done",
+    "complete",
+    "completed",
+    "received",
+    "acknowledged",
+    "ack",
+    "acked",
+    "passed",
+    "passing",
+    "green",
+    "finished",
+    "accepted",
+    "ok",
+];
+
+/// The `say receipt` write-time lint: a receipt acknowledges; it does not
+/// assign. Measured motivation (Easy Terminal Team Test 1, 2026-10-28):
+/// receipts carried new instructions that no peer treated as owed work, since
+/// a receipt closes an obligation instead of opening one. Advisory only, and a
+/// false positive costs one stderr line; the receipt still commits.
+///
+/// Fires when the text contains an ask phrase ("please ", "can you", ...) or a
+/// clause opens with an imperative verb and reports nothing finished.
+pub(crate) fn receipt_instruction_warning(subject: &str, summary: Option<&str>) -> Option<String> {
+    let text = format!("{subject}\n{}", summary.unwrap_or_default()).to_ascii_lowercase();
+    let trigger = RECEIPT_INSTRUCTION_PHRASES
+        .iter()
+        .find(|phrase| text.contains(*phrase))
+        .map(|phrase| format!("\"{}\"", phrase.trim()))
+        .or_else(|| {
+            text.split(['.', ';', ':', '\n', '!'])
+                .flat_map(|clause| clause.split(" then "))
+                .find_map(|clause| {
+                    let mut words = clause
+                        .split(|c: char| !c.is_ascii_alphanumeric())
+                        .filter(|w| !w.is_empty());
+                    let first = words.next()?;
+                    let imperative = RECEIPT_IMPERATIVE_VERBS.contains(&first);
+                    let reports_done = clause
+                        .split(|c: char| !c.is_ascii_alphanumeric())
+                        .any(|w| RECEIPT_DONE_WORDS.contains(&w));
+                    (imperative && !reports_done).then(|| format!("clause starting \"{first}\""))
+                })
+        })?;
+    Some(format!(
+        "this receipt reads as a new instruction ({trigger}). A receipt only acknowledges: \
+         it closes an obligation and nobody owes work on it. To assign the work, send it as \
+         `rally say handoff --target <tool> --subject '<the ask>'`."
+    ))
+}
+
 fn shared_thread(thread_id: &str) -> bool {
     // `rally next` and read checkpoints write one thread per tool; matching on
     // those would link every wake to every item.
@@ -1298,5 +1396,43 @@ mod tests {
         assert!(!plan_marks_done(&path));
         std::fs::write(&path, "---\nstatus: done\n---\n").unwrap();
         assert!(plan_marks_done(&path));
+    }
+
+    #[test]
+    fn receipt_instruction_warning_flags_asks_and_orders() {
+        for (subject, summary) in [
+            ("received; please rebase onto main next", None),
+            ("ack", Some("Can you also run the full suite?")),
+            ("got it. Fix the flaky test in store.rs", None),
+            ("ack: now deploy the preview then merge", None),
+            ("thanks", Some("next: wire the router")),
+            ("Implement the retry budget for inject", None),
+        ] {
+            let warning = receipt_instruction_warning(subject, summary);
+            assert!(
+                warning
+                    .as_deref()
+                    .is_some_and(|w| w.contains("rally say handoff")),
+                "should warn: {subject:?} / {summary:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_instruction_warning_leaves_plain_acks_alone() {
+        for (subject, summary) in [
+            ("received handoff fact_123", None),
+            ("ack: review done, 3 findings filed", None),
+            ("tests passed on 4df00de", Some("merged into the branch")),
+            ("fixed in a841677", Some("verified with cargo test")),
+            ("accepted; working on it", None),
+            ("Merge complete", None),
+        ] {
+            assert_eq!(
+                receipt_instruction_warning(subject, summary),
+                None,
+                "should not warn: {subject:?} / {summary:?}"
+            );
+        }
     }
 }

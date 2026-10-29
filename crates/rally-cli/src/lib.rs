@@ -3910,6 +3910,20 @@ fn command_say(args: SayArgs) -> Result<Output> {
         });
     }
 
+    // Advisory: a receipt that carries a new instruction. A receipt closes an
+    // obligation, so an ask inside it is owed by nobody; it belongs in a
+    // handoff. Warn on stderr and in JSON; the receipt still commits.
+    if fact.kind == FactKind::Receipt
+        && let Some(message) =
+            open_queue::receipt_instruction_warning(&fact.subject, fact.summary.as_deref())
+    {
+        eprintln!("rally: warning: {message}");
+        say_warnings.push(SayWarning {
+            code: "receipt:carries_instruction".to_string(),
+            message,
+        });
+    }
+
     // Advisory protocol-envelope validation (lenient, never blocks): surfaces
     // missing causal ids — e.g. an ACK/resolve that doesn't cite its ref_event_id.
     // Charter: warn and record; hosts decide whether to act.
