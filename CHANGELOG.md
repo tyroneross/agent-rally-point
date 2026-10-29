@@ -23,8 +23,10 @@ activity renewals for auto-claims also pass through this filter.
 A receipt closes an obligation, so an ask inside it is owed by nobody.
 `rally say receipt` now prints a stderr warning (and `data.warnings` code
 `receipt:carries_instruction`) when the text contains an ask phrase ("please",
-"can you", "next:") or a clause opens with an imperative verb and reports
-nothing finished, and suggests `rally say handoff`. The receipt still commits.
+"can you", "next:", matched on word boundaries) or a clause opens with an
+imperative verb and is not syntactically a report (no condition word such as
+"until"/"after", and a done-word at the end or after the subject, or a count),
+and suggests `rally say handoff`. The receipt still commits.
 
 ### Fixed — handoffs wake idle Easy Terminal panes
 

@@ -434,9 +434,9 @@ pub(crate) fn status_report_warning(subject: &str, summary: Option<&str>) -> Opt
 }
 
 /// Phrases that address the reader with an ask. Matched case-insensitively
-/// anywhere in the receipt text.
+/// on word boundaries ("action:" never matches inside "transaction:").
 const RECEIPT_INSTRUCTION_PHRASES: &[&str] = &[
-    "please ",
+    "please",
     "can you",
     "could you",
     "you should",
@@ -477,8 +477,7 @@ const RECEIPT_IMPERATIVE_VERBS: &[&str] = &[
     "pick",
 ];
 
-/// Words that make a clause a report of finished or accepted work, even when
-/// it opens with an imperative verb ("review done", "test passed").
+/// Words that report finished or accepted work.
 const RECEIPT_DONE_WORDS: &[&str] = &[
     "done",
     "complete",
@@ -493,7 +492,47 @@ const RECEIPT_DONE_WORDS: &[&str] = &[
     "finished",
     "accepted",
     "ok",
+    "filed",
+    "landed",
+    "merged",
+    "shipped",
+    "fixed",
+    "verified",
+    "resolved",
+    "closed",
 ];
+
+/// Words that open a condition. A done-word after one describes when to act
+/// ("merge after review is complete"), not something already done.
+const RECEIPT_CONDITION_WORDS: &[&str] = &[
+    "until", "after", "when", "once", "before", "if", "unless", "while",
+];
+
+/// Does `text` contain `phrase` starting and ending on a word boundary?
+fn contains_phrase(text: &str, phrase: &str) -> bool {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    text.match_indices(phrase).any(|(at, _)| {
+        let before_ok = text[..at].chars().next_back().is_none_or(|c| !is_word(c));
+        let after = &text[at + phrase.len()..];
+        let ends_on_word = phrase.chars().next_back().is_some_and(is_word);
+        let after_ok = !ends_on_word || after.chars().next().is_none_or(|c| !is_word(c));
+        before_ok && after_ok
+    })
+}
+
+/// Is this clause syntactically a report of done work, rather than an order
+/// that merely mentions a done-word? A report has no condition word and
+/// either ends on a done-word ("review done", "merge complete"), puts one
+/// right after its subject ("test passed on main"), or carries a count or id
+/// with digits ("412/412 passed", "fixed in a841677").
+fn clause_is_report(clause: &str, words: &[&str]) -> bool {
+    if words.iter().any(|w| RECEIPT_CONDITION_WORDS.contains(w)) {
+        return false;
+    }
+    words.last().is_some_and(|w| RECEIPT_DONE_WORDS.contains(w))
+        || words.get(1).is_some_and(|w| RECEIPT_DONE_WORDS.contains(w))
+        || clause.chars().any(|c| c.is_ascii_digit())
+}
 
 /// The `say receipt` write-time lint: a receipt acknowledges; it does not
 /// assign. Measured motivation (Easy Terminal Team Test 1, 2026-10-28):
@@ -501,27 +540,26 @@ const RECEIPT_DONE_WORDS: &[&str] = &[
 /// a receipt closes an obligation instead of opening one. Advisory only, and a
 /// false positive costs one stderr line; the receipt still commits.
 ///
-/// Fires when the text contains an ask phrase ("please ", "can you", ...) or a
-/// clause opens with an imperative verb and reports nothing finished.
+/// Fires when the text contains an ask phrase ("please", "can you", ...) on
+/// word boundaries, or a clause opens with an imperative verb and is not
+/// syntactically a report (see [`clause_is_report`]).
 pub(crate) fn receipt_instruction_warning(subject: &str, summary: Option<&str>) -> Option<String> {
     let text = format!("{subject}\n{}", summary.unwrap_or_default()).to_ascii_lowercase();
     let trigger = RECEIPT_INSTRUCTION_PHRASES
         .iter()
-        .find(|phrase| text.contains(*phrase))
-        .map(|phrase| format!("\"{}\"", phrase.trim()))
+        .find(|phrase| contains_phrase(&text, phrase))
+        .map(|phrase| format!("\"{phrase}\""))
         .or_else(|| {
-            text.split(['.', ';', ':', '\n', '!'])
+            text.split(['.', ';', ':', '\n', '!', ','])
                 .flat_map(|clause| clause.split(" then "))
                 .find_map(|clause| {
-                    let mut words = clause
+                    let words: Vec<&str> = clause
                         .split(|c: char| !c.is_ascii_alphanumeric())
-                        .filter(|w| !w.is_empty());
-                    let first = words.next()?;
-                    let imperative = RECEIPT_IMPERATIVE_VERBS.contains(&first);
-                    let reports_done = clause
-                        .split(|c: char| !c.is_ascii_alphanumeric())
-                        .any(|w| RECEIPT_DONE_WORDS.contains(&w));
-                    (imperative && !reports_done).then(|| format!("clause starting \"{first}\""))
+                        .filter(|w| !w.is_empty())
+                        .collect();
+                    let first = *words.first()?;
+                    (RECEIPT_IMPERATIVE_VERBS.contains(&first) && !clause_is_report(clause, &words))
+                        .then(|| format!("clause starting \"{first}\""))
                 })
         })?;
     Some(format!(
@@ -1407,6 +1445,9 @@ mod tests {
             ("ack: now deploy the preview then merge", None),
             ("thanks", Some("next: wire the router")),
             ("Implement the retry budget for inject", None),
+            // X2: a done-word inside a condition is not a report.
+            ("Run the tests until they are green", None),
+            ("Merge after review is complete", None),
         ] {
             let warning = receipt_instruction_warning(subject, summary);
             assert!(
@@ -1423,10 +1464,16 @@ mod tests {
         for (subject, summary) in [
             ("received handoff fact_123", None),
             ("ack: review done, 3 findings filed", None),
+            ("review done", None),
             ("tests passed on 4df00de", Some("merged into the branch")),
             ("fixed in a841677", Some("verified with cargo test")),
             ("accepted; working on it", None),
             ("Merge complete", None),
+            ("test suite 412/412 passed", None),
+            ("test passed on main", None),
+            // A5: word boundaries; "action:" is not inside "transaction:".
+            ("received; transaction: recorded", None),
+            ("ack, displeased nobody", None),
         ] {
             assert_eq!(
                 receipt_instruction_warning(subject, summary),
@@ -1434,5 +1481,15 @@ mod tests {
                 "should not warn: {subject:?} / {summary:?}"
             );
         }
+    }
+
+    #[test]
+    fn contains_phrase_respects_word_boundaries() {
+        assert!(contains_phrase("next: x", "next:"));
+        assert!(!contains_phrase("transaction: x", "action:"));
+        assert!(contains_phrase("ok, please do", "please"));
+        assert!(!contains_phrase("displeased", "please"));
+        assert!(contains_phrase("can you run", "can you"));
+        assert!(!contains_phrase("pecan youth", "can you"));
     }
 }
