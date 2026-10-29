@@ -13,7 +13,10 @@ Every heartbeat renewed every claim a session owned, including claims the
 before-write hook took on files the agent then never wrote (Easy Terminal Team
 Test 1: 228 renewals kept 8 untouched scratch files claimed). An auto-claim is
 now renewed only when one of its files was modified since its current lease
-was granted; explicit claims renew as before.
+was granted (the latest renewal's time, projected as `lease_granted_at:`;
+snapshot cache generation 9 -> 10); explicit claims renew as before. Future
+mtimes are distrusted. Once `fix/claim-renewal-on-activity-1022` lands, its
+activity renewals for auto-claims also pass through this filter.
 
 ### Added — `say receipt` warns when the receipt carries an instruction
 

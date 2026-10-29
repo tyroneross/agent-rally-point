@@ -2878,20 +2878,39 @@ fn renew_owned_claim_leases_from(
     Ok(renewed)
 }
 
+/// Slack for filesystem/clock granularity before a future mtime is distrusted.
+const AUTO_CLAIM_MTIME_FUTURE_TOLERANCE_SECS: i64 = 5;
+
 /// Has any file this auto-claim covers been modified since its current lease
-/// was granted? The grant is the claim's effective `lease_expires_at` minus
-/// the size-scaled `lease_secs` (the same window the renewal would grant), so
-/// an auto-claim lives one lease window past the agent's last write, then
-/// lapses; the hook re-claims on the next write.
+/// was granted? The grant time is the projected `lease_granted_at:` marker
+/// (the latest renewal's, else the claim's own `created_at`), so an auto-claim
+/// lives one lease window past the agent's last write, then lapses; the hook
+/// re-claims on the next write. A claim projected without the marker (an
+/// older daemon) falls back to the effective `lease_expires_at` minus the
+/// size-scaled `lease_secs`, floored at the claim's `created_at`.
 ///
-/// Fails toward renewing (today's behavior) whenever the question cannot be
-/// answered: no readable lease marker, or no `file:` scope at all. A missing
-/// file counts as not written.
+/// Edge cases:
+/// * an mtime more than [`AUTO_CLAIM_MTIME_FUTURE_TOLERANCE_SECS`] in the
+///   future (clock skew, `touch -d`) is untrustworthy and counts as not
+///   written; otherwise it would read as "written" on every renewal forever;
+/// * a missing file counts as not written (the hook re-claims a recreated one);
+/// * a tool that preserves mtime on write (`cp -p`, `rsync -t`) is invisible
+///   here, so its auto-claim lapses after one lease window;
+/// * no lease time at all, or no `file:` scope, fails toward renewing.
 fn auto_claim_written_in_current_lease(claim: &Fact, repo_root: &Path, lease_secs: i64) -> bool {
-    let Some(expires) = claim_authority::lease_expires_at_time(claim) else {
-        return true;
+    let now = Utc::now();
+    let granted = match claim_authority::lease_granted_at_time(claim) {
+        Some(granted) => granted,
+        None => {
+            let Some(expires) = claim_authority::lease_expires_at_time(claim) else {
+                return true;
+            };
+            let computed = expires - chrono::Duration::seconds(lease_secs);
+            chrono::DateTime::parse_from_rfc3339(&claim.created_at)
+                .map(|created| computed.max(created.with_timezone(&Utc)))
+                .unwrap_or(computed)
+        }
     };
-    let granted = expires - chrono::Duration::seconds(lease_secs);
     let mut files = claim
         .scope
         .iter()
@@ -2909,7 +2928,12 @@ fn auto_claim_written_in_current_lease(claim: &Fact, repo_root: &Path, lease_sec
         };
         fs::metadata(&abs)
             .and_then(|meta| meta.modified())
-            .map(|modified| chrono::DateTime::<Utc>::from(modified) >= granted)
+            .map(|modified| {
+                let modified = chrono::DateTime::<Utc>::from(modified);
+                modified >= granted
+                    && modified
+                        <= now + chrono::Duration::seconds(AUTO_CLAIM_MTIME_FUTURE_TOLERANCE_SECS)
+            })
             .unwrap_or(false)
     })
 }
@@ -15364,25 +15388,44 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    fn set_mtime(path: &std::path::Path, offset_secs: i64) {
+        let now = std::time::SystemTime::now();
+        let when = if offset_secs >= 0 {
+            now + std::time::Duration::from_secs(offset_secs as u64)
+        } else {
+            now - std::time::Duration::from_secs((-offset_secs) as u64)
+        };
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+
     #[test]
     fn heartbeat_skips_auto_claims_whose_files_were_not_written_in_the_lease() {
         let root = unique_root("auto-claim-renewal-needs-writes");
         std::fs::create_dir_all(root.join(".git")).unwrap();
-        for name in ["explicit.txt", "auto-idle.txt", "auto-written.txt"] {
+        for (name, offset) in [
+            ("explicit.txt", -3600),
+            ("auto-idle.txt", -3600),
+            ("auto-written.txt", -300),
+            ("auto-future.txt", 3600),
+        ] {
             std::fs::write(root.join(name), "x").unwrap();
+            set_mtime(&root.join(name), offset);
         }
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         ensure_presence(&room, "tool-x").unwrap();
         let session = current_protocol_session(Some("tool-x"))
             .from_session_id()
             .to_string();
-        // A lease granted in the FUTURE puts every file mtime before the
-        // grant (untouched); an expired lease puts the grant in the past, so
-        // the files written above count as written during the lease.
-        let future = (chrono::Utc::now() + chrono::Duration::days(2))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let past = "2000-01-01T00:00:00Z".to_string();
-        let claim = |id: &str, file: &str, summary: Option<&str>, lease: &str| store::Fact {
+        let ago = |secs: i64| {
+            (chrono::Utc::now() - chrono::Duration::seconds(secs))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        };
+        let claim = |id: &str, file: &str, summary: Option<&str>, created_at: String| store::Fact {
             from_session_id: Some(session.clone()),
             schema: FACT_SCHEMA.to_string(),
             event_id: id.to_string(),
@@ -15393,9 +15436,9 @@ mod tests {
             role: None,
             subject: format!("claim {file}"),
             scope: vec![format!("file:{file}")],
-            created_at: now_string(),
+            created_at,
             summary: summary.map(str::to_string),
-            evidence: vec![format!("lease_expires_at:{lease}")],
+            evidence: vec!["lease_expires_at:2000-01-01T00:00:00Z".to_string()],
             target: None,
             ref_id: None,
             status: None,
@@ -15405,33 +15448,51 @@ mod tests {
         };
         let auto = Some(hook_runtime::AUTO_CLAIM_SUMMARY);
         for fact in [
-            claim("claim-explicit", "explicit.txt", None, &past),
-            claim("claim-auto-idle", "auto-idle.txt", auto, &future),
-            claim("claim-auto-written", "auto-written.txt", auto, &past),
+            // Explicit: renews regardless of writes.
+            claim("claim-explicit", "explicit.txt", None, ago(600)),
+            // Granted now, file last written an hour ago: untouched.
+            claim("claim-auto-idle", "auto-idle.txt", auto, ago(0)),
+            // Granted 10 min ago, written 5 min ago: written in this lease.
+            claim("claim-auto-written", "auto-written.txt", auto, ago(600)),
+            // A future mtime is distrusted, not "written forever".
+            claim("claim-auto-future", "auto-future.txt", auto, ago(600)),
         ] {
             room.append_fact_verified(&fact).unwrap();
         }
 
         assert_eq!(renew_owned_claim_leases(&room, "tool-x").unwrap(), 2);
+        let renewed = |room: &store::RoomStore| -> Vec<String> {
+            room.facts()
+                .unwrap()
+                .iter()
+                .filter(|f| f.kind == store::FactKind::ClaimRenewed)
+                .filter_map(|f| f.ref_id.clone())
+                .collect()
+        };
+        let first = renewed(&room);
+        assert!(first.contains(&"claim-explicit".to_string()), "{first:?}");
+        assert!(
+            first.contains(&"claim-auto-written".to_string()),
+            "{first:?}"
+        );
+        assert!(!first.contains(&"claim-auto-idle".to_string()), "{first:?}");
+        assert!(
+            !first.contains(&"claim-auto-future".to_string()),
+            "{first:?}"
+        );
 
-        let renewed: Vec<String> = room
-            .facts()
-            .unwrap()
-            .iter()
-            .filter(|f| f.kind == store::FactKind::ClaimRenewed)
-            .filter_map(|f| f.ref_id.clone())
-            .collect();
-        assert!(
-            renewed.contains(&"claim-explicit".to_string()),
-            "{renewed:?}"
-        );
-        assert!(
-            renewed.contains(&"claim-auto-written".to_string()),
-            "{renewed:?}"
-        );
-        assert!(
-            !renewed.contains(&"claim-auto-idle".to_string()),
-            "an untouched auto-claim must not be renewed: {renewed:?}"
+        // The renewal re-grants the lease NOW (its own created_at, read back
+        // from the projection, not recomputed from config): the 5-minute-old
+        // write predates it, so the next heartbeat lets the auto-claim lapse.
+        assert_eq!(renew_owned_claim_leases(&room, "tool-x").unwrap(), 1);
+        let second = renewed(&room);
+        assert_eq!(
+            second
+                .iter()
+                .filter(|id| *id == "claim-auto-written")
+                .count(),
+            1,
+            "{second:?}"
         );
         std::fs::remove_dir_all(root).ok();
     }
@@ -15465,9 +15526,25 @@ mod tests {
         // Lease known, file missing: not written.
         fact.evidence = vec!["lease_expires_at:2000-01-01T00:00:00Z".to_string()];
         assert!(!auto_claim_written_in_current_lease(&fact, &root, 600));
+        // A projected grant marker wins over the config-derived fallback: an
+        // existing file written before the marked grant is not written.
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("old.txt"), "x").unwrap();
+        set_mtime(&root.join("old.txt"), -3600);
+        fact.scope = vec!["file:old.txt".to_string()];
+        fact.created_at = "2000-01-01T00:00:00Z".to_string();
+        // Without the marker the fallback grant is 2000 and the file counts.
+        fact.evidence = vec!["lease_expires_at:2000-01-01T00:10:00Z".to_string()];
+        assert!(auto_claim_written_in_current_lease(&fact, &root, 600));
+        fact.evidence = vec![
+            "lease_expires_at:2000-01-01T00:00:00Z".to_string(),
+            format!("lease_granted_at:{}", now_string()),
+        ];
+        assert!(!auto_claim_written_in_current_lease(&fact, &root, 600));
         // No file scope at all: cannot tell, keep renewing.
         fact.scope = vec!["resource:db".to_string()];
         assert!(auto_claim_written_in_current_lease(&fact, &root, 600));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

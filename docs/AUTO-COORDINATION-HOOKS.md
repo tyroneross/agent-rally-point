@@ -147,8 +147,13 @@ the corresponding adapter.
 the agent's behalf (summary `native-hook:before-write`) is renewed by a
 heartbeat only when one of its files was modified since the claim's current
 lease was granted, so it lapses one lease window after the agent's last write
-and the hook re-claims on the next write. Explicit `rally say claim` claims
-keep renewing on every heartbeat. A claim with no readable lease marker or no
+and the hook re-claims on the next write. The grant time is the latest
+renewal's `created_at` (else the claim's), projected onto active claims as
+`lease_granted_at:`; it does not depend on current config. A missing file
+counts as not written; an mtime more than 5 s in the future is distrusted; a
+tool that preserves mtime on write (`cp -p`, `rsync -t`) is invisible, so that
+auto-claim lapses after one window. Explicit `rally say claim` claims keep
+renewing on every heartbeat. A claim with no readable lease time or no
 `file:` scope keeps renewing.
 
 **Why the Codex matcher remains unset.** Claude's documented matcher keeps its

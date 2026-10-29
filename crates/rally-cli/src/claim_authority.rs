@@ -8,6 +8,10 @@ use std::path::Path;
 
 pub(crate) const CLAIM_INDEX_FILENAME: &str = "claim-index.json";
 const LEASE_EVIDENCE_PREFIX: &str = "lease_expires_at:";
+/// Projected-only evidence marker: when the claim's CURRENT lease was granted
+/// (the latest valid renewal's `created_at`, else the claim's own). Written by
+/// [`project_effective_claim`], never appended to the ledger.
+pub(crate) const LEASE_GRANTED_PREFIX: &str = "lease_granted_at:";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ActiveClaimRecord {
@@ -403,18 +407,44 @@ pub(crate) fn renewable_claim_record(facts: &[Fact], claim_id: &str) -> Option<A
 /// unchanged; only the derived lease view advances.
 pub(crate) fn project_effective_claim(fact: &Fact, facts: &[Fact]) -> Fact {
     let mut projected = fact.clone();
-    if let Some(expires_at) = latest_renewed_lease(fact, facts) {
-        projected
-            .evidence
-            .retain(|item| !item.starts_with(LEASE_EVIDENCE_PREFIX));
-        projected
-            .evidence
-            .push(format!("{LEASE_EVIDENCE_PREFIX}{expires_at}"));
-    }
+    projected
+        .evidence
+        .retain(|item| !item.starts_with(LEASE_GRANTED_PREFIX));
+    let granted_at = match latest_renewal(fact, facts) {
+        Some((expires_at, renewed_at)) => {
+            projected
+                .evidence
+                .retain(|item| !item.starts_with(LEASE_EVIDENCE_PREFIX));
+            projected
+                .evidence
+                .push(format!("{LEASE_EVIDENCE_PREFIX}{expires_at}"));
+            renewed_at
+        }
+        None => fact.created_at.clone(),
+    };
+    projected
+        .evidence
+        .push(format!("{LEASE_GRANTED_PREFIX}{granted_at}"));
     projected
 }
 
+/// When the projected claim's current lease was granted, from the
+/// [`LEASE_GRANTED_PREFIX`] marker. `None` for a claim projected by a build
+/// that did not stamp it (an older daemon) or an unparseable stamp.
+pub(crate) fn lease_granted_at_time(claim: &Fact) -> Option<DateTime<Utc>> {
+    claim
+        .evidence
+        .iter()
+        .find_map(|item| item.strip_prefix(LEASE_GRANTED_PREFIX))
+        .and_then(|raw| parse_time(raw.trim()))
+}
+
 pub(crate) fn latest_renewed_lease(claim: &Fact, facts: &[Fact]) -> Option<String> {
+    latest_renewal(claim, facts).map(|(lease, _)| lease)
+}
+
+/// The latest valid renewal of `claim`: `(lease_expires_at, renewal created_at)`.
+fn latest_renewal(claim: &Fact, facts: &[Fact]) -> Option<(String, String)> {
     facts
         .iter()
         .filter(|fact| {
@@ -430,12 +460,12 @@ pub(crate) fn latest_renewed_lease(claim: &Fact, facts: &[Fact]) -> Option<Strin
         .filter_map(|fact| {
             let lease = lease_expires_at(fact)?;
             let parsed = parse_time(&lease)?;
-            Some((parsed, lease))
+            Some((parsed, lease, fact.created_at.clone()))
         })
         // Projection remains monotonic even for an imported or hand-edited
         // ledger that bypassed the append-boundary ordering guard.
-        .max_by_key(|(parsed, _)| *parsed)
-        .map(|(_, lease)| lease)
+        .max_by_key(|(parsed, _, _)| *parsed)
+        .map(|(_, lease, created_at)| (lease, created_at))
 }
 
 /// R3. Retraction resolution, applied over the caller's in-memory `facts`.
@@ -884,9 +914,7 @@ pub(crate) fn lease_expires_at_time(claim: &Fact) -> Option<DateTime<Utc>> {
 /// `next` ranking and the claim-close write gate, so the two cannot disagree
 /// about whether a claim is still leased.
 pub(crate) fn lease_expired_at(claim: &Fact, now: DateTime<Utc>) -> bool {
-    lease_expires_at(claim)
-        .and_then(|raw| parse_time(raw.trim()))
-        .is_some_and(|expires| expires <= now)
+    lease_expires_at_time(claim).is_some_and(|expires| expires <= now)
 }
 
 fn parse_time(raw: &str) -> Option<DateTime<Utc>> {

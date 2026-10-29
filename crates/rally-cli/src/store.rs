@@ -14064,7 +14064,11 @@ const SNAPSHOT_CACHE_FILENAME: &str = "snapshot.cache.json";
 /// Bumped 8 -> 9 when `pending_wakes` started expiring by closed target and
 /// `wake_ttl_secs` age. A generation-8 cache would keep serving every stale
 /// wake the new fold drops.
-const SNAPSHOT_CACHE_GENERATION: u32 = 9;
+///
+/// Bumped 9 -> 10 when every projected active claim started carrying a
+/// `lease_granted_at:` marker (the current lease's grant time, read by
+/// auto-claim renewal). A generation-9 cache would serve claims without it.
+const SNAPSHOT_CACHE_GENERATION: u32 = 10;
 
 /// Snapshot projected from inputs and a freshness proof captured together under
 /// one room mutation lock. Pure projection runs after releasing that lock.
