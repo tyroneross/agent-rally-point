@@ -82,7 +82,8 @@
 #                            host's timeout; the CLI's accepted range is not a
 #                            promise that a host grants that much time.
 #   RALLY_HOOK_DEADLINE_MS — whole-hook deadline for start/idle/after-write
-#                            (default 4000, under the host's 5s; 100..59999).
+#                            (default idle 2000, start 3500, after-write 4000,
+#                            all under the host's 5s; 100..59999).
 #                            On overrun the hook prints `{}` and exits 0. See
 #                            "Lifecycle deadline supervisor" below.
 #   RALLY_BIN              — dev override for the rally binary. Must be an
@@ -402,7 +403,8 @@ esac
 # This supervisor makes the deadline a property of the hook, not of the load.
 # It re-runs this script as a child in its own process group, buffers the
 # child's stdout, and returns it verbatim when the child finishes inside
-# RALLY_HOOK_DEADLINE_MS (default 4000; 100..59999; scaled by
+# RALLY_HOOK_DEADLINE_MS (default idle 2000 / start 3500 / after-write 4000;
+# 100..59999; scaled by
 # RALLY_HOOK_MS_BUDGET_SCALE, capped at the 4000ms production limit). A core
 # alarm bounds module initialization before the normal watchdog can run.
 # On overrun it kills the
@@ -422,10 +424,18 @@ case "$phase" in
       export -n RALLY_HOOK_CALL_DEADLINE_AT_MS 2>/dev/null || true
     elif command -v perl >/dev/null 2>&1 && find_rally_root >/dev/null 2>&1; then
       unset RALLY_HOOK_CALL_DEADLINE_AT_MS
-      _rally_deadline_ms="${RALLY_HOOK_DEADLINE_MS:-4000}"
+      # Per-phase default. UserPromptSubmit blocks the user's prompt and was
+      # cancelled at the host's 5s; start gets the room reads it needs; Stop is
+      # registered async so it has no host timeout to protect.
+      case "$phase" in
+        idle) _rally_deadline_default=2000 ;;
+        start) _rally_deadline_default=3500 ;;
+        *) _rally_deadline_default=4000 ;;
+      esac
+      _rally_deadline_ms="${RALLY_HOOK_DEADLINE_MS:-$_rally_deadline_default}"
       case "$_rally_deadline_ms" in
         [1-9][0-9][0-9]|[1-9][0-9][0-9][0-9]|[1-5][0-9][0-9][0-9][0-9]) ;;
-        *) _rally_deadline_ms=4000 ;;
+        *) _rally_deadline_ms=$_rally_deadline_default ;;
       esac
       _rally_deadline_scale="${RALLY_HOOK_MS_BUDGET_SCALE:-1}"
       case "$_rally_deadline_scale" in
@@ -465,7 +475,12 @@ case "$phase" in
           exit 0;
         }
         close $w;
-        my $kill = sub { kill "KILL", -$pid; kill "KILL", $pid; waitpid($pid, 0); };
+        # Reap with a short bound: a child stuck in uninterruptible I/O must not
+        # hold back the fail-open `{}` until the host cancels the hook.
+        my $kill = sub {
+          kill "KILL", -$pid; kill "KILL", $pid;
+          for (1 .. 20) { last if waitpid($pid, WNOHANG) != 0; select(undef, undef, undef, 0.01); }
+        };
         $cleanup = $kill;
         $SIG{TERM} = $SIG{INT} = $SIG{HUP} = sub { $kill->(); exit 0; };
         my $deadline = $t0 + $ms / 1000;
@@ -747,6 +762,10 @@ finish(12, {
 fi
 
 _rally_native_meta_field() {
+  # Lifecycle phases never classify an envelope, so native_meta is the literal
+  # `{}` and every field is empty. Answer that without spawning node (one cold
+  # node start costs 100-450ms under load). Same output as the parse below.
+  [ "$native_meta" = '{}' ] && return 0
   printf '%s' "$native_meta" | node -e '
 const fs=require("fs");
 try {
@@ -1272,6 +1291,30 @@ _rally_id_segment() {
 }
 
 _rally_checkin_iso() {
+  # Whole-second windows: add the offset to the epoch ourselves and format that
+  # absolute instant (BSD `date -r`, GNU `date -d @`), so no node start sits on
+  # the blocking path. The result is byte-identical to the Node path below,
+  # which floors to the second. Anything else (fractional, huge, junk) keeps
+  # the Node path.
+  # Without node the historical result is "no timestamp" (the heartbeat then
+  # posts without --wake-after); keep that.
+  local _secs="${RALLY_CHECKIN_SECS:-300}" _now _iso
+  [ "$have_node" = "1" ] || return 0
+  case "$_secs" in
+    *[!0-9]*|0*) ;;
+    *)
+      if [ "${#_secs}" -le 9 ] && _now="$(date +%s 2>/dev/null)" && [ -n "$_now" ]; then
+        _now=$(( _now + _secs ))
+        _iso="$(date -u -r "$_now" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "@$_now" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
+        case "$_iso" in
+          [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z)
+            printf '%s' "$_iso"
+            return 0
+            ;;
+        esac
+      fi
+      ;;
+  esac
   # Use Node because BSD date and GNU date disagree on relative offsets.
   if [ "$have_node" = "1" ]; then
     node -e '

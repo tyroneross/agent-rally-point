@@ -172,6 +172,13 @@ The generated Codex file uses only its accepted top-level `description` and
 generator converts the canonical 5,000/10,000 millisecond values to 5/10 before
 rendering either host surface.
 
+**Claude `Stop` runs async.** The generated Claude `Stop` entry sets
+`"async": true` (from `async.claude_code` in `config/host-integrations.json`), so the turn
+end no longer waits on the Rally reads. Claude delivers an async hook's
+`systemMessage` to the model on the next turn instead of showing it to the user.
+Lifecycle deadlines default to 2,000 ms for `UserPromptSubmit` and 3,500 ms for
+`SessionStart`; on overrun the hook prints `{}` (override with `RALLY_HOOK_DEADLINE_MS`).
+
 **Mutation targets are all-or-none.** `apply_patch` reads only `Add File`,
 `Update File`, `Delete File`, and `Move to/from` directives, and those directive
 paths must be relative to the validated event `cwd`. Other named mutation

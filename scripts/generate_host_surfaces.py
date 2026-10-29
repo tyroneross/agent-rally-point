@@ -221,6 +221,10 @@ def claude_hook_group(
     }
     if include_timeout:
         hook["timeout"] = hook_timeout_seconds(phase)
+    # Stop never blocks and its message is advisory, so Claude runs it in the
+    # background instead of making every turn end wait on Rally reads.
+    if phase.get("async", {}).get("claude_code") is True:
+        hook["async"] = True
     group: dict[str, Any] = {"hooks": [hook]}
     matcher = phase.get("matchers", {}).get("claude_code")
     if matcher:
