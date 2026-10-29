@@ -529,6 +529,84 @@ fn parse_send_reply(reply: &serde_json::Value) -> SendOutcome {
     }
 }
 
+/// The reply of an Easy Terminal pane-inbox `inbox.enqueue`. The message is
+/// QUEUED, not delivered: ptyd types it into the pane once the pane is idle at
+/// its prompt, or a provider hook hands it over at the agent's next boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PaneInboxReceipt {
+    /// ptyd's message id, for `ez-ptyd inbox show <id>`.
+    pub(crate) id: String,
+    /// ptyd's message state at enqueue time (normally `queued`).
+    pub(crate) state: String,
+    /// ptyd's own delivery wording (`typed_when_idle`, ...), when present.
+    pub(crate) delivery: Option<String>,
+    /// True when ptyd matched an earlier enqueue with the same `client_id`.
+    pub(crate) duplicate: bool,
+}
+
+/// Queue `text` in the Easy Terminal pane inbox that serves the Rally
+/// identity `to` (`inbox.enqueue`, local-only). This is ET's readiness-checked
+/// wake path: an idle pane gets the line typed and submitted, a busy pane gets
+/// it from its provider hook at the next boundary, and an open dialog is never
+/// typed into. `client_id` makes a retry idempotent; `ref_id` links the
+/// message to the Rally fact it announces.
+///
+/// The caller MUST pass Rally-rendered text only (no sender-authored prose):
+/// the line is submitted as a prompt in another agent's pane.
+pub(crate) fn enqueue_pane_inbox(
+    socket: &str,
+    to: &str,
+    text: &str,
+    client_id: &str,
+    ref_id: &str,
+) -> Result<PaneInboxReceipt, String> {
+    let params = json!({
+        "to": to,
+        "text": text,
+        "channel": "team",
+        "route": "auto",
+        "client_id": client_id,
+        "ref": ref_id,
+    });
+    let reply = round_trip(socket, "inbox.enqueue", &params, DAEMON_TIMEOUT)
+        .map_err(|e| format!("inbox.enqueue call failed: {e}"))?;
+    parse_enqueue_reply(&reply)
+}
+
+fn parse_enqueue_reply(reply: &serde_json::Value) -> Result<PaneInboxReceipt, String> {
+    if let Some(err) = reply.get("error") {
+        let code = err.get("code").and_then(|c| c.as_str()).unwrap_or("error");
+        return Err(format!(
+            "daemon refused inbox.enqueue ({code}): {}",
+            err_message(err)
+        ));
+    }
+    let result = reply
+        .get("result")
+        .ok_or_else(|| "inbox.enqueue reply had neither result nor error".to_string())?;
+    let id = result
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("malformed inbox.enqueue reply: {result}"))?;
+    Ok(PaneInboxReceipt {
+        id: id.to_string(),
+        state: result
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("queued")
+            .to_string(),
+        delivery: result
+            .get("delivery")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        duplicate: result
+            .get("duplicate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    })
+}
+
 /// Stop (reap) the daemon-owned pane named `name` via `agent.stop`. Used by
 /// `rally stop` on a ptyd session (the user addresses sessions by name). Wire:
 /// `agent.stop {name}` → `ResponseResult::Ok` (ptyd `main.rs:852` +
@@ -837,6 +915,26 @@ mod tests {
             Some(vec![("easy-terminal:a".to_string(), "pane-1".to_string())])
         );
         assert_eq!(parse_live_bound_identities(&json!({"error": {}})), None);
+    }
+
+    #[test]
+    fn parse_enqueue_reply_reads_queued_receipt_and_refusals() {
+        let ok = json!({"result": {"id": "m-1", "state": "queued", "duplicate": false,
+            "delivery": "typed_when_idle", "route": "inbox"}});
+        assert_eq!(
+            parse_enqueue_reply(&ok),
+            Ok(PaneInboxReceipt {
+                id: "m-1".to_string(),
+                state: "queued".to_string(),
+                delivery: Some("typed_when_idle".to_string()),
+                duplicate: false,
+            })
+        );
+        let refused = json!({"error": {"code": "capability_denied", "message": "no"}});
+        let err = parse_enqueue_reply(&refused).unwrap_err();
+        assert!(err.contains("capability_denied"), "{err}");
+        assert!(parse_enqueue_reply(&json!({"result": {"state": "queued"}})).is_err());
+        assert!(parse_enqueue_reply(&json!({})).is_err());
     }
 
     #[cfg(unix)]

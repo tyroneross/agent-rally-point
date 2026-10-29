@@ -21244,18 +21244,37 @@ fn collect_et_reach() -> EtReach {
             .collect(),
         daemon_bound: BTreeMap::new(),
     };
+    for (_socket, identity, pane_id) in live_daemon_bindings() {
+        reach.daemon_bound.entry(identity).or_insert(pane_id);
+    }
+    reach
+}
+
+/// Every `(socket, identity, pane_id)` binding a live ptyd daemon reports via
+/// `pane.list`, across every existing candidate socket, in probe order.
+/// Fails closed: an unreachable socket contributes nothing.
+fn live_daemon_bindings() -> Vec<(String, String, String)> {
     let mut candidates = ptyd_socket_candidates();
     if let Some(owned) = daemon_client::rally_owned_socket() {
         candidates.push(owned);
     }
+    let mut out = Vec::new();
     for socket in existing_unique_paths(&candidates) {
         if let Some(bound) = daemon_client::live_bound_identities(&socket) {
             for (identity, pane_id) in bound {
-                reach.daemon_bound.entry(identity).or_insert(pane_id);
+                out.push((socket.clone(), identity, pane_id));
             }
         }
     }
-    reach
+    out
+}
+
+/// The first live ptyd socket + pane bound to exactly `identity`.
+fn daemon_binding_for(identity: &str) -> Option<(String, String)> {
+    live_daemon_bindings()
+        .into_iter()
+        .find(|(_, bound, _)| bound == identity)
+        .map(|(socket, _, pane_id)| (socket, pane_id))
 }
 
 /// Detect resolvable ptyd sockets. Lists every on-disk candidate, then probes
@@ -22866,14 +22885,25 @@ fn parse_ack_within(raw: &str) -> Result<i64> {
 struct HandoffDelivery {
     /// `inject` or `record` — what the sender asked for.
     mode: String,
-    /// `injected` (pane write attempted through `rally inject --handoff`) or
-    /// `record_only` (ledger copy only; the receiver must pull it).
+    /// `injected` (pane write attempted through `rally inject --handoff`),
+    /// `queued_pane_inbox` (no managed session, but the target is bound to a
+    /// live Easy Terminal pane: a wake line is queued in that pane's inbox,
+    /// typed when the pane is idle or handed over by hook when busy), or
+    /// `record_only` (ledger copy only; the receiver must pull it). None of
+    /// these means "acknowledged": only the receiver's own receipt closes the
+    /// handoff.
     status: String,
     /// Why, in one line: the inject delivery reason, or the fallback cause.
     detail: String,
     /// ACK deadline when `--ack-within` was given.
     #[serde(skip_serializing_if = "Option::is_none")]
     ack_by: Option<String>,
+    /// Easy Terminal pane-inbox message id when `status` is `queued_pane_inbox`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pane_message_id: Option<String>,
+    /// The durable wake fact recording the queued pane wake, when written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wake_event_id: Option<String>,
 }
 
 fn deliver_handoff(
@@ -22893,6 +22923,8 @@ fn deliver_handoff(
         status: "record_only".to_string(),
         detail,
         ack_by: ack_by.clone(),
+        pane_message_id: None,
+        wake_event_id: None,
     };
     if mode == HandoffDeliveryMode::Record {
         return record_only("--deliver record: not injected".to_string());
@@ -22914,9 +22946,39 @@ fn deliver_handoff(
     match resolve_inject_target(target_tool, &bins) {
         Ok(InjectTarget::Managed(_)) => {}
         Ok(InjectTarget::LedgerAgent(_)) => {
-            return record_only(format!(
-                "{target_tool} is not a live rally-managed session; recorded for pull via `rally next`/`rally inbox`"
-            ));
+            // No managed session. If a live ptyd pane is bound to exactly this
+            // identity, wake it through Easy Terminal's pane inbox: ptyd types
+            // the line when the pane is idle (an idle pane never reaches the
+            // turn boundary the prompt hook surfaces handoffs at) and hands it
+            // over by hook when busy. Queued is not delivered: record that.
+            let Some((socket, pane_id)) = daemon_binding_for(target_tool) else {
+                return record_only(format!(
+                    "{target_tool} is not a live rally-managed session and no live ptyd pane is bound to it; recorded for pull via `rally next`/`rally inbox`"
+                ));
+            };
+            return match wake_bound_pane(&socket, &pane_id, sender_tool, target_tool, handoff_id) {
+                Ok((receipt, wake_event_id)) => HandoffDelivery {
+                    mode: "inject".to_string(),
+                    status: "queued_pane_inbox".to_string(),
+                    detail: format!(
+                        "queued in pane {pane_id}'s Easy Terminal inbox as message {} (state {}, {}{}); not yet acknowledged: the handoff closes only on {target_tool}'s receipt",
+                        receipt.id,
+                        receipt.state,
+                        receipt.delivery.as_deref().unwrap_or("typed_when_idle"),
+                        if receipt.duplicate {
+                            ", duplicate of an earlier enqueue"
+                        } else {
+                            ""
+                        },
+                    ),
+                    ack_by,
+                    pane_message_id: Some(receipt.id),
+                    wake_event_id,
+                },
+                Err(reason) => record_only(format!(
+                    "{target_tool} has no managed session; pane {pane_id} wake failed: {reason}; recorded for pull via `rally next`/`rally inbox`"
+                )),
+            };
         }
         Err(error) => return record_only(format!("not injectable: {error}")),
     }
@@ -22945,6 +23007,8 @@ fn deliver_handoff(
                 .unwrap_or("sent")
                 .to_string(),
             ack_by,
+            pane_message_id: None,
+            wake_event_id: None,
         },
         Ok(output) => record_only(format!(
             "inject failed: {}",
@@ -22952,6 +23016,46 @@ fn deliver_handoff(
         )),
         Err(error) => record_only(format!("inject refused: {error}")),
     }
+}
+
+/// Queue the Rally-rendered handoff prompt in the Easy Terminal pane inbox of
+/// the live ptyd pane bound to `target_tool`, then record a durable wake fact
+/// (`queued_awaiting_receipt`, ref = the handoff) so the room shows that a
+/// wake was queued and not that a delivery happened. The wake fact is
+/// best-effort: the pane message already exists, so a failed append is not
+/// reported as a failed wake. Its pending-wake entry expires with the handoff
+/// (store `wake_is_expired` / target-closed rules).
+fn wake_bound_pane(
+    socket: &str,
+    pane_id: &str,
+    sender_tool: &str,
+    target_tool: &str,
+    handoff_id: &str,
+) -> std::result::Result<(daemon_client::PaneInboxReceipt, Option<String>), String> {
+    // Fixed Rally text naming only ids: no sender-authored prose is typed
+    // into another agent's prompt.
+    let text = handoff_prompt_ledger(target_tool, handoff_id);
+    let receipt =
+        daemon_client::enqueue_pane_inbox(socket, target_tool, &text, handoff_id, handoff_id)?;
+    let evidence = vec![
+        vec![format!("pane_inbox_message:{}", receipt.id)],
+        vec![format!("pane:{pane_id}")],
+        vec!["transport:et_pane_inbox".to_string()],
+    ];
+    let wake_event_id = inject_wake_intent_with_room(
+        None,
+        sender_tool,
+        None,
+        target_tool,
+        Some(handoff_id),
+        &evidence,
+        false,
+        DeliveryDisposition::QueuedAwaitingReceipt,
+    )
+    .ok()
+    .flatten()
+    .map(|fact| fact.event_id);
+    Ok((receipt, wake_event_id))
 }
 
 /// One handoff the caller sent whose ACK deadline passed unanswered.

@@ -7,6 +7,19 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Fixed — handoffs wake idle Easy Terminal panes
+
+`say handoff` to a target with no Rally managed session used to record only,
+so an idle pane, which never reaches the turn boundary where its prompt hook
+surfaces handoffs, never saw it. When a live ptyd pane is bound to exactly the
+target identity and ET's router does not own delivery, rally now queues the
+Rally-rendered handoff prompt in that pane's inbox (`inbox.enqueue`); ptyd
+types it when the pane is idle and hands it over by hook when busy.
+`data.delivery.status` is `queued_pane_inbox` with the pane message id, and a
+wake fact records the queued wake. Queued is not delivered; the handoff closes
+only on the receiver's receipt. A refused or failed enqueue falls back to
+`record_only` with the reason.
+
 ### Fixed — rally never starts a ptyd daemon on a socket it does not own
 
 `rally run --backend ptyd` used to autostart a daemon on whatever socket
