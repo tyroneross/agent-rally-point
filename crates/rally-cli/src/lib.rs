@@ -3012,6 +3012,26 @@ fn ensure_presence_tiered_for_session_with_evidence(
     from_session_id: &str,
     extra_evidence: &[String],
 ) -> Result<()> {
+    ensure_presence_seat_policy(room, tool, tier, from_session_id, extra_evidence, true)
+}
+
+/// Presence for a sender whose handoff was routed into another room: same
+/// once-per-session guard, but the room's open lead seat is never taken.
+fn ensure_presence_without_lead_seat(room: &RoomStore, tool: &str) -> Result<()> {
+    let from_session_id = current_protocol_session(Some(tool))
+        .from_session_id()
+        .to_string();
+    ensure_presence_seat_policy(room, tool, None, &from_session_id, &[], false)
+}
+
+fn ensure_presence_seat_policy(
+    room: &RoomStore,
+    tool: &str,
+    tier: Option<&str>,
+    from_session_id: &str,
+    extra_evidence: &[String],
+    may_take_open_lead_seat: bool,
+) -> Result<()> {
     // Stage 0 item 6: the guard needs only this session's presence rows, not
     // the whole ledger. Same predicate as before; a session that has posted
     // presence is never re-posted (no time window), so the implicit append
@@ -3032,7 +3052,7 @@ fn ensure_presence_tiered_for_session_with_evidence(
     }) {
         return Ok(());
     }
-    let lead_seat_open = room.projected_lead()?.is_none();
+    let lead_seat_open = may_take_open_lead_seat && room.projected_lead()?.is_none();
     append_presence_tiered(
         room,
         tool,
@@ -3587,6 +3607,29 @@ fn command_say(args: SayArgs) -> Result<Output> {
     }
 
     let room = RoomStore::open()?;
+    // A NEW handoff with an explicit recipient is written to the recipient's
+    // room, not the sender's cwd room; replies (`--ref`) stay on their thread.
+    // The routing probe needs the pane binding even for `--deliver record`
+    // (the binding is what names the recipient's room); delivery reuses it.
+    let (route, mut probed_binding) = match args.target.as_deref() {
+        Some(target)
+            if kind == FactKind::Handoff
+                && args.ref_id.is_none()
+                && args.ref_standby.is_none()
+                && target != "all"
+                && target != args.tool =>
+        {
+            route_targeted_handoff(&room, target)
+        }
+        _ => (HandoffRoomRoute::Sender { pane_bound: false }, None),
+    };
+    let sender_room_root = room.repo_root().to_path_buf();
+    // (recipient pane cwd when routed, route warning, pane binding confirmed this room)
+    let (room, routed_pane_cwd, route_gap, sender_pane_bound) = match route {
+        HandoffRoomRoute::Recipient { room, pane_cwd } => (room, Some(pane_cwd), None, false),
+        HandoffRoomRoute::Gap(message) => (room, None, Some(message), false),
+        HandoffRoomRoute::Sender { pane_bound } => (room, None, None, pane_bound),
+    };
     let target_policy = args.target_policy.clone();
     let requested_handoff_state = args.handoff_state.clone();
     let requested_idempotency_key = args.idempotency_key.clone();
@@ -3686,7 +3729,18 @@ fn command_say(args: SayArgs) -> Result<Output> {
     // have moved on. Rally-written markers go LAST so they win over any
     // caller-supplied entry with the same prefix, and only as many as fit the
     // ledger's evidence bound, so recording a base can never fail the write.
+    //
+    // A handoff routed to the recipient's room is the exception: its path
+    // scopes were normalized against the SENDER's repository, and base markers
+    // hashed there would be checked against the wrong tree in that room. Omit
+    // the markers and record which root the path scopes are relative to.
+    let routed_with_paths =
+        routed_pane_cwd.is_some() && scope.iter().any(|s| s.starts_with("file:"));
+    if routed_with_paths && evidence.len() < rally_protocol::ledger::MAX_EVIDENCE_ITEMS {
+        evidence.push(format!("scope_root:{}", sender_room_root.display()));
+    }
     if kind == FactKind::Handoff
+        && routed_pane_cwd.is_none()
         && let Some(ref root) = repo_root_for_grounding
     {
         let room_free = rally_protocol::ledger::MAX_EVIDENCE_ITEMS.saturating_sub(evidence.len());
@@ -3834,7 +3888,14 @@ fn command_say(args: SayArgs) -> Result<Output> {
 
     // Register presence only after all fail-closed handoff validation. A
     // rejected target must not create any durable side effect.
-    ensure_presence(&room, &args.tool)?;
+    //
+    // In a room the handoff was ROUTED to, the sender is a visitor: record
+    // its presence but never let it take that room's open lead seat.
+    if routed_pane_cwd.is_some() {
+        ensure_presence_without_lead_seat(&room, &args.tool)?;
+    } else {
+        ensure_presence(&room, &args.tool)?;
+    }
 
     // Path-only release fix (C4):
     //
@@ -4129,12 +4190,58 @@ fn command_say(args: SayArgs) -> Result<Output> {
     if let Some(warning) = stale_target_warning(&snapshot, &args.tool, fact.target.as_deref()) {
         say_warnings.push(warning);
     }
+    // Cross-room routing: say where the handoff went, or name the gap when
+    // the recipient's room could not be determined.
+    if let (Some(cwd), Some(target)) = (routed_pane_cwd.as_deref(), fact.target.as_deref()) {
+        let message = format!(
+            "written to {target}'s room {} (its pane works in {cwd}), not this directory's room {}; that room's lead and consent rules decide the pane wake (a non-lead sender without {target}'s consent gets record_only there); follow it with `rally locate {}` or from that directory",
+            room.repo_root().display(),
+            sender_room_root.display(),
+            fact.event_id
+        );
+        eprintln!("rally: note: {message}");
+        say_warnings.push(SayWarning {
+            code: "handoff:routed_to_recipient_room".to_string(),
+            message,
+        });
+    } else if let Some(message) = route_gap {
+        eprintln!("rally: warning: {message}");
+        say_warnings.push(SayWarning {
+            code: "handoff:recipient_room_unknown".to_string(),
+            message,
+        });
+    } else if fact.kind == FactKind::Handoff
+        && fact.ref_id.is_none()
+        && !sender_pane_bound
+        && let Some(target) = fact.target.as_deref()
+        && target != "all"
+        && target != args.tool
+        && snapshot.squad_for(target).is_none()
+        && !active_session_records(&room).is_ok_and(|sessions| {
+            sessions
+                .iter()
+                .any(|s| s.session_id == target || s.name == target || s.tool == target)
+        })
+    {
+        let message = format!(
+            "{target} has no presence in this room ({}) and no live pane binding names its room, so its room is unknown; it sees this handoff only if it runs rally from this repository",
+            room.repo_root().display()
+        );
+        eprintln!("rally: warning: {message}");
+        say_warnings.push(SayWarning {
+            code: "handoff:recipient_room_unknown".to_string(),
+            message,
+        });
+    }
     // Handoff delivery runs strictly AFTER the durable commit: the ledger copy
     // is the obligation; the pane inject is only the focused notification. Any
     // delivery failure degrades to record-only and says why — never an error,
     // because the handoff already landed and the receiver can still pull it.
     let delivery = match (handoff_delivery_mode, fact.target.as_deref()) {
         (Some((mode, _)), Some(target_tool)) => Some(deliver_handoff(
+            &room,
+            routed_pane_cwd.is_some(),
+            probed_binding.take(),
             mode,
             &args.tool,
             target_tool,
@@ -10368,6 +10475,18 @@ fn inject_authorization(
     let Ok(room) = RoomStore::open() else {
         return unavailable_room_inject_authorization(intent);
     };
+    inject_authorization_in(&room, sender_tool, target_tool, intent)
+}
+
+/// [`inject_authorization`] against an explicit room: a handoff routed to the
+/// recipient's room is authorized by that room's lead and consent, not by the
+/// room of the sender's cwd.
+fn inject_authorization_in(
+    room: &RoomStore,
+    sender_tool: &str,
+    target_tool: &str,
+    intent: MessageIntent,
+) -> InjectAuthorization {
     let Ok(snapshot) = room.snapshot() else {
         return unavailable_room_inject_authorization(intent);
     };
@@ -21744,6 +21863,82 @@ fn select_pane_wake_binding(
     }
 }
 
+/// Which room a NEW targeted handoff (`say handoff --to <id>`, no `--ref`) must
+/// be written to so its recipient sees it. Rooms are keyed by the writer's cwd,
+/// so a lead in repo A addressing a peer that works in room B used to write
+/// the obligation where the peer never looks (2026-10-31: three Easy Terminal
+/// members idle ~59 min).
+enum HandoffRoomRoute {
+    /// The sender's cwd room. `pane_bound` says whether a live pane binding
+    /// confirmed it; when false, the recipient's room is simply unknown.
+    Sender { pane_bound: bool },
+    /// The recipient's single bound pane works in another, existing room.
+    Recipient { room: RoomStore, pane_cwd: String },
+    /// A bound pane names another room that cannot be opened or does not
+    /// exist; the handoff stays in the sender's room and the sender is told.
+    Gap(String),
+}
+
+/// Route a new targeted handoff. Also returns the pane binding when one was
+/// probed, so delivery reuses it instead of probing the sockets a second time.
+fn route_targeted_handoff(
+    room: &RoomStore,
+    target: &str,
+) -> (HandoffRoomRoute, Option<PaneWakeBinding>) {
+    // A managed session recorded in this room is delivered from this room.
+    let managed_here = active_session_records(room).is_ok_and(|sessions| {
+        sessions
+            .iter()
+            .any(|s| s.session_id == target || s.name == target || s.tool == target)
+    });
+    if managed_here {
+        return (HandoffRoomRoute::Sender { pane_bound: false }, None);
+    }
+    let binding = pane_wake_binding(target);
+    let cwd = match &binding {
+        PaneWakeBinding::One { pane, .. } => pane.cwd.clone().filter(|cwd| !cwd.is_empty()),
+        _ => None,
+    };
+    let route = match cwd {
+        Some(cwd) => route_for_pane_cwd(room.repo_root(), target, &cwd),
+        None => HandoffRoomRoute::Sender { pane_bound: false },
+    };
+    (route, Some(binding))
+}
+
+/// Pure half of [`route_targeted_handoff`]: map a recipient pane's cwd to its
+/// room, the same way `rally` run in that cwd would ([`repo_root_for`]).
+fn route_for_pane_cwd(sender_root: &Path, target: &str, cwd: &str) -> HandoffRoomRoute {
+    let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let recipient_root = canon(&repo_root_for(&canon(Path::new(cwd))));
+    if recipient_root == canon(sender_root) {
+        return HandoffRoomRoute::Sender { pane_bound: true };
+    }
+    // Never create a room in a directory the recipient merely works in: only
+    // an existing `.rally/` is a room the recipient can be watching.
+    let existing = if recipient_root.join(".rally").is_dir() {
+        RoomStore::open_existing_at(recipient_root.clone())
+    } else {
+        Ok(None)
+    };
+    match existing {
+        Ok(Some(room)) => HandoffRoomRoute::Recipient {
+            room,
+            pane_cwd: cwd.to_string(),
+        },
+        Ok(None) => HandoffRoomRoute::Gap(format!(
+            "{target}'s pane works in {cwd}, whose room {} does not exist yet; the handoff was written to this room ({}), where {target} will not see it unless it runs rally from here",
+            recipient_root.display(),
+            sender_root.display()
+        )),
+        Err(error) => HandoffRoomRoute::Gap(format!(
+            "{target}'s pane works in {cwd}, but its room {} could not be opened ({error}); the handoff was written to this room ({}) instead",
+            recipient_root.display(),
+            sender_root.display()
+        )),
+    }
+}
+
 /// Is the pane's working directory part of this room's repository: inside the
 /// room root, or a checkout sharing its git common directory (a worktree)?
 /// Reads `.git` / `.git/commondir` in process; never spawns `git` on a path
@@ -22128,13 +22323,21 @@ fn envelope_value(command: &str, schema: &str, data: Value) -> Result<Value> {
 }
 
 pub(crate) fn repo_root() -> Result<PathBuf> {
-    let mut dir = env::current_dir().map_err(RallyError::io("current dir"))?;
+    Ok(repo_root_for(
+        &env::current_dir().map_err(RallyError::io("current dir"))?,
+    ))
+}
+
+/// The room root a process started in `start` resolves: the git common repo
+/// root above it, else `start` itself. [`repo_root`] is this applied to cwd.
+pub(crate) fn repo_root_for(start: &Path) -> PathBuf {
+    let mut dir = start.to_path_buf();
     loop {
         if dir.join(".git").exists() {
-            return Ok(git_common_repo_root(&dir).unwrap_or(dir));
+            return git_common_repo_root(&dir).unwrap_or(dir);
         }
         if !dir.pop() {
-            return env::current_dir().map_err(RallyError::io("current dir"));
+            return start.to_path_buf();
         }
     }
 }
@@ -23399,6 +23602,11 @@ struct HandoffDelivery {
 }
 
 fn deliver_handoff(
+    room: &RoomStore,
+    routed_to_recipient_room: bool,
+    // The pane binding routing already probed, if any; reused so the ptyd
+    // sockets are probed once per `say`.
+    prebound: Option<PaneWakeBinding>,
     mode: HandoffDeliveryMode,
     sender_tool: &str,
     target_tool: &str,
@@ -23432,6 +23640,27 @@ fn deliver_handoff(
                 .to_string(),
         );
     }
+    let ack_for_wake = ack_by.clone();
+    let pane_wake = move || {
+        pane_wake_delivery(
+            room,
+            prebound,
+            sender_tool,
+            target_tool,
+            handoff_id,
+            ack_for_wake,
+        )
+    };
+    // Routed to the recipient's room because its bound pane works there: the
+    // pane wake is the delivery, judged against that room. (Managed sessions
+    // are resolved in the cwd room and are never routed.)
+    if routed_to_recipient_room {
+        return pane_wake().unwrap_or_else(|reason| {
+            record_only(format!(
+                "{reason}; recorded in {target_tool}'s room for pull via `rally next`/`rally inbox`"
+            ))
+        });
+    }
     // Only a LIVE rally-managed session is a pane we may type into. A bare
     // ledger agent id, a human pane, or a stale/gone session is never injected;
     // `resolve_inject_target` already refuses stale and renumbered sessions.
@@ -23442,7 +23671,7 @@ fn deliver_handoff(
             // identity can still be woken through Easy Terminal's pane inbox
             // (an idle pane never reaches the turn boundary where its prompt
             // hook surfaces handoffs). Every refusal degrades to record-only.
-            return pane_wake_delivery(sender_tool, target_tool, handoff_id, ack_by.clone())
+            return pane_wake()
                 .unwrap_or_else(|reason| {
                     record_only(format!(
                         "{target_tool} is not a live rally-managed session; {reason}; recorded for pull via `rally next`/`rally inbox`"
@@ -23502,6 +23731,8 @@ const PANE_WAKE_TRANSPORT_EVIDENCE: &str = "transport:et_pane_inbox";
 ///    (its handoff open and unexpired), no second prompt is queued; one
 ///    `rally next` lists every open handoff.
 fn pane_wake_delivery(
+    room: &RoomStore,
+    prebound: Option<PaneWakeBinding>,
     sender_tool: &str,
     target_tool: &str,
     handoff_id: &str,
@@ -23512,7 +23743,8 @@ fn pane_wake_delivery(
             "pane wake refused: {SYSTEM_TOOL} is the reserved machine author"
         ));
     }
-    let authorization = inject_authorization(sender_tool, target_tool, MessageIntent::Directive);
+    let authorization =
+        inject_authorization_in(room, sender_tool, target_tool, MessageIntent::Directive);
     if let Some(refusal) = authorization.refusal {
         return Err(format!("pane wake refused: {refusal}"));
     }
@@ -23522,7 +23754,8 @@ fn pane_wake_delivery(
                 .to_string(),
         );
     }
-    let (socket, pane) = match pane_wake_binding(target_tool) {
+    let binding = prebound.unwrap_or_else(|| pane_wake_binding(target_tool));
+    let (socket, pane) = match binding {
         PaneWakeBinding::One { socket, pane } => (socket, pane),
         PaneWakeBinding::None => return Err("no live ptyd pane is bound to it".to_string()),
         PaneWakeBinding::Ambiguous(n) => {
@@ -23531,7 +23764,6 @@ fn pane_wake_delivery(
             ));
         }
     };
-    let room = RoomStore::open().map_err(|e| format!("room unavailable: {e}"))?;
     match pane.cwd.as_deref() {
         Some(cwd) if pane_cwd_in_room(cwd, room.repo_root()) => {}
         Some(cwd) => {

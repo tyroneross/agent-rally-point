@@ -654,3 +654,225 @@ fn deliver_record_never_touches_the_pane_inbox() {
     assert!(enqueues(&log).is_empty());
     let _ = std::fs::remove_file(&socket);
 }
+
+/// Run rally from `cwd` (another room), pinned to `socket`, with the
+/// sandbox's isolated HOME.
+fn rally_in(sandbox: &ChannelSandbox, cwd: &Path, socket: &Path, args: &[&str]) -> Value {
+    let mut cmd = base_command(sandbox, &Sockets::Pinned(socket));
+    cmd.current_dir(cwd);
+    run(cmd, args)
+}
+
+fn open_handoff_ids(room: &Value) -> String {
+    room["data"]["room"]["open_handoffs"].to_string()
+}
+
+// 2026-10-31 regression: rooms are keyed by the writer's cwd. A lead sending
+// `say handoff --to X` from repo A, while X's pane works in room B, wrote the
+// obligation to A and refused the wake ("outside this room"); X, watching B,
+// never saw it. The handoff must land in X's room B and wake X's pane there.
+#[test]
+fn targeted_handoff_from_another_room_lands_in_the_recipient_room() {
+    let sandbox = ChannelSandbox::spawn();
+    let socket = short_socket("xroom");
+    let target = "easy-terminal:xroom";
+    // Room B: a second repository with an existing room, where the sender
+    // holds the lead (as the team lead did in the home room).
+    let room_b = sandbox.root().join("room-b");
+    std::fs::create_dir_all(room_b.join(".git")).unwrap();
+    let log = spawn_daemon(
+        &socket,
+        vec![Pane {
+            id: "pane-b",
+            identity: target.to_string(),
+            cwd: Some(room_b.clone()),
+        }],
+        EnqueueReply::Queued,
+    );
+    rally_in(
+        &sandbox,
+        &room_b,
+        &socket,
+        &["enter", "--tool", SENDER, "--json"],
+    );
+
+    // The sender's cwd is room A (the sandbox cwd).
+    let said = handoff(&sandbox, &socket, target);
+    let id = handoff_id(&said);
+    assert_eq!(
+        said["data"]["delivery"]["status"], "queued_pane_inbox",
+        "the recipient's pane in room B is woken: {said}"
+    );
+    assert_eq!(enqueues(&log).len(), 1, "{said}");
+    let warnings = said["data"]["warnings"].to_string();
+    assert!(
+        warnings.contains("handoff:routed_to_recipient_room"),
+        "the sender is told where the handoff went: {said}"
+    );
+
+    // Visible to the recipient in room B, and not left as an orphan in A.
+    let in_b = rally_in(&sandbox, &room_b, &socket, &["room", "--json"]);
+    assert!(open_handoff_ids(&in_b).contains(&id), "room B: {in_b}");
+    let in_a = rally(&sandbox, &socket, &["room", "--json"]);
+    assert!(!open_handoff_ids(&in_a).contains(&id), "room A: {in_a}");
+    let _ = std::fs::remove_file(&socket);
+}
+
+// When the recipient's pane works in a directory with no room yet, the
+// handoff stays in the sender's room and the sender is told why.
+#[test]
+fn targeted_handoff_to_a_pane_without_a_room_warns_and_stays_here() {
+    let sandbox = ChannelSandbox::spawn();
+    let socket = short_socket("xgap");
+    let target = "easy-terminal:xgap";
+    let elsewhere = sandbox.root().join("no-room");
+    std::fs::create_dir_all(elsewhere.join(".git")).unwrap();
+    let _log = spawn_daemon(
+        &socket,
+        vec![Pane {
+            id: "pane-g",
+            identity: target.to_string(),
+            cwd: Some(elsewhere.clone()),
+        }],
+        EnqueueReply::Queued,
+    );
+    let said = handoff(&sandbox, &socket, target);
+    let id = handoff_id(&said);
+    let warnings = said["data"]["warnings"].to_string();
+    assert!(
+        warnings.contains("handoff:recipient_room_unknown"),
+        "the gap is named: {said}"
+    );
+    let in_a = rally(&sandbox, &socket, &["room", "--json"]);
+    assert!(open_handoff_ids(&in_a).contains(&id), "room A: {in_a}");
+    assert!(
+        !elsewhere.join(".rally").exists(),
+        "no room is created in the recipient's directory"
+    );
+    let _ = std::fs::remove_file(&socket);
+}
+
+/// Room B (sibling of the sandbox cwd) with an existing room, bound to one
+/// pane for `target`. `setup` runs rally commands in B before the daemon
+/// starts answering for the pane.
+fn routed_room(
+    sandbox: &ChannelSandbox,
+    tag: &str,
+    target: &str,
+    setup: &[&[&str]],
+) -> (PathBuf, PathBuf, RequestLog) {
+    let socket = short_socket(tag);
+    let room_b = sandbox.root().join(format!("room-{tag}"));
+    std::fs::create_dir_all(room_b.join(".git")).unwrap();
+    let log = spawn_daemon(
+        &socket,
+        vec![Pane {
+            id: "pane-b",
+            identity: target.to_string(),
+            cwd: Some(room_b.clone()),
+        }],
+        EnqueueReply::Queued,
+    );
+    for args in setup {
+        rally_in(sandbox, &room_b, &socket, args);
+    }
+    (socket, room_b, log)
+}
+
+fn lead_of(sandbox: &ChannelSandbox, dir: &Path, socket: &Path) -> Value {
+    rally_in(sandbox, dir, socket, &["room", "--json"])["data"]["room"]["lead"].clone()
+}
+
+// Review fix 1: routing into a room with an OPEN lead seat must not hand the
+// visiting sender that seat.
+#[test]
+fn routed_handoff_never_takes_the_recipient_rooms_open_lead_seat() {
+    let sandbox = ChannelSandbox::spawn();
+    let target = "easy-terminal:xopen";
+    // An executing-tier agent creates room B without taking the lead seat.
+    let (socket, room_b, _log) = routed_room(
+        &sandbox,
+        "xopen",
+        target,
+        &[&[
+            "enter",
+            "--tool",
+            "worker:09",
+            "--tier",
+            "executing",
+            "--json",
+        ]],
+    );
+    assert!(
+        lead_of(&sandbox, &room_b, &socket).is_null(),
+        "B starts leaderless"
+    );
+
+    let said = handoff(&sandbox, &socket, target);
+    let id = handoff_id(&said);
+    assert!(
+        said["data"]["warnings"]
+            .to_string()
+            .contains("handoff:routed_to_recipient_room"),
+        "{said}"
+    );
+    let in_b = rally_in(&sandbox, &room_b, &socket, &["room", "--json"]);
+    assert!(open_handoff_ids(&in_b).contains(&id), "room B: {in_b}");
+    assert!(
+        lead_of(&sandbox, &room_b, &socket).is_null(),
+        "the sender must not become B's lead: {in_b}"
+    );
+    let _ = std::fs::remove_file(&socket);
+}
+
+// Review fix 3: in a room led by someone else, a non-lead sender without the
+// recipient's consent records the handoff there but does not wake the pane.
+#[test]
+fn routed_handoff_into_a_room_with_another_lead_is_record_only() {
+    let sandbox = ChannelSandbox::spawn();
+    let target = "easy-terminal:xother";
+    let (socket, room_b, log) = routed_room(
+        &sandbox,
+        "xother",
+        target,
+        &[&["enter", "--tool", "other-lead:01", "--json"]],
+    );
+    let said = handoff(&sandbox, &socket, target);
+    let id = handoff_id(&said);
+    assert_eq!(said["data"]["delivery"]["status"], "record_only", "{said}");
+    assert!(detail(&said).contains("pane wake refused"), "{said}");
+    assert!(
+        detail(&said).contains("room for pull"),
+        "detail says where it waits: {said}"
+    );
+    assert!(enqueues(&log).is_empty(), "no pane may be typed into");
+    let in_b = rally_in(&sandbox, &room_b, &socket, &["room", "--json"]);
+    assert!(open_handoff_ids(&in_b).contains(&id), "room B: {in_b}");
+    assert_eq!(lead_of(&sandbox, &room_b, &socket), "other-lead:01");
+    let _ = std::fs::remove_file(&socket);
+}
+
+// Review fix 2: path scopes of a routed handoff stay relative to the sender's
+// repository; no base markers are hashed against the wrong tree.
+#[test]
+fn routed_handoff_records_scope_root_and_no_base_markers() {
+    let sandbox = ChannelSandbox::spawn();
+    let target = "easy-terminal:xpath";
+    let (socket, _room_b, _log) = routed_room(
+        &sandbox,
+        "xpath",
+        target,
+        &[&["enter", "--tool", SENDER, "--json"]],
+    );
+    std::fs::write(sandbox.cwd().join("notes.txt"), "x").unwrap();
+    let mut args = handoff_args(SENDER, target, "edit the notes");
+    args.extend(["--path", "notes.txt"]);
+    let said = rally(&sandbox, &socket, &args);
+    let evidence = said["data"]["say"]["fact"]["evidence"].to_string();
+    assert!(evidence.contains("scope_root:"), "{said}");
+    assert!(
+        !evidence.contains("basehash:") && !evidence.contains("base_commit:"),
+        "{said}"
+    );
+    let _ = std::fs::remove_file(&socket);
+}
