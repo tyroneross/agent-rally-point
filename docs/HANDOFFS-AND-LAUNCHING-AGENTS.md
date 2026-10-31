@@ -162,6 +162,10 @@ Default communication order:
 2. Use `rally inject` to deliver the first instruction or urgent steering into a `rally run`-managed session.
 3. Use a committed handoff doc only when the payload is too long or durable enough to review outside the ledger.
 
+### Cross-room targeted handoffs
+
+Rooms are keyed by the writer's directory. A new `say handoff --to <id>` (no `--ref`) whose recipient is not a managed session in the sender's room, but has exactly one live Easy Terminal pane working in another repository that already has a room, is written to the **recipient's** room, and the reply says so (`handoff:routed_to_recipient_room`). In that room the sender only records presence; it never takes an open lead seat. The pane wake is authorized by that room's lead and consent rules: a sender that is not that room's lead and has no invitation from the recipient gets `record_only`, and the handoff waits there for `rally next`. Path scopes stay relative to the sender's repository, named by a `scope_root:` evidence marker; overwrite-guard base markers are not recorded on routed handoffs. If the recipient's room cannot be determined (no pane binding and no presence here, or its directory has no room), the handoff stays in the sender's room with a `handoff:recipient_room_unknown` warning.
+
 ### Named handoffs and the open queue
 
 A handoff with `--target <agent>` is assigned to that agent by name. It stays in that agent's `rally inbox` until the agent answers, at any age, and `rally next` ranks it above everything except a targeted ack-required artifact. Acking or accepting it (`handoff.acked` / `handoff.accepted`) answers the inbox obligation but does not finish the work. `rally next` keeps ranking it as `accepted_handoff_still_open` until it is resolved, and `rally inbox` counts it as `accepted_open`.
