@@ -654,3 +654,100 @@ fn deliver_record_never_touches_the_pane_inbox() {
     assert!(enqueues(&log).is_empty());
     let _ = std::fs::remove_file(&socket);
 }
+
+/// Run rally from `cwd` (another room), pinned to `socket`, with the
+/// sandbox's isolated HOME.
+fn rally_in(sandbox: &ChannelSandbox, cwd: &Path, socket: &Path, args: &[&str]) -> Value {
+    let mut cmd = base_command(sandbox, &Sockets::Pinned(socket));
+    cmd.current_dir(cwd);
+    run(cmd, args)
+}
+
+fn open_handoff_ids(room: &Value) -> String {
+    room["data"]["room"]["open_handoffs"].to_string()
+}
+
+// 2026-10-31 regression: rooms are keyed by the writer's cwd. A lead sending
+// `say handoff --to X` from repo A, while X's pane works in room B, wrote the
+// obligation to A and refused the wake ("outside this room"); X, watching B,
+// never saw it. The handoff must land in X's room B and wake X's pane there.
+#[test]
+fn targeted_handoff_from_another_room_lands_in_the_recipient_room() {
+    let sandbox = ChannelSandbox::spawn();
+    let socket = short_socket("xroom");
+    let target = "easy-terminal:xroom";
+    // Room B: a second repository with an existing room, where the sender
+    // holds the lead (as the team lead did in the home room).
+    let room_b = sandbox.root().join("room-b");
+    std::fs::create_dir_all(room_b.join(".git")).unwrap();
+    let log = spawn_daemon(
+        &socket,
+        vec![Pane {
+            id: "pane-b",
+            identity: target.to_string(),
+            cwd: Some(room_b.clone()),
+        }],
+        EnqueueReply::Queued,
+    );
+    rally_in(
+        &sandbox,
+        &room_b,
+        &socket,
+        &["enter", "--tool", SENDER, "--json"],
+    );
+
+    // The sender's cwd is room A (the sandbox cwd).
+    let said = handoff(&sandbox, &socket, target);
+    let id = handoff_id(&said);
+    assert_eq!(
+        said["data"]["delivery"]["status"], "queued_pane_inbox",
+        "the recipient's pane in room B is woken: {said}"
+    );
+    assert_eq!(enqueues(&log).len(), 1, "{said}");
+    let warnings = said["data"]["warnings"].to_string();
+    assert!(
+        warnings.contains("handoff:routed_to_recipient_room"),
+        "the sender is told where the handoff went: {said}"
+    );
+
+    // Visible to the recipient in room B, and not left as an orphan in A.
+    let in_b = rally_in(&sandbox, &room_b, &socket, &["room", "--json"]);
+    assert!(open_handoff_ids(&in_b).contains(&id), "room B: {in_b}");
+    let in_a = rally(&sandbox, &socket, &["room", "--json"]);
+    assert!(!open_handoff_ids(&in_a).contains(&id), "room A: {in_a}");
+    let _ = std::fs::remove_file(&socket);
+}
+
+// When the recipient's pane works in a directory with no room yet, the
+// handoff stays in the sender's room and the sender is told why.
+#[test]
+fn targeted_handoff_to_a_pane_without_a_room_warns_and_stays_here() {
+    let sandbox = ChannelSandbox::spawn();
+    let socket = short_socket("xgap");
+    let target = "easy-terminal:xgap";
+    let elsewhere = sandbox.root().join("no-room");
+    std::fs::create_dir_all(elsewhere.join(".git")).unwrap();
+    let _log = spawn_daemon(
+        &socket,
+        vec![Pane {
+            id: "pane-g",
+            identity: target.to_string(),
+            cwd: Some(elsewhere.clone()),
+        }],
+        EnqueueReply::Queued,
+    );
+    let said = handoff(&sandbox, &socket, target);
+    let id = handoff_id(&said);
+    let warnings = said["data"]["warnings"].to_string();
+    assert!(
+        warnings.contains("handoff:recipient_room_unknown"),
+        "the gap is named: {said}"
+    );
+    let in_a = rally(&sandbox, &socket, &["room", "--json"]);
+    assert!(open_handoff_ids(&in_a).contains(&id), "room A: {in_a}");
+    assert!(
+        !elsewhere.join(".rally").exists(),
+        "no room is created in the recipient's directory"
+    );
+    let _ = std::fs::remove_file(&socket);
+}
