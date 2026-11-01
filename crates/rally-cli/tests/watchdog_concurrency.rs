@@ -251,9 +251,16 @@ fn default_status_posts_wait_out_transient_contention_and_commit_once() {
             "status post refused before transient contention cleared"
         );
     }
+    // Drain every child before releasing the lock: a later child may win
+    // ownership and fill its output pipe while the first child waits for it.
+    // Waiting in launch order would then manufacture ownership contention.
+    let readers = children
+        .into_iter()
+        .map(|child| thread::spawn(move || child.wait_with_output().unwrap()))
+        .collect::<Vec<_>>();
     drop(lock);
-    for child in children {
-        let output = child.wait_with_output().unwrap();
+    for reader in readers {
+        let output = reader.join().unwrap();
         assert!(
             output.status.success(),
             "{} {}",
