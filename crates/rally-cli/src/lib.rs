@@ -6494,6 +6494,12 @@ fn command_version(args: VersionArgs) -> Result<Output> {
             version: VersionPayload {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 build_id: BUILD_ID.to_string(),
+                wire_version: rally_protocol::store_wire::WIRE_VERSION,
+                executable_path: env::current_exe()
+                    .ok()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                release_check_url: error::RELEASE_CHECK_URL.to_string(),
+                upgrade_guide_url: error::UPGRADE_GUIDE_URL.to_string(),
             },
         },
     )?;
@@ -21912,6 +21918,10 @@ struct AgentInjectability {
 struct VersionPayload {
     version: String,
     build_id: String,
+    wire_version: u32,
+    executable_path: Option<String>,
+    release_check_url: String,
+    upgrade_guide_url: String,
 }
 
 /// Envelope for `version`.

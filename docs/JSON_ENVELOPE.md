@@ -14,6 +14,12 @@ Every `rally <cmd> --json` response has the shape:
 
 **Rule:** `data[command]` always holds the command's primary result object. The key matches the `command` field exactly — kebab preserved (e.g. `data["wake-due"]`, `data["check-ci"]`). Shared/contextual payloads (`room`, `verified`, `warnings`) appear as sibling keys in `data` where noted.
 
+`rally version --json` reports `data.version.version`, `build_id`,
+`wire_version`, `executable_path`, `release_check_url`, and
+`upgrade_guide_url`. The executable path is null if it cannot be resolved.
+These diagnostics work outside a Rally repository and perform no network,
+daemon, or hook calls. Older builds may omit the added diagnostic fields.
+
 The watchdog fail-open response is the one transport-level exception. Rally still exits 0 so a
 host hook is never gated, but `ok` is false because the requested command did not complete:
 

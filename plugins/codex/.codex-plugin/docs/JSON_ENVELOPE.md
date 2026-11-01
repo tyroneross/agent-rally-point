@@ -14,6 +14,12 @@ Every `rally <cmd> --json` response has the shape:
 
 **Rule:** `data[command]` always holds the command's primary result object. The key matches the `command` field exactly — kebab preserved (e.g. `data["wake-due"]`, `data["check-ci"]`). Shared/contextual payloads (`room`, `verified`, `warnings`) appear as sibling keys in `data` where noted.
 
+`rally version --json` reports `data.version.version`, `build_id`,
+`wire_version`, `executable_path`, `release_check_url`, and
+`upgrade_guide_url`. The executable path is null if it cannot be resolved.
+These diagnostics work outside a Rally repository and perform no network,
+daemon, or hook calls. Older builds may omit the added diagnostic fields.
+
 The watchdog fail-open response is the one transport-level exception. Rally still exits 0 so a
 host hook is never gated, but `ok` is false because the requested command did not complete:
 
@@ -157,6 +163,7 @@ is a derived cache rather than a canonical store.
 | `check` | `check: { phase, tool, path?, allow, mode, findings, agent_visible }` | — |
 | `watchdog` | transport exception: `{ watchdog_timeout: boolean, reason, elapsed_ms }` | — |
 | `locate` | `locate: { event_id, located?, warnings }` | — |
+| `replies` | `replies: { repo_root, rows: [{ event_id, found, fact?, reply?, reply_fact?, completion_status? }] }` | Current-room canonical batch; no file ownership or merge authorization |
 | `recent` | `recent: { all, limit, rows, warnings }` | — |
 | `retrospective` | `retrospective: { output_path, action, engagements, total_facts, total_engagements }` | — |
 | `rotate` | `rotate: { threshold_days, threshold_source, cutoff_utc, dry_run, rotated, skipped, … }` | — |
@@ -184,20 +191,22 @@ is a derived cache rather than a canonical store.
 | `mission` (GET) | `mission: { text?, set_by?, set_at?, envelopes }` | — |
 | `mission` (SET) | `mission: { action, fact }` | — |
 
-**Schema coverage: 16 of 48 top-level commands have a schema file under `docs/schemas/`.** The
-count is derived from the `CliCommand` enum (`crates/rally-cli/src/cli.rs:10-85`, 48 variants) and
-the 17 `docs/schemas/agent-rally.command.*.v1.json` files. `adopt`, `check`, `dag`, `enter`,
-`inbox`, `inject`, `locate`, `next`, `recent`, `room`, `run`, `say`, `session` (the
+**Schema coverage: 17 of 50 top-level commands have a schema file under `docs/schemas/`.** The
+count is derived from the `CliCommand` enum (`crates/rally-cli/src/cli.rs`, 50 variants) and
+the 18 `docs/schemas/agent-rally.command.*.v1.json` files. `adopt`, `check`, `dag`, `enter`,
+`inbox`, `inject`, `locate`, `next`, `recent`, `replies`, `room`, `run`, `say`, `session` (the
 `SessionLifecycle` variant), `session-action` (the `Session` variant, covering `attach`/`capture`/
-`stop`), `sessions`, and `wake-due` have a schema file. The 17th file, `watchdog`, documents the
+`stop`), `sessions`, and `wake-due` have a schema file. The 18th file, `watchdog`, documents the
 transport-level fail-open exception above rather than a distinct top-level command. The remaining
-32 commands have no schema file; their shapes are documented only in the field map above or not
+33 commands have no schema file; their shapes are documented only in the field map above or not
 at all.
 
-**`inject.ack` shapes.** The `ack` key is always present. Its value is an object when an ACK wait runs and `null` otherwise. `--require-ack` requests the wait explicitly; `--handoff` and `--ref` request it implicitly. Dry-run mode never waits.
+**`inject.ack` shapes.** The `ack` key is always present. It is an object when an exact prior receiver response is reused or an explicit ACK wait runs; otherwise it is `null`. `--wait-ack` and its compatible alias `--require-ack` request the wait explicitly. `--handoff` and `--ref` return pending by default after recording/delivery. Dry-run mode never waits.
 
 | Scenario | `ack` value |
 |----------|-------------|
+| Pending without an explicit wait or prior response | `null` |
+| Typed ACK or acceptance arrived | `{ "received": true, "resolved": false, "handoff_closed": false, ... }` |
 | Resolve, receipt, or artifact arrived | `{ "received": true, "resolved": true, "handoff_closed": true, "blocked": false, "decision": false, "event_id": "...", "tool": "...", "expected_tool": "...", "kind": "...", "subject": "..." }` |
 | Blocker arrived | `{ "received": true, "resolved": false, "handoff_closed": false, "blocked": true, "decision": false, "event_id": "...", "tool": "...", "expected_tool": "...", "kind": "blocker", "subject": "..." }` |
 | Decision arrived | `{ "received": true, "resolved": false, "handoff_closed": false, "blocked": false, "decision": true, "event_id": "...", "tool": "...", "expected_tool": "...", "kind": "decision", "subject": "..." }` |

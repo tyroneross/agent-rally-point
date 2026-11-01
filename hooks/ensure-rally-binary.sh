@@ -248,7 +248,7 @@ if [ -f "$STATE_FILE" ]; then
   case "${_now_ts:-}" in ''|*[!0-9]*) _now_ts=0 ;; esac
   _age=$(( _now_ts - _cached_ts ))
 
-  if [ "$_cached_result" = "ok" ] && [ "$_age" -lt 86400 ]; then
+  if [ "${RALLY_UPGRADE:-0}" != "1" ] && [ "$_cached_result" = "ok" ] && [ "$_age" -lt 86400 ]; then
     if [ -n "$_cached_bin" ] && _binary_works "$_cached_bin"; then exit 0; fi
     # A rally on PATH satisfies the cached-ok fast-exit only if it still runs.
     _path_rally="$(command -v rally 2>/dev/null || true)"
@@ -264,7 +264,7 @@ if [ -f "$STATE_FILE" ]; then
   fi
 fi
 
-if _check_existing; then exit 0; fi
+if [ "${RALLY_UPGRADE:-0}" != "1" ] && _check_existing; then exit 0; fi
 
 # ---------------------------------------------------------------------------
 # 4. Provisioning — download (SHA256 + attestation verified) or cargo.
@@ -454,18 +454,41 @@ _do_download() {
   chmod +x "$tmp" 2>/dev/null || true
   if ! _timed 5 "$tmp" version >/dev/null 2>&1; then rm -f "$tmp" 2>/dev/null || true; return 1; fi
   mkdir -p "$LOCAL_BIN" 2>/dev/null || true
-  mv "$tmp" "$LOCAL_RALLY" 2>/dev/null || { rm -f "$tmp" 2>/dev/null || true; return 1; }
+  # Preserve the previous executable (or symlink) until the final verification
+  # succeeds. The private backup is beside the destination for atomic rollback.
+  local backup_dir="" backup="" move_failed=0
+  if [ -d "$LOCAL_RALLY" ]; then rm -f "$tmp"; return 1; fi
+  if [ -e "$LOCAL_RALLY" ] || [ -L "$LOCAL_RALLY" ]; then
+    backup_dir="$(mktemp -d "$LOCAL_BIN/.rally-upgrade.XXXXXX" 2>/dev/null)" || { rm -f "$tmp"; return 1; }
+    backup="$backup_dir/previous"
+    if ! cp -pP "$LOCAL_RALLY" "$backup"; then
+      rm -f "$tmp"; rmdir "$backup_dir" 2>/dev/null || true; return 1
+    fi
+  fi
+  mv "$tmp" "$LOCAL_RALLY" 2>/dev/null || move_failed=1
   # SEC-015: re-hash what actually landed, against the hash we verified. This
   # closes the verify -> chmod -> mv window cheaply. It does NOT make the path
   # same-UID safe; the trust model already says same-UID is not defended.
   local final_sha
   final_sha="$(_sha256_of "$LOCAL_RALLY")"
-  if [ -n "$_VERIFIED_SHA" ] && [ "$final_sha" != "$_VERIFIED_SHA" ]; then
-    rm -f "$LOCAL_RALLY" 2>/dev/null || true
+  if [ "$move_failed" = "1" ] || { [ -n "$_VERIFIED_SHA" ] && [ "$final_sha" != "$_VERIFIED_SHA" ]; }; then
+    rm -f "$tmp" 2>/dev/null || true
+    if [ -n "$backup" ]; then
+      if ! rm -f "$LOCAL_RALLY" || ! mv "$backup" "$LOCAL_RALLY"; then
+        _record_rejection "upgrade-rollback-failed $asset@$tag" \
+          "replacement failed; previous executable retained at $backup for manual recovery" 1
+        return 1
+      fi
+    else
+      rm -f "$LOCAL_RALLY" 2>/dev/null || true
+    fi
+    [ -z "$backup_dir" ] || rmdir "$backup_dir" 2>/dev/null || true
     _record_rejection "post-move-sha256-mismatch $asset@$tag" \
-      "the installed file changed between verification and install for $asset@$tag — removed, nothing installed (possible substitution)" 1
+      "replacement or final verification failed for $asset@$tag; rejected candidate removed and any previous executable restored" 1
     return 1
   fi
+  [ -z "$backup" ] || rm -f "$backup"
+  [ -z "$backup_dir" ] || rmdir "$backup_dir"
   _write_state "downloaded" "ok" "$LOCAL_RALLY" ""
   return 0
 }
@@ -569,6 +592,9 @@ _provision() {
     # downgraded to a silent fallback. Stop here; _record_rejection already wrote
     # the state file and the durable log, and the installer refuses on it.
     :
+  elif [ "${RALLY_RELEASE_ONLY:-0}" = "1" ]; then
+    _write_state "download-rejected" "unavailable" "" \
+      "${_REJECTION_HINT:-verified release download unavailable; use --source for an explicit source build}"
   elif _do_cargo; then :
   else
     case "$(grep -o '"method":"[^"]*"' "$STATE_FILE" 2>/dev/null | cut -d'"' -f4 || true)" in

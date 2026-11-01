@@ -796,8 +796,10 @@ mod imp {
                 StoreErrorKind::IncompatibleWire,
                 format!(
                     "wire_version mismatch: daemon speaks {WIRE_VERSION}, client sent {}; \
-                 stop the incompatible daemon with `rally daemon stop` before retrying",
-                    req.wire_version
+                 check releases at {}; upgrade steps at {}; coordinate a matching-client and daemon upgrade with peers before restarting",
+                    req.wire_version,
+                    crate::error::RELEASE_CHECK_URL,
+                    crate::error::UPGRADE_GUIDE_URL,
                 ),
             ));
         }
@@ -1968,6 +1970,9 @@ mod imp {
                     assert_eq!(error.kind, StoreErrorKind::IncompatibleWire);
                     assert!(error.message.contains("daemon speaks 9"));
                     assert!(error.message.contains("client sent 8"));
+                    assert!(error.message.contains(crate::error::RELEASE_CHECK_URL));
+                    assert!(error.message.contains("with peers before restarting"));
+                    assert!(!error.message.contains("stop the incompatible daemon"));
                 }
                 other => panic!("v7 request was not rejected: {other:?}"),
             }

@@ -40,6 +40,7 @@
 #   scripts/install-rally.sh --yes        # no prompt (CI / scripted)
 #   scripts/install-rally.sh --dry-run    # print the plan, write nothing
 #   scripts/install-rally.sh --source     # build from this checkout with cargo
+#   scripts/install-rally.sh --upgrade    # replace an existing CLI after verification
 #   scripts/install-rally.sh --help
 #
 # Exit codes: 0 installed (or dry run) · 1 refused/failed · 2 bad arguments.
@@ -63,6 +64,7 @@ REJECTION_LOG="$CACHE_DIR/download-rejections.log"
 ASSUME_YES=0
 DRY_RUN=0
 MODE="release"
+UPGRADE=0
 
 usage() {
   # Print the header comment block from line 5 through the "Exit codes:" line.
@@ -81,6 +83,7 @@ while [ $# -gt 0 ]; do
     -y|--yes)      ASSUME_YES=1; shift ;;
     -n|--dry-run)  DRY_RUN=1; shift ;;
     --source)      MODE="source"; shift ;;
+    --upgrade)     UPGRADE=1; shift ;;
     -h|--help)     usage; exit 0 ;;
     *) printf 'install-rally: unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
@@ -128,6 +131,11 @@ if command -v shasum >/dev/null 2>&1 || command -v sha256sum >/dev/null 2>&1; th
 say "install-rally — installs the rally CLI for Agent Rally Point."
 say ""
 say "This is the only step that installs software. Hooks never do it."
+if [ "$UPGRADE" = "1" ]; then
+  say "Upgrade: replace the CLI even when an existing binary works."
+  say "The release is pinned to this checkout's release identity; update the checkout/plugin first."
+  say "Coordinate a pause and stop the old daemon with its compatible CLI before replacing clients."
+fi
 say ""
 if [ "$MODE" = "release" ]; then
   say "Plan: download a prebuilt release binary and verify it."
@@ -144,7 +152,7 @@ if [ "$MODE" = "release" ]; then
 else
   say "Plan: build from the source in this checkout."
   say "  source     $REPO_ROOT/crates/rally-cli"
-  say "  builds     cargo install --path crates/rally-cli --root ${HOME}/.local"
+  say "  builds     cargo install --path crates/rally-cli --root ${HOME}/.local --force"
   say "  installs   $LOCAL_RALLY"
   say ""
   say "No download, no signature check. You are trusting the source you have"
@@ -201,7 +209,7 @@ say "Working..."
 if [ "$MODE" = "source" ]; then
   # Force the source path by hiding curl from the engine is fragile; call cargo
   # directly instead. Same target dir the engine uses.
-  if ! cargo install --path "$REPO_ROOT/crates/rally-cli" --root "$HOME/.local" --quiet; then
+  if ! cargo install --path "$REPO_ROOT/crates/rally-cli" --root "$HOME/.local" --quiet --force; then
     fail "cargo install failed. Nothing was installed."
   fi
   [ -x "$LOCAL_RALLY" ] || fail "cargo reported success but $LOCAL_RALLY is missing."
@@ -212,7 +220,7 @@ if [ "$MODE" = "source" ]; then
   say "  NOT verified signature, provenance, checksum"
 else
   # RALLY_EXPLICIT_INSTALL=1 is the engine's ARP-001 gate. Only this line sets it.
-  RALLY_EXPLICIT_INSTALL=1 "$ENGINE" "$REPO_ROOT" || true
+  RALLY_EXPLICIT_INSTALL=1 RALLY_UPGRADE="$UPGRADE" RALLY_RELEASE_ONLY=1 "$ENGINE" "$REPO_ROOT" || true
 
   _method=""; _result=""; _hint=""
   if [ -f "$STATE_FILE" ]; then
@@ -233,7 +241,7 @@ else
     present)
       say "Already installed and working: $LOCAL_RALLY"
       say "  verified     nothing on this run — an existing binary was found and answered"
-      say "  To force a fresh verified download, remove it first: rm -f $LOCAL_RALLY"
+      say "  To replace it with a verified release: $0 --upgrade"
       ;;
     source)
       # SEC-012: the reason the download was refused is printed every time, not

@@ -137,6 +137,14 @@ The installer checks a SHA256 and a build-provenance attestation before it makes
 downloaded file executable, and refuses rather than falling back to an unverified download.
 The release matrix targets macOS and Linux (GNU), each on ARM64 and x86_64. The verified download path requires `gh`; a failed checksum or attestation stops installation. To build the checked-out source instead, run `cargo install --path crates/rally-cli` (source requires Rust 1.89+; this checkout pins Rust 1.95.0).
 
+**Upgrading an existing CLI:** coordinate a pause and stop any shared daemon
+with its existing compatible CLI first. Update the checkout/plugin to the
+intended release, inspect `./scripts/install-rally.sh --upgrade --dry-run`, then run
+`./scripts/install-rally.sh --upgrade`. The explicit flag replaces an existing
+working CLI after verification. It does not restart a daemon, update host plugin
+caches, or override a host's PATH. See [Upgrading Rally](docs/UPGRADING.md) for
+release checks, install locations, and recovery from a protocol mismatch.
+
 **2. Turn it on in the repo your agents share.**
 
 ```bash

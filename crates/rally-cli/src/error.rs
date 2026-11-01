@@ -1,5 +1,21 @@
 use thiserror::Error;
 
+pub(crate) const RELEASE_CHECK_URL: &str =
+    "https://github.com/tyroneross/agent-rally-point/releases/latest";
+pub(crate) const UPGRADE_GUIDE_URL: &str =
+    "https://github.com/tyroneross/agent-rally-point/blob/main/docs/UPGRADING.md";
+
+fn incompatible_wire_recovery() -> String {
+    format!(
+        "Running CLI: {:?} (build {}, wire {}).\nCheck releases: {RELEASE_CHECK_URL}\nUpgrade steps: {UPGRADE_GUIDE_URL}\nCompare `rally version --json` in each host. Coordinate a pause with peers: stop the old daemon with its compatible CLI before replacing clients, then start the matching daemon. Do not stop their daemon automatically.",
+        std::env::current_exe()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "unknown".into()),
+        crate::BUILD_ID,
+        rally_protocol::store_wire::WIRE_VERSION,
+    )
+}
+
 pub(crate) type Result<T> = std::result::Result<T, RallyError>;
 
 #[derive(Debug, Error)]
@@ -31,7 +47,7 @@ pub(crate) enum RallyError {
         phase: String,
         detail: String,
     },
-    #[error("incompatible-wire: {detail}")]
+    #[error("incompatible-wire: {detail}\n{}", incompatible_wire_recovery())]
     IncompatibleWire { detail: String },
     #[error("{context}: {source}")]
     Io {
@@ -82,5 +98,31 @@ impl RallyError {
             phase: phase.into(),
             detail: detail.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_recovery_is_actionable_and_keeps_the_failure() {
+        let error = RallyError::IncompatibleWire {
+            detail: "daemon speaks 9, client sent 7".into(),
+        };
+        let text = error.to_string();
+        assert_eq!(error.exit_code(), 1);
+        assert!(text.contains("daemon speaks 9, client sent 7"));
+        assert!(text.contains(crate::BUILD_ID));
+        assert!(text.contains(RELEASE_CHECK_URL));
+        assert!(text.contains(UPGRADE_GUIDE_URL));
+        assert!(
+            text.contains("stop the old daemon with its compatible CLI before replacing clients")
+        );
+        assert!(
+            !RallyError::NotStarted("claim conflict".into())
+                .to_string()
+                .contains(RELEASE_CHECK_URL)
+        );
     }
 }

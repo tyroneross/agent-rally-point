@@ -245,8 +245,9 @@ T="ARP-001: scripts/install-rally.sh --dry-run writes nothing"
   [ -x "$installer" ] || { printf 'installer missing at %s\n' "$installer" >&2; exit 1; }
   sb="$TMPDIR_ROOT/dryrun"; mkdir -p "$sb/home"
   _make_recorders "$sb"
+  for upgrade_flag in "" "--upgrade"; do
   out=$(HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" \
-        PATH="$sb/stub:/usr/bin:/bin" "$installer" --dry-run 2>&1)
+        PATH="$sb/stub:/usr/bin:/bin" "$installer" --dry-run ${upgrade_flag:+"$upgrade_flag"} 2>&1)
   rc=$?
   [ "$rc" = "0" ] || { printf 'dry run exited %s: %s\n' "$rc" "$out" >&2; exit 1; }
   reason="$(_assert_no_provisioning "$sb")" || { printf '%s\n' "$reason" >&2; exit 1; }
@@ -254,6 +255,7 @@ T="ARP-001: scripts/install-rally.sh --dry-run writes nothing"
     || { printf 'dry run does not say it wrote nothing: %s\n' "$out" >&2; exit 1; }
   printf '%s' "$out" | grep -q "attestation verify" \
     || { printf 'plan does not name the provenance check: %s\n' "$out" >&2; exit 1; }
+  done
   exit 0
 )
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "the explicit installer must print a plan and write nothing"; fi

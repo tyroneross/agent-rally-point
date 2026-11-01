@@ -416,6 +416,77 @@ STUB
   )
   if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
 
+  T="explicit upgrade replaces a working PATH/local binary after verification"
+  (
+    sb="$TMPDIR_ROOT/upgrade-ok"; mkdir -p "$sb/home/.cache/rally" "$sb/tools"
+    _make_fake_rally "$sb/home/.local/bin/rally"
+    printf '{"ts":%s,"method":"present","result":"ok","binary":"%s"}\n' \
+      "$(date +%s)" "$sb/home/.local/bin/rally" > "$sb/home/.cache/rally/provision.json"
+    _write_curl_stub "$sb/tools" "$_GOOD_HASH"
+    _write_gh_stub "$sb/tools" 0
+    HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" \
+      PATH="$sb/home/.local/bin:$sb/tools:/usr/bin:/bin" \
+      CURL_LOG="$sb/curl.log" GH_LOG="$sb/gh.log" \
+      "$REPO_ROOT/scripts/install-rally.sh" --upgrade --yes > "$sb/out" 2>&1 || {
+        cat "$sb/out" >&2; exit 1;
+      }
+    printf '%s' "$_FAKE_BODY" | cmp - "$sb/home/.local/bin/rally" || exit 1
+    grep -q 'attestation verify' "$sb/gh.log" || exit 1
+    grep -q '"method":"downloaded"' "$sb/home/.cache/rally/provision.json" || exit 1
+  )
+  if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+  T="explicit engine upgrade bypasses cached success as well as PATH"
+  (
+    sb="$TMPDIR_ROOT/upgrade-cached"; mkdir -p "$sb/home/.cache/rally" "$sb/tools" "$sb/plugin"
+    _make_fake_rally "$sb/home/.local/bin/rally"
+    printf '{"ts":%s,"method":"present","result":"ok","binary":"%s"}\n' \
+      "$(date +%s)" "$sb/home/.local/bin/rally" > "$sb/home/.cache/rally/provision.json"
+    printf '{"version":"0.0.0-test"}\n' > "$sb/plugin/rally-release.json"
+    _write_curl_stub "$sb/tools" "$_GOOD_HASH"
+    _write_gh_stub "$sb/tools" 0
+    HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" RALLY_UPGRADE=1 \
+      PATH="$sb/home/.local/bin:$sb/tools:/usr/bin:/bin" \
+      "$HOOK" "$sb/plugin" > "$sb/out" 2>&1 || exit 1
+    printf '%s' "$_FAKE_BODY" | cmp - "$sb/home/.local/bin/rally" || exit 1
+    grep -q '"method":"downloaded"' "$sb/home/.cache/rally/provision.json" || exit 1
+  )
+  if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+  T="failed upgrade attestation preserves the working installed binary"
+  (
+    sb="$TMPDIR_ROOT/upgrade-refused"; mkdir -p "$sb/home" "$sb/tools"
+    _make_fake_rally "$sb/home/.local/bin/rally"
+    cp "$sb/home/.local/bin/rally" "$sb/original"
+    _write_curl_stub "$sb/tools" "$_GOOD_HASH"
+    _write_gh_stub "$sb/tools" 1
+    HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" \
+      PATH="$sb/home/.local/bin:$sb/tools:/usr/bin:/bin" \
+      "$REPO_ROOT/scripts/install-rally.sh" --upgrade --yes > "$sb/out" 2>&1
+    [ "$?" != "0" ] || { cat "$sb/out" >&2; exit 1; }
+    cmp "$sb/original" "$sb/home/.local/bin/rally" || exit 1
+    grep -q 'attestation-failed' "$sb/home/.cache/rally/download-rejections.log" || exit 1
+  )
+  if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+  T="offline release upgrade preserves the binary without a silent cargo fallback"
+  (
+    sb="$TMPDIR_ROOT/upgrade-offline"; mkdir -p "$sb/home" "$sb/tools"
+    _make_fake_rally "$sb/home/.local/bin/rally"
+    cp "$sb/home/.local/bin/rally" "$sb/original"
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$sb/tools/curl"
+    printf '#!/usr/bin/env bash\ntouch "%s/cargo-called"\nexit 1\n' "$sb" > "$sb/tools/cargo"
+    chmod +x "$sb/tools/curl" "$sb/tools/cargo"
+    _write_gh_stub "$sb/tools" 0
+    HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" \
+      PATH="$sb/home/.local/bin:$sb/tools:/usr/bin:/bin" \
+      "$REPO_ROOT/scripts/install-rally.sh" --upgrade --yes > "$sb/out" 2>&1
+    [ "$?" != "0" ] || { cat "$sb/out" >&2; exit 1; }
+    [ ! -e "$sb/cargo-called" ] || exit 1
+    cmp "$sb/original" "$sb/home/.local/bin/rally" || exit 1
+  )
+  if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
   # ARP-001: the checksum and the binary come from the same GitHub release, so a
   # good checksum proves nothing about a compromised release. Provenance is the
   # independent authority and it is mandatory.
@@ -651,8 +722,18 @@ STUB
   # Whatever lands in ~/.local/bin is therefore NOT what was verified.
   T="SEC-015 a binary that swaps itself after verification is caught after the move"
   (
-    sb="$TMPDIR_ROOT/post-mv-swap"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin"
+    for previous_kind in fresh regular symlink restore-denied; do
+    sb="$TMPDIR_ROOT/post-mv-swap-$previous_kind"; mkdir -p "$sb/home" "$sb/tools" "$sb/plugin"
     printf '{"schema":"agent-rally.release-identity.v1","version":"0.0.0-test"}\n' > "$sb/plugin/rally-release.json"
+    if [ "$previous_kind" != "fresh" ]; then
+      _make_fake_rally "$sb/original"
+      mkdir -p "$sb/home/.local/bin"
+      if [ "$previous_kind" = "symlink" ]; then
+        ln -s "$sb/original" "$sb/home/.local/bin/rally"
+      else
+        cp "$sb/original" "$sb/home/.local/bin/rally"
+      fi
+    fi
     _SWAP_BODY='#!/usr/bin/env bash
 case "${1:-}" in
   version)
@@ -677,14 +758,43 @@ exit 0
 STUB
     chmod +x "$sb/tools/curl"
     _write_gh_stub "$sb/tools" 0
+    if [ "$previous_kind" = "restore-denied" ]; then
+      cat > "$sb/tools/mv" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in */previous) exit 1;; esac
+exec /bin/mv "$@"
+STUB
+      chmod +x "$sb/tools/mv"
+    fi
     HOME="$sb/home" XDG_CACHE_HOME="$sb/home/.cache" PATH="$sb/tools:/usr/bin:/bin" \
-      "$HOOK" "$sb/plugin" >/dev/null 2>&1
+      "$REPO_ROOT/scripts/install-rally.sh" --upgrade --yes >/dev/null 2>&1
+    [ "$?" != "0" ] || { printf 'swapped upgrade reported success\n' >&2; exit 1; }
     m="$(_poll_method "$sb/home/.cache/rally/provision.json")"
-    [ ! -e "$sb/home/.local/bin/rally" ] \
-      || { printf 'a swapped binary survived in %s\n' "$sb/home/.local/bin/rally" >&2; exit 1; }
+    rejection="post-move-sha256-mismatch"
+    if [ "$previous_kind" = "restore-denied" ]; then
+      [ ! -e "$sb/home/.local/bin/rally" ] || exit 1
+      found_backup=0
+      for backup in "$sb/home/.local/bin"/.rally-upgrade.*/previous; do
+        [ -e "$backup" ] || continue
+        cmp "$sb/original" "$backup" || exit 1
+        found_backup=1
+      done
+      [ "$found_backup" = "1" ] || exit 1
+      grep -q 'previous executable retained at' "$sb/home/.cache/rally/provision.json" || exit 1
+      rejection="upgrade-rollback-failed"
+    elif [ "$previous_kind" = "fresh" ]; then
+      [ ! -e "$sb/home/.local/bin/rally" ] || exit 1
+    else
+      cmp "$sb/original" "$sb/home/.local/bin/rally" || exit 1
+      if [ "$previous_kind" = "symlink" ]; then
+        [ -L "$sb/home/.local/bin/rally" ] || exit 1
+        [ "$(readlink "$sb/home/.local/bin/rally")" = "$sb/original" ] || exit 1
+      fi
+    fi
     [ "$m" = "download-rejected" ] || { printf 'the swap was not recorded, method=%s\n' "$m" >&2; exit 1; }
-    grep -q 'post-move-sha256-mismatch' "$sb/home/.cache/rally/download-rejections.log" 2>/dev/null \
+    grep -q "$rejection" "$sb/home/.cache/rally/download-rejections.log" 2>/dev/null \
       || { printf 'the swap was not recorded durably\n' >&2; exit 1; }
+    done
     exit 0
   )
   if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "the installed bytes must be the verified bytes"; fi

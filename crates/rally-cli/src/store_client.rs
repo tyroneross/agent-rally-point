@@ -336,9 +336,7 @@ pub(crate) fn probe_identity_within(
         }) => {
             if wire_version != WIRE_VERSION {
                 return Err(RallyError::IncompatibleWire {
-                    detail: format!(
-                        "client speaks {WIRE_VERSION}, daemon speaks {wire_version}; run `rally daemon stop` before retrying"
-                    ),
+                    detail: format!("client speaks {WIRE_VERSION}, daemon speaks {wire_version}"),
                 });
             }
             if repo_root != expected_repo_root {

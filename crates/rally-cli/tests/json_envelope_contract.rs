@@ -683,6 +683,13 @@ fn envelope_version_data_fields() {
     let body = ws.json(&["version", "--json"]);
     let v = &body["data"]["version"];
     assert!(v.is_object(), "data.version must be an object");
+    assert_eq!(v["wire_version"], rally_protocol::store_wire::WIRE_VERSION);
+    let executable = std::fs::canonicalize(env!("CARGO_BIN_EXE_rally")).unwrap();
+    assert_eq!(v["executable_path"], executable.to_string_lossy().as_ref());
+    assert_eq!(
+        v["release_check_url"],
+        "https://github.com/tyroneross/agent-rally-point/releases/latest"
+    );
     assert!(
         v["build_id"].is_string(),
         "data.version.build_id must be a string"
