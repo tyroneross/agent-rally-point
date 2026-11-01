@@ -298,6 +298,392 @@ fn referenced_handoff_blocks_wrong_target_before_append_and_binds_author_session
 }
 
 #[test]
+fn concurrent_reply_batches_do_not_grant_same_file_edit_or_merge_authority() {
+    use std::process::Command;
+    use std::sync::{Arc, Barrier};
+    for routed in [false, true] {
+        let room = Room::new();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .current_dir(&room.cwd)
+                .env("HOME", &room.home)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "user.name=Rally Test",
+                    "-c",
+                    "user.email=rally@example.test",
+                ])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let git_ok = |args: &[&str]| {
+            let out = git(args);
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        git_ok(&["init", "--initial-branch=main"]);
+        fs::write(room.cwd.join("shared.rs"), "base\n").unwrap();
+        git_ok(&["add", "shared.rs"]);
+        git_ok(&["commit", "-m", "base"]);
+        let base = git_ok(&["rev-parse", "HEAD"]);
+        for branch in ["codex/agent-a", "codex/agent-b"] {
+            git_ok(&["branch", branch]);
+        }
+        let _daemon = routed.then(|| Daemon::start(&room));
+        let tools = ["peer:a", "peer:b"];
+        let sessions = ["session-peer-a", "session-peer-b"];
+        let requests = tools.map(|tool| {
+            let response = room.json(
+                "session-sender",
+                &[
+                    "say",
+                    "handoff",
+                    "--tool",
+                    "sender:s",
+                    "--target",
+                    tool,
+                    "--path",
+                    "shared.rs",
+                    "--subject",
+                    "edit shared file",
+                    "--deliver",
+                    "record",
+                    "--json",
+                ],
+            );
+            assert_eq!(response["ok"], true);
+            response["data"]["say"]["fact"]["event_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        });
+        for i in 0..2 {
+            assert_eq!(
+                room.json(sessions[i], &["ack", "--tool", tools[i], "--json"])["ok"],
+                true
+            );
+            let accepted = room.json(
+                sessions[i],
+                &[
+                    "say",
+                    "handoff",
+                    "--tool",
+                    tools[i],
+                    "--ref",
+                    &requests[i],
+                    "--handoff-state",
+                    "accepted",
+                    "--subject",
+                    "accepted",
+                    "--deliver",
+                    "record",
+                    "--json",
+                ],
+            );
+            assert_eq!(accepted["ok"], true, "{accepted}");
+        }
+        let barrier = Arc::new(Barrier::new(6));
+        let (claims, observations) = thread::scope(|scope| {
+            let claims = (0..2)
+                .map(|i| {
+                    let barrier = barrier.clone();
+                    let room = &room;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        (
+                            i,
+                            room.json(
+                                sessions[i],
+                                &[
+                                    "say",
+                                    "claim",
+                                    "--tool",
+                                    tools[i],
+                                    "--path",
+                                    "shared.rs",
+                                    "--subject",
+                                    "exclusive edit",
+                                    "--json",
+                                ],
+                            ),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            let readers = (0..4)
+                .map(|_| {
+                    let barrier = barrier.clone();
+                    let room = &room;
+                    let requests = &requests;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        (0..3)
+                            .map(|_| {
+                                room.json(
+                                    "session-observer",
+                                    &[
+                                        "replies",
+                                        "--ref",
+                                        &requests[0],
+                                        "--ref",
+                                        &requests[1],
+                                        "--json",
+                                    ],
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            (
+                claims
+                    .into_iter()
+                    .map(|t| t.join().unwrap())
+                    .collect::<Vec<_>>(),
+                readers
+                    .into_iter()
+                    .flat_map(|t| t.join().unwrap())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(observations.len(), 12);
+        for observation in observations {
+            assert_eq!(observation["ok"], true);
+            let rows = observation["data"]["replies"]["rows"].as_array().unwrap();
+            assert_eq!(rows.len(), 2);
+            for row in rows {
+                assert_eq!(row["fact"]["scope"], serde_json::json!(["file:shared.rs"]));
+                assert_eq!(row["reply"]["state"], "accepted");
+                assert!(!row["reply_fact"].is_null());
+            }
+        }
+        let winners = claims
+            .iter()
+            .filter(|(_, response)| response["ok"] == true)
+            .collect::<Vec<_>>();
+        assert_eq!(winners.len(), 1, "{claims:?}");
+        let winner = winners[0].0;
+        for (i, response) in &claims {
+            if *i != winner {
+                assert_eq!(response["ok"], false);
+                assert!(
+                    response["error"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("claim conflict")),
+                    "{response}"
+                );
+            }
+            let checked_output = room.run(
+                sessions[*i],
+                &[
+                    "check",
+                    "before-write",
+                    "--tool",
+                    tools[*i],
+                    "--path",
+                    "shared.rs",
+                    "--strict",
+                    "--json",
+                ],
+            );
+            assert_eq!(
+                checked_output.status.code(),
+                Some(if *i == winner { 0 } else { 4 })
+            );
+            let check = Room::parse(&["check", "before-write"], checked_output);
+            assert_eq!(check["data"]["check"]["phase"], "before-write");
+            assert_eq!(check["data"]["check"]["allow"], *i == winner, "{check}");
+        }
+        let snapshot = room.json("session-observer", &["room", "--json"]);
+        assert_eq!(
+            snapshot["data"]["room"]["active_claims"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let canonical_claims = fs::read_dir(room.cwd.join(".rally/log"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .flat_map(|path| {
+                fs::read_to_string(path)
+                    .unwrap()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+            .filter(|line| {
+                line["payload"]["kind"] == "claim" && line["payload"]["subject"] == "exclusive edit"
+            })
+            .count();
+        assert_eq!(
+            canonical_claims, 1,
+            "losing claim must not be appended canonically"
+        );
+        for i in 0..2 {
+            let output = room.run(
+                sessions[i],
+                &[
+                    "check",
+                    "coordination",
+                    "--tool",
+                    tools[i],
+                    "--changed",
+                    "shared.rs",
+                    "--strict",
+                    "--json",
+                ],
+            );
+            assert_eq!(output.status.code(), Some(if i == winner { 0 } else { 4 }));
+            let checked = Room::parse(&["check", "coordination"], output);
+            assert_eq!(checked["data"]["check"]["phase"], "coordination");
+            assert_eq!(checked["data"]["check"]["pass"], i == winner);
+        }
+        let claim_id = winners[0].1["data"]["say"]["fact"]["event_id"]
+            .as_str()
+            .unwrap();
+        let loser = 1 - winner;
+        let unauthorized = room.json(
+            sessions[loser],
+            &[
+                "say",
+                "release",
+                "--tool",
+                tools[loser],
+                "--ref",
+                claim_id,
+                "--subject",
+                "steal claim",
+                "--json",
+            ],
+        );
+        assert_eq!(unauthorized["ok"], false, "{unauthorized}");
+        let claim_read = room.json(
+            "session-observer",
+            &["replies", "--ref", claim_id, "--json"],
+        );
+        assert_eq!(
+            claim_read["data"]["replies"]["rows"][0]["fact"]["kind"],
+            "claim"
+        );
+        assert!(
+            claim_read["data"]["replies"]["rows"][0]["reply"].is_null(),
+            "a batch observation is not a file authorization"
+        );
+        assert_eq!(
+            git_ok(&["rev-parse", "HEAD"]),
+            base,
+            "readers and claims never merge or edit the file"
+        );
+        assert_eq!(
+            fs::read_to_string(room.cwd.join("shared.rs")).unwrap(),
+            "base\n"
+        );
+        // Even when a caller ignores the denied Rally check, observation cannot
+        // make two conflicting branch edits safe. Git must surface the conflict.
+        git_ok(&["checkout", "codex/agent-a"]);
+        fs::write(room.cwd.join("shared.rs"), "agent-a\n").unwrap();
+        git_ok(&["commit", "-am", "agent a edit"]);
+        git_ok(&["checkout", "codex/agent-b"]);
+        fs::write(room.cwd.join("shared.rs"), "agent-b\n").unwrap();
+        git_ok(&["commit", "-am", "agent b edit"]);
+        git_ok(&["checkout", "main"]);
+        let winner_branch = if winner == 0 {
+            "codex/agent-a"
+        } else {
+            "codex/agent-b"
+        };
+        let loser_branch = if winner == 0 {
+            "codex/agent-b"
+        } else {
+            "codex/agent-a"
+        };
+        git_ok(&["merge", "--ff-only", winner_branch]);
+        let accepted_head = git_ok(&["rev-parse", "HEAD"]);
+        assert!(!git(&["merge", "--no-edit", loser_branch]).status.success());
+        assert_eq!(git_ok(&["rev-parse", "HEAD"]), accepted_head);
+        let conflicted = fs::read_to_string(room.cwd.join("shared.rs")).unwrap();
+        assert!(
+            conflicted.contains("<<<<<<<")
+                && conflicted.contains("agent-a")
+                && conflicted.contains("agent-b")
+        );
+        git_ok(&["merge", "--abort"]);
+        assert_eq!(
+            fs::read_to_string(room.cwd.join("shared.rs")).unwrap(),
+            if winner == 0 {
+                "agent-a\n"
+            } else {
+                "agent-b\n"
+            }
+        );
+        let released = room.json(
+            sessions[winner],
+            &[
+                "say",
+                "release",
+                "--tool",
+                tools[winner],
+                "--ref",
+                claim_id,
+                "--subject",
+                "handover",
+                "--json",
+            ],
+        );
+        assert_eq!(released["ok"], true, "{released}");
+        let next_claim = room.json(
+            sessions[loser],
+            &[
+                "say",
+                "claim",
+                "--tool",
+                tools[loser],
+                "--path",
+                "shared.rs",
+                "--subject",
+                "next owner",
+                "--json",
+            ],
+        );
+        assert_eq!(next_claim["ok"], true, "{next_claim}");
+        let old_owner = room.json(
+            sessions[winner],
+            &[
+                "check",
+                "before-write",
+                "--tool",
+                tools[winner],
+                "--path",
+                "shared.rs",
+                "--strict",
+                "--json",
+            ],
+        );
+        assert_eq!(
+            old_owner["data"]["check"]["allow"], false,
+            "a stale batch result cannot grant old ownership: {old_owner}"
+        );
+    }
+}
+
+#[test]
 fn inbox_suggested_acceptance_keeps_bound_work_open_until_evidenced_completion() {
     let room = Room::new();
     let (artifact, _) = room.artifact();

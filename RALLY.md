@@ -122,7 +122,10 @@ another room: use `locate` for that fallback. Do not infer ACKs from a capped
 Status bursts wait through the existing bounded ownership corridor. An explicit
 NotStarted refusal means no mutation began; an unknown outcome requires locating
 the event before retrying. Inspect the command result before reporting a post as
-sent. Claims and strict checks still apply before every shared edit.
+sent. Claims and strict checks still apply before every shared edit. A reply batch does not check file ownership.
+Before merging, supply every changed path to `check coordination --strict`
+and validate its actual coordination result (`pass=true`); do not accept a
+watchdog advisory as a passed check. Git still resolves or reports conflicts.
 
 ## The Agent Loop
 
