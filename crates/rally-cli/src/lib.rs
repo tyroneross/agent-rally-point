@@ -8423,7 +8423,15 @@ fn managed_agent_command(agent: &AgentSpec, session: &ManagedSession) -> Result<
             &session.session_id
         ]
     } else {
-        agent.command_line(&session.name)
+        backends::with_codex_identity(
+            agent.command_line(&session.name),
+            &[
+                ("RALLY_SESSION_ID", session.session_id.as_str()),
+                ("RALLY_AGENT_ID", session.session_id.as_str()),
+                ("RALLY_TOOL_ID", session.tool.as_str()),
+                ("RALLY_MANAGED_SESSION_MODE", "persistent"),
+            ],
+        )
     };
     let mode = if session.task_scoped {
         "task"
@@ -9393,7 +9401,15 @@ fn command_task_worker(args: TaskWorkerArgs) -> Result<Output> {
     })?;
     let result_path = managed_task_result_path(&repo, task_id);
     let agent = AgentSpec::from_name(&session.agent)?;
-    let command = agent.task_command_line(&result_path)?;
+    let command = backends::with_codex_identity(
+        agent.task_command_line(&result_path)?,
+        &[
+            ("RALLY_SESSION_ID", session.session_id.as_str()),
+            ("RALLY_AGENT_ID", session.session_id.as_str()),
+            ("RALLY_TOOL_ID", session.tool.as_str()),
+            ("RALLY_MANAGED_SESSION_MODE", "task"),
+        ],
+    );
     #[cfg(debug_assertions)]
     let command = {
         let mut command = command;
@@ -16802,6 +16818,47 @@ mod tests {
         );
         assert_eq!(&command[6..], &["task-worker", "--session-id", "lease-1"]);
         assert!(!command.iter().any(|arg| arg == "inspect"));
+    }
+
+    #[test]
+    fn managed_launch_command_passes_codex_identity_to_tool_shells() {
+        let session = ManagedSession {
+            session_id: "lease-1".to_string(),
+            name: "worker-1".to_string(),
+            agent: "codex".to_string(),
+            tool: "codex:graph-worker".to_string(),
+            backend: "tmux".to_string(),
+            ..Default::default()
+        };
+        let spec = AgentSpec::from_name("codex")
+            .unwrap()
+            .with_command_json(Some(r#"["codex","-m","gpt-6.1-sol"]"#))
+            .unwrap();
+        let command = managed_agent_command(&spec, &session).unwrap();
+        assert_eq!(
+            &command[5..],
+            &[
+                "codex",
+                "-c",
+                "shell_environment_policy.set.RALLY_SESSION_ID=\"lease-1\"",
+                "-c",
+                "shell_environment_policy.set.RALLY_AGENT_ID=\"lease-1\"",
+                "-c",
+                "shell_environment_policy.set.RALLY_TOOL_ID=\"codex:graph-worker\"",
+                "-c",
+                "shell_environment_policy.set.RALLY_MANAGED_SESSION_MODE=\"persistent\"",
+                "-m",
+                "gpt-6.1-sol",
+            ]
+        );
+        let claude = ManagedSession {
+            agent: "claude".to_string(),
+            tool: "claude_code".to_string(),
+            ..session
+        };
+        let command =
+            managed_agent_command(&AgentSpec::from_name("claude").unwrap(), &claude).unwrap();
+        assert!(!command.iter().any(|arg| arg == "-c"));
     }
 
     #[test]

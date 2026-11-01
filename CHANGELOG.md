@@ -7,6 +7,15 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Fixed — Codex tool shells now see the Rally session identity
+
+Codex filters the environment its tool subprocesses inherit, so Rally-launched
+Codex sessions reported `$RALLY_TOOL_ID` unset inside tool shells. Rally now
+passes `RALLY_SESSION_ID`, `RALLY_AGENT_ID`, `RALLY_TOOL_ID` and
+`RALLY_MANAGED_SESSION_MODE` to Codex as
+`-c shell_environment_policy.set.*` overrides, which apply regardless of
+`inherit`. Non-Codex hosts are launched unchanged.
+
 ### Fixed — heartbeats stop renewing auto-claims on untouched files
 
 Every heartbeat renewed every claim a session owned, including claims the

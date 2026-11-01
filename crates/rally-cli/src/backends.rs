@@ -12,6 +12,38 @@ use crate::error::{RallyError, Result};
 use crate::shell_quote;
 use crate::store::Fact;
 
+/// Inserts Rally identity into a Codex argv as `-c shell_environment_policy.set.KEY="value"`
+/// overrides right after argv[0].
+///
+/// Codex filters the environment its tool subprocesses see
+/// (`shell_environment_policy`), so variables set only on the launching
+/// process (`env KEY=.. codex`) do not reliably reach tool shells. The `set`
+/// table is applied regardless of `inherit`, and the dotted-path override
+/// merges into any existing `set` table. A JSON string is a valid TOML basic
+/// string, so `serde_json` handles quoting and escaping. Non-codex commands
+/// (including wrappers such as `env ... codex`) and empty argv are returned
+/// unchanged.
+pub(crate) fn with_codex_identity(command: Vec<String>, identity: &[(&str, &str)]) -> Vec<String> {
+    let is_codex = command
+        .first()
+        .is_some_and(|argv0| Path::new(argv0).file_name().is_some_and(|n| n == "codex"));
+    if !is_codex {
+        return command;
+    }
+    let mut out = Vec::with_capacity(command.len() + identity.len() * 2);
+    let mut rest = command.into_iter();
+    out.extend(rest.next());
+    for (key, value) in identity {
+        out.push("-c".to_string());
+        out.push(format!(
+            "shell_environment_policy.set.{key}={}",
+            serde_json::to_string(value).expect("string serializes")
+        ));
+    }
+    out.extend(rest);
+    out
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct AgentSpec {
     pub(crate) agent: String,
@@ -2725,6 +2757,7 @@ fn shell_words(words: &[String]) -> Result<String> {
 }
 #[cfg(test)]
 mod tests {
+    use super::with_codex_identity;
     use super::{
         AgentAdapter, DeliveryDisposition, InjectData, RunData, SessionActionData, SessionsData,
     };
@@ -2753,6 +2786,48 @@ mod tests {
     use schemars::schema_for;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    #[test]
+    fn codex_identity_inserts_overrides_after_argv0() {
+        let id = [("RALLY_TOOL_ID", "codex:x"), ("RALLY_SESSION_ID", "s1")];
+        for bin in ["codex", "/opt/bin/codex"] {
+            let out = with_codex_identity(vec![bin.into(), "-m".into(), "gpt-x".into()], &id);
+            assert_eq!(
+                out,
+                vec![
+                    bin,
+                    "-c",
+                    "shell_environment_policy.set.RALLY_TOOL_ID=\"codex:x\"",
+                    "-c",
+                    "shell_environment_policy.set.RALLY_SESSION_ID=\"s1\"",
+                    "-m",
+                    "gpt-x"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn codex_identity_leaves_other_commands_unchanged() {
+        let id = [("RALLY_TOOL_ID", "t")];
+        for argv in [
+            vec!["claude".to_string()],
+            vec!["env".into(), "X=1".into(), "codex".into()],
+            vec![],
+        ] {
+            assert_eq!(with_codex_identity(argv.clone(), &id), argv);
+        }
+    }
+
+    #[test]
+    fn codex_identity_hostile_value_round_trips_as_toml_string() {
+        let hostile = "a\"b\\c\nd";
+        let out = with_codex_identity(vec!["codex".into()], &[("K", hostile)]);
+        let value = out[2]
+            .strip_prefix("shell_environment_policy.set.K=")
+            .unwrap();
+        assert_eq!(serde_json::from_str::<String>(value).unwrap(), hostile);
+    }
 
     #[test]
     fn backend_parser_preserves_supported_routes_and_rejects_unknown_values() {

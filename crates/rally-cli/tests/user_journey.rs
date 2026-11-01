@@ -3034,7 +3034,12 @@ fn rally_uses_native_cmux_managed_session_commands() {
         cmux_command.contains("RALLY_TOOL_ID=codex:cmux-builder-01"),
         "{cmux_command}"
     );
-    assert!(cmux_command.ends_with(" codex"), "{cmux_command}");
+    assert!(cmux_command.contains(" codex -c "), "{cmux_command}");
+    assert!(
+        cmux_command
+            .contains("'shell_environment_policy.set.RALLY_TOOL_ID=\"codex:cmux-builder-01\"'"),
+        "{cmux_command}"
+    );
 
     let cmux_inject = workspace.json(&[
         "inject",
