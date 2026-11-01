@@ -7997,6 +7997,123 @@ esac
     workspace.cleanup();
 }
 
+/// A successful Git provision followed by a refused record append must never
+/// start a backend, silently delete the checkout, or report an active agent.
+#[test]
+fn run_prelaunch_record_failure_retires_reservation_and_preserves_worktree() {
+    run_prelaunch_failure_case("record", true);
+}
+
+#[test]
+fn run_prelaunch_record_failure_exposes_recovery_when_retirement_fails() {
+    run_prelaunch_failure_case("retirement", false);
+}
+
+fn run_prelaunch_failure_case(failure: &str, retirement_succeeds: bool) {
+    let _run_guard = serialize_rally_run();
+    let workspace = real_repo_workspace(&format!("rally-run-prelaunch-{failure}"));
+    let stub = workspace.home.join("tmux-prelaunch");
+    fs::write(&stub, r#"#!/bin/sh
+case "$1" in
+  new-session) touch "$0.started"; exit 0 ;;
+  kill-session) touch "$0.stopped" ;;
+esac
+echo 'no server running' >&2
+exit 1
+"#).unwrap();
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rally"))
+        .current_dir(&workspace.cwd)
+        .env("HOME", &workspace.home)
+        .env("RALLY_DAEMON_AUTOSTART", "0")
+        .env("RALLY_HOOK_TIMEOUT_MS", "15000")
+        .env_remove("RALLY_NO_WORKTREE")
+        .env("RALLY_TEST_RUN_PRELAUNCH_RECORD_FAILURE", failure)
+        .args([
+            "run",
+            "claude",
+            "--name",
+            "failed",
+            "--backend",
+            "tmux",
+            "--tmux-bin",
+            stub.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let reply: Value = serde_json::from_slice(&output.stdout).expect("structured failure");
+    assert_eq!(reply["command"], "partial_commit", "{reply:#}");
+    let recovery = &reply["data"]["launch_recovery"];
+    assert_eq!(recovery["backend_started"], false, "{reply:#}");
+    assert_eq!(
+        recovery["reservation_state"],
+        if retirement_succeeds {
+            "stopped"
+        } else {
+            "retirement_unconfirmed"
+        }
+    );
+    let retained = PathBuf::from(
+        recovery["worktree_retained"]
+            .as_str()
+            .expect("retained path"),
+    );
+    assert!(
+        retained.join(".git").is_file(),
+        "provisioned worktree preserved"
+    );
+    let marker = PathBuf::from(format!("{}.started", stub.display()));
+    assert!(
+        !marker.exists(),
+        "backend must not start before durable identity"
+    );
+    let session = recovery["session"]["session_id"].as_str().unwrap();
+    let sessions = workspace.json(&["sessions", "--json", "--tmux-bin", stub.to_str().unwrap()]);
+    let active = sessions["data"]["sessions"]["sessions"].as_array().unwrap();
+    assert_eq!(
+        active.len(),
+        usize::from(!retirement_succeeds),
+        "{sessions:#}"
+    );
+    if !retirement_succeeds {
+        assert_eq!(
+            recovery["stop_command"],
+            format!("rally stop {session} --json")
+        );
+        workspace.json(&[
+            "stop",
+            session,
+            "--json",
+            "--tmux-bin",
+            stub.to_str().unwrap(),
+        ]);
+        assert!(
+            retained.exists(),
+            "registration-only stop preserves unlaunched checkout"
+        );
+        assert!(!marker.exists());
+        assert!(!PathBuf::from(format!("{}.stopped", stub.display())).exists(), "recovery must not send a backend stop");
+    }
+    // A distinct name is a valid retry without overwriting the retained checkout.
+    let retry = workspace.json(&[
+        "run",
+        "claude",
+        "--name",
+        "retry",
+        "--backend",
+        "tmux",
+        "--tmux-bin",
+        stub.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_ne!(retry["data"]["run"]["session"]["session_id"], session);
+    assert!(marker.exists(), "only the valid retry reaches the backend");
+    assert!(retained.exists());
+    workspace.cleanup();
+}
+
 #[test]
 fn run_worktree_failure_in_commitless_repo_leaves_no_active_session() {
     let _run_guard = serialize_rally_run();

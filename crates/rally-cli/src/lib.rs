@@ -705,8 +705,8 @@ const INJECT_MAX_WATCHDOG_TIMEOUT_MS: u64 = 605_000;
 /// this is returned directly rather than clamped through the generic
 /// override path.
 const DAEMON_START_WATCHDOG_TIMEOUT_MS: u64 = 45_000;
-/// `worktree plan` scans every local branch and registered checkout on demand.
-/// Give it room for a busy host without extending the 3s hook-command budget.
+/// Worktree scans and agent launches need room for Git I/O on a busy host
+/// without extending the 3s hook-command budget.
 const WORKTREE_PLAN_WATCHDOG_TIMEOUT_MS: u64 = 15_000;
 
 /// True when the resolved subcommand is `inject`. `inject` is the one
@@ -929,6 +929,14 @@ fn resolve_watchdog_timeout(args: &[String]) -> Duration {
         first_positionals(args),
         (Some("worktree"), Some("closeout"))
     ) {
+        return Duration::from_millis(WORKTREE_PLAN_WATCHDOG_TIMEOUT_MS);
+    }
+
+    // Provisioning a checkout and recording its identity need the same bounded
+    // budget as explicit worktree operations. Dry runs keep the hook default.
+    if matches!(first_positionals(args), (Some("run"), _))
+        && !args.iter().any(|arg| arg == "--dry-run")
+    {
         return Duration::from_millis(WORKTREE_PLAN_WATCHDOG_TIMEOUT_MS);
     }
 
@@ -8750,6 +8758,93 @@ impl Drop for AdmissionRollback<'_> {
     }
 }
 
+/// The backend must not start until its provisioned identity is durable.
+fn record_provisioned_session(
+    room: &RoomStore,
+    session: &ManagedSession,
+    fact: &Fact,
+) -> Result<()> {
+    #[cfg(debug_assertions)]
+    if env::var_os("RALLY_TEST_RUN_PRELAUNCH_RECORD_FAILURE").is_some() {
+        return Err(RallyError::NotStarted(
+            "injected provisioned-session record failure".into(),
+        ));
+    }
+    room.append_fact(&session_fact(
+        session,
+        "active",
+        Some(fact.event_id.clone()),
+    ))?
+    .into_fact_reporting();
+    Ok(())
+}
+
+/// Compensate only the exact reservation; never delete the worktree or send a
+/// stop to a backend that we have not started. If the store is still unavailable,
+/// expose the retained identity and existing registration-only stop recovery.
+fn prelaunch_record_failure(
+    room: &RoomStore,
+    session: &ManagedSession,
+    reservation: &Fact,
+    error: RallyError,
+    json_output: bool,
+) -> Result<Output> {
+    let unknown = matches!(&error, RallyError::OutcomeUnknown { .. });
+    let retirement = if unknown {
+        Err("Query the uncertain append before retiring the reservation.".to_string())
+    } else {
+        #[cfg(debug_assertions)]
+        let injected =
+            env::var("RALLY_TEST_RUN_PRELAUNCH_RECORD_FAILURE").as_deref() == Ok("retirement");
+        #[cfg(not(debug_assertions))]
+        let injected = false;
+        if injected {
+            Err("injected reservation retirement failure".to_string())
+        } else {
+            append_stopped_session_record(room, session, reservation).map_err(|err| err.to_string())
+        }
+    };
+    let retired = retirement.is_ok();
+    let recovery = json!({
+        "backend_started": false,
+        "reservation_state": if retired { "stopped" } else { "retirement_unconfirmed" },
+        "reservation_event_id": reservation.event_id,
+        "session": session,
+        "worktree_retained": session.worktree_path,
+        "retirement_error": retirement.err(),
+        "stop_command": (!retired && !unknown).then(|| format!("rally stop {} --json", session.session_id)),
+        "retry_instruction": if retired {
+            "Retry with a new --name; the failed launch's worktree remains available for review."
+        } else {
+            "Resolve the recorded reservation first. Do not rerun the whole launch command."
+        }
+    });
+    let mut output = output_after_committed_error(error, json_output)?;
+    if let Some(data) = output.body.get_mut("data").and_then(Value::as_object_mut) {
+        data.insert("launch_recovery".to_string(), recovery);
+    }
+    output.text.push_str(&format!(
+        "\nAgent not started. Session {} reservation {}; worktree retained at {}. {}",
+        session.session_id,
+        if retired {
+            "stopped"
+        } else {
+            "retirement unconfirmed"
+        },
+        session
+            .worktree_path
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+        if retired {
+            "Retry with a new --name."
+        } else {
+            "Inspect launch_recovery before retrying."
+        }
+    ));
+    Ok(output)
+}
+
 fn command_run(args: RunArgs) -> Result<Output> {
     let RunArgs {
         command_json,
@@ -8978,12 +9073,9 @@ fn command_run(args: RunArgs) -> Result<Output> {
                     // Refresh the session fact so the durable record reflects
                     // the worktree-rooted cwd + branch.
                     if let Some(fact) = &reservation.fact {
-                        room.append_fact(&session_fact(
-                            &session,
-                            "active",
-                            Some(fact.event_id.clone()),
-                        ))?
-                        .into_fact_reporting();
+                        if let Err(error) = record_provisioned_session(&room, &session, fact) {
+                            return prelaunch_record_failure(&room, &session, fact, error, json);
+                        }
                     }
                 }
                 Err(err) => {
@@ -12309,8 +12401,16 @@ fn command_session_action(args: SessionActionArgs) -> Result<Output> {
         backend_runner.live_target(&session)
     };
     // An explicit stop can close a failed registration without sending bytes
-    // to an unverified process. Its files remain for recovery in that case.
-    let stop_without_target = matches!(action, SessionAction::Stop) && target_validation.is_err();
+    // to an unverified process. A prelaunch tmux reservation has no binding;
+    // if its target is confirmed stale, close only its registration. Its files
+    // remain available for recovery.
+    let stop_without_target = matches!(action, SessionAction::Stop)
+        && (target_validation.is_err()
+            || (!dry_run
+                && session.backend == "tmux"
+                && session.tmux_binding.is_none()
+                && backend_runner.liveness(std::slice::from_ref(&session.target))
+                    == [SessionLiveness::Stale]));
     let live_target = if stop_without_target {
         session.target.clone()
     } else {
@@ -14448,6 +14548,31 @@ mod tests {
         );
         assert_eq!(
             resolve_watchdog_timeout(&argv(&["session", "current", "--json"])),
+            Duration::from_millis(DEFAULT_WATCHDOG_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn run_watchdog_covers_provisioning_without_changing_hooks() {
+        for args in [
+            argv(&["run", "claude"]),
+            argv(&["run", "claude", "--no-worktree"]),
+        ] {
+            assert_eq!(
+                resolve_watchdog_timeout(&args),
+                Duration::from_millis(WORKTREE_PLAN_WATCHDOG_TIMEOUT_MS)
+            );
+        }
+        assert_eq!(
+            resolve_watchdog_timeout(&argv(&["run", "claude", "--dry-run"])),
+            Duration::from_millis(DEFAULT_WATCHDOG_TIMEOUT_MS)
+        );
+        assert_eq!(
+            resolve_watchdog_timeout(&argv(&["run", "claude", "--timeout-ms", "5000"])),
+            Duration::from_millis(5000)
+        );
+        assert_eq!(
+            resolve_watchdog_timeout(&argv(&["hook", "before-write", "--json"])),
             Duration::from_millis(DEFAULT_WATCHDOG_TIMEOUT_MS)
         );
     }
