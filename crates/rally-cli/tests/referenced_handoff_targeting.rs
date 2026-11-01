@@ -299,6 +299,15 @@ fn referenced_handoff_blocks_wrong_target_before_append_and_binds_author_session
 
 #[test]
 fn concurrent_reply_batches_do_not_grant_same_file_edit_or_merge_authority() {
+    same_file_collaboration(false);
+}
+
+#[test]
+fn competing_merge_batches_recheck_same_file_authority_after_transfer() {
+    same_file_collaboration(true);
+}
+
+fn same_file_collaboration(competing_merges: bool) {
     use std::process::Command;
     use std::sync::{Arc, Barrier};
     for routed in [false, true] {
@@ -614,7 +623,106 @@ fn concurrent_reply_batches_do_not_grant_same_file_edit_or_merge_authority() {
         } else {
             "codex/agent-a"
         };
-        git_ok(&["merge", "--ff-only", winner_branch]);
+        // A reply batch grants no merge authority. Two agents request a merge
+        // concurrently while four observers read batches; only the current
+        // claim owner may invoke Git. This tests cooperative callers, not an
+        // atomic Git landing queue or agents bypassing the coordination gate.
+        let merge_wave = |owner: usize, should_succeed: bool| {
+            let barrier = Arc::new(Barrier::new(6));
+            thread::scope(|scope| {
+                let mergers = (0..2)
+                    .map(|i| {
+                        let barrier = barrier.clone();
+                        let room = &room;
+                        let git = &git;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            let output = room.run(
+                                sessions[i],
+                                &[
+                                    "check",
+                                    "coordination",
+                                    "--tool",
+                                    tools[i],
+                                    "--changed",
+                                    "shared.rs",
+                                    "--strict",
+                                    "--json",
+                                ],
+                            );
+                            assert_eq!(
+                                output.status.code(),
+                                Some(if i == owner { 0 } else { 4 }),
+                                "merge wave owner={owner}, actor={i}, routed={routed}: {}",
+                                String::from_utf8_lossy(&output.stdout)
+                            );
+                            let check = Room::parse(&["check", "coordination"], output);
+                            assert_eq!(check["data"]["check"]["phase"], "coordination");
+                            assert_eq!(check["data"]["check"]["pass"], i == owner);
+                            if i != owner {
+                                return false;
+                            }
+                            let branch = ["codex/agent-a", "codex/agent-b"][i];
+                            let merged = git(&["merge", "--no-edit", branch]);
+                            assert_eq!(
+                                merged.status.success(),
+                                should_succeed,
+                                "owner merge: {} {}",
+                                String::from_utf8_lossy(&merged.stdout),
+                                String::from_utf8_lossy(&merged.stderr)
+                            );
+                            true
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let readers = (0..4)
+                    .map(|_| {
+                        let barrier = barrier.clone();
+                        let room = &room;
+                        let requests = &requests;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            for _ in 0..3 {
+                                let batch = room.json(
+                                    "session-observer",
+                                    &[
+                                        "replies",
+                                        "--ref",
+                                        &requests[0],
+                                        "--ref",
+                                        &requests[1],
+                                        "--json",
+                                    ],
+                                );
+                                assert_eq!(batch["ok"], true);
+                                let rows = batch["data"]["replies"]["rows"].as_array().unwrap();
+                                assert_eq!(rows.len(), 2);
+                                for row in rows {
+                                    assert_eq!(row["reply"]["state"], "accepted");
+                                    assert_eq!(
+                                        row["fact"]["scope"],
+                                        serde_json::json!(["file:shared.rs"])
+                                    );
+                                }
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let invoked_git = mergers
+                    .into_iter()
+                    .map(|job| usize::from(job.join().unwrap()))
+                    .sum::<usize>();
+                assert_eq!(invoked_git, 1, "only the current owner may attempt a merge");
+                for reader in readers {
+                    reader.join().unwrap();
+                }
+            });
+        };
+        if competing_merges {
+            merge_wave(winner, true);
+        } else {
+            git_ok(&["merge", "--ff-only", winner_branch]);
+        }
         let accepted_head = git_ok(&["rev-parse", "HEAD"]);
         assert!(!git(&["merge", "--no-edit", loser_branch]).status.success());
         assert_eq!(git_ok(&["rev-parse", "HEAD"]), accepted_head);
@@ -663,6 +771,21 @@ fn concurrent_reply_batches_do_not_grant_same_file_edit_or_merge_authority() {
             ],
         );
         assert_eq!(next_claim["ok"], true, "{next_claim}");
+        if competing_merges {
+            // Both old accepted replies remain visible. Ownership has changed:
+            // the old owner is refused, and the new owner's conflicting branch
+            // must fail visibly without replacing the first accepted commit.
+            merge_wave(loser, false);
+            assert_eq!(git_ok(&["rev-parse", "HEAD"]), accepted_head);
+            let conflict = fs::read_to_string(room.cwd.join("shared.rs")).unwrap();
+            assert!(
+                conflict.contains("<<<<<<<")
+                    && conflict.contains("agent-a")
+                    && conflict.contains("agent-b")
+            );
+            git_ok(&["merge", "--abort"]);
+            assert_eq!(git_ok(&["rev-parse", "HEAD"]), accepted_head);
+        }
         let old_owner = room.json(
             sessions[winner],
             &[

@@ -589,6 +589,7 @@ fn assert_parity<T: std::fmt::Debug + PartialEq>(
     };
     daemon.assert_serving(&routed_room);
     let routed = scenario(&routed_room);
+    daemon.assert_serving(&routed_room);
     drop(daemon);
 
     assert_eq!(
