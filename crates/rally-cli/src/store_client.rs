@@ -474,6 +474,7 @@ fn mutation_query(op: &StoreOp) -> Option<MutationQuery> {
         | StoreOp::FactsByEventId { .. }
         | StoreOp::RecentFacts { .. }
         | StoreOp::ReplyFacts { .. }
+        | StoreOp::BatchReplyFacts { .. }
         | StoreOp::FactsOfKinds { .. }
         | StoreOp::SessionViewFacts
         | StoreOp::FactsPage { .. }
@@ -626,6 +627,21 @@ impl RoutedRoomStore {
         }
         match round_trip(&self.socket, &req, OP_TIMEOUT, false) {
             Ok(StoreResponse::Ok(ok)) => Ok(ok),
+            // A well-formed transport error can arrive AFTER dispatch (for
+            // example the daemon's reader deadline). It proves no more about
+            // commit than a disconnected socket. Only typed NotStarted may
+            // authorize a safe retry of a mutation.
+            Ok(StoreResponse::Err(err))
+                if err.kind == StoreErrorKind::Transport && req.op.is_mutating() =>
+            {
+                Err(transport_error(
+                    &req.op,
+                    &std::io::Error::other(format!(
+                        "{}; reconcile before retrying",
+                        err.message.trim_end_matches("; retry")
+                    )),
+                ))
+            }
             Ok(StoreResponse::Err(err)) => Err(store_error_to_rally_error(err)),
             Err(io_err) => Err(transport_error(&req.op, &io_err)),
         }
@@ -746,6 +762,15 @@ impl RoutedRoomStore {
         })? {
             StoreOk::Facts { facts } => facts.into_iter().map(from_value).collect(),
             _ => Err(unexpected_reply("reply_facts")),
+        }
+    }
+
+    pub(crate) fn batch_reply_facts(&self, event_ids: &[String]) -> Result<Vec<Fact>> {
+        match self.dispatch(StoreOp::BatchReplyFacts {
+            event_ids: event_ids.to_vec(),
+        })? {
+            StoreOk::Facts { facts } => facts.into_iter().map(from_value).collect(),
+            _ => Err(unexpected_reply("batch_reply_facts")),
         }
     }
 
@@ -1045,6 +1070,38 @@ mod tests {
         ));
         assert!(matches!(error, RallyError::NotStarted(_)));
         assert_eq!(error.exit_code(), 4);
+    }
+
+    #[test]
+    fn daemon_timeout_reply_does_not_authorize_blind_mutation_retry() {
+        for kind in [StoreErrorKind::Transport, StoreErrorKind::NotStarted] {
+            let socket = unique_socket("error-reply");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(&stream).read_line(&mut request).unwrap();
+                assert!(request.contains("fact-timeout-control"));
+                let response =
+                    StoreResponse::Err(StoreError::new(kind, "daemon store op timed out; retry"));
+                writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+            });
+            let routed = RoutedRoomStore::for_test(socket.clone(), PathBuf::from("/repo"), "test");
+            let error = routed
+                .dispatch(StoreOp::AppendFact {
+                    fact: serde_json::json!({"event_id":"fact-timeout-control"}),
+                })
+                .unwrap_err();
+            server.join().unwrap();
+            std::fs::remove_file(socket).ok();
+            match kind {
+                StoreErrorKind::Transport => assert!(
+                    matches!(error, RallyError::OutcomeUnknown { ref event_id, .. } if event_id == "fact-timeout-control")
+                ),
+                StoreErrorKind::NotStarted => assert!(matches!(error, RallyError::NotStarted(_))),
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]

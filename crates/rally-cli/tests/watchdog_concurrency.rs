@@ -200,6 +200,95 @@ fn unique_subject(label: &str, index: usize) -> String {
     )
 }
 
+#[cfg(unix)]
+#[test]
+fn default_status_posts_wait_out_transient_contention_and_commit_once() {
+    use std::os::fd::AsRawFd;
+    let room = TempRoom::new("status-default-budget");
+    let rally_dir = room.cwd.join(".rally");
+    fs::create_dir_all(&rally_dir).unwrap();
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(rally_dir.join("direct.owner.lock"))
+        .unwrap();
+    // SAFETY: hold only this fixture's lock on an owned file descriptor.
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let subjects = (0..3)
+        .map(|i| unique_subject("status-default", i))
+        .collect::<Vec<_>>();
+    let mut children = subjects
+        .iter()
+        .map(|subject| {
+            room.rally()
+                .env_remove("RALLY_HOOK_TIMEOUT_MS")
+                .args([
+                    "say",
+                    "artifact",
+                    "--tool",
+                    "codex:status",
+                    "--subject",
+                    subject,
+                    "--json",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    // Longer than the former ~2s routing corridor. Every child must still be
+    // waiting rather than abandoning an ordinary short burst as overload.
+    thread::sleep(Duration::from_millis(2400));
+    for child in &mut children {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "status post refused before transient contention cleared"
+        );
+    }
+    drop(lock);
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let response = stdout_json(&output);
+        assert_eq!(response["data"]["say"]["committed"], true);
+        assert_eq!(response["data"]["say"]["projection_complete"], true);
+    }
+    let facts = fs::read_dir(rally_dir.join("log"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .flat_map(|path| {
+            fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+        .collect::<Vec<_>>();
+    for subject in subjects {
+        assert_eq!(
+            facts
+                .iter()
+                .filter(|fact| fact["payload"]["subject"] == subject)
+                .count(),
+            1,
+            "{subject}"
+        );
+    }
+}
+
 #[test]
 fn thirty_two_cold_direct_commands_are_lossless_and_integral() {
     const N: usize = 32;

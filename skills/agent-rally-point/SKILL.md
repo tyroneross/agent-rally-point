@@ -180,7 +180,7 @@ ack, `next` writes ONE durable `risk` fact (`no-response: <tool> did not ack
 handoff <id>`) and lists the handoff under `data.overdue_handoffs`. Then run the
 declared backup once (re-inject with `rally inject <tool> --handoff <id>`, post a
 backup locator, or reroute/tell the user). The entry clears only when the
-receiver acks (`rally say receipt|resolve --ref <id>`). `--deliver record`
+receiver answers through the inbox's `ack_command` (typed acceptance keeps work open). `--deliver record`
 opts out of the inject.
 
 Use two delivery paths with different failure modes:
@@ -201,6 +201,23 @@ passes, execute the declared backup once and reference the original handoff;
 do not create a second task or repeatedly inject the same instruction. If the
 primary channel is unavailable at dispatch time, use the backup immediately
 and state why.
+
+## Observe Replies Efficiently
+
+Ordinary `inject --handoff` returns pending; use `--wait-ack` (or compatible
+`--require-ack`) only for an explicit bounded wait. Poll several IDs with one
+`rally replies --ref <id> --ref <id> --json` instead of repeated request/reply
+locates. Rows contain the original, typed state and counted reply from one
+current-room read, honoring withdrawals. Use `locate` when an ID is missing in
+this room; never treat a capped `recent` result as canonical ACK evidence.
+`done` alone is not verified work; inspect `completion_status` and evidence.
+Recover accepted assignments through `room.open_handoffs`, since acceptance
+removes their inbox obligation while their work remains open.
+
+Inspect status-post results: NotStarted proves no mutation began; unknown
+outcomes require locating the event before retrying. Never silently drop a
+refused post or blindly resend an ambiguous mutation. Interactive status posts
+have a bounded ownership wait; explicit hook budgets remain authoritative.
 
 ## Sending a Handoff Document
 
@@ -240,12 +257,10 @@ before you plan, before you touch a file.** The ACK is two seconds of work and
 it is the only signal that separates "received" from "never delivered." Reading
 a long brief first, then acking, leaves the sender unable to tell which happened.
 
-For a session-bound handoff (`protocol:to_session_id` on the original fact),
-use the typed ACK below. A legacy unbound handoff cannot establish an exact
-receiver session. Its inbox offers the compatible `receipt` command, which
-also closes the legacy handoff; use a newly session-bound request when receipt,
-acceptance and completion must remain separate. Do not invent or override a
-missing target binding.
+Use the inbox's generated `ack_command` for bound and unbound handoffs. It
+records typed acceptance before work; the first typed response binds a legacy
+request to the receiver session. Acceptance keeps assigned work open. Never
+invent or override a target binding.
 
 ```bash
 rally say handoff --tool "$TOOL" --ref <their-event-id> --target <their-tool> \

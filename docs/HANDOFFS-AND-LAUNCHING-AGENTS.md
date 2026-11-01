@@ -112,7 +112,25 @@ use that typed boundary rather than infer authority from tone or from the word
 `peer`. `peer` is viewer-relative, is not a stored role, and is rejected on new
 `enter` and `say` writes.
 
-- `--require-ack` requires `--handoff <event-id>` or `--ref` — it does **not** work with free `--text`. For a plain steer, omit it.
+- Handoff injection returns after durable recording and the transport attempt,
+  with `ack_state=pending` until a target-authored ACK exists. A pending ACK
+  proves neither receipt nor completion. Use `--wait-ack` (or the compatible
+  `--require-ack`) for a bounded synchronous wait; both require `--handoff
+  <event-id>` or `--ref` and do not work with free `--text`.
+- Observe several sender-known request IDs in one current-room read:
+  `rally replies --ref <id> --ref <other-id> --json`. Each row includes the
+  original, the canonical reply state, and the counted reply fact from the same
+  read. Withdrawn requests stay `retracted`. A missing ID means absent in that
+  room; use `rally locate <id> --json` for cross-room discovery. `done` means
+  closed; `completion_status=evidenced` reports a receiver artifact with
+  nonblank evidence, and `resolved-unverified` reports closure without it.
+  Neither label verifies an application's external effect.
+- Use an inbox handoff's `ack_command` to accept work without completing it.
+  Accepted work remains in `room.open_handoffs` and is counted as
+  `inbox.accepted_open`; an unanswered-inbox-only worker must also reconcile
+  that unfinished work after interruption. Stable logical IDs and application
+  transactions or idempotency keys are still needed to prevent duplicate
+  external effects after an effect-before-ACK crash.
 - `--urgent` is refused for `inform`, `request`, and `propose`; those intents are non-controlling.
 - A plain `--text` inject has no target-authored ACK channel. Treat
   `delivered` and `delivery_state` as compatibility fields for the immediate
@@ -289,3 +307,7 @@ Rally deconflicts **file ownership, not git branch/checkout state**. Multiple ag
 After handing off: `rally stop <your-session>` (releases claims) or just let the takeover own the room. Leave the handoff doc committed and the canonical branch green.
 
 See the [identity and transport investigation](research/2026-09-08-identity-and-transport.md) for measured host boundaries and adapter acceptance gates.
+
+### Status bursts and ambiguous delivery results
+
+Interactive `say artifact` and manual `status post` use the existing bounded store-ownership corridor with response headroom. They wait for short bursts to clear; they never bypass the owner lock. Explicit `--timeout-ms` or `RALLY_HOOK_TIMEOUT_MS` still wins, and hook entrypoints retain their short default. A successful append reports its canonical event ID and sequence. A pre-write refusal means no write started; an unknown mutation outcome requires locating the event before retrying. A daemon transport-error reply after dispatch is also an unknown outcome.

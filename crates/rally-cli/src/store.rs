@@ -2942,6 +2942,14 @@ pub(crate) enum AckPollingStore {
 }
 
 impl AckPollingStore {
+    pub(crate) fn log_watcher(&self) -> crate::log_watch::LogWatcher {
+        let log_dir = match self {
+            Self::Direct { log_dir, .. } => log_dir.clone(),
+            Self::Routed(store) => store.repo_root().join(".rally").join(LOG_DIRNAME),
+        };
+        crate::log_watch::LogWatcher::new(&log_dir, &log_dir.join(LOG_INDEX_FILENAME))
+    }
+
     pub(crate) fn facts(&self) -> Result<Vec<Fact>> {
         match self {
             Self::Direct {
@@ -4688,6 +4696,23 @@ impl RoomStore {
             RoomStore::Routed(r) => match r.reply_facts(event_id) {
                 Err(error) if is_reply_too_large(&error) => {
                     Ok(select_reply_facts(r.facts()?, event_id))
+                }
+                other => other,
+            },
+        }
+    }
+
+    /// One store epoch for every original/reply/retraction in the batch.
+    /// An older daemon falls back ONCE, never once per requested id.
+    pub(crate) fn batch_reply_facts(&self, event_ids: &[String]) -> Result<Vec<Fact>> {
+        if event_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        match self {
+            RoomStore::Direct(store) => store.batch_reply_facts(event_ids),
+            RoomStore::Routed(store) => match store.batch_reply_facts(event_ids) {
+                Err(error) if is_reply_too_large(&error) || is_unknown_store_op(&error) => {
+                    Ok(select_batch_reply_facts(store.facts()?, event_ids))
                 }
                 other => other,
             },
@@ -6473,6 +6498,34 @@ impl DirectRoomStore {
         Ok(select_reply_facts(candidates, event_id))
     }
 
+    pub(crate) fn batch_reply_facts(&self, event_ids: &[String]) -> Result<Vec<Fact>> {
+        if event_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let room_dir = self
+            .facts_db_path
+            .parent()
+            .ok_or_else(|| RallyError::Message("facts db path has no parent".into()))?;
+        let _guard = acquire_room_mutation_lock(room_dir)?;
+        reconcile_segments_and_db(
+            &self.log_dir,
+            &self.archive_dir,
+            &self.facts_db_path,
+            self.warm_fact_store.is_none(),
+        )?;
+        let indexed = self.derived_db_proof().and_then(|_| {
+            let connection = derived_index::open(&self.facts_db_path).ok()?;
+            let mut facts = derived_index::batch_reply_facts(&connection, event_ids).ok()?;
+            facts.extend(derived_index::retraction_facts(&connection).ok()?);
+            Some(facts)
+        });
+        let candidates = match indexed {
+            Some(facts) => facts,
+            None => self.facts_under_lock()?,
+        };
+        Ok(select_batch_reply_facts(candidates, event_ids))
+    }
+
     /// See [`RoomStore::recent_facts`]. Indexed path while the derived
     /// database is proven canonical: SQL narrows by kind/tool/target and pages
     /// newest-first; every row is then re-checked with the same predicate the
@@ -7920,6 +7973,7 @@ fn facts_from_store(store: &SqliteStore) -> Result<Vec<Fact>> {
 /// * `rally_events_seq`       — the canonical seq exactly as
 ///   [`Fact::from_value`] derives it (payload seq, else the row sequence)
 /// * `rally_events_retraction` — partial index over `retract:` subjects
+/// * `rally_events_ref`       — replies to one handoff or artifact
 ///
 /// The indexes are derived state: `CREATE INDEX IF NOT EXISTS` rebuilds them
 /// after any `facts.db` rebuild, older binaries ignore them, and every caller
@@ -7990,16 +8044,26 @@ mod derived_index {
         count == INDEX_NAMES.len() as i64
     }
 
+    // An optional accelerator: older databases still satisfy the existing
+    // canonical proof and narrow reads until the next append installs it.
+    pub(super) fn reply_index_present(connection: &Connection) -> bool {
+        connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'rally_events_ref')",
+            [], |row| row.get(0),
+        ).unwrap_or(false)
+    }
+
     /// Create the derived indexes. Writes `facts.db`, so callers run this only
     /// in the projection phase, never while proving the database unchanged.
     pub(super) fn ensure_indexes(connection: &Connection) -> Result<()> {
-        if indexes_present(connection) {
+        if indexes_present(connection) && reply_index_present(connection) {
             return Ok(());
         }
         let ddl = format!(
             "CREATE INDEX IF NOT EXISTS rally_events_event_id ON events(json_extract(payload,'$.event_id'));
              CREATE INDEX IF NOT EXISTS rally_events_session ON events(json_extract(payload,'$.from_session_id'));
              CREATE INDEX IF NOT EXISTS rally_events_seq ON events({SEQ_EXPR});
+             CREATE INDEX IF NOT EXISTS rally_events_ref ON events(json_extract(payload,'$.ref'));
              CREATE INDEX IF NOT EXISTS rally_events_retraction ON events(sequence_number) WHERE {};",
             retraction_predicate()
         );
@@ -8347,14 +8411,27 @@ mod derived_index {
         decode(collected)
     }
 
-    /// Facts whose `ref` is `event_id` (replies to it). No index on `ref`:
-    /// one scan of the payload column, ~tens of ms on a 90k-row room.
+    /// Facts whose `ref` is `event_id`, using the derived reference index.
     pub(super) fn facts_by_ref(connection: &Connection, event_id: &str) -> Result<Vec<Fact>> {
         rows(
             connection,
             "SELECT sequence_number, payload FROM events \
              WHERE json_extract(payload,'$.ref') = ?1",
             Some(event_id),
+        )
+    }
+
+    pub(super) fn batch_reply_facts(
+        connection: &Connection,
+        event_ids: &[String],
+    ) -> Result<Vec<Fact>> {
+        let ids = serde_json::to_string(event_ids).map_err(RallyError::json("render reply ids"))?;
+        rows(
+            connection,
+            "SELECT sequence_number, payload FROM events \
+             WHERE json_extract(payload,'$.event_id') IN (SELECT value FROM json_each(?1)) \
+                OR json_extract(payload,'$.ref') IN (SELECT value FROM json_each(?1))",
+            Some(&ids),
         )
     }
 
@@ -9021,12 +9098,23 @@ fn is_unknown_store_op(error: &RallyError) -> bool {
 /// target is one of those. Deduplicated by (event id, seq) and seq-ordered,
 /// so the indexed and full-load paths return the same list.
 pub(crate) fn select_reply_facts(candidates: Vec<Fact>, event_id: &str) -> Vec<Fact> {
+    select_batch_reply_facts(candidates, &[event_id.to_string()])
+}
+
+pub(crate) fn select_batch_reply_facts(candidates: Vec<Fact>, event_ids: &[String]) -> Vec<Fact> {
+    let requested: BTreeSet<&str> = event_ids.iter().map(String::as_str).collect();
     let mut wanted: BTreeSet<String> = candidates
         .iter()
-        .filter(|f| f.event_id == event_id || f.ref_id.as_deref() == Some(event_id))
+        .filter(|fact| {
+            requested.contains(fact.event_id.as_str())
+                || fact
+                    .ref_id
+                    .as_deref()
+                    .is_some_and(|id| requested.contains(id))
+        })
         .map(|f| f.event_id.clone())
         .collect();
-    wanted.insert(event_id.to_string());
+    wanted.extend(event_ids.iter().cloned());
     let mut seen = BTreeSet::new();
     let mut out = candidates
         .into_iter()
@@ -9624,9 +9712,8 @@ pub(crate) fn project_reply_state(
     })
 }
 
-/// Projected `status` label for a Resolve that closed a targeted or
-/// requires-ack handoff with free-text evidence only — no artifact fact refs
-/// that handoff. See `resolved_unverified` on [`RoomSnapshot`].
+/// Projected `status` label for a completion without a receiver-authored
+/// artifact carrying evidence. See `resolved_unverified` on [`RoomSnapshot`].
 pub(crate) const RESOLVED_UNVERIFIED_STATUS: &str = "resolved-unverified";
 
 /// A handoff whose closure deserves an artifact-backed evidence trail: it was
@@ -9653,6 +9740,15 @@ fn closure_is_a_completion_claim(handoff: &Fact, closer: &Fact) -> bool {
         // `fact_closes_handoff` already encodes, legacy arm included.
         _ => fact_closes_handoff(handoff, closer),
     }
+}
+
+pub(crate) fn artifact_is_completion_evidence(handoff: &Fact, artifact: &Fact) -> bool {
+    artifact.kind == FactKind::Artifact
+        && artifact
+            .evidence
+            .iter()
+            .any(|entry| !entry.trim().is_empty())
+        && closure_is_a_completion_claim(handoff, artifact)
 }
 
 fn handoff_requires_verified_resolution(handoff: &Fact) -> bool {
@@ -9857,6 +9953,7 @@ fn code_progress_age_per_tool(facts: &[Fact], now_secs: i64) -> BTreeMap<String,
 /// (first present wins) from a `planned_heartbeat_secs:<n>` evidence stamp on the
 /// tool's newest presence/session fact. `None` → caller uses the default
 /// cadence. Pure over `facts`; never panics on a bad value.
+#[cfg(test)]
 fn planned_cadence_for_tool(facts: &[Fact], tool: &str) -> Option<i64> {
     facts
         .iter()
@@ -9870,6 +9967,36 @@ fn planned_cadence_for_tool(facts: &[Fact], tool: &str) -> Option<i64> {
                     .filter(|n| *n > 0)
             })
         })
+}
+
+/// Select the newest presence/session once per tool, including a newest row
+/// with no valid cadence. Falling back to an older declaration would change
+/// the liveness window and could hide a peer that the reference fold keeps.
+fn planned_cadences_by_tool(facts: &[Fact]) -> BTreeMap<&str, Option<i64>> {
+    let mut latest: BTreeMap<&str, &Fact> = BTreeMap::new();
+    for fact in facts {
+        if matches!(fact.kind, FactKind::Presence | FactKind::Session)
+            && let Some(tool) = fact.tool.as_deref()
+        {
+            let entry = latest.entry(tool).or_insert(fact);
+            // Iterator::max_by_key keeps the LAST equal-seq row.
+            if fact.seq >= entry.seq {
+                *entry = fact;
+            }
+        }
+    }
+    latest
+        .into_iter()
+        .map(|(tool, fact)| {
+            let cadence = fact.evidence.iter().find_map(|evidence| {
+                evidence
+                    .strip_prefix("planned_heartbeat_secs:")
+                    .and_then(|value| value.trim().parse::<i64>().ok())
+                    .filter(|value| *value > 0)
+            });
+            (tool, cadence)
+        })
+        .collect()
 }
 
 /// Build a room snapshot, applying recency-decay ordering and archive-floor
@@ -10233,15 +10360,19 @@ fn snapshot_from_facts_with_policy_at(
         .filter(|f| f.kind == FactKind::Artifact)
         .filter_map(|artifact| {
             let handoff = handoffs_by_id.get(artifact.ref_id.as_deref()?)?;
-            closure_is_a_completion_claim(handoff, artifact).then_some(handoff.event_id.as_str())
+            artifact_is_completion_evidence(handoff, artifact).then_some(handoff.event_id.as_str())
         })
         .collect();
     let mut resolved_unverified = facts
         .iter()
-        // Resolve AND Receipt. `receiver_ack_closes_obligation` accepts both as
-        // completion records, so labeling only resolves left `rally say receipt
-        // --ref <handoff>` as a one-flag bypass of the whole label.
-        .filter(|f| matches!(f.kind, FactKind::Resolve | FactKind::Receipt))
+        // All completion carriers need evidenced work, including an Artifact
+        // with no evidence. A transport/receipt flag never verifies the work.
+        .filter(|f| {
+            matches!(
+                f.kind,
+                FactKind::Resolve | FactKind::Receipt | FactKind::Artifact
+            )
+        })
         .filter(|f| !is_system_authored(f))
         .filter(|closer| {
             closer
@@ -10493,6 +10624,7 @@ fn snapshot_from_facts_with_policy_at(
     }
 
     let cadence = coord.default_cadence_secs;
+    let planned_cadences = planned_cadences_by_tool(facts);
     let mult = coord.miss_multiplier;
     let grace = coord.grace_secs;
     // Provably-stale authors, captured for the relevance model. Collected here
@@ -10518,7 +10650,11 @@ fn snapshot_from_facts_with_policy_at(
             let acknowledged = acked.contains(&tool);
 
             // --- Adaptive multi-signal liveness (the squad-decay gap) ---
-            let planned_interval = planned_cadence_for_tool(facts, &tool).unwrap_or(cadence);
+            let planned_interval = planned_cadences
+                .get(tool.as_str())
+                .copied()
+                .flatten()
+                .unwrap_or(cadence);
             let window =
                 crate::liveness::adaptive_window_secs(planned_interval, cadence, mult, grace);
             let signals = crate::liveness::LivenessSignals {
@@ -14084,7 +14220,8 @@ const SNAPSHOT_CACHE_FILENAME: &str = "snapshot.cache.json";
 /// Bumped 9 -> 10 when every projected active claim started carrying a
 /// `lease_granted_at:` marker (the current lease's grant time, read by
 /// auto-claim renewal). A generation-9 cache would serve claims without it.
-const SNAPSHOT_CACHE_GENERATION: u32 = 10;
+/// Bumped 10 -> 11: evidence-free artifacts now label unverified completion.
+const SNAPSHOT_CACHE_GENERATION: u32 = 11;
 
 /// Snapshot projected from inputs and a freshness proof captured together under
 /// one room mutation lock. Pure projection runs after releasing that lock.
@@ -22331,6 +22468,186 @@ mod ledger_tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[test]
+    fn reply_reference_index_migrates_and_preserves_retractions_and_fallback() {
+        let root = unique_root("reply-reference-index");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        let original = make_fact("request", FactKind::Decision, "", "request");
+        store.append_fact(&original).unwrap();
+        for (id, reference) in [("reply", "request"), ("unrelated", "another-request")] {
+            let mut fact = make_fact(id, FactKind::Decision, "", "reply");
+            fact.ref_id = Some(reference.into());
+            store.append_fact(&fact).unwrap();
+        }
+        let mut retract = make_fact("withdrawal", FactKind::Artifact, "", "withdraw reply");
+        retract.subject = "retract: reply".into();
+        store.append_fact(&retract).unwrap();
+        let expected = select_reply_facts(store.facts().unwrap(), "request");
+        let encode = |facts: Vec<Fact>| serde_json::to_value(facts).unwrap();
+        assert_eq!(
+            encode(store.reply_facts("request").unwrap()),
+            encode(expected.clone())
+        );
+
+        let connection = derived_index::open(&store.facts_db_path).unwrap();
+        let plan: String = connection.query_row(
+            "EXPLAIN QUERY PLAN SELECT sequence_number, payload FROM events WHERE json_extract(payload,'$.ref') = ?1",
+            ["request"], |row| row.get(3),
+        ).unwrap();
+        assert!(
+            plan.contains("SEARCH") && plan.contains("rally_events_ref"),
+            "{plan}"
+        );
+        connection
+            .execute_batch("DROP INDEX rally_events_ref")
+            .unwrap();
+        assert!(derived_index::indexes_present(&connection));
+        assert!(!derived_index::reply_index_present(&connection));
+        drop(connection);
+        assert_eq!(
+            encode(store.reply_facts("request").unwrap()),
+            encode(expected.clone())
+        );
+
+        // The next projection upgrades an older database without changing
+        // canonical facts or making an absent index look like an empty reply.
+        store
+            .append_fact(&make_fact("upgrade", FactKind::Decision, "", "upgrade"))
+            .unwrap();
+        let connection = derived_index::open(&store.facts_db_path).unwrap();
+        assert!(derived_index::indexes_present(&connection));
+        assert!(derived_index::reply_index_present(&connection));
+        assert_eq!(
+            encode(store.reply_facts("request").unwrap()),
+            encode(expected)
+        );
+        drop(connection);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn planned_cadences_match_reference_for_unsorted_ties_and_invalid_latest() {
+        let mut facts = Vec::new();
+        for i in 0..10_000 {
+            let mut fact = make_fact(
+                &format!("cadence-{i}"),
+                if i % 3 == 0 {
+                    FactKind::Session
+                } else {
+                    FactKind::Presence
+                },
+                "",
+                "",
+            );
+            fact.seq = i / 2; // Equal sequences exercise max_by_key's last tie.
+            fact.tool = Some(format!("peer-{}", i % 300));
+            fact.evidence = match i % 5 {
+                0 => vec![],
+                1 => vec!["planned_heartbeat_secs:invalid".into()],
+                2 => vec!["planned_heartbeat_secs:0".into()],
+                _ => vec![format!("planned_heartbeat_secs: {} ", i + 1)],
+            };
+            facts.push(fact);
+        }
+        // The selection must not rely on the slice being ordered by seq.
+        facts.reverse();
+        for (id, marker) in [
+            ("first-tie", Some("planned_heartbeat_secs:18000")),
+            ("last-tie", None),
+        ] {
+            let mut fact = make_fact(id, FactKind::Presence, "", "");
+            fact.seq = 10_001;
+            fact.tool = Some("peer-0".into());
+            fact.evidence = marker.into_iter().map(str::to_string).collect();
+            facts.push(fact);
+        }
+        assert_eq!(planned_cadence_for_tool(&facts, "peer-0"), None);
+        let start = Instant::now();
+        let expected = (0..300)
+            .map(|i| {
+                let tool = format!("peer-{i}");
+                let cadence = planned_cadence_for_tool(&facts, &tool);
+                (tool, cadence)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let reference_time = start.elapsed();
+        let start = Instant::now();
+        let actual = planned_cadences_by_tool(&facts);
+        let indexed_time = start.elapsed();
+        for (tool, expected) in expected {
+            assert_eq!(actual.get(tool.as_str()), Some(&expected), "{tool}");
+        }
+        eprintln!(
+            "cadence fold, 10k facts/300 peers: reference={reference_time:?}, indexed={indexed_time:?}"
+        );
+    }
+
+    #[test]
+    fn batch_reply_facts_matches_single_reads_with_large_quoted_missing_ids_and_retractions() {
+        let root = unique_root("batch-replies");
+        let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        for id in ["request-one", "request-'日本語"] {
+            store
+                .append_fact(&make_fact(id, FactKind::Decision, "", "original"))
+                .unwrap();
+            let mut reply = make_fact(&format!("reply-{id}"), FactKind::Decision, "", "response");
+            reply.ref_id = Some(id.to_string());
+            store.append_fact(&reply).unwrap();
+        }
+        let mut withdraw = make_fact("withdraw-original", FactKind::Artifact, "", "withdraw");
+        withdraw.subject = "retract: request-one".into();
+        store.append_fact(&withdraw).unwrap();
+        let mut requested = vec![
+            "request-one".into(),
+            "request-'日本語".into(),
+            "request-one".into(),
+        ];
+        requested.extend((0..1200).map(|i| format!("absent-{i}")));
+        let expected = select_batch_reply_facts(store.facts().unwrap(), &requested);
+        let encode = |facts: Vec<Fact>| serde_json::to_value(facts).unwrap();
+        assert_eq!(
+            encode(store.batch_reply_facts(&requested).unwrap()),
+            encode(expected.clone())
+        );
+        for id in &requested[..2] {
+            assert_eq!(
+                encode(select_reply_facts(expected.clone(), id)),
+                encode(store.reply_facts(id).unwrap())
+            );
+        }
+        let connection = derived_index::open(&store.facts_db_path).unwrap();
+        let plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT sequence_number, payload FROM events \
+                WHERE json_extract(payload,'$.event_id') IN (SELECT value FROM json_each(?1)) \
+                   OR json_extract(payload,'$.ref') IN (SELECT value FROM json_each(?1))",
+            )
+            .unwrap()
+            .query_map([serde_json::to_string(&requested).unwrap()], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for index in ["rally_events_event_id", "rally_events_ref"] {
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("SEARCH") && step.contains(index)),
+                "{plan:?}"
+            );
+        }
+        connection
+            .execute_batch("DROP INDEX rally_events_ref")
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            encode(store.batch_reply_facts(&requested).unwrap()),
+            encode(expected)
+        );
+        assert!(store.batch_reply_facts(&[]).unwrap().is_empty());
+        fs::remove_dir_all(root).ok();
+    }
+
     /// `recent_facts` returns the same rows through the indexed SQL path and
     /// through the full-load fallback, across kind/tool/target filters, time
     /// bounds, the archive floor (both sides of the horizon), a malformed
@@ -22835,7 +23152,10 @@ mod ledger_tests {
                 let raw: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
                 // StoreOp is internally tagged by `kind` (snake_case).
                 let op_name = raw["op"]["kind"].as_str().unwrap_or_default().to_string();
-                let response = if op_name == "facts_of_kinds" || op_name == "session_view_facts" {
+                let response = if matches!(
+                    op_name.as_str(),
+                    "facts_of_kinds" | "session_view_facts" | "batch_reply_facts"
+                ) {
                     rejected_log.lock().unwrap().push(op_name.clone());
                     // What rallyd_core answers when serde cannot parse the op.
                     StoreResponse::Err(StoreError::new(
@@ -22869,12 +23189,17 @@ mod ledger_tests {
         );
         assert_eq!(
             ids(room.session_view_facts().unwrap()),
-            ids(select_session_view_facts(all))
+            ids(select_session_view_facts(all.clone()))
+        );
+        let requested = vec!["s1".to_string(), "b1".to_string()];
+        assert_eq!(
+            ids(room.batch_reply_facts(&requested).unwrap()),
+            ids(select_batch_reply_facts(all, &requested))
         );
         assert_eq!(
             rejected.lock().unwrap().len(),
-            2,
-            "both narrow ops were tried"
+            3,
+            "all narrow ops were tried"
         );
         assert!(is_unknown_store_op(&RallyError::Command(
             "malformed request: unknown variant `X`".to_string()
@@ -25381,6 +25706,73 @@ mod resolved_unverified_tests {
             snapshot.resolved_unverified
         );
         assert_eq!(snapshot.totals.resolved_unverified, 0);
+    }
+
+    #[test]
+    fn empty_artifact_evidence_is_unverified_until_receiver_supplies_evidence() {
+        for evidence in [vec![], vec!["  \n\t".to_string()]] {
+            let mut handoff = fact(FactKind::Handoff, "sender");
+            handoff.target = Some("receiver".into());
+            let mut artifact = fact(FactKind::Artifact, "receiver");
+            artifact.ref_id = Some(handoff.event_id.clone());
+            artifact.evidence = evidence;
+            let snapshot = snap(vec![handoff.clone(), artifact.clone()]);
+            assert!(snapshot.open_handoffs.is_empty());
+            assert_eq!(snapshot.resolved_unverified.len(), 1);
+            assert_eq!(snapshot.resolved_unverified[0].event_id, artifact.event_id);
+            let mut verified = fact(FactKind::Artifact, "receiver");
+            verified.ref_id = Some(handoff.event_id.clone());
+            verified.evidence = vec!["cargo test: passed".into()];
+            let snapshot = snap(vec![handoff, artifact, verified]);
+            assert!(snapshot.resolved_unverified.is_empty());
+        }
+    }
+
+    #[test]
+    fn withdrawing_evidence_restores_unverified_and_sibling_evidence_cannot_verify() {
+        let mut handoff = fact(FactKind::Handoff, "sender");
+        handoff.target = Some("receiver".into());
+        handoff.ref_id = Some("upstream".into());
+        handoff.evidence = [
+            ("bridge_version", "fact-v1"),
+            ("event_kind", "handoff.requested"),
+            ("target_policy", "ref-author"),
+            ("to_session_id", "receiver-session"),
+            ("ref_event_id", "upstream"),
+            ("causation_id", "upstream"),
+            ("correlation_id", handoff.thread_id.as_str()),
+            ("handoff_id", "request"),
+            ("idempotency_key", "request"),
+        ]
+        .iter()
+        .map(|(key, value)| format!("protocol:{key}={value}"))
+        .collect();
+        assert_eq!(
+            strict_handoff_target_session(&handoff),
+            Some("receiver-session")
+        );
+        let mut empty = fact(FactKind::Artifact, "receiver");
+        empty.ref_id = Some(handoff.event_id.clone());
+        empty.from_session_id = Some("receiver-session".into());
+        let mut evidence = empty.clone();
+        evidence.event_id = "evidence".into();
+        evidence.evidence = vec!["verification passed".into()];
+        let mut sibling = evidence.clone();
+        sibling.event_id = "sibling-evidence".into();
+        sibling.from_session_id = Some("receiver-sibling".into());
+        let snapshot = snap(vec![handoff.clone(), empty.clone(), sibling.clone()]);
+        assert_eq!(snapshot.resolved_unverified.len(), 1);
+        let snapshot = snap(vec![
+            handoff.clone(),
+            empty.clone(),
+            evidence.clone(),
+            sibling.clone(),
+        ]);
+        assert!(snapshot.resolved_unverified.is_empty());
+        let mut withdrawal = fact(FactKind::Artifact, "receiver");
+        withdrawal.subject = "retract: evidence".into();
+        let snapshot = snap(vec![handoff, empty, evidence, sibling, withdrawal]);
+        assert_eq!(snapshot.resolved_unverified.len(), 1);
     }
 
     /// A broadcast/untargeted handoff without a requires_ack marker stays out:

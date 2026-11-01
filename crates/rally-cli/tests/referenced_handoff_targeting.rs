@@ -298,6 +298,207 @@ fn referenced_handoff_blocks_wrong_target_before_append_and_binds_author_session
 }
 
 #[test]
+fn inbox_suggested_acceptance_keeps_bound_work_open_until_evidenced_completion() {
+    let room = Room::new();
+    let (artifact, _) = room.artifact();
+    let request = room.json(
+        "session-reviewer",
+        &[
+            "say",
+            "handoff",
+            "--tool",
+            "reviewer:r",
+            "--ref",
+            &artifact,
+            "--subject",
+            "review",
+            "--deliver",
+            "record",
+            "--json",
+        ],
+    );
+    let handoff = request["data"]["say"]["fact"]["event_id"].as_str().unwrap();
+    let inbox = room.json("session-author", &["inbox", "--tool", "author:a", "--json"]);
+    let command = inbox["data"]["inbox"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["event_id"] == handoff)
+        .unwrap()["ack_command"]
+        .as_str()
+        .unwrap();
+    assert!(command.contains("--handoff-state accepted"), "{command}");
+    let words = shlex::split(command).unwrap();
+    let args = words.iter().skip(1).map(String::as_str).collect::<Vec<_>>();
+    let wrong_session = room.json("session-sibling", &args);
+    assert_refusal(&wrong_session, "handoff_reply_author_mismatch");
+    let accepted = room.json("session-author", &args);
+    assert_eq!(accepted["ok"], true, "{accepted}");
+    let inbox = room.json("session-author", &["inbox", "--tool", "author:a", "--json"]);
+    assert_eq!(inbox["data"]["inbox"]["count"], 0);
+    assert_eq!(inbox["data"]["inbox"]["accepted_open"], 1);
+    let snapshot = room.json("session-author", &["room", "--json"]);
+    assert!(
+        snapshot["data"]["room"]["open_handoffs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|fact| fact["event_id"] == handoff)
+    );
+    let completed = room.json(
+        "session-author",
+        &[
+            "say",
+            "artifact",
+            "--tool",
+            "author:a",
+            "--ref",
+            handoff,
+            "--subject",
+            "review results",
+            "--evidence",
+            "review checks passed",
+            "--json",
+        ],
+    );
+    assert_eq!(completed["ok"], true, "{completed}");
+    let snapshot = room.json("session-author", &["room", "--json"]);
+    assert!(
+        !snapshot["data"]["room"]["open_handoffs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|fact| fact["event_id"] == handoff)
+    );
+}
+
+#[test]
+fn handoff_injection_returns_pending_by_default_and_waits_only_when_requested() {
+    let room = Room::new();
+    let (artifact, _) = room.artifact();
+    let request = room.json(
+        "session-reviewer",
+        &[
+            "say",
+            "handoff",
+            "--tool",
+            "reviewer:r",
+            "--ref",
+            &artifact,
+            "--subject",
+            "async handoff",
+            "--deliver",
+            "record",
+            "--json",
+        ],
+    );
+    let handoff = request["data"]["say"]["fact"]["event_id"].as_str().unwrap();
+    let args = [
+        "inject",
+        "author:a",
+        "--tool",
+        "author:a",
+        "--handoff",
+        handoff,
+        "--timeout-seconds",
+        "1",
+        "--json",
+    ];
+    let pending = room.json("session-author", &args);
+    let injection = &pending["data"]["inject"];
+    assert_eq!(injection["ack_state"], "pending");
+    assert_eq!(injection["verified_received"], false);
+    assert!(injection["ack"].is_null());
+    assert_ne!(injection["fallback_plan"]["trigger"], "ack_timeout");
+    let mut waiting = args.to_vec();
+    waiting.push("--wait-ack");
+    let waited = room.json("session-author", &waiting);
+    assert_eq!(waited["data"]["inject"]["ack_state"], "timeout");
+    assert_eq!(waited["data"]["inject"]["verified_received"], false);
+    let accepted = room.json(
+        "session-author",
+        &[
+            "say",
+            "handoff",
+            "--tool",
+            "author:a",
+            "--ref",
+            handoff,
+            "--handoff-state",
+            "accepted",
+            "--subject",
+            "accepted",
+            "--deliver",
+            "record",
+            "--json",
+        ],
+    );
+    assert_eq!(accepted["ok"], true);
+    let received = room.json("session-author", &args);
+    assert_eq!(received["data"]["inject"]["ack_state"], "acked");
+    assert_eq!(received["data"]["inject"]["ack"]["resolved"], false);
+    assert_eq!(received["data"]["inject"]["mode"], "already-received");
+    let batch = room.json(
+        "session-reviewer",
+        &["replies", "--ref", handoff, "--ref", "missing", "--json"],
+    );
+    assert_eq!(
+        batch["data"]["replies"]["rows"][0]["reply"]["state"],
+        "accepted"
+    );
+    assert_eq!(
+        batch["data"]["replies"]["rows"][0]["reply_fact"]["event_id"],
+        accepted["data"]["say"]["fact"]["event_id"]
+    );
+    assert_eq!(batch["data"]["replies"]["rows"][1]["found"], false);
+}
+
+#[test]
+fn unbound_inbox_acceptance_binds_receiver_without_claiming_completion() {
+    let room = Room::new();
+    room.artifact();
+    let request = room.json(
+        "session-reviewer",
+        &[
+            "say",
+            "handoff",
+            "--tool",
+            "reviewer:r",
+            "--target",
+            "author:a",
+            "--subject",
+            "unbound work",
+            "--deliver",
+            "record",
+            "--json",
+        ],
+    );
+    let id = request["data"]["say"]["fact"]["event_id"].as_str().unwrap();
+    let inbox = room.json("session-author", &["inbox", "--tool", "author:a", "--json"]);
+    let words = shlex::split(
+        inbox["data"]["inbox"]["items"][0]["ack_command"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let args = words.iter().skip(1).map(String::as_str).collect::<Vec<_>>();
+    assert!(args.contains(&"accepted"));
+    assert_eq!(room.json("session-author", &args)["ok"], true);
+    let inbox = room.json("session-author", &["inbox", "--tool", "author:a", "--json"]);
+    assert_eq!(inbox["data"]["inbox"]["accepted_open"], 1);
+    assert_refusal(
+        &room.json("session-sibling", &args),
+        "handoff_reply_author_mismatch",
+    );
+    let batch = room.json("session-reviewer", &["replies", "--ref", id, "--json"]);
+    assert_eq!(
+        batch["data"]["replies"]["rows"][0]["reply"]["state"],
+        "accepted"
+    );
+    assert!(batch["data"]["replies"]["rows"][0]["completion_status"].is_null());
+}
+
+#[test]
 fn retry_is_idempotent_and_only_exact_bound_receiver_can_reply() {
     let room = Room::new();
     let (artifact, _) = room.artifact();

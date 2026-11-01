@@ -98,6 +98,32 @@ managed session, do not guess a terminal pane. Keep the targeted handoff as the
 source of truth and report that direct injection is unavailable unless the exact
 running surface can be positively adopted.
 
+## Keep Collaboration Moving
+
+Ordinary `inject --handoff` returns pending after recording/delivery. Add
+`--wait-ack` only when the caller needs to wait now; `--require-ack` remains
+compatible. Receipt is separate from completed work: use the inbox's
+`ack_command` to accept before working, then post an artifact with verification.
+Acceptance keeps the assignment open, including legacy requests whose first
+typed response binds the receiver session.
+
+Observe several handoffs in one current-room read:
+
+```bash
+rally replies --ref <handoff-id> --ref <another-id> --json
+```
+
+Each row includes its original, reply state and counted reply. Withdrawals still
+apply; `done` alone does not verify the work. `completion_status` distinguishes
+an evidenced artifact from an unverified closure. Missing IDs may belong to
+another room: use `locate` for that fallback. Do not infer ACKs from a capped
+`recent` query. Recover accepted work from `room.open_handoffs` as well as inbox.
+
+Status bursts wait through the existing bounded ownership corridor. An explicit
+NotStarted refusal means no mutation began; an unknown outcome requires locating
+the event before retrying. Inspect the command result before reporting a post as
+sent. Claims and strict checks still apply before every shared edit.
+
 ## The Agent Loop
 
 ```text

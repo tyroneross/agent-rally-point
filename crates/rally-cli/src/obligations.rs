@@ -43,7 +43,7 @@ pub(crate) struct InboxItem {
     /// telling the agent about. It MUST NOT filter: age deciding an obligation is
     /// finished is the exact defect this whole feature closes.
     pub(crate) stale: bool,
-    /// The one command that clears this row.
+    /// Acknowledge this row; accepting a bound handoff keeps the work open.
     pub(crate) ack_command: String,
     /// The handoff's ACK deadline (RFC 3339, UTC), when the authoring
     /// `say handoff --ack-within` set one. Parsed from the same `ack-by:`
@@ -246,7 +246,7 @@ pub(crate) fn build_inbox(
                 from: fact.tool.clone().unwrap_or_default(),
                 age_secs,
                 stale: age_secs > stale_wait_secs,
-                ack_command: ack_command(tool, &fact.event_id),
+                ack_command: obligation_ack_command(tool, fact),
                 ack_by,
                 ack_by_ms,
             }
@@ -304,6 +304,20 @@ pub(crate) fn ack_command(tool: &str, event_id: &str) -> String {
         shell_quote(tool),
         shell_quote(event_id)
     )
+}
+
+fn obligation_ack_command(tool: &str, fact: &Fact) -> String {
+    if fact.kind == FactKind::Handoff
+        && let Some(sender) = fact.tool.as_deref()
+    {
+        return format!(
+            "rally say handoff --tool {} --ref {} --target {} --handoff-state accepted --subject \"accepted\" --json",
+            shell_quote(tool),
+            shell_quote(&fact.event_id),
+            shell_quote(sender)
+        );
+    }
+    ack_command(tool, &fact.event_id)
 }
 
 /// Cap for one rendered inbox field, in characters.
@@ -430,6 +444,40 @@ fn fact_age_secs(fact: &Fact) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bound_handoff_ack_accepts_work_instead_of_completing_it() {
+        let mut handoff = crate::store::Fact {
+            event_id: "request".into(),
+            ref_id: Some("upstream".into()),
+            kind: crate::store::FactKind::Handoff,
+            tool: Some("sender".into()),
+            target: Some("receiver".into()),
+            evidence: vec![
+                "protocol:bridge_version=fact-v1".into(),
+                "protocol:event_kind=handoff.requested".into(),
+                "protocol:to_session_id=sess:receiver#live".into(),
+                "protocol:target_policy=ref-author".into(),
+                "protocol:ref_event_id=upstream".into(),
+                "protocol:causation_id=upstream".into(),
+                "protocol:correlation_id=thread".into(),
+                "protocol:handoff_id=request".into(),
+                "protocol:idempotency_key=request".into(),
+            ],
+            thread_id: "thread".into(),
+            ..Default::default()
+        };
+        let command = super::obligation_ack_command("receiver", &handoff);
+        assert!(command.contains("--handoff-state accepted"), "{command}");
+        assert!(command.contains("--target sender"), "{command}");
+        handoff.evidence.clear();
+        assert!(
+            super::obligation_ack_command("receiver", &handoff)
+                .contains("--handoff-state accepted")
+        );
+        handoff.kind = crate::store::FactKind::Artifact;
+        assert!(super::obligation_ack_command("receiver", &handoff).contains("say receipt"));
+    }
+
     #[test]
     fn bounded_inbox_preserves_exact_accepted_count_across_wire() {
         let unanswered = crate::store::Fact {

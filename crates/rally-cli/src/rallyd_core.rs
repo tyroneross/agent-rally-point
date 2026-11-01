@@ -617,15 +617,18 @@ mod imp {
     }
 
     /// SEC-003: answer an over-cap / un-spawnable connection immediately with a
-    /// retryable transport error, then close. The client's fresh-connection-per-
-    /// op path maps this to R6's "retry", so a momentary reader-thread saturation
-    /// sheds load gracefully instead of the accept loop dying on a `spawn` panic.
+    /// typed NotStarted response, then close. No job was dispatched, so a
+    /// caller can retry without duplicating a durable mutation. Saturation
+    /// sheds load instead of the accept loop dying on a `spawn` panic.
     fn respond_busy(stream: &UnixStream) {
         if let Err(e) = prepare_accepted_stream(stream) {
             log(&format!("configure busy response stream failed: {e}"));
             return;
         }
-        let resp = StoreResponse::Err(StoreError::transport("daemon busy; retry"));
+        let resp = StoreResponse::Err(StoreError::new(
+            StoreErrorKind::NotStarted,
+            "daemon busy before dispatch; no durable mutation started; retry is safe",
+        ));
         if let Err(e) = write_response(stream, &resp) {
             log(&format!("write busy response failed: {e}"));
         }
@@ -663,24 +666,28 @@ mod imp {
                                 receipt: RequestReceipt::now(),
                             };
                             if job_tx.send(job).is_err() {
-                                StoreResponse::Err(StoreError::transport(
-                                    "daemon dispatcher stopped; retry",
+                                StoreResponse::Err(StoreError::new(
+                                    StoreErrorKind::NotStarted,
+                                    "daemon dispatcher stopped before dispatch; no durable mutation started; retry is safe",
                                 ))
                             } else {
                                 // SEC-003: bound the wait on the dispatcher reply
                                 // with CONN_TIMEOUT. A wedged store op would
                                 // otherwise park this reader thread FOREVER;
                                 // timing out lets the reader shed (close the
-                                // connection, free the thread) with a retryable
-                                // error instead of accumulating parked threads.
+                                // connection, free the thread). After dispatch
+                                // the commit outcome is unknown, so clients
+                                // reconcile mutations before considering retry.
                                 match reply_rx.recv_timeout(CONN_TIMEOUT) {
                                     Ok(resp) => resp,
-                                    Err(RecvTimeoutError::Timeout) => StoreResponse::Err(
-                                        StoreError::transport("daemon store op timed out; retry"),
-                                    ),
+                                    Err(RecvTimeoutError::Timeout) => {
+                                        StoreResponse::Err(StoreError::transport(
+                                            "daemon store op timed out after dispatch; outcome unknown; reconcile before retrying",
+                                        ))
+                                    }
                                     Err(RecvTimeoutError::Disconnected) => {
                                         StoreResponse::Err(StoreError::transport(
-                                            "daemon dispatcher dropped the reply; retry",
+                                            "daemon dispatcher dropped the reply after dispatch; outcome unknown; reconcile before retrying",
                                         ))
                                     }
                                 }
@@ -1082,6 +1089,12 @@ mod imp {
             }
             StoreOp::ReplyFacts { event_id } => {
                 let facts = store.reply_facts(&event_id).map_err(rally_to_wire)?;
+                StoreOk::Facts {
+                    facts: to_wire_values(&facts)?,
+                }
+            }
+            StoreOp::BatchReplyFacts { event_ids } => {
+                let facts = store.batch_reply_facts(&event_ids).map_err(rally_to_wire)?;
                 StoreOk::Facts {
                     facts: to_wire_values(&facts)?,
                 }

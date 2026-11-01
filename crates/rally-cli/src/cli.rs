@@ -30,6 +30,7 @@ pub(crate) enum CliCommand {
     SessionLifecycle(SessionLifecycleArgs),
     Session(SessionActionArgs),
     Locate(LocateArgs),
+    Replies(RepliesArgs),
     Recent(RecentArgs),
     Retrospective(RetrospectiveArgs),
     Rotate(RotateArgs),
@@ -317,6 +318,12 @@ pub(crate) struct InboxArgs {
 pub(crate) struct LocateArgs {
     pub(crate) json: bool,
     pub(crate) event_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RepliesArgs {
+    pub(crate) json: bool,
+    pub(crate) event_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1005,6 +1012,7 @@ pub(crate) const COMMANDS: &[&str] = &[
     "capture",
     "stop",
     "locate",
+    "replies",
     "recent",
     "retrospective",
     "rotate",
@@ -1150,7 +1158,8 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .descr(
             "Open obligations addressed to this tool: targeted handoffs and targeted \
              requires-ack artifacts. Read-only — writes no fact, advances no cursor. An item \
-             stays listed until the RECEIVER acks it (`rally say receipt|resolve --ref <id>`); \
+             stays listed until the RECEIVER acks it (use its ack_command); accepting a handoff \
+             keeps the assigned work open. \
              neither age, nor entering the room again, nor recency decay, nor reaper expiry \
              removes it. `--limit` caps the rows shown, never the reported count. \
              Attribution is by the closer's declared `--tool`, which rally does not \
@@ -1165,6 +1174,11 @@ fn cli_parser() -> OptionParser<CliCommand> {
         .to_options()
         .command("locate")
         .map(CliCommand::Locate);
+    let replies = replies_parser()
+        .to_options()
+        .descr("Read reply states for exact --ref ids together in the current room. Includes the original and counted reply fact; withdrawn requests stay withdrawn. Missing means absent in this room: use locate for cross-room discovery. Acknowledged or closed does not prove completed work or an external effect.")
+        .command("replies")
+        .map(CliCommand::Replies);
     let retract = retract_parser()
         .to_options()
         .descr("Withdraw a posted fact by appending a retraction naming its event id. The ledger is never rewritten; room/next/recent stop surfacing the withdrawn fact while the retraction stays visible. Authority-carrying facts are gated; prose is free. Withdrawing another agent's active claim follows the same rules as `release`: the owner, a takeover after the owner's size-scaled silence window, or an expired lease. Withdrawing the decision the lead seat rests on moves the seat, so it follows the same rules as `lead handoff`: the holder, or a takeover after the holder's silence window. Like every Rally rule, this stops accidents and honest mistakes — identity is self-asserted and unsigned, so it is not a security boundary and cannot stop an agent that lies about its name. Retracting anything else — an artifact, an ordinary decision, a risk — is open to anyone.")
@@ -1407,6 +1421,7 @@ fn cli_parser() -> OptionParser<CliCommand> {
         next,
         inbox,
         locate,
+        replies,
         recent,
         check,
         hook,
@@ -1845,6 +1860,15 @@ fn locate_parser() -> impl Parser<LocateArgs> {
     construct!(json, event_id).map(|(json, event_id)| LocateArgs { json, event_id })
 }
 
+fn replies_parser() -> impl Parser<RepliesArgs> {
+    let json = json_flag();
+    let event_ids = long("ref")
+        .argument::<String>("EVENT_ID")
+        .guard(|id| !id.trim().is_empty(), "--ref must not be blank")
+        .some("at least one --ref is required");
+    construct!(RepliesArgs { json, event_ids })
+}
+
 fn recent_parser() -> impl Parser<RecentArgs> {
     let json = json_flag();
     let all = long("all").switch();
@@ -2161,7 +2185,10 @@ fn inject_parser() -> impl Parser<InjectArgs> {
     let dry_run = dry_run_flag();
     let text = optional_string_arg("text", "TEXT");
     let handoff = handoff_arg();
-    let require_ack = long("require-ack").switch();
+    let require_ack = long("require-ack")
+        .long("wait-ack")
+        .help("Wait for the target's acknowledgment; handoffs return pending by default")
+        .switch();
     let timeout_seconds = bounded_i64_arg("timeout-seconds", "SECONDS", 10, 1, 600);
     let bins = backend_bins_parser();
     let tool = optional_string_arg("tool", "TOOL")
@@ -3024,6 +3051,16 @@ mod inject_message_cli_tests {
         let args = inject_args(&["inject", "codex:target", "--text", "work"]);
         assert_eq!(args.intent, MessageIntent::Directive);
         assert_eq!(args.responsibility, WorkResponsibility::Unspecified);
+    }
+
+    #[test]
+    fn handoff_wait_is_explicit_with_compatible_alias() {
+        let args = inject_args(&["inject", "codex:target", "--handoff", "request"]);
+        assert!(!args.require_ack);
+        for flag in ["--wait-ack", "--require-ack"] {
+            let args = inject_args(&["inject", "codex:target", "--handoff", "request", flag]);
+            assert!(args.require_ack);
+        }
     }
 
     #[test]

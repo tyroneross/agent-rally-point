@@ -418,10 +418,12 @@ fn validate_schema(schema: &Value, value: &Value, path: &str) {
             "schema enum mismatch at {path}: {value}; allowed={allowed:?}"
         );
     }
-    if let Some(required) = schema.get("required").and_then(Value::as_array) {
-        let object = value
-            .as_object()
-            .unwrap_or_else(|| panic!("schema required used on non-object at {path}"));
+    // JSON Schema's `required` constrains objects; a nullable object may
+    // validly be null, with its `type` checked independently above.
+    if let (Some(required), Some(object)) = (
+        schema.get("required").and_then(Value::as_array),
+        value.as_object(),
+    ) {
         for key in required.iter().filter_map(Value::as_str) {
             assert!(
                 object.contains_key(key),
@@ -565,6 +567,35 @@ fn sessions_v1_accepts_pre_injectability_payload() {
         }
     });
     assert_matches_schema("agent-rally.command.sessions.v1.json", &legacy);
+}
+
+#[test]
+fn replies_schema_covers_missing_and_pending_rows() {
+    let workspace = Workspace::new("replies-schema");
+    let missing = workspace.json(&["replies", "--ref", "absent", "--json"]);
+    assert_matches_schema("agent-rally.command.replies.v1.json", &missing);
+    assert_eq!(missing["data"]["replies"]["rows"][0]["found"], false);
+    let request = workspace.json(&[
+        "say",
+        "handoff",
+        "--tool",
+        "sender",
+        "--target",
+        "receiver",
+        "--subject",
+        "pending schema fixture",
+        "--deliver",
+        "record",
+        "--json",
+    ]);
+    let id = request["data"]["say"]["fact"]["event_id"].as_str().unwrap();
+    let pending = workspace.json(&["replies", "--ref", id, "--json"]);
+    assert_matches_schema("agent-rally.command.replies.v1.json", &pending);
+    assert_eq!(
+        pending["data"]["replies"]["rows"][0]["reply"]["state"],
+        "pending"
+    );
+    workspace.cleanup();
 }
 
 fn type_matches(type_schema: &Value, value: &Value) -> bool {
@@ -2512,6 +2543,7 @@ fn rally_next_and_inject_emit_wake_intent_facts() {
         "--json",
         "--handoff",
         handoff_id,
+        "--wait-ack",
         "--timeout-seconds",
         "1",
         "--tmux-bin",
@@ -2527,7 +2559,7 @@ fn rally_next_and_inject_emit_wake_intent_facts() {
     assert_eq!(inject["data"]["inject"]["wake_intent"]["status"], "failed");
     assert_eq!(
         inject["data"]["inject"]["require_ack"], true,
-        "--handoff injects require target ACK by default"
+        "explicit wait requires a target ACK"
     );
     assert_eq!(
         inject["data"]["inject"]["ack_state"], "timeout",

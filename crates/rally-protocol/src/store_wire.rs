@@ -197,6 +197,10 @@ pub enum StoreOp {
     /// whose `ref` names it, and any retraction of those. Answered as
     /// [`StoreOk::Facts`]. v9.
     ReplyFacts { event_id: String },
+    /// The union of original items, their replies and retractions for a
+    /// batch of exact ids. Additive v9 operation; older daemons reject it
+    /// and clients recover through one paged canonical fact read.
+    BatchReplyFacts { event_ids: Vec<String> },
     /// Every fact of one of `kinds` (any on-disk spelling), unfiltered by
     /// retraction or decay, in seq order. Answered as [`StoreOk::Facts`].
     /// Used for the backlog listing. v9.
@@ -313,6 +317,7 @@ impl StoreOp {
             | Self::FactsByEventId { .. }
             | Self::RecentFacts { .. }
             | Self::ReplyFacts { .. }
+            | Self::BatchReplyFacts { .. }
             | Self::FactsOfKinds { .. }
             | Self::SessionViewFacts
             | Self::FactsPage { .. }
@@ -790,6 +795,17 @@ mod tests {
                 event_id: "e".into()
             }
             .is_mutating()
+        );
+        let batch = StoreOp::BatchReplyFacts {
+            event_ids: vec!["quoted-'日本語".into(), "absent".into()],
+        };
+        assert!(!batch.is_mutating());
+        assert_eq!(
+            serde_json::to_value(
+                serde_json::from_str::<StoreOp>(&serde_json::to_string(&batch).unwrap()).unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(batch).unwrap()
         );
         assert!(!StoreOp::FactsOfKinds { kinds: vec![] }.is_mutating());
         assert!(!StoreOp::SessionViewFacts.is_mutating());

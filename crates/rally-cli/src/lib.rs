@@ -35,6 +35,7 @@ const SCHEMA_ROOM: &str = "agent-rally.command.room.v1";
 const SCHEMA_NEXT: &str = "agent-rally.command.next.v1";
 const SCHEMA_INBOX: &str = "agent-rally.command.inbox.v1";
 const SCHEMA_LOCATE: &str = "agent-rally.command.locate.v1";
+const SCHEMA_REPLIES: &str = "agent-rally.command.replies.v1";
 const SCHEMA_RECENT: &str = "agent-rally.command.recent.v1";
 const SCHEMA_RETRACT: &str = "agent-rally.command.retract.v1";
 const SCHEMA_CHECK: &str = "agent-rally.command.check.v1";
@@ -710,8 +711,8 @@ const DAEMON_START_WATCHDOG_TIMEOUT_MS: u64 = 45_000;
 const WORKTREE_PLAN_WATCHDOG_TIMEOUT_MS: u64 = 15_000;
 
 /// True when the resolved subcommand is `inject`. `inject` is the one
-/// deliberately-LONG interactive coordination verb: with `--handoff` /
-/// `--require-ack` it BLOCKS polling the ledger for a target-authored ACK up to
+/// potentially long interactive coordination verb: with `--wait-ack` /
+/// `--require-ack` it waits for a target-authored ACK up to
 /// `--timeout-seconds` (1–600s). The 3s-default / 60s-max hook watchdog exists
 /// to stop a write-hook wedged on stuck I/O — it must not pre-empt inject's
 /// legitimate ACK wait, which it otherwise always does (firing first and
@@ -883,11 +884,11 @@ fn resolve_watchdog_timeout(args: &[String]) -> Duration {
         return Duration::from_millis(ms.clamp(MIN_WATCHDOG_TIMEOUT_MS, MAX_WATCHDOG_TIMEOUT_MS));
     }
 
-    // (2) inject — the deliberately-blocking interactive verb — sizes its
-    // watchdog from the ACK budget so the wait is never pre-empted.
+    // (2) Keep inject's watchdog large enough for an explicitly requested ACK
+    // wait. Ordinary handoffs return pending without consuming this budget.
     if first_positional_is_inject(args) {
         // Default inject ACK budget mirrors the CLI default (10s) when the flag
-        // is absent so a bare `inject --handoff` still gets room to wait.
+        // is absent so an explicit `--wait-ack` still gets room to wait.
         let ack_secs = inject_timeout_seconds(args).unwrap_or(10);
         let ms = ack_secs
             .saturating_mul(1000)
@@ -909,6 +910,19 @@ fn resolve_watchdog_timeout(args: &[String]) -> Duration {
             .saturating_add(INJECT_WATCHDOG_HEADROOM_MS)
             .clamp(MIN_WATCHDOG_TIMEOUT_MS, INJECT_MAX_WATCHDOG_TIMEOUT_MS);
         return Duration::from_millis(ms);
+    }
+
+    // Status/artifact posts are interactive durable writes, not editor hooks.
+    // A measured 24k-fact room refused two of six concurrent posts because
+    // the hook-sized watchdog cut the existing ownership corridor to ~2s.
+    // Let that SAME bounded corridor finish, with response headroom; this
+    // neither bypasses the lock nor retries an ambiguous committed mutation.
+    if matches!(
+        first_positionals(args),
+        (Some("say"), Some("artifact")) | (Some("status"), Some("post"))
+    ) {
+        return store_client::CORRIDOR_BOUND
+            .saturating_add(Duration::from_millis(INJECT_WATCHDOG_HEADROOM_MS));
     }
 
     // (2b) `daemon start` (D1) — elevated fixed budget so it isn't pre-empted
@@ -1667,6 +1681,7 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
         CliCommand::Next(args) => command_next(args),
         CliCommand::Inbox(args) => command_inbox(args),
         CliCommand::Locate(args) => command_locate(args),
+        CliCommand::Replies(args) => command_replies(args),
         CliCommand::Recent(args) => command_recent(args),
         CliCommand::Check(args) => command_check(args),
         CliCommand::Hook(args) => command_hook(args),
@@ -5443,6 +5458,34 @@ fn command_locate(args: LocateArgs) -> Result<Output> {
         }
     }
     let body = envelope("locate", SCHEMA_LOCATE, LocateEnvelope { locate: data })?;
+    Ok(Output::new(args.json, text, body))
+}
+
+#[derive(JsonSchema, Serialize)]
+struct RepliesEnvelope {
+    replies: discovery::BatchRepliesData,
+}
+
+fn command_replies(args: RepliesArgs) -> Result<Output> {
+    let data = discovery::replies(&args.event_ids)?;
+    let mut text = format!(
+        "replies room={} count={}",
+        data.repo_root.display(),
+        data.rows.len()
+    );
+    for row in &data.rows {
+        let state = row
+            .reply
+            .as_ref()
+            .map(|reply| reply.state.as_str())
+            .unwrap_or(if row.found {
+                "no-reply-contract"
+            } else {
+                "absent-in-room"
+            });
+        text.push_str(&format!("\n{} {state}", row.event_id));
+    }
+    let body = envelope("replies", SCHEMA_REPLIES, RepliesEnvelope { replies: data })?;
     Ok(Output::new(args.json, text, body))
 }
 
@@ -11018,7 +11061,7 @@ fn command_inject_managed(
     // Reuse an existing exact receiver response without writing another
     // directive or touching the terminal.
     let prior_ack = match (room.as_ref(), handoff.as_deref()) {
-        (Some(room), Some(id)) => prior_receiver_ack(&room.facts()?, id, &session.tool),
+        (Some(room), Some(id)) => prior_receiver_ack(&room.reply_facts(id)?, id, &session.tool),
         _ => None,
     };
     let already_received = prior_ack.is_some();
@@ -11309,7 +11352,7 @@ fn command_inject_managed(
     };
     let mut ack = if prior_ack.is_some() {
         prior_ack
-    } else if effective_require_ack && !dry_run {
+    } else if require_ack && !dry_run {
         let handoff = handoff.as_deref().unwrap_or_default();
         // room is always Some here (require_ack && !dry_run guards this branch).
         let ack_room = room
@@ -11465,7 +11508,7 @@ fn command_inject_ledger(
     // Reuse an existing exact receiver response without writing another
     // directive or touching the terminal.
     let prior_ack = match (room.as_ref(), handoff.as_deref()) {
-        (Some(room), Some(id)) => prior_receiver_ack(&room.facts()?, id, &agent_id),
+        (Some(room), Some(id)) => prior_receiver_ack(&room.reply_facts(id)?, id, &agent_id),
         _ => None,
     };
     let already_received = prior_ack.is_some();
@@ -11552,14 +11595,14 @@ fn command_inject_ledger(
             "no active managed session for {agent_id}; delivery is ledger-queued (a rally-termd-registered pane may still deliver). For guaranteed live injection, adopt a pane you already started: `rally adopt {agent_id} --tmux <target>`. `rally run <agent>` also mints one, when a backend is installed."
         )),
     };
-    if effective_require_ack && !dry_run && !already_received {
+    if require_ack && !dry_run && !already_received {
         eprintln!(
             "rally: inject target {agent_id} is not synchronously injectable (presence-only; no active managed session). Waiting up to {timeout}s for an async ACK anyway — a polling agent or a rally-termd-registered pane can still resolve. Size any outer timeout accordingly."
         );
     }
     let mut ack = if prior_ack.is_some() {
         prior_ack
-    } else if effective_require_ack && !dry_run {
+    } else if require_ack && !dry_run {
         let handoff = handoff.as_deref().unwrap_or_default();
         let ack_room = room
             .take()
@@ -13709,8 +13752,9 @@ fn handoff_prompt(session: &ManagedSession, handoff: &str) -> String {
     // FIRST (the artifact is the verified closer), then a resolve refing that
     // artifact to mark it consumed.
     format!(
-        "Rally managed-session injection for {}. Run: rally next --tool {} --json. If it is actionable for handoff {}, record your work product first: rally say artifact --tool {} --ref {} --subject '<what you produced>' --evidence '<how you verified it>' --json — the artifact closes the handoff with reviewable evidence. Then mark it consumed: rally say resolve --tool {} --ref <artifact event_id from the previous command> --subject 'resolved via Rally managed session' --json. Do not resolve the handoff id directly without an artifact; that closure projects as resolved-unverified. Do not edit files unless the Rally action explicitly requires it. Do not ask for confirmation after the Rally commands succeed.",
-        session.name, session.tool, handoff, session.tool, handoff, session.tool
+        "Rally managed-session injection for {}. {}",
+        session.name,
+        handoff_instructions(&session.tool, handoff)
     )
 }
 
@@ -13723,7 +13767,14 @@ fn handoff_prompt_ledger(target: &str, handoff: &str) -> String {
     // Same artifact-first contract as [`handoff_prompt`] — see the comment
     // there for why the resolve refs the artifact, never the handoff directly.
     format!(
-        "Rally ledger injection for {target}. Run: rally next --tool {target} --json. If it is actionable for handoff {handoff}, record your work product first: rally say artifact --tool {target} --ref {handoff} --subject '<what you produced>' --evidence '<how you verified it>' --json — the artifact closes the handoff with reviewable evidence. Then mark it consumed: rally say resolve --tool {target} --ref <artifact event_id from the previous command> --subject 'resolved via Rally ledger' --json. Do not resolve the handoff id directly without an artifact; that closure projects as resolved-unverified. Do not edit files unless the Rally action explicitly requires it. Do not ask for confirmation after the Rally commands succeed."
+        "Rally ledger injection for {target}. {}",
+        handoff_instructions(target, handoff)
+    )
+}
+
+fn handoff_instructions(target: &str, handoff: &str) -> String {
+    format!(
+        "Run rally next --tool {target} --json. If handoff {handoff} is actionable, accept before working: rally say handoff --tool {target} --ref {handoff} --handoff-state accepted --subject accepted --json. Acceptance keeps work open. Claim/check paths before edits; follow authorized scope. On completion: rally say artifact --tool {target} --ref {handoff} --subject '<result>' --evidence '<verification>' --json. Then consume it: rally say resolve --tool {target} --ref <artifact event_id> --subject consumed --json. Direct resolve or empty evidence is resolved-unverified. Report failed commands exactly; claim receipt/completion only with evidence."
     )
 }
 
@@ -13764,6 +13815,9 @@ fn wait_for_resolution(
     expected_tool: &str,
 ) -> Result<Value> {
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    // Register before the first read; one persistent watch retains changes
+    // that arrive between a read and the next wait. Events remain hints.
+    let mut watcher = room.log_watcher();
     let mut last_seen_seq = after_seq;
     let mut ignored_target_responses = BTreeSet::new();
     loop {
@@ -13820,7 +13874,7 @@ fn wait_for_resolution(
         if remaining.is_zero() {
             break;
         }
-        thread::sleep(remaining.min(Duration::from_millis(250)));
+        watcher.wait(remaining.min(Duration::from_millis(250)));
     }
     Ok(json!({
         "received": false,
@@ -13888,7 +13942,7 @@ fn inject_fallback_plan(
     if ack
         .and_then(|ack| ack.get("timed_out"))
         .and_then(Value::as_bool)
-        == Some(false)
+        != Some(true)
     {
         return None;
     }
@@ -15473,6 +15527,30 @@ mod tests {
         assert!(
             resolve_watchdog_timeout(&argv(&["say", "handoff", "--subject", "x"]))
                 > Duration::from_millis(DEFAULT_WATCHDOG_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn interactive_artifacts_allow_the_existing_ownership_corridor_but_hooks_stay_short() {
+        assert_eq!(
+            resolve_watchdog_timeout(&argv(&["say", "artifact", "--subject", "status"])),
+            store_client::CORRIDOR_BOUND + Duration::from_millis(INJECT_WATCHDOG_HEADROOM_MS)
+        );
+        assert_eq!(
+            resolve_watchdog_timeout(&argv(&["status", "post", "--state", "working"])),
+            store_client::CORRIDOR_BOUND + Duration::from_millis(INJECT_WATCHDOG_HEADROOM_MS)
+        );
+        assert_eq!(
+            resolve_watchdog_timeout(&argv(&["status", "post", "--timeout-ms", "400"])),
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            resolve_watchdog_timeout(&argv(&["say", "artifact", "--timeout-ms", "400"])),
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            resolve_watchdog_timeout(&argv(&["hook", "before-write", "--tool", "codex"])),
+            Duration::from_millis(DEFAULT_WATCHDOG_TIMEOUT_MS)
         );
     }
 
@@ -23597,8 +23675,9 @@ fn help_text() -> String {
         "  rally next --tool <tool> [--path <path>] [--role <role>] [--limit <n>] [--json]",
         "  rally inbox --tool <tool> [--limit <n>] [--json]",
         "    open obligations addressed to <tool>; read-only, and cleared only by an ack <tool> itself authors",
-        "    (`rally say receipt --ref <id>`). Age, cursor, decay, and reaper expiry never remove one.",
+        "    follow each item's ack_command; accepting a handoff keeps its work open. Age, cursor, decay, and reaper expiry never remove one.",
         "  rally locate <event-id> [--json]",
+        "  rally replies --ref <event-id> [--ref <event-id> ...] [--json]  # one current-room read; missing ids may belong to another room",
         "  rally recent [--all] [--limit <n>] [--json]",
         "  rally migrate-legacy [--json]  # one-shot replay of legacy ~/.agent-rally-point/apps/<slug>/changes.jsonl into this repo ledger",
         "  rally ack --tool <tool> [--json]  # acknowledge rules/guardrails/lead/mission (coordination-mandate C1)",
@@ -23633,8 +23712,8 @@ fn help_text() -> String {
         "    close one exact tool/session lease and release only claims authored by that lease",
         "  rally session current [--tool <tool>] [--json]  # bounded current leases with freshness and omission counts",
         "  rally session history [--tool <tool>] [--limit <1..100>] [--json]  # explicit lease transitions",
-        "  rally inject <session|name|tool> (--text <text>|--handoff <event-id>) [--tool <sender>] [--intent inform|request|propose|directive] [--responsibility investigator|planner|implementer|verifier|reviewer|integrator|operator|unspecified] [--timeout-seconds <n>] [--json]",
-        "    --handoff waits for target-authored Rally ACK by default; without that evidence, branch on reached_target, queued, and fallback_plan",
+        "  rally inject <session|name|tool> (--text <text>|--handoff <event-id>) [--tool <sender>] [--intent inform|request|propose|directive] [--responsibility investigator|planner|implementer|verifier|reviewer|integrator|operator|unspecified] [--wait-ack|--require-ack] [--timeout-seconds <n>] [--json]",
+        "    --handoff returns pending until a target-authored Rally ACK; --wait-ack explicitly waits; without that evidence, branch on reached_target, queued, and fallback_plan",
         "  rally attach <session|name|tool> [--dry-run] [--json]",
         "  rally capture <session|name|tool> [--lines <n>] [--dry-run] [--json]",
         "  rally stop <session|name|tool> [--dry-run] [--json]",
@@ -24228,7 +24307,7 @@ fn escalate_overdue_handoffs(
             format!(
                 "no response from {} to handoff {} ({}) — ack deadline {} passed {}s ago. \
                  Escalate: re-inject (`rally inject {} --handoff {} --tool {tool}`), post a \
-                 backup locator, or reroute. Clears when {} acks (`rally say receipt --ref {}`).",
+                 backup locator, or reroute. {} can read `rally inbox --tool {} --json` and use the item's ack_command; acceptance keeps unfinished work open.",
                 item.target,
                 item.event_id,
                 obligations::single_line(&item.subject),
@@ -24237,7 +24316,7 @@ fn escalate_overdue_handoffs(
                 item.target,
                 item.event_id,
                 item.target,
-                item.event_id,
+                item.target,
             ),
             Vec::new(),
             "warn",

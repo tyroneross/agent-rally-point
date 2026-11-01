@@ -405,6 +405,7 @@ fn ack_timeout_after_unverified_managed_delivery_never_recommends_another_send()
         handoff_id,
         "--timeout-seconds",
         "1",
+        "--wait-ack",
         "--tool",
         "sender:01",
         "--tmux-bin",

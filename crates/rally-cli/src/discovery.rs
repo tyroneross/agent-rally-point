@@ -60,6 +60,95 @@ pub(crate) struct LocateData {
     pub(crate) warnings: Vec<DiscoveryWarning>,
 }
 
+/// Current-room reply observations captured together; every requested id is
+/// represented, including missing and withdrawn originals. Raw facts are
+/// source data, with the same trust boundary as `locate`.
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct BatchRepliesData {
+    pub(crate) repo_root: PathBuf,
+    pub(crate) rows: Vec<BatchReplyRow>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+pub(crate) struct BatchReplyRow {
+    pub(crate) event_id: String,
+    pub(crate) found: bool,
+    pub(crate) fact: Option<Fact>,
+    pub(crate) reply: Option<crate::store::ReplyState>,
+    /// The counted response that set the projected state, in the SAME read.
+    /// This avoids a second locate racing a withdrawal or a newer response.
+    pub(crate) reply_fact: Option<Fact>,
+    /// `evidenced` means a counted receiver artifact has nonblank evidence,
+    /// not that Rally independently verified the work or an external effect.
+    pub(crate) completion_status: Option<String>,
+}
+
+pub(crate) fn replies(event_ids: &[String]) -> Result<BatchRepliesData> {
+    let room = RoomStore::open()?;
+    let facts = room.batch_reply_facts(event_ids)?;
+    Ok(BatchRepliesData {
+        repo_root: room.repo_root().to_path_buf(),
+        rows: project_batch_replies(event_ids, &facts),
+    })
+}
+
+fn project_batch_replies(event_ids: &[String], facts: &[Fact]) -> Vec<BatchReplyRow> {
+    let retracted = crate::retraction::retracted_ids(facts);
+    let mut by_id: BTreeMap<&str, &Fact> = BTreeMap::new();
+    let mut by_ref: BTreeMap<&str, Vec<Fact>> = BTreeMap::new();
+    for fact in facts {
+        by_id.entry(fact.event_id.as_str()).or_insert(fact);
+        if let Some(reference) = fact.ref_id.as_deref() {
+            by_ref.entry(reference).or_default().push(fact.clone());
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    event_ids
+        .iter()
+        .filter(|id| seen.insert(id.as_str()))
+        .map(|event_id| {
+            let fact = by_id.get(event_id.as_str()).copied();
+            let related = by_ref
+                .get(event_id.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let reply =
+                fact.and_then(|fact| crate::store::project_reply_state(fact, related, &retracted));
+            let reply_fact = reply
+                .as_ref()
+                .and_then(|reply| reply.reply_event_id.as_deref())
+                .and_then(|id| by_id.get(id).copied())
+                .cloned();
+            let completion_status = reply
+                .as_ref()
+                .filter(|reply| reply.kind == "handoff" && reply.state == "done")
+                .and(fact)
+                .map(|original| {
+                    if related
+                        .iter()
+                        .filter(|fact| !retracted.contains(&fact.event_id))
+                        .any(|artifact| {
+                            crate::store::artifact_is_completion_evidence(original, artifact)
+                        })
+                    {
+                        "evidenced"
+                    } else {
+                        crate::store::RESOLVED_UNVERIFIED_STATUS
+                    }
+                    .to_string()
+                });
+            BatchReplyRow {
+                event_id: event_id.clone(),
+                found: fact.is_some(),
+                fact: fact.cloned(),
+                reply,
+                reply_fact,
+                completion_status,
+            }
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 pub(crate) struct RecentRow {
     pub(crate) source: String,
@@ -1024,6 +1113,167 @@ fn warning_count(
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn batch_projection_preserves_single_reply_states_and_original_withdrawal() {
+        use crate::store::{FactKind, project_reply_state};
+        let request = Fact {
+            event_id: "request".into(),
+            kind: FactKind::Handoff,
+            seq: 1,
+            tool: Some("sender".into()),
+            target: Some("receiver".into()),
+            ..Default::default()
+        };
+        let reply = Fact {
+            event_id: "reply".into(),
+            kind: FactKind::Receipt,
+            seq: 2,
+            tool: Some("receiver".into()),
+            ref_id: Some("request".into()),
+            ..Default::default()
+        };
+        let withdrawal = Fact {
+            event_id: "withdraw".into(),
+            kind: FactKind::Artifact,
+            seq: 3,
+            subject: "retract: request".into(),
+            ..Default::default()
+        };
+        let requested = vec!["request".into(), "missing".into(), "request".into()];
+        for facts in [
+            vec![request.clone(), reply.clone()],
+            vec![request.clone(), reply, withdrawal],
+        ] {
+            let rows = project_batch_replies(&requested, &facts);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                rows[0].reply,
+                project_reply_state(&request, &facts, &crate::retraction::retracted_ids(&facts))
+            );
+            assert!(!rows[1].found);
+            if facts.len() == 3 {
+                assert_eq!(rows[0].reply.as_ref().unwrap().state, "retracted");
+                assert!(rows[0].reply_fact.is_none());
+            } else {
+                assert_eq!(rows[0].reply_fact.as_ref().unwrap().event_id, "reply");
+            }
+        }
+    }
+
+    #[test]
+    fn batch_projection_preserves_strict_authority_acceptance_and_evidence() {
+        use crate::store::FactKind;
+        let typed = |id: &str, reference: &str, event: &str, seq: i64| Fact {
+            event_id: id.into(),
+            kind: FactKind::Handoff,
+            seq,
+            tool: Some("receiver".into()),
+            from_session_id: Some("receiver-session".into()),
+            target: Some("sender".into()),
+            ref_id: Some(reference.into()),
+            evidence: [
+                ("bridge_version", "fact-v1"),
+                ("event_kind", event),
+                ("target_policy", "ref-author"),
+                ("to_session_id", "receiver-session"),
+                ("ref_event_id", reference),
+                ("causation_id", reference),
+                ("correlation_id", "thread"),
+                ("handoff_id", "request"),
+                ("idempotency_key", id),
+            ]
+            .iter()
+            .map(|(k, v)| format!("protocol:{k}={v}"))
+            .collect(),
+            ..Default::default()
+        };
+        let mut request = typed("request", "upstream", "handoff.requested", 1);
+        request.tool = Some("sender".into());
+        request.target = Some("receiver".into());
+        request.from_session_id = Some("sender-session".into());
+        assert_eq!(
+            crate::store::strict_handoff_target_session(&request),
+            Some("receiver-session")
+        );
+        let accepted = typed("accepted", "request", "handoff.accepted", 2);
+        let mut wrong_session = accepted.clone();
+        wrong_session.event_id = "sibling".into();
+        wrong_session.from_session_id = Some("sibling-session".into());
+        let mut wrong_author = accepted.clone();
+        wrong_author.event_id = "outsider".into();
+        wrong_author.tool = Some("outsider".into());
+        let mut artifact = Fact {
+            event_id: "evidence".into(),
+            kind: FactKind::Artifact,
+            seq: 3,
+            tool: Some("receiver".into()),
+            from_session_id: Some("receiver-session".into()),
+            ref_id: Some("request".into()),
+            evidence: vec!["test passed".into()],
+            ..Default::default()
+        };
+        let withdrawal = Fact {
+            event_id: "withdraw-acceptance".into(),
+            kind: FactKind::Artifact,
+            seq: 4,
+            subject: "retract: accepted".into(),
+            ..Default::default()
+        };
+        for (extra, state, counted, completion) in [
+            (vec![wrong_session, wrong_author], "pending", None, None),
+            (vec![accepted.clone()], "accepted", Some("accepted"), None),
+            (vec![accepted.clone(), withdrawal], "pending", None, None),
+            (
+                vec![accepted.clone(), artifact.clone()],
+                "done",
+                Some("evidence"),
+                Some("evidenced"),
+            ),
+            {
+                artifact.evidence.clear();
+                (
+                    vec![accepted, artifact],
+                    "done",
+                    Some("evidence"),
+                    Some("resolved-unverified"),
+                )
+            },
+        ] {
+            let facts = std::iter::once(request.clone())
+                .chain(extra)
+                .collect::<Vec<_>>();
+            let row = project_batch_replies(&["request".into()], &facts).remove(0);
+            assert_eq!(
+                row.reply,
+                crate::store::project_reply_state(
+                    &request,
+                    &facts,
+                    &crate::retraction::retracted_ids(&facts)
+                )
+            );
+            assert_eq!(row.reply.as_ref().unwrap().state, state);
+            assert_eq!(
+                row.reply_fact.as_ref().map(|f| f.event_id.as_str()),
+                counted
+            );
+            assert_eq!(row.completion_status.as_deref(), completion);
+        }
+        // Preserve legacy state and its separate receiver-answer flag exactly.
+        request.evidence.clear();
+        request.ref_id = None;
+        let legacy = Fact {
+            event_id: "legacy".into(),
+            kind: FactKind::Resolve,
+            seq: 2,
+            tool: Some("outsider".into()),
+            ref_id: Some("request".into()),
+            ..Default::default()
+        };
+        let row = project_batch_replies(&["request".into()], &[request, legacy]).remove(0);
+        assert_eq!(row.reply.as_ref().unwrap().state, "done");
+        assert_eq!(row.reply.as_ref().unwrap().receiver_answered, Some(false));
+    }
 
     fn tmp_path(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
