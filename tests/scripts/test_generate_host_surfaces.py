@@ -186,6 +186,25 @@ class GenerateHostSurfacesTests(unittest.TestCase):
         }
         self.assertEqual(actual, expected)
 
+    def test_only_stop_is_async_on_claude(self) -> None:
+        # Stop is advisory and must not hold the turn end; every other event
+        # feeds Claude or guards an edit and stays synchronous.
+        surfaces = GEN.render_hook_surfaces(GEN.load_config(ROOT))
+        for path in (Path("hooks/hooks.json"), Path(".claude/settings.json")):
+            surface = json.loads(surfaces[path])
+            actual = {
+                event: groups[0]["hooks"][0].get("async", False)
+                for event, groups in surface["hooks"].items()
+            }
+            self.assertEqual(
+                actual,
+                {"SessionStart": False, "UserPromptSubmit": False,
+                 "PreToolUse": False, "Stop": True},
+                str(path),
+            )
+        for path in (Path(".codex/hooks.json"), Path(".cursor/hooks.json")):
+            self.assertNotIn('"async"', surfaces[path], str(path))
+
     def test_claude_hook_surfaces_use_documented_second_timeouts(self) -> None:
         config = GEN.load_config(ROOT)
         surfaces = GEN.render_hook_surfaces(config)

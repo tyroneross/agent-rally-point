@@ -206,6 +206,56 @@ class LifecycleBudgetTests(unittest.TestCase):
             self.assertEqual(result.stdout, "{}")
             self.assertIn("internal deadline", result.stderr)
 
+    def test_idle_phase_spawns_no_avoidable_node(self):
+        # Each cold node start costs 100-450ms on a loaded host. Idle needs
+        # three (session id, hooks-status parse, renderer); the empty-metadata
+        # read and the check-in timestamp used to add two more and must not
+        # come back. The heartbeat must still carry a well-formed wake-after.
+        import re
+        import shutil
+        import time
+        real_node = shutil.which("node")
+        if not real_node:
+            self.skipTest("node not installed")
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            base = Path(directory)
+            repo = base / "repo"
+            (repo / ".rally").mkdir(parents=True)
+            stub = base / "rally"
+            stub.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$CALLS"\nprintf "{}"\n')
+            stub.chmod(0o700)
+            shim = base / "shim"
+            shim.mkdir()
+            (shim / "node").write_text(
+                f'#!/bin/bash\necho x >> "$NODE_CALLS"\nexec {real_node} "$@"\n')
+            (shim / "node").chmod(0o700)
+            calls, node_calls = base / "calls", base / "node-calls"
+            env = {k: v for k, v in os.environ.items() if not k.startswith("RALLY_")}
+            env.update(RALLY_BIN=str(stub), RALLY_HOOKS="on", RALLY_NATIVE_HOOK="off",
+                       RALLY_TOOL_ID="codex:node-count", CALLS=str(calls),
+                       NODE_CALLS=str(node_calls), PATH=f"{shim}:{env.get('PATH', '')}")
+            result = subprocess.run(
+                ["bash", str(HOOK), "idle", "codex"], cwd=repo, env=env,
+                input=json.dumps({"cwd": str(repo), "session_id": "node-count",
+                                  "hook_event_name": "UserPromptSubmit"}),
+                text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertLessEqual(len(node_calls.read_text().split()), 3)
+            for _ in range(40):
+                if calls.exists() and "status post" in calls.read_text():
+                    break
+                time.sleep(0.05)
+            post = [l for l in calls.read_text().splitlines() if l.startswith("status post")]
+            self.assertTrue(post, calls.read_text())
+            match = re.search(r"--wake-after (\S+)", post[0])
+            self.assertIsNotNone(match, post[0])
+            self.assertRegex(match.group(1), r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+            # Same instant the Node formula gives, to within scheduling noise.
+            from datetime import datetime, timezone
+            wake = datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc).timestamp()
+            self.assertAlmostEqual(wake, time.time() + 300, delta=30)
+
 
 if __name__ == "__main__":
     unittest.main()

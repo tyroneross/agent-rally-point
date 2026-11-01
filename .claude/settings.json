@@ -41,7 +41,8 @@
           {
             "type": "command",
             "command": "RALLY_HOOK_SOURCE=project \"${CLAUDE_PROJECT_DIR}/hooks/rally-coordination-hook.sh\" after-write claude_code",
-            "timeout": 5
+            "timeout": 5,
+            "async": true
           }
         ]
       }

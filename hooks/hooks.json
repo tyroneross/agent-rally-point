@@ -41,7 +41,8 @@
           {
             "type": "command",
             "command": "RALLY_HOOK_SOURCE=plugin \"${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh\" after-write claude_code",
-            "timeout": 5
+            "timeout": 5,
+            "async": true
           }
         ]
       }

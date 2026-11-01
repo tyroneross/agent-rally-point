@@ -187,6 +187,9 @@
       {
         "phase": "after-write",
         "timeout_ms": 5000,
+        "async": {
+          "claude_code": true
+        },
         "events": {
           "claude_code": "Stop",
           "codex": "Stop",
