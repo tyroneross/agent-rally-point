@@ -3634,7 +3634,7 @@ fn command_say(args: SayArgs) -> Result<Output> {
     let sender_room_root = room.repo_root().to_path_buf();
     // (recipient pane cwd when routed, route warning, pane binding confirmed this room)
     let (room, routed_pane_cwd, route_gap, sender_pane_bound) = match route {
-        HandoffRoomRoute::Recipient { room, pane_cwd } => (room, Some(pane_cwd), None, false),
+        HandoffRoomRoute::Recipient { room, pane_cwd } => (*room, Some(pane_cwd), None, false),
         HandoffRoomRoute::Gap(message) => (room, None, Some(message), false),
         HandoffRoomRoute::Sender { pane_bound } => (room, None, None, pane_bound),
     };
@@ -4247,9 +4247,11 @@ fn command_say(args: SayArgs) -> Result<Output> {
     // because the handoff already landed and the receiver can still pull it.
     let delivery = match (handoff_delivery_mode, fact.target.as_deref()) {
         (Some((mode, _)), Some(target_tool)) => Some(deliver_handoff(
-            &room,
-            routed_pane_cwd.is_some(),
-            probed_binding.take(),
+            HandoffDeliveryRoute {
+                room: &room,
+                routed_to_recipient_room: routed_pane_cwd.is_some(),
+                prebound: probed_binding.take(),
+            },
             mode,
             &args.tool,
             target_tool,
@@ -9072,10 +9074,10 @@ fn command_run(args: RunArgs) -> Result<Output> {
                     provisioned_path = Some(pw.path);
                     // Refresh the session fact so the durable record reflects
                     // the worktree-rooted cwd + branch.
-                    if let Some(fact) = &reservation.fact {
-                        if let Err(error) = record_provisioned_session(&room, &session, fact) {
-                            return prelaunch_record_failure(&room, &session, fact, error, json);
-                        }
+                    if let Some(fact) = &reservation.fact
+                        && let Err(error) = record_provisioned_session(&room, &session, fact)
+                    {
+                        return prelaunch_record_failure(&room, &session, fact, error, json);
                     }
                 }
                 Err(err) => {
@@ -21998,7 +22000,10 @@ enum HandoffRoomRoute {
     /// confirmed it; when false, the recipient's room is simply unknown.
     Sender { pane_bound: bool },
     /// The recipient's single bound pane works in another, existing room.
-    Recipient { room: RoomStore, pane_cwd: String },
+    Recipient {
+        room: Box<RoomStore>,
+        pane_cwd: String,
+    },
     /// A bound pane names another room that cannot be opened or does not
     /// exist; the handoff stays in the sender's room and the sender is told.
     Gap(String),
@@ -22048,7 +22053,7 @@ fn route_for_pane_cwd(sender_root: &Path, target: &str, cwd: &str) -> HandoffRoo
     };
     match existing {
         Ok(Some(room)) => HandoffRoomRoute::Recipient {
-            room,
+            room: Box::new(room),
             pane_cwd: cwd.to_string(),
         },
         Ok(None) => HandoffRoomRoute::Gap(format!(
@@ -23726,12 +23731,15 @@ struct HandoffDelivery {
     wake_event_id: Option<String>,
 }
 
-fn deliver_handoff(
-    room: &RoomStore,
+struct HandoffDeliveryRoute<'a> {
+    room: &'a RoomStore,
     routed_to_recipient_room: bool,
-    // The pane binding routing already probed, if any; reused so the ptyd
-    // sockets are probed once per `say`.
+    // Reuse the binding routing already probed so sockets are queried once.
     prebound: Option<PaneWakeBinding>,
+}
+
+fn deliver_handoff(
+    route: HandoffDeliveryRoute<'_>,
     mode: HandoffDeliveryMode,
     sender_tool: &str,
     target_tool: &str,
@@ -23739,6 +23747,11 @@ fn deliver_handoff(
     ack_by: Option<String>,
     bins: BackendBins,
 ) -> HandoffDelivery {
+    let HandoffDeliveryRoute {
+        room,
+        routed_to_recipient_room,
+        prebound,
+    } = route;
     let record_only = |detail: String| HandoffDelivery {
         mode: match mode {
             HandoffDeliveryMode::Inject => "inject",
@@ -23928,7 +23941,7 @@ fn pane_wake_delivery(
         });
     }
     let (receipt, wake_event_id) = wake_bound_pane(
-        &room,
+        room,
         &socket,
         &pane.pane_id,
         sender_tool,
