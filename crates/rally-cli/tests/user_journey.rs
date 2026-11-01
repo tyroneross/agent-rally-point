@@ -8013,14 +8013,18 @@ fn run_prelaunch_failure_case(failure: &str, retirement_succeeds: bool) {
     let _run_guard = serialize_rally_run();
     let workspace = real_repo_workspace(&format!("rally-run-prelaunch-{failure}"));
     let stub = workspace.home.join("tmux-prelaunch");
-    fs::write(&stub, r#"#!/bin/sh
+    fs::write(
+        &stub,
+        r#"#!/bin/sh
 case "$1" in
   new-session) touch "$0.started"; exit 0 ;;
   kill-session) touch "$0.stopped" ;;
 esac
 echo 'no server running' >&2
 exit 1
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_rally"))
         .current_dir(&workspace.cwd)
@@ -8094,7 +8098,10 @@ exit 1
             "registration-only stop preserves unlaunched checkout"
         );
         assert!(!marker.exists());
-        assert!(!PathBuf::from(format!("{}.stopped", stub.display())).exists(), "recovery must not send a backend stop");
+        assert!(
+            !PathBuf::from(format!("{}.stopped", stub.display())).exists(),
+            "recovery must not send a backend stop"
+        );
     }
     // A distinct name is a valid retry without overwriting the retained checkout.
     let retry = workspace.json(&[
