@@ -99,6 +99,7 @@
 #![cfg(unix)]
 #![allow(clippy::zombie_processes)]
 
+use rally_protocol::store_wire::WIRE_VERSION;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -512,10 +513,14 @@ impl Daemon {
         };
         let deadline = Instant::now() + Duration::from_secs(DAEMON_READY_TIMEOUT_SECS);
         while Instant::now() < deadline {
-            if room.cwd.join(".rally").join("rallyd.sock.addr").exists()
-                && room.run(&["daemon", "status", "--json"]).status.success()
-            {
-                return Some(d);
+            if room.cwd.join(".rally").join("rallyd.sock.addr").exists() {
+                let status = room.run(&["daemon", "status", "--json"]);
+                if status.status.success()
+                    && serde_json::from_slice::<Value>(&status.stdout)
+                        .is_ok_and(|value| d.matches_status(&value))
+                {
+                    return Some(d);
+                }
             }
             thread::sleep(Duration::from_millis(100));
         }
@@ -523,15 +528,19 @@ impl Daemon {
         None
     }
 
+    fn matches_status(&self, status: &Value) -> bool {
+        status["ok"] == true
+            && status["data"]["daemon"]["live"] == true
+            && status["data"]["daemon"]["pid"] == self.child.id()
+            && status["data"]["daemon"]["wire_version"] == WIRE_VERSION
+    }
+
     /// Confirm the daemon is actually SERVING this room's writes. Without this
     /// the whole file could pass while exercising the direct path twice.
     fn assert_serving(&self, room: &Room) {
         let v = room.json(&["daemon", "status", "--json"]);
-        let text = v.to_string();
         assert!(
-            text.contains("\"serving\"")
-                || text.contains("\"running\"")
-                || v["ok"] == Value::Bool(true),
+            self.matches_status(&v),
             "daemon must be live before parity is claimed: {v}"
         );
     }
@@ -857,7 +866,7 @@ fn field_bounds_are_identical_in_direct_and_routed_mode() {
 #[test]
 fn the_daemon_fixture_actually_serves_before_parity_is_claimed() {
     let room = Room::new("fixture-selfcheck");
-    let Some(daemon) = Daemon::start(&room) else {
+    let Some(mut daemon) = Daemon::start(&room) else {
         assert!(
             !daemon_required(),
             "rallyd did not start; routed fixture is required"
@@ -884,6 +893,21 @@ fn the_daemon_fixture_actually_serves_before_parity_is_claimed() {
         "routed self-release must be authorized"
     );
     assert_eq!(room.active_claim_count(), 0, "routed close must project");
-    drop(daemon);
+    daemon.stop();
+    let stopped = room.json(&["daemon", "status", "--json"]);
+    assert_eq!(stopped["ok"], true);
+    assert_eq!(stopped["data"]["daemon"]["live"], false);
+    let rejection = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        daemon.assert_serving(&room);
+    }))
+    .expect_err("a stopped daemon must never establish routed parity");
+    let message = rejection
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| rejection.downcast_ref::<&str>().copied());
+    assert!(
+        message.is_some_and(|text| text.contains("daemon must be live before parity is claimed")),
+        "negative control must fail on daemon readiness, not another setup error: {message:?}"
+    );
     let _ = Path::new(".");
 }
