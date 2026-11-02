@@ -238,11 +238,16 @@ pub(crate) fn cleanup_against(
         };
         match status {
             Ok(out) if out.status.success() && out.stdout.is_empty() => {}
+            Ok(out)
+                if out.status.success()
+                    && ignored_only(&out.stdout)
+                    && all_regenerable_build_output(worktree_path, &out.stdout) => {}
             Ok(out) if out.status.success() && ignored_only(&out.stdout) => {
                 let text = String::from_utf8_lossy(&out.stdout);
                 let ignored: Vec<&str> = text
                     .lines()
                     .filter_map(|line| line.strip_prefix("!! "))
+                    .filter(|path| !is_regenerable_build_output(worktree_path, path))
                     .collect();
                 let sample = ignored
                     .iter()
@@ -513,6 +518,41 @@ fn git_output(repo_root: &Path, git_bin: &str, args: &[&str]) -> Result<String> 
 // Unit tests
 // ---------------------------------------------------------------------------
 
+/// Build-output folders a build regenerates, each paired with the manifest
+/// that must sit beside it. Only a folder next to its manifest counts, so a
+/// hand-made `target/` with notes in it still retains the worktree.
+const REGENERABLE_BUILD_OUTPUT: &[(&str, &str)] = &[
+    ("target", "Cargo.toml"),
+    (".build", "Package.swift"),
+    ("node_modules", "package.json"),
+];
+
+/// True when `rel` (a `git status --ignored` path) lies inside a regenerable
+/// build-output folder of `worktree`.
+fn is_regenerable_build_output(worktree: &Path, rel: &str) -> bool {
+    let mut parent = worktree.to_path_buf();
+    for component in Path::new(rel.trim_end_matches('/')).components() {
+        let name = component.as_os_str();
+        if REGENERABLE_BUILD_OUTPUT
+            .iter()
+            .any(|(dir, manifest)| name == OsStr::new(dir) && parent.join(manifest).is_file())
+        {
+            return true;
+        }
+        parent.push(name);
+    }
+    false
+}
+
+/// True when every ignored path in porcelain `stdout` is regenerable build
+/// output, so removing the worktree loses nothing a build cannot recreate.
+fn all_regenerable_build_output(worktree: &Path, stdout: &[u8]) -> bool {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("!! "))
+        .all(|path| is_regenerable_build_output(worktree, path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,6 +722,87 @@ mod tests {
             "unmerged branch should still be present after cleanup"
         );
 
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Merged worktree whose ignored content is laid out by `setup`.
+    fn cleanup_with_ignored(
+        name: &str,
+        tracked_cargo: bool,
+        setup: impl FnOnce(&Path),
+    ) -> (PathBuf, CleanupOutcome, PathBuf) {
+        let repo = tmp_dir(name);
+        init_test_repo(&repo);
+        fs::write(repo.join(".gitignore"), b"target/\nmemory/\n").unwrap();
+        let mut add = vec!["add", ".gitignore"];
+        if tracked_cargo {
+            fs::write(repo.join("Cargo.toml"), b"[package]\nname = \"x\"\n").unwrap();
+            add.push("Cargo.toml");
+        }
+        crate::test_git_fixture::fixture_git(&repo, &add);
+        crate::test_git_fixture::fixture_git(&repo, &["commit", "-m", "fixture"]);
+        let pw = provision(&repo, &format!("{name}-01"), "git").expect("provision");
+        setup(&pw.path);
+        let outcome = cleanup(&repo, &pw.path, &pw.branch, "git");
+        (repo, outcome, pw.path)
+    }
+
+    #[test]
+    fn cleanup_removes_worktree_holding_only_regenerable_build_output() {
+        if !git_available() {
+            return;
+        }
+        let (repo, outcome, path) = cleanup_with_ignored("cleanup-build-out", true, |wt| {
+            fs::create_dir_all(wt.join("target/debug")).unwrap();
+            fs::write(wt.join("target/debug/app"), b"binary").unwrap();
+        });
+        assert!(
+            outcome.worktree_removed,
+            "build output alone must not retain: {:?}",
+            outcome.warnings
+        );
+        assert!(!path.exists());
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn cleanup_retains_target_dir_without_cargo_manifest() {
+        if !git_available() {
+            return;
+        }
+        let (repo, outcome, path) = cleanup_with_ignored("cleanup-bare-target", false, |wt| {
+            fs::create_dir_all(wt.join("target")).unwrap();
+            fs::write(wt.join("target/notes.md"), b"not build output").unwrap();
+        });
+        assert!(!outcome.worktree_removed);
+        assert_eq!(outcome.reason, "ignored_files");
+        assert!(path.join("target/notes.md").exists());
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn cleanup_retains_build_output_mixed_with_agent_memory_and_lists_only_memory() {
+        if !git_available() {
+            return;
+        }
+        let (repo, outcome, path) = cleanup_with_ignored("cleanup-mixed", true, |wt| {
+            fs::create_dir_all(wt.join("target")).unwrap();
+            fs::write(wt.join("target/out"), b"binary").unwrap();
+            fs::create_dir_all(wt.join("memory")).unwrap();
+            fs::write(wt.join("memory/notes.md"), b"agent memory").unwrap();
+        });
+        assert!(!outcome.worktree_removed);
+        assert_eq!(outcome.reason, "ignored_files");
+        assert!(path.join("memory/notes.md").exists());
+        let warning = outcome
+            .warnings
+            .iter()
+            .find(|w| w.contains("for review"))
+            .unwrap();
+        assert!(
+            warning.contains("memory/") && !warning.contains("target/"),
+            "{warning}"
+        );
         fs::remove_dir_all(&repo).ok();
     }
 

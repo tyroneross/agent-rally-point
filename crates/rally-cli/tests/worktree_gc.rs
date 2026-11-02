@@ -270,6 +270,51 @@ fn incomplete_managed_owner_retains_merged_tree() {
 }
 
 #[test]
+fn worktreeless_and_unrelated_owner_records_do_not_retain_merged_tree() {
+    if !git_available() {
+        return;
+    }
+    let repo = tmp_dir("merged-worktreeless-owners");
+    init_repo(&repo);
+    let session_id = "codex-done-01";
+    let wt = make_rally_worktree(&repo, session_id);
+    add_commit_in_worktree(&wt);
+    merge_branch_into_main(&repo, &format!("rally/{session_id}"));
+    let owner = |path: Option<PathBuf>, branch: Option<&str>, id: &str| {
+        rally_cli::worktree_gc::ManagedOwner {
+            worktree_path: path,
+            branch: branch.map(str::to_string),
+            session_id: id.to_string(),
+            tool: format!("claude_code:{id}"),
+        }
+    };
+    let report = rally_cli::worktree_gc::run_gc(rally_cli::worktree_gc::GcConfig {
+        repo_root: repo.clone(),
+        apply: true,
+        ttl_secs: 3600,
+        now_ts: None,
+        presence_facts: vec![],
+        // Sessions that never had a worktree (plain tmux/herdr agents), plus a
+        // half-filled record naming some other branch: none names this tree.
+        managed_owners: Some(vec![
+            owner(None, None, "no-worktree-01"),
+            owner(None, None, "no-worktree-02"),
+            owner(None, Some("rally/someone-else-01"), "other-01"),
+        ]),
+        git_bin: "git".to_string(),
+        backend_liveness_probe: None,
+    })
+    .unwrap();
+    assert!(
+        report.reaped.iter().any(|row| row.worktree_path == wt),
+        "merged tree must be reaped; skipped: {:?}",
+        report.skipped
+    );
+    assert!(!wt.exists());
+    fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
 fn missing_but_registered_tree_is_not_reported_reaped() {
     if !git_available() {
         return;
