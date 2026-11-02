@@ -223,10 +223,18 @@ pub fn run_gc(config: GcConfig) -> Result<GcReport, String> {
             });
             continue;
         };
-        if owners
-            .iter()
-            .any(|owner| owner.worktree_path.is_none() || owner.branch.is_none())
-        {
+        // A half-filled record retains only the worktree it could name. A
+        // session with neither field runs without a worktree and names none,
+        // so it must not block cleanup of every other worktree in the room.
+        if owners.iter().any(|owner| {
+            let path_names = owner
+                .worktree_path
+                .as_ref()
+                .is_some_and(|path| same_path(path, &entry.path));
+            let branch_names = owner.branch.as_deref() == Some(entry.branch.as_str());
+            (owner.worktree_path.is_none() != owner.branch.is_none())
+                && (path_names || branch_names)
+        }) {
             skipped.push(GcSkipped {
                 worktree_path: entry.path.clone(),
                 branch: entry.branch.clone(),
