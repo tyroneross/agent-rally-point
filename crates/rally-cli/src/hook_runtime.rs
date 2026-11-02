@@ -1659,6 +1659,14 @@ pub(crate) fn capabilities() -> Value {
             "mutation": MUTATION_TOOLS,
         },
         "max_targets": MAX_TARGETS,
+        // `rally hook batch`: the lifecycle wrapper's one-process read set.
+        // The wrapper probes for this key (cached with the before-write
+        // verdict) and keeps its multi-call path when it is absent.
+        "batch": {
+            "contract": crate::HOOK_BATCH_CONTRACT,
+            "max_ops": crate::HOOK_BATCH_MAX_OPS,
+            "ops": crate::HOOK_BATCH_ALLOWED_OPS,
+        },
         "coordination_contract": {
             "version": 1,
             "levels": ["enforced", "advisory", "unmanaged"],

@@ -1020,6 +1020,11 @@ pub fn main() -> ExitCode {
 /// process is the only correct release, and it is what a fresh `rally`
 /// invocation would do anyway.)
 fn run_with_watchdog(args: Vec<String>) -> ExitCode {
+    // `hook batch` runs several commands, each under its OWN watchdog, so it
+    // must see every op's `--timeout-ms` before the single-command strip.
+    if is_hook_batch_invocation(&args) {
+        return run_hook_batch(&args);
+    }
     // D1 (Chunk C, BACKLOG S-P3): `rally daemon serve` bypasses the watchdog
     // race entirely — see `first_two_positionals_are_daemon_serve`'s doc
     // comment. Route straight to the no-deadline inline path (the same path
@@ -1091,33 +1096,7 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
         .spawn(move || {
             let _commit_signal_guard = install_watchdog_commit_signal(worker_commit_signal);
             let _deadline_guard = install_watchdog_deadline(deadline);
-            let result = match run_inner_with(&args) {
-                Ok(mut output) => {
-                    attach_pending_append_outcomes(&mut output);
-                    let exit_code = output.exit_code;
-                    let rendered = output.render();
-                    WatchdogResult {
-                        rendered,
-                        exit_code,
-                    }
-                }
-                Err(err) => match output_after_committed_error(err, wants_json) {
-                    Ok(output) => {
-                        let exit_code = output.exit_code;
-                        WatchdogResult {
-                            rendered: output.render(),
-                            exit_code,
-                        }
-                    }
-                    Err(err) => {
-                        let err = CliError::from_error(err, wants_json);
-                        WatchdogResult {
-                            rendered: err.render_err(),
-                            exit_code: err.exit_code,
-                        }
-                    }
-                },
-            };
+            let (result, _hooks_enabled) = watched_command_result(&args, wants_json);
             // Send may fail if the main thread already timed out and moved on;
             // that's fine — we're abandoning this worker.
             let _ = tx.send(result);
@@ -1214,6 +1193,319 @@ fn run_with_watchdog(args: Vec<String>) -> ExitCode {
             }
         }
     }
+}
+
+/// Run one command on the current thread and pre-render it exactly as the
+/// standalone CLI would print it. Shared by the single-command watchdog and
+/// `hook batch` so a batched op's bytes cannot drift from a separate process.
+/// The second value is `data.hooks.enabled` when the command reports it
+/// (`hooks status`), read before rendering so the batch can gate on it.
+fn watched_command_result(args: &[String], wants_json: bool) -> (WatchdogResult, Option<bool>) {
+    match run_inner_with(args) {
+        Ok(mut output) => {
+            attach_pending_append_outcomes(&mut output);
+            let hooks_enabled = output
+                .body
+                .pointer("/data/hooks/enabled")
+                .and_then(Value::as_bool);
+            let exit_code = output.exit_code;
+            let rendered = output.render();
+            (
+                WatchdogResult {
+                    rendered,
+                    exit_code,
+                },
+                hooks_enabled,
+            )
+        }
+        Err(err) => match output_after_committed_error(err, wants_json) {
+            Ok(output) => {
+                let exit_code = output.exit_code;
+                (
+                    WatchdogResult {
+                        rendered: output.render(),
+                        exit_code,
+                    },
+                    None,
+                )
+            }
+            Err(err) => {
+                let err = CliError::from_error(err, wants_json);
+                (
+                    WatchdogResult {
+                        rendered: err.render_err(),
+                        exit_code: err.exit_code,
+                    },
+                    None,
+                )
+            }
+        },
+    }
+}
+
+// =============================================================================
+// `rally hook batch` — one process for a lifecycle hook's whole read set
+// =============================================================================
+//
+// Each lifecycle hook fire (SessionStart / UserPromptSubmit / Stop) used to
+// spawn `rally` 4-6 times: hooks status, enter, room, next, status read,
+// check before-complete, status post. Every exec pays process start, store
+// discovery, the direct-owner lock, and on managed Macs an endpoint-security
+// scan. `hook batch` runs the same commands in ONE process, in order, each
+// through the same `run_inner_with` + render path and under its own watchdog
+// deadline, and returns every op's stdout verbatim.
+//
+// Grammar (positional counts make op boundaries unambiguous, so no argument
+// value can be mistaken for a separator):
+//
+//   rally hook batch [--gate-hooks] --counts N1,N2,... -- <op1 argv> <op2 argv> ... [--timeout-ms MS]
+//
+// The trailing `--timeout-ms` is the AGGREGATE budget (the wrapper's
+// `rally_timeout_ms` appends it); each op's own `--timeout-ms` bounds that op
+// and is clamped to what is left of the aggregate.
+//
+// Output (one write, then exit):
+//
+//   RALLY-HOOK-BATCH/1 <rc1>:<len1> <rc2>:<len2> ... <rcN>:<lenN>\n<out1><out2>...<outN>\n
+//
+// <lenK> is the BYTE length of <outK>; the outputs are concatenated with no
+// separator, so any byte sequence frames unambiguously and the wrapper slices
+// them with byte-offset substrings (a delimiter scan in bash was quadratic on
+// a 600 KB room). Each <out> is exactly what `$(rally <op> 2>/dev/null)` captured before:
+// rendered stdout with trailing newlines removed, empty for an error (errors
+// render to stderr, which is forwarded to this process's stderr).
+//
+// rc 124: the op's watchdog fired. The op's worker thread is abandoned (it
+//         may hold the store lock), so every later op is skipped and the
+//         process exits right after printing, which releases it -- the same
+//         outcome as the wrapper's outer kill of a separate process.
+// rc 125: skipped (aggregate budget exhausted, an earlier op timed out, or
+//         `--gate-hooks` saw `hooks status` report hooks disabled).
+
+pub(crate) const HOOK_BATCH_CONTRACT: u32 = 1;
+pub(crate) const HOOK_BATCH_MAX_OPS: usize = 8;
+/// The lifecycle read set plus its heartbeat. Anything else (long-running
+/// `watch`, `run`, `daemon serve`, claims) is refused: a batch op must be a
+/// bounded hook-sized command.
+pub(crate) const HOOK_BATCH_ALLOWED_OPS: &[&str] = &[
+    "hooks status",
+    "enter",
+    "room",
+    "next",
+    "status read",
+    "status post",
+    "check before-complete",
+];
+const HOOK_BATCH_HEADER: &str = "RALLY-HOOK-BATCH/1";
+const HOOK_BATCH_RC_TIMEOUT: u8 = 124;
+const HOOK_BATCH_RC_SKIPPED: u8 = 125;
+
+fn is_hook_batch_invocation(args: &[String]) -> bool {
+    args.first().map(String::as_str) == Some("hook")
+        && args.get(1).map(String::as_str) == Some("batch")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct HookBatchSpec {
+    ops: Vec<Vec<String>>,
+    gate_hooks: bool,
+    budget: Duration,
+}
+
+fn hook_batch_op_allowed(op: &[String]) -> bool {
+    let first = op.first().map(String::as_str).unwrap_or("");
+    let second = op.get(1).map(String::as_str).unwrap_or("");
+    HOOK_BATCH_ALLOWED_OPS.iter().any(|allowed| {
+        let mut words = allowed.split(' ');
+        let head = words.next().unwrap_or("");
+        match words.next() {
+            Some(sub) => head == first && sub == second,
+            None => head == first,
+        }
+    })
+}
+
+fn parse_hook_batch(args: &[String]) -> std::result::Result<HookBatchSpec, String> {
+    let mut gate_hooks = false;
+    let mut counts: Option<Vec<usize>> = None;
+    let mut budget_ms: Option<u64> = None;
+    let mut index = 2;
+    let parse_ms = |raw: &str| {
+        raw.parse::<u64>()
+            .map_err(|_| format!("--timeout-ms expects milliseconds, got {raw:?}"))
+    };
+    loop {
+        let Some(arg) = args.get(index) else {
+            return Err("missing `--` before the op argv list".to_string());
+        };
+        index += 1;
+        match arg.as_str() {
+            "--" => break,
+            "--json" => {}
+            "--gate-hooks" => gate_hooks = true,
+            "--counts" => {
+                let raw = args
+                    .get(index)
+                    .ok_or_else(|| "--counts expects a comma list".to_string())?;
+                index += 1;
+                let parsed = raw
+                    .split(',')
+                    .map(|n| n.parse::<usize>().ok().filter(|n| *n > 0))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| format!("--counts expects positive integers, got {raw:?}"))?;
+                counts = Some(parsed);
+            }
+            "--timeout-ms" => {
+                let raw = args
+                    .get(index)
+                    .ok_or_else(|| "--timeout-ms expects milliseconds".to_string())?;
+                index += 1;
+                budget_ms = Some(parse_ms(raw)?);
+            }
+            other => {
+                if let Some(raw) = other.strip_prefix("--timeout-ms=") {
+                    budget_ms = Some(parse_ms(raw)?);
+                } else {
+                    return Err(format!("unexpected argument {other:?} before `--`"));
+                }
+            }
+        }
+    }
+    let counts = counts.ok_or_else(|| "--counts is required".to_string())?;
+    if counts.is_empty() || counts.len() > HOOK_BATCH_MAX_OPS {
+        return Err(format!(
+            "a batch carries 1..={HOOK_BATCH_MAX_OPS} ops, got {}",
+            counts.len()
+        ));
+    }
+    let mut ops = Vec::with_capacity(counts.len());
+    for count in counts {
+        let end = index + count;
+        if end > args.len() {
+            return Err("--counts names more argv tokens than were given".to_string());
+        }
+        let op = args[index..end].to_vec();
+        if !hook_batch_op_allowed(&op) {
+            return Err(format!(
+                "op {:?} is not batchable (allowed: {})",
+                op.iter().take(2).cloned().collect::<Vec<_>>().join(" "),
+                HOOK_BATCH_ALLOWED_OPS.join(", ")
+            ));
+        }
+        ops.push(op);
+        index = end;
+    }
+    // The wrapper's millisecond guard appends the aggregate budget AFTER the
+    // op list; it is the only thing allowed to follow it.
+    match &args[index..] {
+        [] => {}
+        [flag, raw] if flag == "--timeout-ms" => budget_ms = Some(parse_ms(raw)?),
+        [flag] if flag.starts_with("--timeout-ms=") => {
+            budget_ms = Some(parse_ms(&flag["--timeout-ms=".len()..])?);
+        }
+        rest => return Err(format!("unexpected trailing arguments {rest:?}")),
+    }
+    let budget = match budget_ms {
+        Some(ms) => {
+            Duration::from_millis(ms.clamp(MIN_WATCHDOG_TIMEOUT_MS, MAX_WATCHDOG_TIMEOUT_MS))
+        }
+        None => resolve_watchdog_timeout(&[]),
+    };
+    Ok(HookBatchSpec {
+        ops,
+        gate_hooks,
+        budget,
+    })
+}
+
+/// Run one op on a worker thread under `timeout`. `None` = the watchdog
+/// fired; the worker is abandoned and the caller must not run further ops.
+fn run_hook_batch_op(op: &[String], timeout: Duration) -> Option<(WatchdogResult, Option<bool>)> {
+    let wants_json = op.iter().any(|arg| arg == "--json");
+    let args = strip_timeout_flag(op.to_vec());
+    let (tx, rx) = std::sync::mpsc::channel::<(WatchdogResult, Option<bool>)>();
+    let commit_signal = Arc::new(Mutex::new(WatchdogMutationState::NotStarted));
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let worker = thread::Builder::new()
+        .name("rally-batch-op".to_string())
+        .spawn(move || {
+            let _commit_signal_guard = install_watchdog_commit_signal(commit_signal);
+            let _deadline_guard = install_watchdog_deadline(deadline);
+            let _ = tx.send(watched_command_result(&args, wants_json));
+        });
+    let worker = worker.ok()?;
+    match receive_with_watchdog(&rx, timeout, started) {
+        WatchdogReceive::Completed(result) => {
+            let _ = worker.join();
+            Some(result)
+        }
+        WatchdogReceive::TimedOut(_) => None,
+    }
+}
+
+fn run_hook_batch(args: &[String]) -> ExitCode {
+    let spec = match parse_hook_batch(args) {
+        Ok(spec) => spec,
+        Err(message) => {
+            eprintln!("rally: hook batch: {message}");
+            return ExitCode::from(2);
+        }
+    };
+    let aggregate_deadline = Instant::now() + spec.budget;
+    let mut codes: Vec<u8> = Vec::with_capacity(spec.ops.len());
+    let mut outputs: Vec<String> = Vec::with_capacity(spec.ops.len());
+    let mut stopped = false;
+    let mut abandoned_worker = false;
+    for op in &spec.ops {
+        let remaining = aggregate_deadline.saturating_duration_since(Instant::now());
+        if stopped || remaining < Duration::from_millis(MIN_WATCHDOG_TIMEOUT_MS) {
+            stopped = true;
+            codes.push(HOOK_BATCH_RC_SKIPPED);
+            outputs.push(String::new());
+            continue;
+        }
+        let timeout = resolve_watchdog_timeout(op).min(remaining);
+        match run_hook_batch_op(op, timeout) {
+            Some((result, hooks_enabled)) => {
+                let exit_code = result.exit_code;
+                let (stdout, stderr) = result.rendered.stdout_and_stderr();
+                if let Some(stderr) = stderr {
+                    eprintln!("{stderr}");
+                }
+                codes.push(exit_code);
+                outputs.push(stdout.trim_end_matches('\n').to_string());
+                if spec.gate_hooks && hooks_enabled == Some(false) {
+                    stopped = true;
+                }
+            }
+            None => {
+                eprintln!(
+                    "rally: hook batch op `{}` did not complete (watchdog budget {}ms); later ops skipped",
+                    op.iter().take(2).cloned().collect::<Vec<_>>().join(" "),
+                    timeout.as_millis()
+                );
+                codes.push(HOOK_BATCH_RC_TIMEOUT);
+                outputs.push(String::new());
+                stopped = true;
+                abandoned_worker = true;
+            }
+        }
+    }
+    let mut framed = String::from(HOOK_BATCH_HEADER);
+    for (code, output) in codes.iter().zip(&outputs) {
+        framed.push_str(&format!(" {code}:{}", output.len()));
+    }
+    framed.push('\n');
+    for output in &outputs {
+        framed.push_str(output);
+    }
+    crate::output::write_line_or_exit_on_broken_pipe(&framed);
+    if abandoned_worker {
+        // Release whatever the abandoned worker holds (store lock, fds).
+        std::process::exit(0);
+    }
+    ExitCode::SUCCESS
 }
 
 enum WatchdogReceive<T> {
@@ -23694,6 +23986,7 @@ fn help_text() -> String {
         "  rally check before-write --tool <tool> --path <path> [--strict] [--json]",
         "  rally hook before-write --tool <tool> [--session-id <id>] [--repo-root <dir>] [--strict]  # native host hook: host envelope on stdin -> host envelope on stdout; always exits 0",
         "  rally hook capabilities [--json]  # contract version, served phases, and effect tables (the wrapper's native-vs-fallback probe)",
+        "  rally hook batch [--gate-hooks] --counts <n,...> -- <op argv>... [--timeout-ms <ms>]  # lifecycle hooks: run several bounded read/heartbeat commands in one process; framed verbatim outputs",
         "  rally check before-complete --tool <tool> [--strict] [--json]",
         "  rally check tier-fit --role <role> [--proposed-tier <tier>] [--json]  # advisory: does this role's tier fit",
         "  rally check liveness [--tool <exact-target>] [--actor <release-author> --enforce] [--json]  # advisory may scan all; enforce requires one exact target and explicit actor",

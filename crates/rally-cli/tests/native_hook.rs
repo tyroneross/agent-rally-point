@@ -981,15 +981,18 @@ esac\n",
             std::env::var("PATH").unwrap_or_default()
         );
         let stat_calls_env = stat_calls.to_string_lossy().into_owned();
+        // Prime with a MUTATION: pure reads now short-circuit in the wrapper
+        // without spawning rally, so they no longer write the probe marker.
+        // A separate session keeps the priming claim off the asserted tool.
         let prime_stdin =
-            json!({"tool_name":"Read","tool_input":{"file_path":"src/slow.rs"}}).to_string();
+            json!({"tool_name":"Write","tool_input":{"file_path":"src/prime.rs"}}).to_string();
         let prime = fx.run_shell(
             "before-write",
             "claude_code",
             &prime_stdin,
             &[
                 ("RALLY_BIN", BIN),
-                ("RALLY_SESSION_ID", "sess-slow-one"),
+                ("RALLY_SESSION_ID", "sess-slow-prime"),
                 ("PATH", &path_env),
                 ("STAT_CALLS", &stat_calls_env),
             ],
