@@ -15,7 +15,8 @@ one-time capabilities probe per binary:
 It also pins byte parity: the batched lifecycle output equals the legacy
 multi-call output (RALLY_HOOK_BATCH=off) on identical copies of one room.
 
-Requires target/debug/rally (`cargo build -p rally-cli`); skipped otherwise.
+Requires a target/debug/rally that advertises `hook batch`
+(`cargo build -p rally-cli`); skipped otherwise.
 """
 import json
 import os
@@ -40,7 +41,21 @@ def _env(**extra):
     return env
 
 
-@unittest.skipUnless(BIN.exists(), f"{BIN} not built")
+def _bin_supports_batch():
+    """True when BIN advertises `hook batch`. An older build (for example a
+    stale target/ in another checkout) still runs the multi-call path, so
+    counting its calls would report failures that are not regressions."""
+    if not BIN.exists():
+        return False
+    try:
+        out = subprocess.run([str(BIN), "hook", "capabilities", "--json"],
+                             capture_output=True, text=True, timeout=30).stdout
+        return "batch" in json.loads(out).get("data", {}).get("hook", {})
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return False
+
+
+@unittest.skipUnless(_bin_supports_batch(), f"{BIN} missing or predates `rally hook batch`; run `cargo build -p rally-cli`")
 class HookProcessCountTests(unittest.TestCase):
     def setUp(self):
         self.base = Path(tempfile.mkdtemp(dir="/var/tmp", prefix="hook-count-"))
