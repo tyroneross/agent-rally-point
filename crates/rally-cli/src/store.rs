@@ -3,7 +3,7 @@ use factstr_sqlite::SqliteStore;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -2977,6 +2977,7 @@ pub(crate) struct DirectRoomStore {
     /// in-process, re-creating #50 inside the daemon). `None` in direct-CLI mode
     /// ⇒ per-op opens, byte-identical to main. Installed by Chunk B at startup.
     warm_fact_store: Option<SqliteStore>,
+    decoded_facts: RefCell<Option<DecodedFacts>>,
     cursor_path: PathBuf,
     repo_root: PathBuf,
     facts_db_path: PathBuf,
@@ -2992,6 +2993,14 @@ pub(crate) struct DirectRoomStore {
     /// date). Empty string is never produced. Rebindable per-request in daemon
     /// mode via [`DirectRoomStore::set_engagement_scope`] (L9/R4).
     active_engagement: String,
+}
+
+/// Daemon-only decoded projection. The cursor is SQLite's row sequence, not
+/// payload `Fact::seq` (legacy payloads can carry a different sequence).
+struct DecodedFacts {
+    facts: Arc<Vec<Fact>>,
+    last_sequence: i64,
+    proof: ReconcileCache,
 }
 
 /// Handle returned by [`DirectRoomStore::fact_store_handle`]: either the warm
@@ -5162,6 +5171,7 @@ impl DirectRoomStore {
             // Direct-CLI mode: no warm pool ⇒ per-op opens, byte-identical to
             // main (G1). Chunk B installs a warm pool for daemon mode.
             warm_fact_store: None,
+            decoded_facts: RefCell::new(None),
             cursor_path: dir.join("cursors.json"),
             repo_root: root,
             facts_db_path: fact_store_path,
@@ -5204,6 +5214,7 @@ impl DirectRoomStore {
         let store = Self {
             // Direct-CLI mode: no warm pool ⇒ per-op opens (G1).
             warm_fact_store: None,
+            decoded_facts: RefCell::new(None),
             cursor_path: dir.join("cursors.json"),
             repo_root: root,
             facts_db_path: fact_store_path,
@@ -5254,6 +5265,16 @@ impl DirectRoomStore {
     /// racing the next open) that R1 exists to prevent. Direct-CLI stores never
     /// call this (`warm_fact_store` stays `None`, byte-identical to main — G1).
     pub(crate) fn install_warm_fact_store(&mut self) -> Result<()> {
+        let room_dir = self
+            .facts_db_path
+            .parent()
+            .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
+        let _guard = acquire_room_mutation_lock(room_dir)?;
+        // Older rooms may never have appended with the indexed-query path.
+        // Install its derived indexes once, before serving read-only clients.
+        let connection = derived_index::open(&self.facts_db_path)?;
+        derived_index::ensure_indexes(&connection)?;
+        drop(connection);
         self.warm_fact_store = Some(open_fact_store_lenient(&self.facts_db_path)?);
         Ok(())
     }
@@ -6890,25 +6911,70 @@ impl DirectRoomStore {
     /// room mutation lock. Snapshot-cache capture uses this to keep projection
     /// and canonical fingerprint inside one epoch without recursive locking.
     fn facts_under_lock(&self) -> Result<Vec<Fact>> {
+        Ok(Arc::unwrap_or_clone(self.shared_facts_under_lock()?))
+    }
+
+    /// Capture an owned immutable view, releasing the room lock before paging
+    /// or projecting. Arc avoids copying the ledger on every daemon page.
+    pub(crate) fn shared_facts(&self) -> Result<Arc<Vec<Fact>>> {
+        let room_dir = self
+            .facts_db_path
+            .parent()
+            .ok_or_else(|| RallyError::Message("facts db path has no parent".to_string()))?;
+        let _guard = acquire_room_mutation_lock(room_dir)?;
+        self.shared_facts_under_lock()
+    }
+
+    fn shared_facts_under_lock(&self) -> Result<Arc<Vec<Fact>>> {
+        // A failed existing reconcile proof means history may have been
+        // repaired/replaced, even if its high-water did not change.
+        let before = self
+            .warm_fact_store
+            .as_ref()
+            .and_then(|_| self.derived_db_proof());
+        if before.is_none() {
+            self.decoded_facts.borrow_mut().take();
+        }
         reconcile_segments_and_db(
             &self.log_dir,
             &self.archive_dir,
             &self.facts_db_path,
             self.warm_fact_store.is_none(),
         )?;
-        // Warm-pool facade for the READ path (snapshot's underlying read, L11/R1):
-        // in daemon mode read through the ONE warm pool; on a corrupt-db error
-        // fall through to the cold recovery path (quarantine + reconcile + reopen),
-        // same as direct mode. In direct mode (`warm_fact_store` is None) this
-        // block is skipped entirely ⇒ byte-identical to main (G1).
         if let Some(warm) = &self.warm_fact_store {
-            match facts_from_store(warm) {
-                Ok(facts) => return Ok(facts),
-                Err(err) if is_malformed_db_error(&err) => {
-                    return Err(live_db_recovery_required_error(&self.facts_db_path));
+            let proof = before.or_else(|| self.derived_db_proof());
+            if let Some(proof) = proof {
+                let mut cached = self.decoded_facts.borrow_mut();
+                let can_tail = cached.as_ref().is_some_and(|old| {
+                    old.proof == proof.cache
+                        || self.decoded_history_only_appended(&old.proof, &proof.cache)
+                });
+                if !can_tail {
+                    *cached = None;
                 }
-                Err(err) => return Err(err),
+                if let Some(old) = cached.as_ref().filter(|old| old.proof == proof.cache) {
+                    return Ok(Arc::clone(&old.facts));
+                }
+                let after = cached.as_ref().map_or(0, |old| old.last_sequence);
+                let (tail, last_sequence) = derived_index::open(&self.facts_db_path)
+                    .and_then(|connection| derived_index::facts_after_sequence(&connection, after))
+                    .map_err(|error| self.decoded_read_error(error))?;
+                let old = cached.get_or_insert_with(|| DecodedFacts {
+                    facts: Arc::new(Vec::new()),
+                    last_sequence: 0,
+                    proof: proof.cache.clone(),
+                });
+                if !tail.is_empty() {
+                    Arc::make_mut(&mut old.facts).extend(tail);
+                    old.last_sequence = last_sequence;
+                }
+                old.proof = proof.cache;
+                return Ok(Arc::clone(&old.facts));
             }
+            // An unproved projection never leaves a reusable decoded cache.
+            return facts_from_store(warm)
+                .map(Arc::new)
+                .map_err(|error| self.decoded_read_error(error));
         }
         // BOUNDED RECOVERY PATH (f1/G10): the corrupt-db fallback opens a fresh
         // pool directly (not via `fact_store_handle`), so it is intentionally
@@ -6919,6 +6985,43 @@ impl DirectRoomStore {
         // G10's hot-path claim (append/query/snapshot) is what the counter
         // proves; recovery churn here is out of that scope.
         facts_from_db_with_query_recovery(&self.log_dir, &self.archive_dir, &self.facts_db_path)
+            .map(Arc::new)
+    }
+
+    fn decoded_read_error(&self, error: RallyError) -> RallyError {
+        if is_malformed_db_error(&error) {
+            live_db_recovery_required_error(&self.facts_db_path)
+        } else {
+            error
+        }
+    }
+
+    /// Reuse the reconcile contract's prefix-tail check. Removed, rotated,
+    /// rewritten or truncated segments force a full decode. New rows must
+    /// advance both the canonical count and high-water.
+    fn decoded_history_only_appended(&self, old: &ReconcileCache, new: &ReconcileCache) -> bool {
+        if new.db_count <= old.db_count || new.db_max_seq <= old.db_max_seq {
+            return false;
+        }
+        old.segments_fingerprint.iter().all(|previous| {
+            let matches = new
+                .segments_fingerprint
+                .iter()
+                .filter(|fp| fp.name == previous.name)
+                .collect::<Vec<_>>();
+            let [current] = matches.as_slice() else {
+                return false;
+            };
+            if *current == previous {
+                return true;
+            }
+            current.len > previous.len && previous.tail_hash.is_some() && {
+                let live = self.log_dir.join(&previous.name);
+                let archived = self.archive_dir.join(&previous.name);
+                let path = if live.exists() { live } else { archived };
+                hash_file_prefix_tail(&path, previous.len) == previous.tail_hash
+            }
+        })
     }
 
     #[allow(dead_code)]
@@ -7155,7 +7258,7 @@ impl DirectRoomStore {
         // Fingerprinting again afterward could bless stale facts as current.
         let (facts, coord, fingerprint) = {
             let _guard = acquire_room_mutation_lock(rally_dir)?;
-            let facts = self.facts_under_lock()?;
+            let facts = self.shared_facts_under_lock()?;
             let coord =
                 crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
             let fingerprint = snapshot_cache_fingerprint_at(
@@ -8070,6 +8173,39 @@ mod derived_index {
         connection
             .execute_batch(&ddl)
             .map_err(|error| sql_error("create facts.db derived indexes", error))
+    }
+
+    pub(super) fn facts_after_sequence(
+        connection: &Connection,
+        after: i64,
+    ) -> Result<(Vec<Fact>, i64)> {
+        let mut statement = connection.prepare(
+            "SELECT sequence_number, payload FROM events WHERE sequence_number > ?1 ORDER BY sequence_number ASC"
+        ).map_err(|error| sql_error("prepare facts tail", error))?;
+        let mut rows = statement
+            .query(params![after])
+            .map_err(|error| sql_error("query facts tail", error))?;
+        let mut facts = Vec::new();
+        let mut last = after;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| sql_error("read facts tail", error))?
+        {
+            last = row
+                .get(0)
+                .map_err(|error| sql_error("read facts sequence", error))?;
+            let payload: String = row
+                .get(1)
+                .map_err(|error| sql_error("read facts payload", error))?;
+            let value = serde_json::from_str(&payload)
+                .map_err(RallyError::json("parse facts.db payload"))?;
+            facts.push(Fact::from_value(value, last)?);
+        }
+        if after == 0 {
+            super::history_probe::note(super::history_probe::Work::FactsDbFullLoad);
+        }
+        super::history_probe::note_materialized(facts.len());
+        Ok((facts, last))
     }
 
     fn decode(rows: Vec<(i64, String)>) -> Result<Vec<Fact>> {
@@ -14440,6 +14576,96 @@ pub(crate) fn write_snapshot_cache_for(repo_root: &Path, capture: &SnapshotCache
 }
 
 #[cfg(test)]
+mod decoded_tail_tests {
+    use super::*;
+
+    #[test]
+    fn decoded_history_reloads_after_same_highwater_rewrite() {
+        let root =
+            std::env::temp_dir().join(format!("rally-decoded-rewrite-{}", uuid::Uuid::new_v4()));
+        let mut store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        store
+            .append_fact(&Fact {
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: "rewrite-event".to_string(),
+                thread_id: "rewrite-thread".to_string(),
+                subject: "before".to_string(),
+                created_at: crate::now_string(),
+                ..Fact::default()
+            })
+            .unwrap();
+        store.install_warm_fact_store().unwrap();
+        let captured = store.shared_facts().unwrap();
+        {
+            let _guard = acquire_room_mutation_lock(&root.join(".rally")).unwrap();
+            for segment in read_segment_files(&store.log_dir).unwrap() {
+                let original = fs::read_to_string(&segment).unwrap();
+                fs::write(segment, original.replace("before", "after!")).unwrap();
+            }
+            let connection = derived_index::open(&store.facts_db_path).unwrap();
+            connection
+                .execute(
+                    "UPDATE events SET payload = json_set(payload, '$.subject', 'after!')",
+                    [],
+                )
+                .unwrap();
+        }
+        history_probe::reset();
+        let changed = store.shared_facts().unwrap();
+        assert_eq!(captured[0].subject, "before");
+        assert_eq!(changed[0].subject, "after!");
+        assert_eq!(changed[0].seq, captured[0].seq);
+        assert_eq!(changed.len(), captured.len());
+        assert!(history_probe::counts().facts_db_full_loads > 0);
+        history_probe::reset();
+        assert_eq!(store.shared_facts().unwrap()[0].subject, "after!");
+        assert_eq!(history_probe::counts().facts_materialized, 0);
+        store
+            .close_warm_fact_store_bounded(Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&*changed).unwrap(),
+            serde_json::to_vec(&store.facts().unwrap()).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sqlite_tail_cursor_is_independent_of_sparse_payload_sequences() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE events (sequence_number INTEGER PRIMARY KEY, payload TEXT NOT NULL)",
+            )
+            .unwrap();
+        for (row, logical) in [(1, 10), (2, 40), (3, 90)] {
+            let fact = Fact {
+                schema: crate::FACT_SCHEMA.to_string(),
+                event_id: format!("sparse-{row}"),
+                seq: logical,
+                ..Fact::default()
+            };
+            connection
+                .execute(
+                    "INSERT INTO events VALUES (?1, ?2)",
+                    rusqlite::params![row, serde_json::to_string(&fact).unwrap()],
+                )
+                .unwrap();
+        }
+        let (first, cursor) = derived_index::facts_after_sequence(&connection, 0).unwrap();
+        assert_eq!(cursor, 3);
+        assert_eq!(
+            first.iter().map(|f| f.seq).collect::<Vec<_>>(),
+            vec![10, 40, 90]
+        );
+        let (tail, cursor) = derived_index::facts_after_sequence(&connection, 2).unwrap();
+        assert_eq!(cursor, 3);
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].seq, 90);
+    }
+}
+
+#[cfg(test)]
 mod ledger_tests {
     use super::*;
     use rusqlite::Connection;
@@ -20227,8 +20453,6 @@ mod ledger_tests {
     /// readers all see the same 5 facts and the db file is never recreated.
     #[test]
     fn parallel_reads_do_not_destroy_cache() {
-        use std::sync::Arc;
-
         let root = unique_root("reconcile-parallel-read");
         let store = RoomStore::open_at(root.clone()).unwrap();
         for n in 1..=5 {
@@ -20266,8 +20490,6 @@ mod ledger_tests {
 
     #[test]
     fn parallel_opens_and_appends_keep_db_and_segments_in_lockstep() {
-        use std::sync::Arc;
-
         let root = Arc::new(unique_root("parallel-open-append-lockstep"));
         let store = RoomStore::open_at((*root).clone()).unwrap();
         drop(store);
