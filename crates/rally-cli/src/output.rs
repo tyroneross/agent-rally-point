@@ -53,6 +53,16 @@ pub(crate) struct RenderedOutput {
 }
 
 impl RenderedOutput {
+    /// The exact bytes `print` would put on stdout, minus the newline it
+    /// appends. Errors render to stderr only, so their stdout is empty --
+    /// the same text a shell `$(rally ... 2>/dev/null)` capture receives.
+    pub(crate) fn stdout_and_stderr(self) -> (String, Option<String>) {
+        match self.stderr {
+            Some(err) => (String::new(), Some(err)),
+            None => (self.stdout, None),
+        }
+    }
+
     pub(crate) fn print(self) {
         if let Some(err) = self.stderr {
             eprintln!("{err}");

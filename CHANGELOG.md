@@ -7,6 +7,21 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+### Changed — each hook fire launches `rally` at most once
+
+Lifecycle hooks spawned `rally` 6 (SessionStart), 4 (UserPromptSubmit) and 5
+(Stop) times per fire; every exec paid process start, store discovery, the
+direct-owner lock and, on managed Macs, an endpoint-security scan. The new
+`rally hook batch` runs the same commands (hooks status, enter, room, next,
+status read, check before-complete, idle heartbeat) in order in one process,
+each under its own watchdog budget, and returns each command's stdout
+byte-for-byte. The hook uses it when the binary's cached `hook capabilities`
+advertises `batch`; older binaries keep the multi-call path
+(`RALLY_HOOK_BATCH=off` forces it). The idle heartbeat now runs as the batch's
+last op instead of a detached second process. Before-write fires for
+pure-read and opaque-shell tools (Codex sends every tool call) now answer the
+constant `{}` in the wrapper without spawning `rally`.
+
 ### Fixed — Codex tool shells now see the Rally session identity
 
 Codex filters the environment its tool subprocesses inherit, so Rally-launched

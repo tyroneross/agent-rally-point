@@ -323,8 +323,10 @@ _rally_safe_seen_dir() { # $1=root; prints the physical safe directory
 }
 
 _rally_native_capable() {  # $1=root $2=absolute resolved binary path
+  # Also sets _rally_probe_batch=batch|nobatch from the same (cached) probe.
   local root="$1" bin="$2" marker_dir marker safe_bin verdict out tmp
-  local bin_id cached_verdict cached_id
+  local bin_id cached_verdict cached_id cached_batch probe_rc
+  _rally_probe_batch="nobatch"
   safe_bin="${bin//[^A-Za-z0-9._-]/_}"
   marker_dir="$(_rally_safe_seen_dir "$root" 2>/dev/null || true)"
   marker="${marker_dir:+$marker_dir/native-probe.$safe_bin.seen}"
@@ -336,8 +338,12 @@ _rally_native_capable() {  # $1=root $2=absolute resolved binary path
   if [ -n "$marker" ] && [ -f "$marker" ] && [ -n "$bin_id" ]; then
     cached_verdict=""
     cached_id=""
-    { read -r cached_verdict; read -r cached_id; } < "$marker" 2>/dev/null || true
-    if [ "$cached_id" = "$bin_id" ]; then
+    cached_batch=""
+    { read -r cached_verdict; read -r cached_id; read -r cached_batch; } < "$marker" 2>/dev/null || true
+    # A marker written before the batch line existed is a cache miss: probe
+    # once more so the lifecycle phases learn whether `hook batch` exists.
+    if [ "$cached_id" = "$bin_id" ] && { [ "$cached_batch" = "batch" ] || [ "$cached_batch" = "nobatch" ]; }; then
+      _rally_probe_batch="$cached_batch"
       [ "$cached_verdict" = "native" ]
       return $?
     fi
@@ -348,10 +354,28 @@ _rally_native_capable() {  # $1=root $2=absolute resolved binary path
   # foreign binary on $RALLY_BIN, or a future capabilities that consults the
   # envelope, would drain the pipe and leave the exec'd transaction reading an
   # empty one (which classifies as malformed and coordinates nothing).
-  out="$("$bin" hook capabilities --json </dev/null 2>/dev/null || true)"
+  # Lifecycle phases probe after the millisecond guard exists; bound the probe
+  # there so a wedged binary cannot eat the whole lifecycle deadline. A probe
+  # that timed out proves nothing and is not cached.
+  if [ "${_rally_probe_bounded:-0}" = "1" ]; then
+    probe_rc=0
+    out="$(rally_timeout_ms 500 hook capabilities --json </dev/null 2>/dev/null)" || probe_rc=$?
+    if [ "$probe_rc" = "124" ] || [ "$probe_rc" = "137" ]; then
+      _rally_probe_batch="nobatch"
+      return 1
+    fi
+  else
+    out="$("$bin" hook capabilities --json </dev/null 2>/dev/null || true)"
+  fi
   case "$out" in
     *'"before-write"'*) verdict="native" ;;
     *)                  verdict="fallback" ;;
+  esac
+  # `rally hook batch` (lifecycle one-process reads). Pretty JSON pins the
+  # `"batch": {` spelling; anything else is an older binary.
+  case "$out" in
+    *'"batch": {'*) _rally_probe_batch="batch" ;;
+    *)              _rally_probe_batch="nobatch" ;;
   esac
   # PERSISTENCE IS BEST-EFFORT; THE VERDICT IS NOT. An unwritable `.rally/`
   # (read-only checkout, wrong owner, full disk) must not discard a verdict
@@ -360,9 +384,15 @@ _rally_native_capable() {  # $1=root $2=absolute resolved binary path
   # in front of classification, every fire including a pure read paid a probe
   # spawn PLUS the whole Node path. Only the CACHE is lost: no marker lands,
   # so the next fire re-probes.
-  if [ -n "$marker_dir" ] &&
+  if [ -n "$marker_dir" ] && [ "${_rally_probe_bounded:-0}" = "1" ]; then
+    # Lifecycle phases write in place with a builtin redirect: no mktemp/mv
+    # process on the start path (ARP-001 pins that start runs no file-moving
+    # tool). A torn concurrent write fails the 3-line/id check on read and
+    # costs one re-probe, never a wrong verdict.
+    printf '%s\n%s\n%s\n' "$verdict" "$bin_id" "$_rally_probe_batch" > "$marker" 2>/dev/null || true
+  elif [ -n "$marker_dir" ] &&
      tmp="$(mktemp "$marker.XXXXXX" 2>/dev/null)"; then
-    if printf '%s\n%s\n' "$verdict" "$bin_id" > "$tmp" 2>/dev/null; then
+    if printf '%s\n%s\n%s\n' "$verdict" "$bin_id" "$_rally_probe_batch" > "$tmp" 2>/dev/null; then
       mv -f "$tmp" "$marker" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
     else
       rm -f "$tmp" 2>/dev/null || true
@@ -550,6 +580,49 @@ if printf '%s' "$input" | grep -qE '"cursor_version"|"cursorVersion"|"conversati
     esac
     export RALLY_TOOL_ID
   fi
+fi
+
+# Zero-process pure reads and opaque shell calls. Codex registers PreToolUse
+# with no matcher, so EVERY tool call (mostly `exec_command`) reaches this
+# hook; the binary's answer for a pure-read or opaque-shell tool is a constant
+# `{}` returned before it resolves a root or opens the store
+# (hook_runtime::run_before_write), and the legacy Node classifier answers the
+# same. Spawning `rally` (plus an endpoint-security scan per exec) to learn a
+# constant is the waste this removes. Bash builtins only -- no process.
+#
+# Deliberately narrow: only a small (<=64 KiB) single-object envelope with
+# exactly one top-level-looking "tool_name", no camelCase aliases, and an
+# object "tool_input" (when present) short-circuits. Anything else takes the
+# authoritative path below, so a nested/duplicated tool_name or an odd
+# envelope still gets the binary's classification and diagnostics. Matching is
+# case-insensitive, like the binary's registry lookup.
+_rally_effect_is_constant_noop() {
+  local name was_nocase=0 hit=1
+  [ "${#input}" -le 65536 ] || return 1
+  [[ $input =~ ^[[:space:]]*\{ ]] || return 1
+  [[ $input =~ \}[[:space:]]*$ ]] || return 1
+  [[ $input =~ \"tool_name\".*\"tool_name\" ]] && return 1
+  [[ $input =~ \"toolName\"|\"toolInput\" ]] && return 1
+  if [[ $input =~ \"tool_input\" ]]; then
+    [[ $input =~ \"tool_input\"[[:space:]]*:[[:space:]]*\{ ]] || return 1
+  fi
+  [[ $input =~ \"tool_name\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9_]+)\" ]] || return 1
+  name="${BASH_REMATCH[1]}"
+  shopt -q nocasematch && was_nocase=1
+  shopt -s nocasematch
+  if [[ $_RALLY_NATIVE_PURE_READ_TOOLS == *\"$name\"* ]] || \
+     [[ $_RALLY_NATIVE_OPAQUE_SHELL_TOOLS == *\"$name\"* ]]; then
+    hit=0
+  fi
+  [ "$was_nocase" = "1" ] || shopt -u nocasematch
+  return "$hit"
+}
+# Without node the wrapper owes the node-missing advisory on every
+# before-write, so that host keeps the authoritative path.
+if [ "$phase" = "before-write" ] && [ -n "$input" ] && command -v node >/dev/null 2>&1 && \
+   _rally_effect_is_constant_noop; then
+  printf '{}'
+  exit 0
 fi
 
 # Native execution branch. A `case`, not a `tr` spawn: this runs on every
@@ -1772,11 +1845,136 @@ if _duplicate_hook_event; then
   exit 0
 fi
 
+# --- One rally process per lifecycle hook (`rally hook batch`) -------------
+# start / idle / after-write used to spawn rally 6 / 4 / 5 times (hooks
+# status, enter, room, next, status read, check before-complete, and the idle
+# heartbeat). A binary that advertises `hook batch` runs that exact list, in
+# the same order, in ONE process: each op through the same command path and
+# render as a separate invocation, under its own budget, with stdout returned
+# verbatim. The values below therefore feed the renderers byte-for-byte what
+# the separate calls captured. The heartbeat rides the same process as the
+# LAST op (after every read, as before), so it can never hold the store lock
+# against this hook's own reads.
+#
+# Opt-outs: RALLY_HOOK_BATCH=off, or RALLY_NATIVE_HOOK=off (which also pins
+# the before-write fallback). An older binary (no `"batch"` in its cached
+# capabilities) keeps the multi-call path. A batch that comes back
+# unframeable for any reason other than a deadline kill also falls back for
+# this fire; a deadline kill does NOT re-run the calls (that would double the
+# overrun) -- it fails open with empty results, exactly like separate calls
+# that all timed out.
+_rally_batched=0
+_rally_batch_split() {  # $1=framed output $2=expected op count -> _rb_rc[] _rb_out[]
+  # Byte-offset slicing under LC_ALL=C: the header carries each output's byte
+  # length, so this is O(size) with no delimiter scan.
+  local LC_ALL=C
+  local raw="$1" header body body_len item rc len off=0 i=0
+  case "$raw" in "RALLY-HOOK-BATCH/1 "*) ;; *) return 1 ;; esac
+  header="${raw%%$'\n'*}"
+  [ "$header" != "$raw" ] || return 1
+  body="${raw:${#header}+1}"
+  body_len="${#body}"
+  set -- ${header#RALLY-HOOK-BATCH/1 } "$2"
+  _rb_rc=()
+  _rb_out=()
+  while [ "$#" -gt 1 ]; do
+    item="$1"
+    shift
+    rc="${item%%:*}"
+    len="${item#*:}"
+    case "$rc$len" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$(( off + len ))" -le "$body_len" ] || return 1
+    _rb_rc[$i]="$rc"
+    _rb_out[$i]="${body:$off:$len}"
+    off=$(( off + len ))
+    i=$(( i + 1 ))
+  done
+  [ "$i" = "$1" ] && [ "$off" = "$body_len" ]
+}
+_rb_counts=""
+_rb_ops=()
+_rb_names=()
+_rb_budget=0
+_rb_add() {  # $1=name $2=unscaled budget ms, then the op argv
+  local name="$1" ms="$2"
+  shift 2
+  _rb_names[${#_rb_names[@]}]="$name"
+  _rb_budget=$(( _rb_budget + ms ))
+  set -- "$@" --timeout-ms "$(( ms * _rally_ms_scale ))"
+  _rb_counts="${_rb_counts:+$_rb_counts,}$#"
+  _rb_ops=(${_rb_ops[@]+"${_rb_ops[@]}"} "$@")
+}
+_rb_value() {  # $1=name -> prints the op's captured stdout; rc = op's rc
+  local i=0
+  while [ "$i" -lt "${#_rb_names[@]}" ]; do
+    if [ "${_rb_names[$i]}" = "$1" ]; then
+      printf '%s' "${_rb_out[$i]:-}"
+      return "${_rb_rc[$i]:-125}"
+    fi
+    i=$((i + 1))
+  done
+  return 125
+}
+case "${RALLY_HOOK_BATCH:-}" in
+  0|off|false|no|disabled) _rally_batch_opt_out=1 ;;
+  *) _rally_batch_opt_out=0 ;;
+esac
+if [ "$have_node" = "1" ] && [ "$_rally_batch_opt_out" = "0" ] && \
+   [ "$_rally_native_hook_disabled" = "0" ] && [ "$_rally_timeout_ms_capable" = "1" ]; then
+  case "$phase" in
+    start|idle|after-write)
+      _rally_batch_bin="$(command -v "$RALLY_BIN" 2>/dev/null || true)"
+      if [ -z "$_rally_batch_bin" ] && [ -x "$RALLY_BIN" ]; then
+        _rally_batch_bin="$RALLY_BIN"
+      fi
+      _rally_probe_batch="nobatch"
+      if [ -n "$_rally_batch_bin" ]; then
+        _rally_probe_bounded=1
+        _rally_native_capable "$_rally_native_root" "$_rally_batch_bin" || true
+        _rally_probe_bounded=0
+      fi
+      if [ "$_rally_probe_batch" = "batch" ]; then
+        _rb_wake="$(_rally_checkin_iso)"
+        _rb_add hooks 400 hooks status --json
+        if [ "$phase" = "start" ]; then
+          _rb_add enter 1000 enter --tool "$tool" --session-id "$session" --json
+          _rb_add room 750 room --json
+          _rb_add next 750 next --tool "$tool" --audit --json
+          _rb_add status 400 status read --json
+        else
+          _rb_add status 400 status read --json
+          if [ "$phase" = "after-write" ]; then
+            _rb_add before_complete 750 check before-complete --tool "$tool" --strict --json
+          fi
+          _rb_add next 750 next --tool "$tool" --audit --json
+        fi
+        if [ -n "$_rb_wake" ]; then
+          _rb_add heartbeat 400 status post --tool "$tool" --state idle --wake-after "$_rb_wake" --json
+        else
+          _rb_add heartbeat 400 status post --tool "$tool" --state idle --json
+        fi
+        _rb_raw_rc=0
+        _rb_raw="$(rally_timeout_ms "$_rb_budget" hook batch --gate-hooks --counts "$_rb_counts" -- "${_rb_ops[@]}" 2>/dev/null)" || _rb_raw_rc=$?
+        if _rally_batch_split "$_rb_raw" "${#_rb_names[@]}"; then
+          _rally_batched=1
+        elif [ "$_rb_raw_rc" = "124" ] || [ "$_rb_raw_rc" = "137" ]; then
+          # Deadline kill: every value stays empty (fail-open), no re-run.
+          _rb_rc=()
+          _rb_out=()
+          _rally_batched=1
+        fi
+      fi
+      ;;
+  esac
+fi
+
 # Read hook enable/prompt settings after duplicate suppression so two host
 # registrations produce one complete Rally interaction, not merely one message.
 if [ "$have_node" = "1" ]; then
   hooks_status_rc=0
-  if [ "$phase" = "before-write" ] && { [ "$_rally_native_effect" = "mutation" ] || [ "$_rally_native_effect" = "legacy" ]; }; then
+  if [ "$_rally_batched" = "1" ]; then
+    hooks_status="$(_rb_value hooks)" || hooks_status_rc=$?
+  elif [ "$phase" = "before-write" ] && { [ "$_rally_native_effect" = "mutation" ] || [ "$_rally_native_effect" = "legacy" ]; }; then
     hooks_status="$(rally_timeout_ms 400 hooks status --json 2>/dev/null)" || hooks_status_rc=$?
   else
     hooks_status="$(rally_timeout_ms 400 hooks status --json 2>/dev/null)" || hooks_status_rc=$?
@@ -1839,16 +2037,24 @@ if [ "$phase" = "start" ]; then
   # sequential 3s guards previously took 6.25s in a live room even without
   # a hung binary. Keep the foreground CLI sum below 3.5s, leaving time for
   # shell/Node startup and rendering. Idle status remains asynchronous.
-  rally_timeout_ms 1000 enter --tool "$tool" --session-id "$session" --json >/dev/null 2>&1 || true
+  if [ "$_rally_batched" != "1" ]; then
+    rally_timeout_ms 1000 enter --tool "$tool" --session-id "$session" --json >/dev/null 2>&1 || true
+  fi
   # The detached idle heartbeat is posted AFTER the foreground reads below,
   # not before them. Without a daemon every Rally command takes the room's
   # direct.owner.lock; a heartbeat launched first held it for 0.4-2.7s
   # (measured on a 870 MB ledger) and made this same hook's room/next/status
   # reads fail with direct-store-busy, so the agent got an empty room.
   if [ "$have_node" = "1" ]; then
-    room_json="$(rally_timeout_ms 750 room --json 2>/dev/null || true)"
-    next_json="$(rally_timeout_ms 750 next --tool "$tool" --audit --json 2>/dev/null || true)"
-    status_json="$(rally_timeout_ms 400 status read --json 2>/dev/null || true)"
+    if [ "$_rally_batched" = "1" ]; then
+      room_json="$(_rb_value room || true)"
+      next_json="$(_rb_value next || true)"
+      status_json="$(_rb_value status || true)"
+    else
+      room_json="$(rally_timeout_ms 750 room --json 2>/dev/null || true)"
+      next_json="$(rally_timeout_ms 750 next --tool "$tool" --audit --json 2>/dev/null || true)"
+      status_json="$(rally_timeout_ms 400 status read --json 2>/dev/null || true)"
+    fi
     rally_output="$({ printf '%s' "$room_json" | RALLY_NEXT_JSON="$next_json" RALLY_STATUS_JSON="$status_json" RALLY_SELF_TOOL="$tool" node -e '
 const fs = require("fs");
 const tool = process.env.RALLY_SELF_TOOL || "";
@@ -2189,7 +2395,7 @@ msg += "Provably stale peers, inactive claims, and non-actionable waits are omit
 process.stdout.write(JSON.stringify({ agent_visible: { present: true, severity: "warn", message: msg }, ledger_data: ledgerData, brief: briefData }));
 ' ; } 2>/dev/null)"
   fi
-  _rally_status_idle
+  [ "$_rally_batched" = "1" ] || _rally_status_idle
 elif [ "$phase" = "before-write" ]; then
   checked_paths="$(printf '%s\n' "$paths" | sed '/^$/d' | wc -l | tr -d ' ')"
   case "$checked_paths" in ''|*[!0-9]*) checked_paths=0 ;; esac
@@ -2281,7 +2487,9 @@ elif [ "$phase" = "before-write" ]; then
 else
   status_json=""
   before_complete_json=""
-  if [ "$phase" = "after-write" ] || [ "$phase" = "idle" ]; then
+  if [ "$_rally_batched" = "1" ]; then
+    status_json="$(_rb_value status || true)"
+  elif [ "$phase" = "after-write" ] || [ "$phase" = "idle" ]; then
     status_json="$(rally_timeout_ms 400 status read --json 2>/dev/null || true)"
   fi
   if [ "$phase" = "after-write" ]; then
@@ -2294,11 +2502,20 @@ else
     # translator below always renders Stop as advisory. Strict mode is a
     # mutation-boundary control; one conversation turn ending is not proof
     # that the agent completed or abandoned the work behind an active claim.
-    before_complete_json="$(rally_timeout_ms 750 check before-complete --tool "$tool" --strict --json 2>/dev/null || true)"
+    if [ "$_rally_batched" = "1" ]; then
+      before_complete_json="$(_rb_value before_complete || true)"
+    else
+      before_complete_json="$(rally_timeout_ms 750 check before-complete --tool "$tool" --strict --json 2>/dev/null || true)"
+    fi
   fi
-  rally_output="$(rally_timeout_ms 750 next --tool "$tool" --audit --json 2>/dev/null || true)"
-  # Heartbeat after the foreground reads; see the start branch for why.
-  if [ "$phase" = "after-write" ] || [ "$phase" = "idle" ]; then
+  if [ "$_rally_batched" = "1" ]; then
+    rally_output="$(_rb_value next || true)"
+  else
+    rally_output="$(rally_timeout_ms 750 next --tool "$tool" --audit --json 2>/dev/null || true)"
+  fi
+  # Heartbeat after the foreground reads; see the start branch for why. The
+  # batch already posted it as its last op.
+  if [ "$_rally_batched" != "1" ] && { [ "$phase" = "after-write" ] || [ "$phase" = "idle" ]; }; then
     _rally_status_idle
   fi
 fi
