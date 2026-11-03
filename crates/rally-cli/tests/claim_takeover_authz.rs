@@ -21,8 +21,11 @@
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "support/rally_cmd.rs"]
+mod rally_cmd;
 
 struct Workspace {
     cwd: PathBuf,
@@ -44,7 +47,7 @@ impl Workspace {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_rally"))
+        rally_cmd::rally_command()
             .current_dir(&self.cwd)
             .env("HOME", &self.home)
             .env("RALLY_HOOKS", "off")
@@ -54,7 +57,7 @@ impl Workspace {
     }
 
     fn run_as_session(&self, session_id: &str, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_rally"))
+        rally_cmd::rally_command()
             .current_dir(&self.cwd)
             .env("HOME", &self.home)
             .env("RALLY_HOOKS", "off")

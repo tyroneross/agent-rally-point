@@ -290,6 +290,10 @@ use crate::backends::ManagedSession;
 use crate::cli::RoomArgs;
 use crate::discovery::refresh_room_index;
 use crate::error::{RallyError, Result};
+
+/// CPU-only read work over owned committed inputs. A daemon worker receives
+/// this projection, never the mutable store, a database handle or live scope.
+pub(crate) type ReadProjection<T> = Box<dyn FnOnce() -> Result<T> + Send>;
 use crate::store_client::{self, RoutedRoomStore};
 use std::hash::{Hash, Hasher};
 #[cfg(test)]
@@ -7222,17 +7226,43 @@ impl DirectRoomStore {
         presence_evidence: &[String],
         session_alias: Option<&str>,
     ) -> Result<EnterSnapshotContext> {
-        let facts = self.facts()?;
-        let coord = crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
-        Ok(enter_snapshot_context_from_facts(
-            &facts,
-            &coord,
+        self.prepare_snapshot_for_enter(
             tool,
             build_id,
             from_session_id,
             presence_evidence,
             session_alias,
-        ))
+        )?()
+    }
+
+    pub(crate) fn prepare_snapshot_for_enter(
+        &self,
+        tool: &str,
+        build_id: &str,
+        from_session_id: &str,
+        presence_evidence: &[String],
+        session_alias: Option<&str>,
+    ) -> Result<ReadProjection<EnterSnapshotContext>> {
+        let facts = self.shared_facts()?;
+        let coord = crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
+        let now_secs = projection_unix_sec();
+        let tool = tool.to_string();
+        let build_id = build_id.to_string();
+        let from_session_id = from_session_id.to_string();
+        let presence_evidence = presence_evidence.to_vec();
+        let session_alias = session_alias.map(str::to_string);
+        Ok(Box::new(move || {
+            Ok(enter_snapshot_context_from_facts(
+                &facts,
+                &coord,
+                &tool,
+                &build_id,
+                &from_session_id,
+                &presence_evidence,
+                session_alias.as_deref(),
+                now_secs,
+            ))
+        }))
     }
 
     /// Snapshot honoring an explicit `include_archived` flag (the
@@ -7249,11 +7279,26 @@ impl DirectRoomStore {
         self.snapshot_cache_capture_at(include_archived, projection_unix_sec())
     }
 
+    pub(crate) fn prepare_snapshot_cache_capture(
+        &self,
+        include_archived: bool,
+    ) -> Result<ReadProjection<SnapshotCacheCapture>> {
+        self.prepare_snapshot_cache_capture_at(include_archived, projection_unix_sec())
+    }
+
     fn snapshot_cache_capture_at(
         &self,
         include_archived: bool,
         projection_unix_sec: i64,
     ) -> Result<SnapshotCacheCapture> {
+        self.prepare_snapshot_cache_capture_at(include_archived, projection_unix_sec)?()
+    }
+
+    fn prepare_snapshot_cache_capture_at(
+        &self,
+        include_archived: bool,
+        projection_unix_sec: i64,
+    ) -> Result<ReadProjection<SnapshotCacheCapture>> {
         let rally_dir = self
             .facts_db_path
             .parent()
@@ -7277,18 +7322,22 @@ impl DirectRoomStore {
             (facts, coord, fingerprint)
         };
         #[cfg(test)]
-        pause_snapshot_projection_after_capture(rally_dir);
+        let pause_dir = rally_dir.to_path_buf();
+        Ok(Box::new(move || {
+            #[cfg(test)]
+            pause_snapshot_projection_after_capture(&pause_dir);
 
-        let snapshot = snapshot_from_facts_with_policy_at(
-            &facts,
-            &coord,
-            include_archived,
-            projection_unix_sec,
-        );
-        Ok(SnapshotCacheCapture {
-            snapshot,
-            fingerprint: Some(fingerprint),
-        })
+            let snapshot = snapshot_from_facts_with_policy_at(
+                &facts,
+                &coord,
+                include_archived,
+                projection_unix_sec,
+            );
+            Ok(SnapshotCacheCapture {
+                snapshot,
+                fingerprint: Some(fingerprint),
+            })
+        }))
     }
 
     #[cfg(test)]
@@ -7387,6 +7436,23 @@ impl DirectRoomStore {
         include_archived: bool,
         include_presence_only: bool,
     ) -> Result<RoomSnapshot> {
+        self.prepare_snapshot_scoped(
+            engagement,
+            run_id,
+            path,
+            include_archived,
+            include_presence_only,
+        )?()
+    }
+
+    pub(crate) fn prepare_snapshot_scoped(
+        &self,
+        engagement: &str,
+        run_id: Option<&str>,
+        path: Option<&str>,
+        include_archived: bool,
+        include_presence_only: bool,
+    ) -> Result<ReadProjection<RoomSnapshot>> {
         let engagement = validate_scoped_engagement(engagement)?;
         let run_marker = run_id
             .map(str::trim)
@@ -7433,77 +7499,93 @@ impl DirectRoomStore {
             (engagement_facts, claim_lifecycle_facts)
         };
 
-        #[cfg(test)]
-        pause_snapshot_projection_after_capture(room_dir);
-
-        let scoped_facts = select_scoped_facts(
-            &engagement_facts,
-            run_marker.as_deref(),
-            normalized_path.as_deref(),
-        );
         let coord = crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
-        let mut snapshot = snapshot_from_facts_with_policy(&scoped_facts, &coord, include_archived);
+        let now_secs = projection_unix_sec();
+        #[cfg(test)]
+        let pause_dir = room_dir.to_path_buf();
+        Ok(Box::new(move || {
+            #[cfg(test)]
+            pause_snapshot_projection_after_capture(&pause_dir);
 
-        if include_presence_only {
-            let engagement_snapshot =
-                snapshot_from_facts_with_policy(&engagement_facts, &coord, include_archived);
-            snapshot.squads = engagement_snapshot.squads;
-            snapshot.stale_authors = engagement_snapshot.stale_authors;
-            snapshot.author_last_seen = engagement_snapshot.author_last_seen;
-        } else {
-            let contributors = scoped_contributor_tools(&scoped_facts);
-            snapshot
-                .squads
-                .retain(|squad| contributors.contains(&squad.tool));
-            snapshot
-                .stale_authors
-                .retain(|tool| contributors.contains(tool));
-            snapshot
-                .author_last_seen
-                .retain(|tool, _| contributors.contains(tool));
-        }
+            let scoped_facts = select_scoped_facts(
+                &engagement_facts,
+                run_marker.as_deref(),
+                normalized_path.as_deref(),
+            );
+            let mut snapshot = snapshot_from_facts_with_policy_at(
+                &scoped_facts,
+                &coord,
+                include_archived,
+                now_secs,
+            );
 
-        if let Some(path) = normalized_path.as_deref() {
-            let lifecycle = claim_lifecycle_facts.as_deref().ok_or_else(|| {
-                RallyError::Message(
-                    "path-scoped snapshot captured no claim lifecycle input".to_string(),
-                )
-            })?;
-            let collision_lifecycle = claim_lifecycle_relevant_to_path(lifecycle, path);
-            let collision_closers = claim_authority::ClaimClosers::new(&collision_lifecycle);
-            let mut external_claims = collision_lifecycle
-                .iter()
-                .filter(|fact| collision_closers.is_active(fact))
-                .map(|fact| claim_authority::project_effective_claim(fact, &collision_lifecycle))
-                .collect::<Vec<_>>();
-            external_claims.sort_by_key(|fact| fact.seq);
-            for claim in external_claims {
-                if !snapshot
-                    .active_claims
+            if include_presence_only {
+                let engagement_snapshot = snapshot_from_facts_with_policy_at(
+                    &engagement_facts,
+                    &coord,
+                    include_archived,
+                    now_secs,
+                );
+                snapshot.squads = engagement_snapshot.squads;
+                snapshot.stale_authors = engagement_snapshot.stale_authors;
+                snapshot.author_last_seen = engagement_snapshot.author_last_seen;
+            } else {
+                let contributors = scoped_contributor_tools(&scoped_facts);
+                snapshot
+                    .squads
+                    .retain(|squad| contributors.contains(&squad.tool));
+                snapshot
+                    .stale_authors
+                    .retain(|tool| contributors.contains(tool));
+                snapshot
+                    .author_last_seen
+                    .retain(|tool, _| contributors.contains(tool));
+            }
+
+            if let Some(path) = normalized_path.as_deref() {
+                let lifecycle = claim_lifecycle_facts.as_deref().ok_or_else(|| {
+                    RallyError::Message(
+                        "path-scoped snapshot captured no claim lifecycle input".to_string(),
+                    )
+                })?;
+                let collision_lifecycle = claim_lifecycle_relevant_to_path(lifecycle, path);
+                let collision_closers = claim_authority::ClaimClosers::new(&collision_lifecycle);
+                let mut external_claims = collision_lifecycle
                     .iter()
-                    .any(|existing| existing.event_id == claim.event_id)
+                    .filter(|fact| collision_closers.is_active(fact))
+                    .map(|fact| {
+                        claim_authority::project_effective_claim(fact, &collision_lifecycle)
+                    })
+                    .collect::<Vec<_>>();
+                external_claims.sort_by_key(|fact| fact.seq);
+                for claim in external_claims {
+                    if !snapshot
+                        .active_claims
+                        .iter()
+                        .any(|existing| existing.event_id == claim.event_id)
+                    {
+                        snapshot.active_claims.push(claim);
+                    }
+                }
+                snapshot.active_claims.sort_by_key(|fact| fact.seq);
+
+                // The collision answer is derived from lifecycle inputs, not only
+                // the claims it emits. A newer renewal changes the projected lease;
+                // a newer close can remove the claim entirely. Advance the cursor
+                // to the newest path-relevant source even when its origin claim is
+                // older or the projection emits no claim.
+                if let Some(latest_source) = collision_lifecycle.iter().max_by_key(|fact| fact.seq)
+                    && latest_source.seq > snapshot.max_seq
                 {
-                    snapshot.active_claims.push(claim);
+                    snapshot.max_seq = latest_source.seq;
+                    snapshot.content_max_seq = snapshot.content_max_seq.max(latest_source.seq);
+                    snapshot.last_activity_ts = Some(latest_source.created_at.clone());
                 }
             }
-            snapshot.active_claims.sort_by_key(|fact| fact.seq);
 
-            // The collision answer is derived from lifecycle inputs, not only
-            // the claims it emits. A newer renewal changes the projected lease;
-            // a newer close can remove the claim entirely. Advance the cursor
-            // to the newest path-relevant source even when its origin claim is
-            // older or the projection emits no claim.
-            if let Some(latest_source) = collision_lifecycle.iter().max_by_key(|fact| fact.seq)
-                && latest_source.seq > snapshot.max_seq
-            {
-                snapshot.max_seq = latest_source.seq;
-                snapshot.content_max_seq = snapshot.content_max_seq.max(latest_source.seq);
-                snapshot.last_activity_ts = Some(latest_source.created_at.clone());
-            }
-        }
-
-        refresh_snapshot_totals(&mut snapshot);
-        Ok(snapshot)
+            refresh_snapshot_totals(&mut snapshot);
+            Ok(snapshot)
+        }))
     }
 
     /// Return the current read cursor for `tool`.
@@ -7672,58 +7754,11 @@ impl DirectRoomStore {
         facts: &[Fact],
         max_seq: i64,
     ) -> Result<Vec<ReadReceipt>> {
-        // Collect highest read_seq per tool from checkpoint facts.
-        let mut ledger_reads: BTreeMap<String, i64> = BTreeMap::new();
-        for fact in facts {
-            if fact.kind != "read" {
-                continue;
-            }
-            let Some(tool) = fact.tool.as_deref() else {
-                continue;
-            };
-            let Some(seq) = fact
-                .summary
-                .as_deref()
-                .and_then(|s| s.strip_prefix("read_seq:"))
-                .and_then(|n| n.parse::<i64>().ok())
-            else {
-                continue;
-            };
-            let entry = ledger_reads.entry(tool.to_string()).or_insert(0);
-            if seq > *entry {
-                *entry = seq;
-            }
-        }
-
-        // Merge with cursors.json (fast-path cache); ledger takes precedence.
-        let cursors = read_cursors_at(&self.cursor_path).unwrap_or_default();
-        let mut combined: BTreeMap<String, i64> = cursors;
-        for (tool, seq) in ledger_reads {
-            let entry = combined.entry(tool).or_insert(0);
-            if seq > *entry {
-                *entry = seq;
-            }
-        }
-
-        // Build receipts.
-        let receipts = combined
-            .into_iter()
-            .map(|(tool, last_read_seq)| {
-                let behind_by = (max_seq - last_read_seq).max(0);
-                let status = if behind_by == 0 {
-                    "caught_up".to_string()
-                } else {
-                    "behind".to_string()
-                };
-                ReadReceipt {
-                    tool,
-                    last_read_seq,
-                    behind_by,
-                    status,
-                }
-            })
-            .collect();
-        Ok(receipts)
+        project_read_receipts_from_captured_facts(
+            facts,
+            max_seq,
+            read_cursors_at(&self.cursor_path).unwrap_or_default(),
+        )
     }
 
     /// Variant of `snapshot()` that additionally populates `readers` by
@@ -7738,12 +7773,83 @@ impl DirectRoomStore {
         &self,
         include_archived: bool,
     ) -> Result<RoomSnapshot> {
-        let facts = self.facts()?;
-        let coord = crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
-        let mut snapshot = snapshot_from_facts_with_policy(&facts, &coord, include_archived);
-        snapshot.readers = self.project_read_receipts_from_facts(&facts, snapshot.max_seq)?;
-        Ok(snapshot)
+        self.prepare_snapshot_with_readers_archived(include_archived)?()
     }
+
+    pub(crate) fn prepare_snapshot_with_readers_archived(
+        &self,
+        include_archived: bool,
+    ) -> Result<ReadProjection<RoomSnapshot>> {
+        let facts = self.shared_facts()?;
+        let coord = crate::hooks_config::resolve_coordination(&self.repo_root).unwrap_or_default();
+        let now_secs = projection_unix_sec();
+        let cursors = read_cursors_at(&self.cursor_path).unwrap_or_default();
+        Ok(Box::new(move || {
+            let mut snapshot =
+                snapshot_from_facts_with_policy_at(&facts, &coord, include_archived, now_secs);
+            snapshot.readers =
+                project_read_receipts_from_captured_facts(&facts, snapshot.max_seq, cursors)?;
+            Ok(snapshot)
+        }))
+    }
+}
+
+fn project_read_receipts_from_captured_facts(
+    facts: &[Fact],
+    max_seq: i64,
+    cursors: BTreeMap<String, i64>,
+) -> Result<Vec<ReadReceipt>> {
+    // Collect highest read_seq per tool from checkpoint facts.
+    let mut ledger_reads: BTreeMap<String, i64> = BTreeMap::new();
+    for fact in facts {
+        if fact.kind != "read" {
+            continue;
+        }
+        let Some(tool) = fact.tool.as_deref() else {
+            continue;
+        };
+        let Some(seq) = fact
+            .summary
+            .as_deref()
+            .and_then(|s| s.strip_prefix("read_seq:"))
+            .and_then(|n| n.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        let entry = ledger_reads.entry(tool.to_string()).or_insert(0);
+        if seq > *entry {
+            *entry = seq;
+        }
+    }
+
+    // Merge with cursors.json (fast-path cache); ledger takes precedence.
+    let mut combined: BTreeMap<String, i64> = cursors;
+    for (tool, seq) in ledger_reads {
+        let entry = combined.entry(tool).or_insert(0);
+        if seq > *entry {
+            *entry = seq;
+        }
+    }
+
+    // Build receipts.
+    let receipts = combined
+        .into_iter()
+        .map(|(tool, last_read_seq)| {
+            let behind_by = (max_seq - last_read_seq).max(0);
+            let status = if behind_by == 0 {
+                "caught_up".to_string()
+            } else {
+                "behind".to_string()
+            };
+            ReadReceipt {
+                tool,
+                last_read_seq,
+                behind_by,
+                status,
+            }
+        })
+        .collect();
+    Ok(receipts)
 }
 
 fn filter_facts(facts: Vec<Fact>, query: &RoomQuery) -> Vec<Fact> {
@@ -7815,6 +7921,24 @@ struct SnapshotCapturePause {
 
 #[cfg(test)]
 static SNAPSHOT_CAPTURE_PAUSES: Mutex<Vec<SnapshotCapturePause>> = Mutex::new(Vec::new());
+
+/// Pause one captured snapshot in a worker without retaining store authority.
+#[cfg(test)]
+pub(crate) fn test_pause_next_snapshot_projection(
+    room_dir: PathBuf,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (captured, captured_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume) = std::sync::mpsc::channel();
+    SNAPSHOT_CAPTURE_PAUSES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(SnapshotCapturePause {
+            room_dir,
+            captured,
+            resume,
+        });
+    (captured_rx, resume_tx)
+}
 
 /// Test seam at the exact ownership boundary: selected canonical inputs have
 /// been captured, and the mutation lock must already be available to a peer.
@@ -10251,6 +10375,9 @@ fn enter_has_other_active_session(
     })
 }
 
+// The captured clock joins the existing caller context so liveness and room
+// projection use one epoch even when a read waits for a worker.
+#[allow(clippy::too_many_arguments)]
 fn enter_snapshot_context_from_facts(
     facts: &[Fact],
     coord: &crate::hooks_config::CoordinationConfig,
@@ -10259,6 +10386,7 @@ fn enter_snapshot_context_from_facts(
     from_session_id: &str,
     presence_evidence: &[String],
     session_alias: Option<&str>,
+    now_secs: i64,
 ) -> EnterSnapshotContext {
     let duplicate_squad_subject = format!("duplicate-active-squad-id: {tool}");
     let unmanaged_agent_subject = format!("unmanaged-agent: {tool}");
@@ -10306,14 +10434,14 @@ fn enter_snapshot_context_from_facts(
     });
 
     EnterSnapshotContext {
-        snapshot: snapshot_from_facts_with_policy(facts, coord, false),
+        snapshot: snapshot_from_facts_with_policy_at(facts, coord, false, now_secs),
         has_other_active_session: enter_has_other_active_session(
             facts,
             tool,
             from_session_id,
             presence_evidence,
             session_alias,
-            projection_unix_sec(),
+            now_secs,
         ),
         duplicate_squad_recorded: durable_risk_subject_recorded(
             facts,
@@ -16458,6 +16586,80 @@ mod ledger_tests {
         );
         assert_eq!(stats.queue_pops, facts.len());
         assert_eq!(stats.scope_buckets_processed, 2);
+    }
+
+    #[test]
+    fn prepared_snapshot_reads_own_inputs_after_scope_change_and_store_removal() {
+        let root = unique_root("prepared-snapshot-owned-inputs");
+        let mut store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+        store.set_engagement_scope(Some("engagement-alpha".to_string()));
+        let first = store
+            .append_fact(&make_fact(
+                "prepared-first",
+                FactKind::Artifact,
+                "run:alpha",
+                "first captured row",
+            ))
+            .unwrap();
+        write_cursor_at(&store.cursor_path, "reader", first.fact.seq).unwrap();
+
+        let at = projection_unix_sec();
+        let expected = store.snapshot_cache_capture_at(false, at).unwrap();
+        let full = store.prepare_snapshot_cache_capture_at(false, at).unwrap();
+        let scoped = store
+            .prepare_snapshot_scoped("engagement-alpha", Some("alpha"), None, false, false)
+            .unwrap();
+        let enter = store
+            .prepare_snapshot_for_enter("test", "test-build", "sess:test", &[], None)
+            .unwrap();
+        let readers = store.prepare_snapshot_with_readers_archived(false).unwrap();
+
+        store.set_engagement_scope(Some("engagement-beta".to_string()));
+        let later = store
+            .append_fact(&make_fact(
+                "prepared-later",
+                FactKind::Artifact,
+                "run:beta",
+                "must remain outside captured views",
+            ))
+            .unwrap();
+        write_cursor_at(&store.cursor_path, "reader", later.fact.seq).unwrap();
+        drop(store);
+        // Projection must not reopen the database, configuration, segment or
+        // cursor files, even when its originating owner no longer exists.
+        fs::remove_dir_all(&root).unwrap();
+
+        let full = thread::spawn(full).join().unwrap().unwrap();
+        let scoped = thread::spawn(scoped).join().unwrap().unwrap();
+        let enter = thread::spawn(enter).join().unwrap().unwrap();
+        let readers = thread::spawn(readers).join().unwrap().unwrap();
+        assert_eq!(full.fingerprint, expected.fingerprint);
+        assert_eq!(
+            snapshot_to_wire_value(&full.snapshot).unwrap(),
+            snapshot_to_wire_value(&expected.snapshot).unwrap()
+        );
+        for snapshot in [&scoped, &enter.snapshot, &readers] {
+            assert_eq!(snapshot.max_seq, first.fact.seq);
+            assert!(
+                snapshot
+                    .recent_artifacts
+                    .iter()
+                    .any(|fact| fact.event_id == "prepared-first")
+            );
+            assert!(
+                snapshot
+                    .recent_artifacts
+                    .iter()
+                    .all(|fact| fact.event_id != "prepared-later")
+            );
+        }
+        let reader = readers
+            .readers
+            .iter()
+            .find(|receipt| receipt.tool == "reader")
+            .unwrap();
+        assert_eq!(reader.last_read_seq, first.fact.seq);
+        assert_eq!(reader.behind_by, 0);
     }
 
     #[test]

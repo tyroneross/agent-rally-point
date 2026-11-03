@@ -27,8 +27,8 @@
 //!    queue in the listen backlog and dispatch only once the store is ready
 //!    (accept-after-ready). A store-open failure drains pending connections with
 //!    a structured error, then exits non-zero (never hangs).
-//! 4. Start the ONE dispatcher thread that owns the store (total order by
-//!    construction, ADR-05) and the nonblocking accept loop.
+//! 4. Start the ONE dispatcher thread that owns the store and orders capture /
+//!    mutations, CPU-sized immutable read workers, and the nonblocking accept loop.
 //!
 //! ## Serving
 //!
@@ -38,7 +38,9 @@
 //! funnels `(req, reply)` over an mpsc channel to the single dispatcher. The
 //! dispatcher applies each request's engagement via `set_engagement_scope`
 //! BEFORE the op (L9/R4), then converts `Value -> Fact` for appends, runs the
-//! store method, and converts the result back into the frozen `StoreOk`/
+//! store method. Bulk reads capture immutable inputs on the owner then project
+//! and construct replies on read workers. Mutations retain total commit order.
+//! Results convert back into the frozen `StoreOk`/
 //! `StoreError` wire shapes. `Ping` is answered directly with `Pong` (the first
 //! successful ping implies the dispatcher is live — Chunk C's `start` blocks on
 //! it).
@@ -146,9 +148,9 @@ mod imp {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-    use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -214,7 +216,7 @@ mod imp {
     /// rejects a legitimate burst; it only sheds load in a genuine
     /// thread-exhaustion / wedge scenario, answering over-cap connections with a
     /// retryable transport error. This bounds ACCEPT-side resources only; the
-    /// dispatcher stays single-threaded (total order preserved).
+    /// dispatcher still orders capture and mutation; projections run separately.
     const MAX_READER_THREADS: usize = 512;
 
     /// Log the "waiting for direct writers to drain" line only if the EX acquire
@@ -304,6 +306,232 @@ mod imp {
         request: StoreRequest,
         reply: Sender<StoreResponse>,
         receipt: RequestReceipt,
+    }
+
+    type ReadWork = Box<dyn FnOnce() -> Result<StoreOk, StoreError> + Send>;
+
+    struct ReadJob {
+        work: ReadWork,
+        reply: Sender<StoreResponse>,
+    }
+
+    /// CPU projection and JSON construction have no store handle, owner lock or
+    /// mutable engagement. Queue capacity reuses the existing connection budget;
+    /// a full read lane rejects reads instead of parking the mutation dispatcher.
+    struct ReadWorkers {
+        tx: SyncSender<ReadJob>,
+        pending: Arc<AtomicUsize>,
+    }
+
+    impl ReadWorkers {
+        fn start(
+            count: usize,
+            capacity: usize,
+            activity: Arc<AtomicI64>,
+        ) -> Result<Self, ServeError> {
+            let (tx, rx) = mpsc::sync_channel::<ReadJob>(capacity);
+            let rx = Arc::new(Mutex::new(rx));
+            let pending = Arc::new(AtomicUsize::new(0));
+            for _ in 0..count.max(1) {
+                let rx = Arc::clone(&rx);
+                let pending = Arc::clone(&pending);
+                let activity = Arc::clone(&activity);
+                thread::Builder::new()
+                    .name("rallyd-read".into())
+                    .spawn(move || {
+                        loop {
+                            // Release the receiver mutex before doing any read work.
+                            let job = match rx.lock() {
+                                Ok(receiver) => receiver.recv(),
+                                Err(_) => return,
+                            };
+                            let Ok(job) = job else { return };
+                            let response = match std::panic::catch_unwind(
+                                std::panic::AssertUnwindSafe(job.work),
+                            ) {
+                                Ok(Ok(ok)) => StoreResponse::Ok(ok),
+                                Ok(Err(error)) => StoreResponse::Err(error),
+                                Err(_) => StoreResponse::Err(StoreError::new(
+                                    StoreErrorKind::Internal,
+                                    "daemon read projection panicked; no mutation executed",
+                                )),
+                            };
+                            activity.store(now_millis(), Ordering::Relaxed);
+                            pending.fetch_sub(1, Ordering::SeqCst);
+                            let _ = job.reply.send(response);
+                        }
+                    })
+                    .map_err(|error| ServeError::new(format!("start read worker: {error}")))?;
+            }
+            // Workers exit when this sender is dropped and captured reads drain.
+            // They hold immutable values only, so owner shutdown need not wait
+            // for projection or retain durable authority on their behalf.
+            Ok(Self { tx, pending })
+        }
+
+        fn submit(&self, work: ReadWork, reply: Sender<StoreResponse>) {
+            self.pending.fetch_add(1, Ordering::SeqCst);
+            if let Err(error) = self.tx.try_send(ReadJob { work, reply }) {
+                self.pending.fetch_sub(1, Ordering::SeqCst);
+                let job = match error {
+                    mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job) => job,
+                };
+                let _ = job.reply.send(StoreResponse::Err(StoreError::transport(
+                    "daemon read capacity unavailable; no mutation executed; retry the read",
+                )));
+            }
+        }
+    }
+
+    /// Capture on the single owner; execute only owned immutable projections on
+    /// read workers. Small indexed reads and all check-and-write operations stay
+    /// on the owner. No new protocol or second database owner is introduced.
+    fn prepare_bulk_read(
+        store: &DirectRoomStore,
+        op: &StoreOp,
+        engagement: Option<&str>,
+    ) -> Result<Option<ReadWork>, StoreError> {
+        let work: ReadWork = match op {
+            StoreOp::Facts => {
+                let facts = store.shared_facts().map_err(rally_to_wire)?;
+                Box::new(move || {
+                    Ok(StoreOk::Facts {
+                        facts: to_wire_values(facts.iter())?,
+                    })
+                })
+            }
+            StoreOp::FactsPage {
+                after_seq,
+                max_bytes,
+            } => {
+                let facts = store.shared_facts().map_err(rally_to_wire)?;
+                let (after_seq, max_bytes) = (*after_seq, *max_bytes);
+                Box::new(move || {
+                    let (facts, next_after_seq) = facts_page(&facts, after_seq, max_bytes)?;
+                    Ok(StoreOk::FactsPage {
+                        facts,
+                        next_after_seq,
+                    })
+                })
+            }
+            StoreOp::SnapshotWithArchived { include_archived } => {
+                let project = store
+                    .prepare_snapshot_cache_capture(*include_archived)
+                    .map_err(rally_to_wire)?;
+                let include_archived = *include_archived;
+                Box::new(move || {
+                    let capture = project().map_err(rally_to_wire)?;
+                    let snapshot = capture.snapshot.without_caller_scoped_transport();
+                    let mut ok = StoreOk::Snapshot {
+                        snapshot: snapshot_to_wire(&snapshot)?,
+                        fingerprint: capture
+                            .fingerprint
+                            .as_ref()
+                            .map(to_wire_value)
+                            .transpose()?,
+                    };
+                    clear_stale_facts_if_oversized(&mut ok, include_archived, MAX_LINE_BYTES);
+                    Ok(ok)
+                })
+            }
+            StoreOp::SnapshotForEnter {
+                tool,
+                build_id,
+                from_session_id,
+                presence_evidence,
+                session_alias,
+            } => {
+                let project = store
+                    .prepare_snapshot_for_enter(
+                        tool,
+                        build_id,
+                        from_session_id,
+                        presence_evidence,
+                        session_alias.as_deref(),
+                    )
+                    .map_err(rally_to_wire)?;
+                Box::new(move || {
+                    let context = project().map_err(rally_to_wire)?;
+                    let snapshot = context.snapshot.without_caller_scoped_transport();
+                    Ok(StoreOk::SnapshotForEnter {
+                        snapshot: snapshot_to_wire(&snapshot)?,
+                        duplicate_squad_recorded: context.duplicate_squad_recorded,
+                        has_other_active_session: context.has_other_active_session,
+                        unmanaged_agent_recorded: context.unmanaged_agent_recorded,
+                        has_managed_session: context.has_managed_session,
+                        presence_recorded_for_session: context.presence_recorded_for_session,
+                        last_presence_build_id: context.last_presence_build_id,
+                        binary_drift_recorded: context.binary_drift_recorded,
+                    })
+                })
+            }
+            StoreOp::SnapshotForObligationTarget {
+                tool,
+                row_limit,
+                include_archived,
+            } => {
+                let project = store
+                    .prepare_snapshot_cache_capture(*include_archived)
+                    .map_err(rally_to_wire)?;
+                let (tool, row_limit) = (tool.clone(), *row_limit);
+                Box::new(move || {
+                    let snapshot = project()
+                        .map_err(rally_to_wire)?
+                        .snapshot
+                        .for_obligation_target(&tool, row_limit);
+                    Ok(StoreOk::Snapshot {
+                        snapshot: snapshot_to_wire(&snapshot)?,
+                        fingerprint: None,
+                    })
+                })
+            }
+            StoreOp::SnapshotScoped {
+                run_id,
+                path,
+                include_archived,
+                include_presence_only,
+            } => {
+                let engagement = engagement.ok_or_else(|| {
+                    StoreError::new(
+                        StoreErrorKind::Usage,
+                        "snapshot_scoped requires StoreRequest.engagement",
+                    )
+                })?;
+                let project = store
+                    .prepare_snapshot_scoped(
+                        engagement,
+                        run_id.as_deref(),
+                        path.as_deref(),
+                        *include_archived,
+                        *include_presence_only,
+                    )
+                    .map_err(rally_to_wire)?;
+                Box::new(move || {
+                    let snapshot = project()
+                        .map_err(rally_to_wire)?
+                        .without_caller_scoped_transport();
+                    Ok(StoreOk::Snapshot {
+                        snapshot: snapshot_to_wire(&snapshot)?,
+                        fingerprint: None,
+                    })
+                })
+            }
+            StoreOp::SnapshotWithReadersArchived { include_archived } => {
+                let project = store
+                    .prepare_snapshot_with_readers_archived(*include_archived)
+                    .map_err(rally_to_wire)?;
+                Box::new(move || {
+                    let snapshot = project()
+                        .map_err(rally_to_wire)?
+                        .without_caller_scoped_transport();
+                    Ok(StoreOk::SnapshotWithReaders {
+                        snapshot: snapshot_to_wire(&snapshot)?,
+                    })
+                })
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(work))
     }
 
     fn unix_now_ms() -> u64 {
@@ -795,6 +1023,38 @@ mod imp {
         dispatch_one_received_with_hook(store, repo_root, req, receipt, || {})
     }
 
+    /// Shared prelude for inline operations and detached bulk reads. Receipt
+    /// deadlines apply only to mutations below; reads retain the same wire and
+    /// scope validation, and Ping reports this exact owner's identity.
+    fn immediate_response(req: &StoreRequest, repo_root: &str) -> Option<StoreResponse> {
+        if req.wire_version != WIRE_VERSION {
+            return Some(StoreResponse::Err(StoreError::new(
+                StoreErrorKind::IncompatibleWire,
+                format!(
+                    "wire_version mismatch: daemon speaks {WIRE_VERSION}, client sent {}; \
+                 check releases at {}; upgrade steps at {}; coordinate a matching-client and daemon upgrade with peers before restarting",
+                    req.wire_version,
+                    crate::error::RELEASE_CHECK_URL,
+                    crate::error::UPGRADE_GUIDE_URL,
+                ),
+            )));
+        }
+        if matches!(&req.op, StoreOp::Ping) {
+            return Some(StoreResponse::Ok(StoreOk::Pong {
+                repo_root: repo_root.to_string(),
+                pid: std::process::id(),
+                wire_version: WIRE_VERSION,
+            }));
+        }
+        if matches!(&req.op, StoreOp::SnapshotScoped { .. }) && req.engagement.is_none() {
+            return Some(StoreResponse::Err(StoreError::new(
+                StoreErrorKind::Usage,
+                "snapshot_scoped requires StoreRequest.engagement",
+            )));
+        }
+        None
+    }
+
     fn dispatch_one_received_with_hook<F>(
         store: &mut DirectRoomStore,
         repo_root: &str,
@@ -805,30 +1065,8 @@ mod imp {
     where
         F: FnOnce(),
     {
-        if req.wire_version != WIRE_VERSION {
-            return StoreResponse::Err(StoreError::new(
-                StoreErrorKind::IncompatibleWire,
-                format!(
-                    "wire_version mismatch: daemon speaks {WIRE_VERSION}, client sent {}; \
-                 check releases at {}; upgrade steps at {}; coordinate a matching-client and daemon upgrade with peers before restarting",
-                    req.wire_version,
-                    crate::error::RELEASE_CHECK_URL,
-                    crate::error::UPGRADE_GUIDE_URL,
-                ),
-            ));
-        }
-        if matches!(req.op, StoreOp::Ping) {
-            return StoreResponse::Ok(StoreOk::Pong {
-                repo_root: repo_root.to_string(),
-                pid: std::process::id(),
-                wire_version: WIRE_VERSION,
-            });
-        }
-        if matches!(req.op, StoreOp::SnapshotScoped { .. }) && req.engagement.is_none() {
-            return StoreResponse::Err(StoreError::new(
-                StoreErrorKind::Usage,
-                "snapshot_scoped requires StoreRequest.engagement",
-            ));
+        if let Some(response) = immediate_response(&req, repo_root) {
+            return response;
         }
         // Per-request engagement rebind (L9/R4): safe because the dispatcher is
         // single-threaded. The daemon NEVER consults its own process env here.
@@ -1034,6 +1272,9 @@ mod imp {
         op: StoreOp,
         request_engagement: Option<&str>,
     ) -> Result<StoreOk, StoreError> {
+        if let Some(work) = prepare_bulk_read(store, &op, request_engagement)? {
+            return work();
+        }
         Ok(match op {
             StoreOp::Ping => {
                 // Handled in dispatch_one before engagement rebinding.
@@ -1075,12 +1316,6 @@ mod imp {
                     .map_err(rally_to_wire)?;
                 StoreOk::AppendSessionFactIfContext {
                     result: to_wire_value(&out)?,
-                }
-            }
-            StoreOp::Facts => {
-                let facts = store.shared_facts().map_err(rally_to_wire)?;
-                StoreOk::Facts {
-                    facts: to_wire_values(facts.iter())?,
                 }
             }
             StoreOp::SessionPresenceFacts { session_id } => {
@@ -1125,17 +1360,6 @@ mod imp {
                 let facts = store.facts_by_event_id(&event_id).map_err(rally_to_wire)?;
                 StoreOk::Facts {
                     facts: to_wire_values(&facts)?,
-                }
-            }
-            StoreOp::FactsPage {
-                after_seq,
-                max_bytes,
-            } => {
-                let facts = store.shared_facts().map_err(rally_to_wire)?;
-                let (facts, next_after_seq) = facts_page(&facts, after_seq, max_bytes)?;
-                StoreOk::FactsPage {
-                    facts,
-                    next_after_seq,
                 }
             }
             StoreOp::RepoWideClaimLifecycleFacts => {
@@ -1193,99 +1417,14 @@ mod imp {
                     .map(to_wire_value)
                     .transpose()?,
             },
-            StoreOp::SnapshotWithArchived { include_archived } => {
-                let capture = store
-                    .snapshot_cache_capture(include_archived)
-                    .map_err(rally_to_wire)?;
-                let snapshot = capture.snapshot.without_caller_scoped_transport();
-                let mut ok = StoreOk::Snapshot {
-                    snapshot: snapshot_to_wire(&snapshot)?,
-                    fingerprint: capture
-                        .fingerprint
-                        .as_ref()
-                        .map(to_wire_value)
-                        .transpose()?,
-                };
-                clear_stale_facts_if_oversized(&mut ok, include_archived, MAX_LINE_BYTES);
-                ok
-            }
-            StoreOp::SnapshotForEnter {
-                tool,
-                build_id,
-                from_session_id,
-                presence_evidence,
-                session_alias,
-            } => {
-                let context = store
-                    .snapshot_for_enter(
-                        &tool,
-                        &build_id,
-                        &from_session_id,
-                        &presence_evidence,
-                        session_alias.as_deref(),
-                    )
-                    .map_err(rally_to_wire)?;
-                let snapshot = context.snapshot.without_caller_scoped_transport();
-                StoreOk::SnapshotForEnter {
-                    snapshot: snapshot_to_wire(&snapshot)?,
-                    duplicate_squad_recorded: context.duplicate_squad_recorded,
-                    has_other_active_session: context.has_other_active_session,
-                    unmanaged_agent_recorded: context.unmanaged_agent_recorded,
-                    has_managed_session: context.has_managed_session,
-                    presence_recorded_for_session: context.presence_recorded_for_session,
-                    last_presence_build_id: context.last_presence_build_id,
-                    binary_drift_recorded: context.binary_drift_recorded,
-                }
-            }
-            StoreOp::SnapshotForObligationTarget {
-                tool,
-                row_limit,
-                include_archived,
-            } => {
-                let snapshot = store
-                    .snapshot_with_archived(include_archived)
-                    .map_err(rally_to_wire)?
-                    .for_obligation_target(&tool, row_limit);
-                StoreOk::Snapshot {
-                    snapshot: snapshot_to_wire(&snapshot)?,
-                    fingerprint: None,
-                }
-            }
-            StoreOp::SnapshotScoped {
-                run_id,
-                path,
-                include_archived,
-                include_presence_only,
-            } => {
-                let engagement = request_engagement.ok_or_else(|| {
-                    StoreError::new(
-                        StoreErrorKind::Usage,
-                        "snapshot_scoped requires StoreRequest.engagement",
-                    )
-                })?;
-                let snap = store
-                    .snapshot_scoped(
-                        engagement,
-                        run_id.as_deref(),
-                        path.as_deref(),
-                        include_archived,
-                        include_presence_only,
-                    )
-                    .map_err(rally_to_wire)?
-                    .without_caller_scoped_transport();
-                StoreOk::Snapshot {
-                    snapshot: snapshot_to_wire(&snap)?,
-                    fingerprint: None,
-                }
-            }
-            StoreOp::SnapshotWithReadersArchived { include_archived } => {
-                let snap = store
-                    .snapshot_with_readers_archived(include_archived)
-                    .map_err(rally_to_wire)?
-                    .without_caller_scoped_transport();
-                StoreOk::SnapshotWithReaders {
-                    snapshot: snapshot_to_wire(&snap)?,
-                }
+            StoreOp::Facts
+            | StoreOp::FactsPage { .. }
+            | StoreOp::SnapshotWithArchived { .. }
+            | StoreOp::SnapshotForEnter { .. }
+            | StoreOp::SnapshotForObligationTarget { .. }
+            | StoreOp::SnapshotScoped { .. }
+            | StoreOp::SnapshotWithReadersArchived { .. } => {
+                unreachable!("bulk reads prepared above")
             }
             StoreOp::LastCheckpointSeq { tool } => {
                 let seq = store.last_checkpoint_seq(&tool).map_err(rally_to_wire)?;
@@ -1419,6 +1558,23 @@ mod imp {
             std::process::id()
         ));
 
+        // Start fallible reader infrastructure before opening the warm DB pool.
+        // A thread-spawn failure can then release owner authority without any
+        // unclosed database work surviving it.
+        let last_activity = Arc::new(AtomicI64::new(now_millis()));
+        let read_count = thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .min(MAX_READER_THREADS);
+        let read_workers =
+            match ReadWorkers::start(read_count, MAX_READER_THREADS, Arc::clone(&last_activity)) {
+                Ok(workers) => workers,
+                Err(error) => {
+                    cleanup(&socket_path, &addr_path, &pid_path);
+                    return Err(error);
+                }
+            };
+
         // (3) Open the direct store (reconcile may take seconds; connects queue
         // in the listen backlog). On failure, drain pending connections with a
         // structured error, then exit non-zero.
@@ -1443,22 +1599,52 @@ mod imp {
             ServeError::new("daemon owner lock missing after successful store open")
         })?;
 
+        // Startup reconciliation is not serving idle time.
+        last_activity.store(now_millis(), Ordering::Relaxed);
         let canonical_root = Arc::new(canonical_repo_root(&repo_root));
 
         // (4) ONE dispatcher thread owns the store => total order by construction.
         let (job_tx, job_rx) = mpsc::channel::<Job>();
-        let last_activity = Arc::new(AtomicI64::new(now_millis()));
+        let pending_reads = Arc::clone(&read_workers.pending);
         let disp_root = canonical_root.clone();
         let disp_activity = last_activity.clone();
         let (close_tx, close_rx) = mpsc::sync_channel(1);
         let dispatcher = thread::spawn(move || {
             let mut store = store;
             while let Ok(job) = job_rx.recv() {
+                // Wire validation precedes capture. Each closure owns its scope;
+                // later owner rebinding cannot change a read already in flight.
+                if let Some(response) = immediate_response(&job.request, disp_root.as_str()) {
+                    disp_activity.store(now_millis(), Ordering::Relaxed);
+                    let _ = job.reply.send(response);
+                    continue;
+                }
+                if !job.request.op.is_mutating() {
+                    store.set_engagement_scope(job.request.engagement.clone());
+                    match prepare_bulk_read(
+                        &store,
+                        &job.request.op,
+                        job.request.engagement.as_deref(),
+                    ) {
+                        Ok(Some(work)) => {
+                            read_workers.submit(work, job.reply);
+                            disp_activity.store(now_millis(), Ordering::Relaxed);
+                            continue;
+                        }
+                        Err(error) => {
+                            disp_activity.store(now_millis(), Ordering::Relaxed);
+                            let _ = job.reply.send(StoreResponse::Err(error));
+                            continue;
+                        }
+                        Ok(None) => {}
+                    }
+                }
                 let resp =
                     dispatch_one_received(&mut store, disp_root.as_str(), job.request, job.receipt);
                 disp_activity.store(now_millis(), Ordering::Relaxed);
                 let _ = job.reply.send(resp);
             }
+            drop(read_workers);
             // Channel closed (all senders dropped): explicitly close the warm
             // pool under mutation.lock. The caller bounds its wait on
             // `close_rx`; DirectRoomStore::Drop is only a prompt fallback.
@@ -1477,8 +1663,8 @@ mod imp {
         // arrive between wakes and this inner loop empties it fully each time,
         // so clients no longer see ECONNREFUSED (which the fresh-connect client
         // path surfaces as R6's routed transport failure). The
-        // dispatcher stays single-threaded (total order preserved); we widen
-        // ONLY accept concurrency (reader threads feeding the one mpsc).
+        // dispatcher orders captures and mutations; immutable read projection
+        // runs separately after capture. Connection readers feed the owner mpsc.
         let _ = listener.set_nonblocking(true);
         // SEC-003: live count of concurrent per-connection reader threads, so a
         // wedged dispatcher can't let them accumulate until `spawn` panics and
@@ -1495,8 +1681,12 @@ mod imp {
                 break;
             }
             if let Some(secs) = config.idle_exit_secs {
-                let idle_ms = now_millis() - last_activity.load(Ordering::Relaxed);
-                if idle_ms >= (secs as i64) * 1000 {
+                // Observe completion before its activity timestamp. Loading the
+                // timestamp first could race a worker finishing and exit using
+                // stale idle time after its pending count reaches zero.
+                if pending_reads.load(Ordering::SeqCst) == 0
+                    && now_millis() - last_activity.load(Ordering::Relaxed) >= (secs as i64) * 1000
+                {
                     log("idle-exit window elapsed; stopping");
                     break;
                 }
@@ -1626,6 +1816,256 @@ mod imp {
             ));
             std::fs::create_dir_all(dir.join(".rally")).unwrap();
             dir
+        }
+
+        #[test]
+        fn read_workers_are_concurrent_and_overload_does_not_park_submitter() {
+            let workers = ReadWorkers::start(2, 1, Arc::new(AtomicI64::new(now_millis()))).unwrap();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_a, wait_a) = mpsc::channel();
+            let (release_b, wait_b) = mpsc::channel();
+            let (reply, replies) = mpsc::channel();
+            for wait in [wait_a, wait_b] {
+                let started = started_tx.clone();
+                workers.submit(
+                    Box::new(move || {
+                        started.send(()).unwrap();
+                        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                        Ok(StoreOk::LastCheckpointSeq { seq: 1 })
+                    }),
+                    reply.clone(),
+                );
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            // Both workers are demonstrably active before release. One queued
+            // read fits; the following read must refuse promptly, not block.
+            workers.submit(
+                Box::new(|| Ok(StoreOk::LastCheckpointSeq { seq: 2 })),
+                reply.clone(),
+            );
+            workers.submit(
+                Box::new(|| Ok(StoreOk::LastCheckpointSeq { seq: 3 })),
+                reply,
+            );
+            let refused = replies.recv_timeout(Duration::from_secs(1));
+            release_a.send(()).unwrap();
+            release_b.send(()).unwrap();
+            assert!(
+                matches!(refused, Ok(StoreResponse::Err(_))),
+                "full read queue blocked submission: {refused:?}"
+            );
+            for _ in 0..3 {
+                assert!(matches!(
+                    replies.recv_timeout(Duration::from_secs(5)),
+                    Ok(StoreResponse::Ok(_))
+                ));
+            }
+            assert_eq!(workers.pending.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn read_worker_failure_releases_idle_accounting_and_keeps_worker_alive() {
+            let activity = Arc::new(AtomicI64::new(0));
+            let workers = ReadWorkers::start(1, 1, Arc::clone(&activity)).unwrap();
+            let failures: [ReadWork; 2] = [
+                Box::new(|| {
+                    Err(StoreError::new(
+                        StoreErrorKind::Command,
+                        "fixture read error",
+                    ))
+                }),
+                Box::new(|| panic!("fixture read projection panic")),
+            ];
+            for work in failures {
+                let (reply, result) = mpsc::channel();
+                workers.submit(work, reply);
+                assert!(matches!(
+                    result.recv_timeout(Duration::from_secs(5)),
+                    Ok(StoreResponse::Err(_))
+                ));
+                assert_eq!(workers.pending.load(Ordering::SeqCst), 0);
+                assert!(activity.load(Ordering::Relaxed) > 0);
+            }
+            let (reply, result) = mpsc::channel();
+            workers.submit(
+                Box::new(|| Ok(StoreOk::LastCheckpointSeq { seq: 7 })),
+                reply,
+            );
+            assert!(matches!(
+                result.recv_timeout(Duration::from_secs(5)),
+                Ok(StoreResponse::Ok(StoreOk::LastCheckpointSeq { seq: 7 }))
+            ));
+            assert_eq!(workers.pending.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn daemon_idle_exit_resumes_after_a_detached_read_completes() {
+            let root = unique_repo_root("detached-read-idle-exit");
+            let rally_dir = root.join(".rally");
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_stop = Arc::clone(&stop);
+            let server_root = root.clone();
+            let (finished, completion) = mpsc::channel();
+            let server = thread::spawn(move || {
+                let result = serve_unix_with_stop(
+                    ServeConfig {
+                        repo_root: server_root,
+                        idle_exit_secs: Some(1),
+                        foreground: true,
+                    },
+                    server_stop,
+                );
+                let _ = finished.send(());
+                result
+            });
+            let socket = wait_for_addr(&rally_dir);
+            let read = round_trip(&socket, &StoreRequest::new(None, StoreOp::Facts));
+            let idled = completion.recv_timeout(Duration::from_secs(5));
+            // Cleanup on failure does not masquerade as a successful idle exit.
+            if idled.is_err() {
+                stop.store(true, Ordering::SeqCst);
+            }
+            let result = server.join().unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(matches!(read, StoreResponse::Ok(StoreOk::Facts { .. })));
+            assert!(
+                idled.is_ok(),
+                "completed reads kept the daemon permanently non-idle"
+            );
+            result.unwrap();
+        }
+
+        #[test]
+        fn paused_daemon_snapshot_does_not_block_a_write_or_indexed_read() {
+            let root = unique_repo_root("detached-read-write-progress");
+            let rally_dir = root.join(".rally");
+            let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+            let before = store
+                .append_fact(&store::Fact {
+                    schema: crate::FACT_SCHEMA.to_string(),
+                    event_id: "before-read".into(),
+                    thread_id: "read-lane-thread".into(),
+                    kind: store::FactKind::Artifact,
+                    subject: "before detached snapshot".into(),
+                    created_at: crate::now_string(),
+                    ..store::Fact::default()
+                })
+                .unwrap()
+                .fact
+                .seq;
+            drop(store);
+            let (captured, release) = store::test_pause_next_snapshot_projection(rally_dir.clone());
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_stop = Arc::clone(&stop);
+            let server_root = root.clone();
+            let server = thread::spawn(move || {
+                serve_unix_with_stop(
+                    ServeConfig {
+                        repo_root: server_root,
+                        idle_exit_secs: Some(1),
+                        foreground: true,
+                    },
+                    server_stop,
+                )
+            });
+            let socket = wait_for_addr(&rally_dir);
+            let read_socket = socket.clone();
+            let reader = thread::spawn(move || {
+                round_trip(
+                    &read_socket,
+                    &StoreRequest::new(
+                        None,
+                        StoreOp::SnapshotWithArchived {
+                            include_archived: false,
+                        },
+                    ),
+                )
+            });
+            captured.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Cross the configured idle interval with a read demonstrably in
+            // flight. The owner must remain available for the following write.
+            thread::sleep(Duration::from_millis(1100));
+            let write = round_trip(
+                &socket,
+                &StoreRequest::new(
+                    None,
+                    StoreOp::AppendFact {
+                        fact: serde_json::to_value(store::Fact {
+                            schema: crate::FACT_SCHEMA.to_string(),
+                            event_id: "after-read".into(),
+                            thread_id: "read-lane-thread".into(),
+                            kind: store::FactKind::Artifact,
+                            subject: "write progresses during paused read".into(),
+                            created_at: crate::now_string(),
+                            ..store::Fact::default()
+                        })
+                        .unwrap(),
+                    },
+                ),
+            );
+            let lookup = round_trip(
+                &socket,
+                &StoreRequest::new(
+                    None,
+                    StoreOp::FactsByEventId {
+                        event_id: "after-read".into(),
+                    },
+                ),
+            );
+            let mut bad_wire = StoreRequest::new(None, StoreOp::Facts);
+            bad_wire.wire_version = WIRE_VERSION + 1;
+            let invalid_wire = round_trip(&socket, &bad_wire);
+            let missing_scope = round_trip(
+                &socket,
+                &StoreRequest::new(
+                    None,
+                    StoreOp::SnapshotScoped {
+                        run_id: None,
+                        path: None,
+                        include_archived: false,
+                        include_presence_only: false,
+                    },
+                ),
+            );
+            // Always release/stop before assertions so a failing regression
+            // cannot leave a fixture daemon or worker waiting indefinitely.
+            release.send(()).unwrap();
+            let read = reader.join().unwrap();
+            stop.store(true, Ordering::SeqCst);
+            server.join().unwrap().unwrap();
+            assert!(
+                matches!(write, StoreResponse::Ok(StoreOk::AppendFact { .. })),
+                "write waited behind snapshot: {write:?}"
+            );
+            assert!(matches!(
+                invalid_wire,
+                StoreResponse::Err(StoreError {
+                    kind: StoreErrorKind::IncompatibleWire,
+                    ..
+                })
+            ));
+            assert!(matches!(
+                missing_scope,
+                StoreResponse::Err(StoreError {
+                    kind: StoreErrorKind::Usage,
+                    ..
+                })
+            ));
+            match lookup {
+                StoreResponse::Ok(StoreOk::Facts { facts }) => assert_eq!(facts.len(), 1),
+                other => panic!("indexed read blocked: {other:?}"),
+            }
+            match read {
+                StoreResponse::Ok(StoreOk::Snapshot { snapshot, .. }) => {
+                    assert_eq!(
+                        snapshot["max_seq"].as_i64(),
+                        Some(before),
+                        "snapshot mixed a later commit into captured state"
+                    );
+                }
+                other => panic!("snapshot failed: {other:?}"),
+            }
+            std::fs::remove_dir_all(root).unwrap();
         }
 
         /// One line-delimited round trip against the daemon (mirrors the client
