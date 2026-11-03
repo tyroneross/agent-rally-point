@@ -7,6 +7,49 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+## 0.2.9 — 2026-11-02
+
+### Changed — large room reads no longer hold the mutation dispatcher during projection
+
+The per-repository store daemon still owns all durable mutations. Bulk fact
+responses, fact pages and room snapshots now capture consistent inputs on that
+owner, then project and construct replies on CPU-sized read workers. Request
+scope, policy, time and cache proofs travel with the captured view. Writes and
+indexed reads can proceed while a captured snapshot is being projected; worker
+errors and completed reads preserve idle-shutdown accounting. Read admission is
+bounded and refuses overload without waiting for a worker slot in the mutation
+dispatcher. Capture and reconciliation remain serial, and retained shared fact
+vectors can still require copying when history grows. This is not a production
+throughput or capacity claim.
+
+The daemon also caches decoded facts and reads incremental SQLite tails when
+canonical history safely extends, instead of re-decoding unchanged history for
+each request. Narrow event, reply, recent and session reads and batched room
+queries reduce avoidable full-ledger work; existing clients keep their wire
+contracts and recovery behavior.
+
+### Added — approved coordinator rooms can recover a stopped daemon
+
+Ordinary commands can restart the background coordinator in rooms that already
+approved it. This does not approve a coordinator in a new room, start a terminal
+runtime, or negotiate an incompatible wire version. Released `rally` binaries
+include this store-daemon implementation; `rally daemon start` launches the
+installed executable with `daemon serve`.
+
+### Fixed — upgrades, recovery and worktree cleanup preserve their boundaries
+
+Verified CLI upgrades retain a recovery copy and explain protocol mismatch
+recovery. Replace clients only after stopping a shared daemon with its compatible
+CLI; update host integrations separately. Canonical history and claims are not
+deleted as part of that upgrade.
+
+Coordination fixes include lease-expiry visibility and recovery, claim renewal
+activity checks, scoped wake handling, canonical reply observation, and recovery
+of prelaunch-record failures. Worktree cleanup can recognize merged worktrees
+holding only build output while retaining incomplete or unknown ownership and
+other protected work. Corruption, handover, concurrent-append and authorization
+regressions cover the corresponding source contracts.
+
 ### Changed — each hook fire launches `rally` at most once
 
 Lifecycle hooks spawned `rally` 6 (SessionStart), 4 (UserPromptSubmit) and 5
