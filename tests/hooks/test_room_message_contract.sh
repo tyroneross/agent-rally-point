@@ -135,6 +135,10 @@ _sandbox() {
 # codex:<uuid>) because RALLY_TOOL_ID replaces the whole id INCLUDING the host
 # family, and a claude id on a codex run would silently grade the Claude
 # envelope twice.
+# These fixtures grade rendered content. Enter the existing supervised-child
+# path so scheduler delays cannot replace that content with a valid fail-open
+# `{}`. Production lifecycle deadlines are graded by test_lifecycle_budget.py.
+# Reuse the stub-budget scale documented in test_rally_coordination_hook.sh.
 # ---------------------------------------------------------------------------
 _run() {
   _sb="$1"; _ph="$2"; _host="$3"; _sess="$4"; _out="$5"; _hk="${6:-$HOOK}"
@@ -144,7 +148,8 @@ _run() {
     ROOM_JSON="$_sb/room.json" NEXT_JSON="$_sb/next.json" STATUS_JSON="$_sb/status.json" \
       PROMPT_MODE="${PROMPT_MODE:-once}" SELF_TOOL="$_self" \
       RALLY_BIN="$STUB" RALLY_TOOL_ID="$_self" RALLY_SESSION_ID="$_sess" \
-      "$_hk" "$_ph" "$_host" </dev/null 2>/dev/null
+      RALLY_HOOK_SUPERVISED_CHILD=1 RALLY_HOOK_MS_BUDGET_SCALE=8 \
+      "$_hk" "$_ph" "$_host" </dev/null 2>"$_out.stderr"
   ) > "$_out"
 }
 
@@ -1158,6 +1163,39 @@ case "$_gr_env" in
   *) _gr_fail="$_gr_fail; RALLY_HOOK_ROOM_DETAIL=brief did not override the persisted verbose config" ;;
 esac
 if [ -z "$_gr_fail" ]; then ok "$T"; else bad "$T" "${_gr_fail#; }"; fi
+
+# A renderer-only fixture must still inspect its content when a cold Node
+# startup takes longer than the production idle deadline. Delaying exactly
+# one Node call makes this deterministic without loading the machine.
+T="rendering fixtures retain content after a slow Node startup"
+sb="$(_sandbox G-fixture-deadline)"
+printf '%s' '{"data":{"status_read":{"states":[{"tool":"codex:slow","state":"working","file":"CHANGELOG.md","stale":false}]}}}' > "$sb/status.json"
+real_node="$(command -v node)"
+mkdir "$sb/slow-node"
+cat > "$sb/slow-node/node" <<'EOF'
+#!/usr/bin/env bash
+[ "${1:-}" = --warm ] && exit 0
+printf '.\n' >> "$NODE_CALLS"
+if [ ! -f "$NODE_DELAY_ONCE" ]; then
+  : > "$NODE_DELAY_ONCE"
+  sleep 5
+fi
+exec "$REAL_NODE" "$@"
+EOF
+chmod +x "$sb/slow-node/node"
+"$sb/slow-node/node" --warm
+fixture_failure=""
+for fixture_host in claude_code codex; do
+  PATH="$sb/slow-node:$PATH" REAL_NODE="$real_node" \
+    NODE_DELAY_ONCE="$sb/$fixture_host.delayed" NODE_CALLS="$sb/$fixture_host.calls" \
+    _run "$sb" idle "$fixture_host" "fixture-deadline-$fixture_host-$$" "$sb/$fixture_host.json"
+  rendered="$(_extract "$sb/$fixture_host.json" "$fixture_host:$SELF_SUFFIX")"
+  if [ ! -f "$sb/$fixture_host.delayed" ] || [ ! -s "$sb/$fixture_host.calls" ] || \
+     [[ "$rendered" != *"codex:slow"* ]]; then
+    fixture_failure="$fixture_failure $fixture_host did not render after the measured startup delay (stderr: $(cat "$sb/$fixture_host.json.stderr"));"
+  fi
+done
+if [ -z "$fixture_failure" ]; then ok "$T"; else bad "$T" "$fixture_failure"; fi
 
 echo ""
 echo "Passed: $PASS / Failed: $FAIL"

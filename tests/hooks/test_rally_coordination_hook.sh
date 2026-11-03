@@ -52,6 +52,12 @@ export RALLY_HOOK_MS_BUDGET_SCALE
 RALLY_NATIVE_HOOK="${RALLY_NATIVE_HOOK:-off}"
 export RALLY_NATIVE_HOOK
 
+# These fixtures assert which calls run and what context is rendered. The
+# production lifecycle supervisor may legitimately skip either on a loaded
+# host. Enter its existing child path here; the independent lifecycle-budget
+# suite below retains the real supervisor, host ceiling and fail-open tests.
+export RALLY_HOOK_SUPERVISED_CHILD=1
+
 # Host sessionStart env (or a parent agent) can leak these into the suite and
 # override every test's intended --tool. Isolate.
 unset RALLY_TOOL_ID RALLY_SESSION_ID RALLY_AGENT_ID RALLY_ET_ROUTER_HEALTH RALLY_NOTICE_VERBOSITY
@@ -3556,6 +3562,13 @@ u4_write_health "$health_i" "$future_ms" "false" "[\"$u4_id\"]" "{\"$u4_id\":[\"
   exit 0
 )
 if [ "$?" = "0" ]; then ok "$T"; else bad "$T"; fi
+
+T="production lifecycle deadlines and fail-open behavior remain enforced"
+if python3 "$REPO_ROOT/tests/hooks/test_lifecycle_budget.py"; then
+  ok "$T"
+else
+  bad "$T"
+fi
 
 # Summary
 # ----------------------------------------------------------------------
