@@ -45,7 +45,9 @@ launcher's process group and verifies that the coordinator remains available.
 ### Security
 
 Updated compatible TLS dependency patches to resolve six blocking RustSec
-advisories. Existing allowed warnings remain visible in the dependency audit.
+advisories. Updated Tokio to 1.53.3 for RUSTSEC-2026-0386, addressing I/O-safety
+unsoundness in its `AsyncFd` constructors. Remaining allowed warnings stay
+visible; the audit and dependency policies are unchanged.
 
 ### Fixed — upgrades, recovery and worktree cleanup preserve their boundaries
 
