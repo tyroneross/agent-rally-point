@@ -185,27 +185,33 @@ def render_plugin_surfaces(config: dict[str, Any], version: str) -> dict[Path, s
     }
 
 
-def command_for(host: str, source: str, phase: str) -> str:
+def command_for(host: str, source: str, phase: str, timeout_ms: int) -> str:
+    allowance = hook_timeout_seconds({"phase": phase, "timeout_ms": timeout_ms}) * 1000
+    declaration = f"RALLY_HOOK_HOST_TIMEOUT_MS={allowance} "
     if host == "claude_code" and source == "plugin":
         return (
             "RALLY_HOOK_SOURCE=plugin "
-            f'"${{CLAUDE_PLUGIN_ROOT}}/hooks/rally-coordination-hook.sh" {phase} claude_code'
+            + declaration
+            + f'"${{CLAUDE_PLUGIN_ROOT}}/hooks/rally-coordination-hook.sh" {phase} claude_code'
         )
     if host == "claude_code":
         return (
             "RALLY_HOOK_SOURCE=project "
-            f'"${{CLAUDE_PROJECT_DIR}}/hooks/rally-coordination-hook.sh" {phase} claude_code'
+            + declaration
+            + f'"${{CLAUDE_PROJECT_DIR}}/hooks/rally-coordination-hook.sh" {phase} claude_code'
         )
     if host == "codex":
         return (
             "RALLY_HOOK_SOURCE=project "
-            'bash "$(git rev-parse --show-toplevel 2>/dev/null || pwd)'
+            + declaration
+            + 'bash "$(git rev-parse --show-toplevel 2>/dev/null || pwd)'
             f'/hooks/rally-coordination-hook.sh" {phase} codex'
         )
     if host == "cursor":
         return (
             "RALLY_HOOK_SOURCE=project "
-            'bash "$(git rev-parse --show-toplevel 2>/dev/null || pwd)'
+            + declaration
+            + 'bash "$(git rev-parse --show-toplevel 2>/dev/null || pwd)'
             f'/hooks/rally-coordination-hook.sh" {phase} cursor'
         )
     raise GenerationError(f"unsupported hook host {host!r}")
@@ -217,7 +223,7 @@ def claude_hook_group(
     event = phase["events"]["claude_code"]
     hook: dict[str, Any] = {
         "type": "command",
-        "command": command_for("claude_code", source, phase["phase"]),
+        "command": command_for("claude_code", source, phase["phase"], phase["timeout_ms"]),
     }
     if include_timeout:
         hook["timeout"] = hook_timeout_seconds(phase)
@@ -237,7 +243,7 @@ def codex_hook_group(phase: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     hook = {
         "type": "command",
         "timeout": hook_timeout_seconds(phase),
-        "command": command_for("codex", "project", phase["phase"]),
+        "command": command_for("codex", "project", phase["phase"], phase["timeout_ms"]),
     }
     group: dict[str, Any] = {"hooks": [hook]}
     matcher = phase.get("matchers", {}).get("codex")
@@ -313,7 +319,7 @@ def render_hook_surfaces(config: dict[str, Any]) -> dict[Path, str]:
         if "cursor" in events:
             cursor_event = events["cursor"]
             entry: dict[str, Any] = {
-                "command": command_for("cursor", "project", phase["phase"]),
+                "command": command_for("cursor", "project", phase["phase"], phase["timeout_ms"]),
                 "timeout": hook_timeout_seconds(phase),
             }
             matcher = phase.get("matchers", {}).get("cursor")

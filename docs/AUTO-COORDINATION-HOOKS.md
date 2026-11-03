@@ -381,10 +381,16 @@ Any rally CLI error, timeout, or missing binary causes the hook to exit 0
 silently. The hook MUST NEVER stall a host session. Specifically:
 
 - **Missing binary** — detected up front (`command -v RALLY_BIN`) → exit 0.
-- **Hung binary** — bounded by a wall-clock watchdog (default 5s per call;
-  `RALLY_HOOK_TIMEOUT_MS` ms env override). The watchdog kills the entire
-  process group on overrun (fixed a leak in the earlier `exec`-based shim
-  where grandchildren kept the captured stdout FD open and stalled `$(...)`).
+- **Hung binary** — new generated start, idle, and after-write profiles declare
+  a 30s caller allowance and share a 25s internal work allowance. The remaining
+  5s is provisional shutdown headroom, not a measured percentile. Explicit
+  `RALLY_HOOK_TIMEOUT_MS` and lifecycle deadline overrides can shorten work.
+  Profiles without a declaration retain legacy 5s caller compatibility;
+  before-write retains its separate 10s caller setting. With Perl, cancellation
+  owns and stops the foreground CLI group, including grandchildren. Without
+  Perl, GNU/gtimeout retains the legacy per-call slices and best-effort cleanup;
+  the stronger parent-loss guarantee requires the Perl supervisor. Installed
+  profiles must be updated separately to adopt the new declarations.
 - **Malformed rally output** — JSON parse failure → empty envelope.
 
 ## Strict mode

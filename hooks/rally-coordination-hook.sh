@@ -75,15 +75,19 @@
 #     hatch.
 #
 # Env:
-#   RALLY_HOOK_TIMEOUT_MS  — Rally call budget (default 3000), including the
+#   RALLY_HOOK_TIMEOUT_MS  — explicit Rally call cap, including the
 #                            native before-write transaction. Legacy mutations
 #                            use documented stage sub-budgets. Custom values
 #                            must leave startup/cleanup time below the registering
 #                            host's timeout; the CLI's accepted range is not a
 #                            promise that a host grants that much time.
-#   RALLY_HOOK_DEADLINE_MS — whole-hook deadline for start/idle/after-write
-#                            (default idle 2000, start 3500, after-write 4000,
-#                            all under the host's 5s; 100..59999).
+#                            New supervised lifecycle calls inherit their allowance;
+#                            other callers retain the3000ms default.
+#   RALLY_HOOK_HOST_TIMEOUT_MS — caller-declared host allowance. New generated
+#                            lifecycle definitions declare30000; absent means
+#                            legacy5000 compatibility, not a provider maximum.
+#   RALLY_HOOK_DEADLINE_MS — explicit whole-hook override for lifecycle phases,
+#                            capped below the caller allowance with headroom.
 #                            On overrun the hook prints `{}` and exits 0. See
 #                            "Lifecycle deadline supervisor" below.
 #   RALLY_BIN              — dev override for the rally binary. Must be an
@@ -419,23 +423,51 @@ case "$(printf '%s' "${RALLY_HOOKS:-}" | tr '[:upper:]' '[:lower:]')" in
   0|off|false|no|disabled) exit 0 ;;
 esac
 
+# Milliseconds must fit the portable alarm representation and scaled shell
+# arithmetic. This representation check is not an operating-time policy.
+_rally_valid_ms() {
+  [[ "$1" =~ ^[1-9][0-9]{0,12}$ ]] && [ "$1" -le 2147483647000 ]
+}
+_rally_host_declared=0
+_rally_host_ms=5000
+if _rally_valid_ms "${RALLY_HOOK_HOST_TIMEOUT_MS:-}" && \
+   [ "$RALLY_HOOK_HOST_TIMEOUT_MS" -ge 1000 ]; then
+  _rally_host_ms="$RALLY_HOOK_HOST_TIMEOUT_MS"
+  _rally_host_declared=1
+fi
+_rally_host_headroom_ms=$(( (_rally_host_ms + 5) / 6 ))
+[ "$_rally_host_headroom_ms" -ge 1000 ] || _rally_host_headroom_ms=1000
+[ "$_rally_host_headroom_ms" -lt "$_rally_host_ms" ] || \
+  _rally_host_headroom_ms=$(( _rally_host_ms / 2 ))
+_rally_lifecycle_max_ms=$(( _rally_host_ms - _rally_host_headroom_ms ))
+_rally_lifecycle_budget_ms=0
+case "$phase" in
+  start|idle|after-write)
+    if [ "$_rally_host_declared" = 1 ] && command -v perl >/dev/null 2>&1; then
+      _rally_lifecycle_budget_ms="$_rally_lifecycle_max_ms"
+    fi
+    ;;
+esac
+
 # --- Lifecycle deadline supervisor (start / idle / after-write) ------------
-# SessionStart, UserPromptSubmit and Stop get 5s in hooks.json, and
-# `async: true` cannot help any of them: per
-# https://code.claude.com/docs/en/hooks ("Run hooks in the background") async
-# is honoured only on observational events, is ignored on blocking events such
-# as Stop, and discards all output. A host-side timeout discards the hook's
-# output and is logged as a hook failure; Easy Terminal's hook-failure store
-# recorded such timeouts on all three events. Measured against a hung binary
-# at load-avg ~30, SessionStart took 3.8s of its 5s: the per-call budgets fit,
-# but shell/perl/node overhead under load left ~1s of margin.
+# Newly generated launchers declare their configured host allowance (30s).
+# The internal default spends five-sixths of that allowance, reserving at
+# least one second for launcher/scheduler/cleanup overhead: 30s -> 25s.
+# This headroom is provisional policy, not a measured percentile. Older
+# callers without a declaration retain the historical 5s compatibility
+# allowance and 2s/3.5s/4s phase defaults. Five seconds is NOT a provider cap.
 #
-# This supervisor makes the deadline a property of the hook, not of the load.
+# Provider timeouts are configurable; async delivery differs by host. This
+# supervisor owns its lifetime independently of whether the caller waits.
+# See https://code.claude.com/docs/en/hooks#common-fields and the canonical
+# config/host-integrations.json for our selected allowance.
+#
+# This supervisor owns the nested work deadline; scheduler/startup headroom
+# remains provisional and is not a guarantee under arbitrary host pressure.
 # It re-runs this script as a child in its own process group, buffers the
 # child's stdout, and returns it verbatim when the child finishes inside
-# RALLY_HOOK_DEADLINE_MS (default idle 2000 / start 3500 / after-write 4000;
-# 100..59999; scaled by
-# RALLY_HOOK_MS_BUDGET_SCALE, capped at the 4000ms production limit). A core
+# RALLY_HOOK_DEADLINE_MS (an explicit shorter override); test scaling remains
+# capped by the declared allowance minus headroom. A core
 # alarm bounds module initialization before the normal watchdog can run.
 # On overrun it kills the
 # child's group, writes one stderr line (host debug log only) and prints the
@@ -443,8 +475,8 @@ esac
 # the failure. It also hands the child a call deadline (hard deadline minus a
 # render reserve) that rally_timeout_ms clamps every foreground Rally call to,
 # so a slow room degrades to partial context instead of losing the envelope.
-# Before-write is not supervised: it has its own budget proof and 10s limit.
-# Without perl the hook runs unsupervised, exactly as before.
+# Before-write is separate, with its existing configured10s allowance.
+# Without Perl the hook keeps legacy slices and best-effort cancellation.
 case "$phase" in
   start|idle|after-write)
     if [ "${RALLY_HOOK_SUPERVISED_CHILD:-}" = "1" ]; then
@@ -454,39 +486,51 @@ case "$phase" in
       export -n RALLY_HOOK_CALL_DEADLINE_AT_MS 2>/dev/null || true
     elif command -v perl >/dev/null 2>&1 && find_rally_root >/dev/null 2>&1; then
       unset RALLY_HOOK_CALL_DEADLINE_AT_MS
-      # Per-phase default. UserPromptSubmit blocks the user's prompt and was
-      # cancelled at the host's 5s; start gets the room reads it needs; Stop is
-      # registered async so it has no host timeout to protect.
+      # Retain old per-phase behavior only for undeclared legacy callers.
       case "$phase" in
         idle) _rally_deadline_default=2000 ;;
         start) _rally_deadline_default=3500 ;;
         *) _rally_deadline_default=4000 ;;
       esac
+      [ "$_rally_host_declared" = 0 ] || _rally_deadline_default="$_rally_lifecycle_max_ms"
       _rally_deadline_ms="${RALLY_HOOK_DEADLINE_MS:-$_rally_deadline_default}"
-      case "$_rally_deadline_ms" in
-        [1-9][0-9][0-9]|[1-9][0-9][0-9][0-9]|[1-5][0-9][0-9][0-9][0-9]) ;;
-        *) _rally_deadline_ms=$_rally_deadline_default ;;
-      esac
+      _rally_valid_ms "$_rally_deadline_ms" || _rally_deadline_ms="$_rally_deadline_default"
       _rally_deadline_scale="${RALLY_HOOK_MS_BUDGET_SCALE:-1}"
       case "$_rally_deadline_scale" in
         [1-9]|1[0-6]) _rally_deadline_ms=$(( _rally_deadline_ms * _rally_deadline_scale )) ;;
       esac
-      # Test/load tuning must never outgrow the host's five-second limit.
-      [ "$_rally_deadline_ms" -gt 4000 ] && _rally_deadline_ms=4000
+      [ "$_rally_deadline_ms" -le "$_rally_lifecycle_max_ms" ] || \
+        _rally_deadline_ms="$_rally_lifecycle_max_ms"
       exec perl -e '
         # Core alarm works before loading any modules. The cleanup callback
         # becomes available once a supervised child has been created.
         our $cleanup;
         BEGIN {
-          $SIG{ALRM} = sub { $cleanup->() if $cleanup; print STDOUT "{}"; exit 0; };
-          alarm(4);
+          my ($budget, $event) = @ARGV;
+          $SIG{ALRM} = sub {
+            $cleanup->() if $cleanup;
+            printf STDERR "rally hook: %s exceeded its %dms internal deadline; returned {} (fail-open)\n", $event, $budget;
+            print STDOUT "{}"; exit 0;
+          };
+          alarm(int(($budget + 999) / 1000));
         }
         use strict;
-        use Time::HiRes qw(time);
+        use Time::HiRes qw(time getitimer setitimer ITIMER_REAL);
         our $started_at;
-        BEGIN { $started_at = time; }
+        BEGIN {
+          # Recover the original origin from the already armed kernel timer;
+          # module initialization consumes this same allowance, not a new one.
+          my $now = time;
+          my ($left) = getitimer(ITIMER_REAL);
+          my $ms = $ARGV[0];
+          my $rounding = int(($ms + 999) / 1000) - $ms / 1000;
+          my $remaining = $left - $rounding;
+          $started_at = $now + $remaining - $ms / 1000;
+          $SIG{ALRM}->() if $remaining <= 0;
+          setitimer(ITIMER_REAL, $remaining);
+        }
         # Loading POSIX can stall under startup contention. Count it too.
-        use POSIX qw(setsid :sys_wait_h);
+        use POSIX qw(setsid :sys_wait_h :signal_h);
         my ($ms, $phase) = (shift @ARGV, shift @ARGV);
         my $t0 = $started_at;
         my $reserve = $ms >= 2100 ? 700 : int($ms / 3);
@@ -507,14 +551,23 @@ case "$phase" in
         close $w;
         # Reap with a short bound: a child stuck in uninterruptible I/O must not
         # hold back the fail-open `{}` until the host cancels the hook.
+        my ($buf, $eof, $reaped) = ("", 0, 0);
+        my $reap_signals = POSIX::SigSet->new(SIGALRM, SIGTERM, SIGINT, SIGHUP);
+        my $reap = sub {
+          my $previous = POSIX::SigSet->new();
+          sigprocmask(SIG_BLOCK, $reap_signals, $previous);
+          $reaped = 1 if !$reaped && waitpid($pid, WNOHANG) == $pid;
+          sigprocmask(SIG_SETMASK, $previous);
+        };
         my $kill = sub {
+          return if $reaped; # never target a reaped PID or detached descendants
+          $SIG{ALRM} = $SIG{TERM} = $SIG{INT} = $SIG{HUP} = "IGNORE";
           kill "KILL", -$pid; kill "KILL", $pid;
           for (1 .. 20) { last if waitpid($pid, WNOHANG) != 0; select(undef, undef, undef, 0.01); }
         };
         $cleanup = $kill;
         $SIG{TERM} = $SIG{INT} = $SIG{HUP} = sub { $kill->(); exit 0; };
         my $deadline = $t0 + $ms / 1000;
-        my ($buf, $eof, $reaped) = ("", 0, 0);
         while (1) {
           my $left = $deadline - time;
           last if $left <= 0;
@@ -525,13 +578,21 @@ case "$phase" in
             my $got = sysread($r, $buf, 65536, length $buf);
             $eof = 1 if !$got;
           }
-          $reaped = 1 if !$reaped && waitpid($pid, WNOHANG) == $pid;
+          $reap->();
           # Once the hook itself has exited, a detached grandchild that kept
           # the pipe open must not hold the result hostage.
           last if $reaped && ($eof || $n == 0);
         }
-        if ($reaped) { print STDOUT $buf; exit 0; }
+        if ($reaped) {
+          # The response is selected. A slow consumer must not let the startup
+          # alarm interrupt this write and append a second JSON value.
+          alarm(0);
+          $cleanup = undef;
+          $SIG{TERM} = $SIG{INT} = $SIG{HUP} = sub { exit 0; };
+          print STDOUT $buf; exit 0;
+        }
         $kill->();
+        alarm(0);
         printf STDERR "rally hook: %s exceeded its %dms internal deadline; returned {} (fail-open)\n", $phase, $ms;
         print STDOUT "{}";
         exit 0;
@@ -1121,13 +1182,13 @@ fi
 # even if the binary is old/missing. macOS ships no `timeout(1)` by default,
 # so we detect a real timeout command and otherwise fall back to a portable
 # perl-alarm shim, with a pure-bash background-kill shim as last resort.
-# MUST stay strictly below the host hook timeout in hooks/hooks.json (5s).
-# They were both 5000ms/5s, so the hook budgeted itself to exactly the wall
-# clock at which the host kills it: its own fail-loud fallback could never be
-# rendered and emitted in time, and the host discarded the output instead
-# ("UserPromptSubmit hook timed out after 5s"). 3000ms leaves ~2s to render and
-# return. Raise the hooks.json timeout first if this is ever raised.
+# New lifecycle calls inherit the declared allowance minus headroom. The3s
+# fallback belongs to older callers and the separate before-write path;
+# it is not a provider maximum. Explicit operator caps remain supported.
 _rally_budget_ms="${RALLY_HOOK_TIMEOUT_MS:-3000}"
+if [ -z "${RALLY_HOOK_TIMEOUT_MS:-}" ] && [ "$_rally_lifecycle_budget_ms" -gt 0 ]; then
+  _rally_budget_ms="$_rally_lifecycle_budget_ms"
+fi
 _rally_budget_s=$(( (_rally_budget_ms + 999) / 1000 ))
 [ "$_rally_budget_s" -lt 1 ] && _rally_budget_s=1
 
@@ -1175,9 +1236,9 @@ let m=""; process.stdin.on("data",c=>m+=c); process.stdin.on("end",()=>{
 fi
 
 if command -v timeout >/dev/null 2>&1; then
-  rally_timeout() { timeout -k 1 "${_rally_budget_s}s" "$RALLY_BIN" "$@"; }
+  rally_timeout() { timeout -k 1 "${_rally_budget_s}s" "$RALLY_BIN" "$@" --timeout-ms "$_rally_budget_ms"; }
 elif command -v gtimeout >/dev/null 2>&1; then
-  rally_timeout() { gtimeout -k 1 "${_rally_budget_s}s" "$RALLY_BIN" "$@"; }
+  rally_timeout() { gtimeout -k 1 "${_rally_budget_s}s" "$RALLY_BIN" "$@" --timeout-ms "$_rally_budget_ms"; }
 elif command -v perl >/dev/null 2>&1; then
   # IMPORTANT: this shim fork+setsid's the child so we can kill its WHOLE
   # process group on timeout. The earlier `exec`-based shim leaked grandchildren
@@ -1202,7 +1263,7 @@ elif command -v perl >/dev/null 2>&1; then
       alarm $t;
       waitpid($pid, 0);
       exit($? >> 8);
-    ' "$_rally_budget_s" "$RALLY_BIN" "$@";
+    ' "$_rally_budget_s" "$RALLY_BIN" "$@" --timeout-ms "$_rally_budget_ms";
   }
 else
   # Pure-bash shim: run rally in its own process group, kill the group on
@@ -1210,9 +1271,9 @@ else
   # if available; without it we kill what we can.
   rally_timeout() {
     if command -v setsid >/dev/null 2>&1; then
-      setsid "$RALLY_BIN" "$@" &
+      setsid "$RALLY_BIN" "$@" --timeout-ms "$_rally_budget_ms" &
     else
-      "$RALLY_BIN" "$@" &
+      "$RALLY_BIN" "$@" --timeout-ms "$_rally_budget_ms" &
     fi
     local pid=$!
     local waited=0
@@ -1284,24 +1345,44 @@ _rally_clamp_to_deadline() {
   return 0
 }
 
+# New lifecycle callers share their remaining allowance with each operation;
+# the aggregate supervisor still caps the whole pipeline. Legacy callers keep
+# the old slices. An explicit RALLY_HOOK_TIMEOUT_MS remains an operator cap.
+# The caller declares a local budget_ms (Bash dynamic scope), as for the clamp.
+_rally_set_call_budget() {
+  if [ "$_rally_lifecycle_budget_ms" -gt 0 ]; then
+    budget_ms="$_rally_budget_ms"
+  else
+    budget_ms=$(( $1 * _rally_ms_scale ))
+  fi
+}
+
 # Millisecond guard for the bounded multi-target transaction. The CLI receives
 # the same explicit watchdog value, while the outer guard still kills an old or
 # wedged binary that ignores it. Appending the global flag preserves subcommand
 # position for older wrappers and test doubles.
-if command -v timeout >/dev/null 2>&1; then
+_rally_lifecycle_perl_owner=0
+case "$phase" in
+  start|idle|after-write) command -v perl >/dev/null 2>&1 && _rally_lifecycle_perl_owner=1 ;;
+esac
+# Without Perl keep the old GNU/gtimeout slices and best-effort cancellation;
+# the stronger parent-loss guarantee belongs to the supervised Perl path.
+if [ "$_rally_lifecycle_perl_owner" = 0 ] && command -v timeout >/dev/null 2>&1; then
   _rally_timeout_ms_capable=1
   rally_timeout_ms() {
-    local budget_ms=$(( $1 * _rally_ms_scale )) whole rem duration
+    local budget_ms whole rem duration
+    _rally_set_call_budget "$1"
     shift
     _rally_clamp_to_deadline || return 124
     whole=$((budget_ms / 1000)); rem=$((budget_ms % 1000))
     duration="${whole}.$(printf '%03d' "$rem")s"
     timeout -s KILL "$duration" "$RALLY_BIN" "$@" --timeout-ms "$budget_ms"
   }
-elif command -v gtimeout >/dev/null 2>&1; then
+elif [ "$_rally_lifecycle_perl_owner" = 0 ] && command -v gtimeout >/dev/null 2>&1; then
   _rally_timeout_ms_capable=1
   rally_timeout_ms() {
-    local budget_ms=$(( $1 * _rally_ms_scale )) whole rem duration
+    local budget_ms whole rem duration
+    _rally_set_call_budget "$1"
     shift
     _rally_clamp_to_deadline || return 124
     whole=$((budget_ms / 1000)); rem=$((budget_ms % 1000))
@@ -1311,10 +1392,17 @@ elif command -v gtimeout >/dev/null 2>&1; then
 elif command -v perl >/dev/null 2>&1; then
   _rally_timeout_ms_capable=1
   rally_timeout_ms() {
-    local budget_ms=$(( $1 * _rally_ms_scale ))
+    local budget_ms
+    _rally_set_call_budget "$1"
     shift
-    perl -MTime::HiRes=ualarm,time -e '
-      use POSIX qw(setsid);
+    perl -e '
+      # Capture the owner before module initialization or detachment. A
+      # guardian survives worker-group cancellation so cleanup cannot lose
+      # a race against the final supervisor KILL.
+      our $owner;
+      BEGIN { $owner = getppid(); }
+      use Time::HiRes qw(ualarm time);
+      use POSIX qw(setsid WNOHANG :signal_h);
       my $ms = shift;
       # Lifecycle call deadline, clamped here so the common macOS path pays
       # no extra process. The CLI flag value is the last argument.
@@ -1324,20 +1412,53 @@ elif command -v perl >/dev/null 2>&1; then
         exit 124 if $left < 100;
         if ($left < $ms) { $ms = $left; $ARGV[-1] = $ms; }
       }
-      my $pid = fork();
+      exit 124 if $owner <= 1 || getppid() != $owner;
+      my $session = setsid();
+      exit 125 if !defined($session) || $session < 0;
+      exit 124 if getppid() != $owner;
+      my $pid;
+      my ($done, $code) = (0, 0);
+      my $reap_signals = POSIX::SigSet->new(SIGALRM, SIGTERM, SIGINT, SIGHUP);
+      my $cancel = sub {
+        $SIG{ALRM} = $SIG{TERM} = $SIG{INT} = $SIG{HUP} = "IGNORE";
+        if ($pid) {
+          kill "KILL", -$pid;
+          kill "KILL", $pid if !$done; # before child setsid; never a reaped PID
+          my $until = time + 0.2;
+          while (!$done && time < $until) {
+            last if waitpid($pid, WNOHANG) != 0;
+            select(undef, undef, undef, 0.01);
+          }
+        }
+        exit 124;
+      };
+      $SIG{ALRM} = $SIG{TERM} = $SIG{INT} = $SIG{HUP} = $cancel;
+      $SIG{CHLD} = sub {}; # wake healthy completions without waiting a poll
+      $pid = fork();
       die "fork failed" unless defined $pid;
       if ($pid == 0) {
         setsid();
         exec @ARGV or exit 127;
       }
-      $SIG{ALRM} = sub {
-        kill "-KILL", $pid;
-        waitpid($pid, 0);
-        exit 124;
-      };
       ualarm($ms * 1000);
-      waitpid($pid, 0);
-      exit($? >> 8);
+      while (1) {
+        # Reaping and its ownership flag form one operation with respect to
+        # cancellation handlers, so no handler can target the released PID.
+        my $previous = POSIX::SigSet->new();
+        sigprocmask(SIG_BLOCK, $reap_signals, $previous);
+        if (!$done && waitpid($pid, WNOHANG) == $pid) {
+          $code = $? >> 8;
+          $done = 1;
+        }
+        sigprocmask(SIG_SETMASK, $previous);
+        # A coordinator intentionally starts its own group; only this
+        # foreground group belongs to this guardian, including grandchildren.
+        exit $code if $done && !kill(0, -$pid);
+        $cancel->() if getppid() != $owner;
+        # A10ms poll observes owner loss without scanning unrelated processes;
+        # ALRM still owns the work deadline and CHLD wakes normal completions.
+        select(undef, undef, undef, 0.01);
+      }
     ' "$budget_ms" "${RALLY_HOOK_CALL_DEADLINE_AT_MS:-0}" "$RALLY_BIN" "$@" --timeout-ms "$budget_ms"
   }
 else
@@ -1896,11 +2017,12 @@ _rb_ops=()
 _rb_names=()
 _rb_budget=0
 _rb_add() {  # $1=name $2=unscaled budget ms, then the op argv
-  local name="$1" ms="$2"
+  local name="$1" ms="$2" budget_ms
   shift 2
   _rb_names[${#_rb_names[@]}]="$name"
   _rb_budget=$(( _rb_budget + ms ))
-  set -- "$@" --timeout-ms "$(( ms * _rally_ms_scale ))"
+  _rally_set_call_budget "$ms"
+  set -- "$@" --timeout-ms "$budget_ms"
   _rb_counts="${_rb_counts:+$_rb_counts,}$#"
   _rb_ops=(${_rb_ops[@]+"${_rb_ops[@]}"} "$@")
 }
@@ -2033,10 +2155,9 @@ if [ "$phase" = "start" ]; then
   # Register presence (auto-enter), then surface room awareness so a NEW agent
   # automatically knows there is an active room + who owns what, and deconflicts
   # before editing. Stays quiet (no nag) when the agent is solo.
-  # Lifecycle hosts allow 5s for the WHOLE hook, not each CLI call. Five
-  # sequential 3s guards previously took 6.25s in a live room even without
-  # a hung binary. Keep the foreground CLI sum below 3.5s, leaving time for
-  # shell/Node startup and rendering. Idle status remains asynchronous.
+  # Legacy callers retain the old requested slices below. New supervised
+  # callers share their declared allowance across calls, startup and rendering.
+  # The presence heartbeat retains its separate asynchronous lifetime.
   if [ "$_rally_batched" != "1" ]; then
     rally_timeout_ms 1000 enter --tool "$tool" --session-id "$session" --json >/dev/null 2>&1 || true
   fi

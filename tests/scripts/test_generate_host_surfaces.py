@@ -186,6 +186,20 @@ class GenerateHostSurfacesTests(unittest.TestCase):
         }
         self.assertEqual(actual, expected)
 
+    def test_each_launcher_declares_the_same_budget_as_its_host_field(self) -> None:
+        surfaces = GEN.render_hook_surfaces(GEN.load_config(ROOT))
+        for path, contents in surfaces.items():
+            for event, groups in json.loads(contents)["hooks"].items():
+                for group in groups:
+                    for hook in group.get("hooks", [group]):
+                        declaration = re.search(
+                            r"RALLY_HOOK_HOST_TIMEOUT_MS=(\d+)", hook["command"]
+                        )
+                        self.assertIsNotNone(declaration, (str(path), event))
+                        self.assertEqual(int(declaration[1]), hook["timeout"] * 1000)
+                        if event not in ("PreToolUse", "preToolUse"):
+                            self.assertEqual(hook["timeout"], 30)
+
     def test_only_stop_is_async_on_claude(self) -> None:
         # Stop is advisory and must not hold the turn end; every other event
         # feeds Claude or guards an edit and stays synchronous.

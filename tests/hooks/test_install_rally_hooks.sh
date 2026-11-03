@@ -100,10 +100,10 @@ codex_description = codex.get("description", "")
 if "native matcher evidence" not in codex_description or "wrapper classifies" not in codex_description:
     raise AssertionError(f"{codex_path}: missing explicit Codex matcher uncertainty")
 expected_timeouts = {
-    "SessionStart": 5,
-    "UserPromptSubmit": 5,
+    "SessionStart": 30,
+    "UserPromptSubmit": 30,
     "PreToolUse": 10,
-    "Stop": 5,
+    "Stop": 30,
 }
 for event, timeout_sec in expected_timeouts.items():
     groups = codex.get("hooks", {}).get(event, [])
@@ -111,11 +111,16 @@ for event, timeout_sec in expected_timeouts.items():
         raise AssertionError(f"{codex_path}: unexpected {event} handler shape")
     if groups[0]["hooks"][0].get("timeout") != timeout_sec:
         raise AssertionError(f"{codex_path}: {event} timeout is not {timeout_sec} seconds")
+    declaration = f"RALLY_HOOK_HOST_TIMEOUT_MS={timeout_sec * 1000}"
+    if declaration not in groups[0]["hooks"][0].get("command", ""):
+        raise AssertionError(f"{codex_path}: {event} caller budget is not declared")
     claude_groups = claude.get("hooks", {}).get(event, [])
     if len(claude_groups) != 1 or len(claude_groups[0].get("hooks", [])) != 1:
         raise AssertionError(f"{claude_path}: unexpected {event} handler shape")
     if claude_groups[0]["hooks"][0].get("timeout") != timeout_sec:
         raise AssertionError(f"{claude_path}: {event} timeout is not {timeout_sec} seconds")
+    if declaration not in claude_groups[0]["hooks"][0].get("command", ""):
+        raise AssertionError(f"{claude_path}: {event} caller budget is not declared")
 for group in codex.get("hooks", {}).get("PreToolUse", []):
     if any("before-write codex" in hook.get("command", "") for hook in group.get("hooks", [])):
         if "matcher" in group:

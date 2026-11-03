@@ -6,8 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "RALLY_HOOK_SOURCE=plugin \"${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh\" start claude_code",
-            "timeout": 5
+            "command": "RALLY_HOOK_SOURCE=plugin RALLY_HOOK_HOST_TIMEOUT_MS=30000 \"${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh\" start claude_code",
+            "timeout": 30
           }
         ]
       }
@@ -17,8 +17,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "RALLY_HOOK_SOURCE=plugin \"${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh\" idle claude_code",
-            "timeout": 5
+            "command": "RALLY_HOOK_SOURCE=plugin RALLY_HOOK_HOST_TIMEOUT_MS=30000 \"${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh\" idle claude_code",
+            "timeout": 30
           }
         ]
       }
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "RALLY_HOOK_SOURCE=plugin \"${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh\" before-write claude_code",
+            "command": "RALLY_HOOK_SOURCE=plugin RALLY_HOOK_HOST_TIMEOUT_MS=10000 \"${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh\" before-write claude_code",
             "timeout": 10
           }
         ],
@@ -40,8 +40,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "RALLY_HOOK_SOURCE=plugin \"${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh\" after-write claude_code",
-            "timeout": 5,
+            "command": "RALLY_HOOK_SOURCE=plugin RALLY_HOOK_HOST_TIMEOUT_MS=30000 \"${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh\" after-write claude_code",
+            "timeout": 30,
             "async": true
           }
         ]

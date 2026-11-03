@@ -9,6 +9,22 @@ All notable changes to Agent Rally Point are documented here.
 
 ## 0.2.9 — 2026-11-03
 
+### Changed — lifecycle hooks declare their waiting allowance
+
+New generated SessionStart, UserPromptSubmit and Stop profiles declare 30 seconds.
+The Perl-supervised path reserves 5 seconds for startup and cleanup and shares
+the remaining 25 seconds across foreground operations. Older profiles without
+a declaration retain their 5-second compatibility behavior until updated;
+before-write remains a separate 10-second configuration. The no-Perl fallback
+keeps its legacy per-call slices and best-effort cancellation.
+
+On the supervised path, a foreground guardian cancels its own CLI group and
+grandchildren when the worker exits or is interrupted. Detached coordinators
+and the intentional background heartbeat keep separate lifetimes. Once a
+buffered response is selected, the startup alarm cannot interrupt its terminal
+write and corrupt the JSON. Installed profile updates and host trust review
+remain separate from publishing these source changes.
+
 ### Changed — large room reads no longer hold the mutation dispatcher during projection
 
 The per-repository store daemon still owns all durable mutations. Bulk fact

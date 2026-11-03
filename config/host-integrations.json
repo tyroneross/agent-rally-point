@@ -134,7 +134,7 @@
         "Shell",
         "run_terminal_cmd"
       ],
-        "mutation": [
+      "mutation": [
         "apply_patch",
         "Write",
         "Edit",
@@ -154,7 +154,7 @@
     "phases": [
       {
         "phase": "start",
-        "timeout_ms": 5000,
+        "timeout_ms": 30000,
         "events": {
           "claude_code": "SessionStart",
           "codex": "SessionStart",
@@ -163,7 +163,7 @@
       },
       {
         "phase": "idle",
-        "timeout_ms": 5000,
+        "timeout_ms": 30000,
         "events": {
           "claude_code": "UserPromptSubmit",
           "codex": "UserPromptSubmit",
@@ -186,7 +186,7 @@
       },
       {
         "phase": "after-write",
-        "timeout_ms": 5000,
+        "timeout_ms": 30000,
         "async": {
           "claude_code": true
         },

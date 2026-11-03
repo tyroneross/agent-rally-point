@@ -138,7 +138,7 @@ _sandbox() {
 # These fixtures grade rendered content. Enter the existing supervised-child
 # path so scheduler delays cannot replace that content with a valid fail-open
 # `{}`. Production lifecycle deadlines are graded by test_lifecycle_budget.py.
-# Reuse the stub-budget scale documented in test_rally_coordination_hook.sh.
+# Use the same caller allowance as the generated lifecycle configuration.
 # ---------------------------------------------------------------------------
 _run() {
   _sb="$1"; _ph="$2"; _host="$3"; _sess="$4"; _out="$5"; _hk="${6:-$HOOK}"
@@ -148,7 +148,8 @@ _run() {
     ROOM_JSON="$_sb/room.json" NEXT_JSON="$_sb/next.json" STATUS_JSON="$_sb/status.json" \
       PROMPT_MODE="${PROMPT_MODE:-once}" SELF_TOOL="$_self" \
       RALLY_BIN="$STUB" RALLY_TOOL_ID="$_self" RALLY_SESSION_ID="$_sess" \
-      RALLY_HOOK_SUPERVISED_CHILD=1 RALLY_HOOK_MS_BUDGET_SCALE=8 \
+      RALLY_HOOK_SUPERVISED_CHILD=1 \
+      RALLY_HOOK_HOST_TIMEOUT_MS=30000 \
       "$_hk" "$_ph" "$_host" </dev/null 2>"$_out.stderr"
   ) > "$_out"
 }
@@ -1165,7 +1166,7 @@ esac
 if [ -z "$_gr_fail" ]; then ok "$T"; else bad "$T" "${_gr_fail#; }"; fi
 
 # A renderer-only fixture must still inspect its content when a cold Node
-# startup takes longer than the production idle deadline. Delaying exactly
+# startup takes longer than an explicit short override. Delaying exactly
 # one Node call makes this deterministic without loading the machine.
 T="rendering fixtures retain content after a slow Node startup"
 sb="$(_sandbox G-fixture-deadline)"
@@ -1186,7 +1187,7 @@ chmod +x "$sb/slow-node/node"
 "$sb/slow-node/node" --warm
 fixture_failure=""
 for fixture_host in claude_code codex; do
-  PATH="$sb/slow-node:$PATH" REAL_NODE="$real_node" \
+  PATH="$sb/slow-node:$PATH" REAL_NODE="$real_node" RALLY_HOOK_DEADLINE_MS=1000 \
     NODE_DELAY_ONCE="$sb/$fixture_host.delayed" NODE_CALLS="$sb/$fixture_host.calls" \
     _run "$sb" idle "$fixture_host" "fixture-deadline-$fixture_host-$$" "$sb/$fixture_host.json"
   rendered="$(_extract "$sb/$fixture_host.json" "$fixture_host:$SELF_SUFFIX")"
