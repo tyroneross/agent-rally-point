@@ -127,6 +127,7 @@ mod check;
 mod check_ci;
 mod claim_authority;
 mod cli;
+mod daemon_autostart;
 mod daemon_client;
 mod dag;
 mod decay;
@@ -1964,7 +1965,10 @@ fn run_inner_with(args: &[String]) -> Result<Output> {
 
     match command {
         CliCommand::Init(args) => command_init(args),
-        CliCommand::Setup(args) => runtime_setup::command(args),
+        CliCommand::Setup(args) => {
+            daemon_autostart::suppress_for_this_process();
+            runtime_setup::command(args)
+        }
         CliCommand::Routes(args) => runtime_routes::command(args),
         CliCommand::Hooks(args) => command_hooks(args),
         CliCommand::Enter(args) => command_enter(args),
@@ -2228,6 +2232,7 @@ fn daemon_envelope_body(
 }
 
 fn command_daemon(args: cli::DaemonArgs) -> Result<Output> {
+    daemon_autostart::suppress_for_this_process();
     match args.subcommand {
         cli::DaemonSubcommand::Serve(serve_args) => command_daemon_serve(args.json, serve_args),
         cli::DaemonSubcommand::Start(start_args) => command_daemon_start(args.json, start_args),
@@ -12325,6 +12330,7 @@ fn command_session_lifecycle(args: SessionLifecycleArgs) -> Result<Output> {
 }
 
 fn command_session_ensure(json: bool, args: SessionEnsureArgs) -> Result<Output> {
+    daemon_autostart::suppress_for_this_process();
     let resources = canonical_admission_resources(args.resources.clone())?;
     let inherited = args
         .session_id

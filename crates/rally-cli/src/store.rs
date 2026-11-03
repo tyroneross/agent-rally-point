@@ -4451,6 +4451,7 @@ fn acquire_direct_ownership_or_route_bounded(
 ) -> Result<Option<RoutedRoomStore>> {
     const RETRY_SLEEP: Duration = Duration::from_millis(10);
     let deadline = Instant::now() + bound;
+    let mut autostart_checked = false;
     loop {
         // Clamp the probe to what is left of THIS wait. Without it a probe
         // against a socket that accepts and never answers blocks for its own
@@ -4464,6 +4465,12 @@ fn acquire_direct_ownership_or_route_bounded(
         }
         if process_owns_direct_room(rally_dir) {
             return Ok(None);
+        }
+        // No coordinator answered: in an owner-approved room, start one for
+        // later commands (throttled, detached); this command continues direct.
+        if !autostart_checked {
+            autostart_checked = true;
+            crate::daemon_autostart::maybe_start(root, rally_dir);
         }
         // Which lock refused THIS attempt. Recorded per iteration rather than
         // accumulated: the report wants the state at the moment the wait
