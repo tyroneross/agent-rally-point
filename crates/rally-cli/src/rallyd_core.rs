@@ -544,12 +544,12 @@ mod imp {
     /// one fact when any remain (a single fact is capped far below the budget).
     /// `next_after_seq` is the last included seq when more facts remain.
     fn facts_page(
-        mut facts: Vec<store::Fact>,
+        facts: &[store::Fact],
         after_seq: i64,
         max_bytes: usize,
     ) -> Result<(Vec<Value>, Option<i64>), StoreError> {
         let budget = max_bytes.min(MAX_LINE_BYTES - FACTS_PAGE_HEADROOM);
-        facts.retain(|fact| fact.seq > after_seq);
+        let mut facts: Vec<_> = facts.iter().filter(|fact| fact.seq > after_seq).collect();
         facts.sort_by_key(|fact| fact.seq);
         let mut page = Vec::new();
         let mut used = 0usize;
@@ -1064,9 +1064,9 @@ mod imp {
                 }
             }
             StoreOp::Facts => {
-                let facts = store.facts().map_err(rally_to_wire)?;
+                let facts = store.shared_facts().map_err(rally_to_wire)?;
                 StoreOk::Facts {
-                    facts: to_wire_values(&facts)?,
+                    facts: to_wire_values(facts.iter())?,
                 }
             }
             StoreOp::SessionPresenceFacts { session_id } => {
@@ -1117,8 +1117,8 @@ mod imp {
                 after_seq,
                 max_bytes,
             } => {
-                let facts = store.facts().map_err(rally_to_wire)?;
-                let (facts, next_after_seq) = facts_page(facts, after_seq, max_bytes)?;
+                let facts = store.shared_facts().map_err(rally_to_wire)?;
+                let (facts, next_after_seq) = facts_page(&facts, after_seq, max_bytes)?;
                 StoreOk::FactsPage {
                     facts,
                     next_after_seq,
@@ -1760,7 +1760,7 @@ mod imp {
             let mut pages = Vec::new();
             let mut after = i64::MIN;
             loop {
-                let (page, next) = facts_page(facts.to_vec(), after, max_bytes).unwrap();
+                let (page, next) = facts_page(facts, after, max_bytes).unwrap();
                 let bytes = page
                     .iter()
                     .map(|v| serde_json::to_string(v).unwrap().len() + 1)
@@ -1801,8 +1801,113 @@ mod imp {
             let (pages, _) = drain_pages(&facts, 1);
             assert_eq!(pages.len(), 5);
             assert!(pages.iter().all(|page| page.len() == 1));
-            let (empty, next) = facts_page(Vec::new(), i64::MIN, 1).unwrap();
+            let (empty, next) = facts_page(&[], i64::MIN, 1).unwrap();
             assert!(empty.is_empty() && next.is_none());
+        }
+
+        #[test]
+        fn daemon_facts_reuse_decoded_history_and_tail_appends_with_byte_parity() {
+            let root = unique_repo_root("decoded-history");
+            let mut store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+            for n in 1..=32 {
+                store.append_fact(&seq_fact(n, 20)).unwrap();
+            }
+            let direct = store.facts().unwrap();
+            let expected = serde_json::to_vec(&StoreResponse::Ok(StoreOk::Facts {
+                facts: to_wire_values(&direct).unwrap(),
+            }))
+            .unwrap();
+            // Upgrade a read-only older room, without requiring an append.
+            let connection = rusqlite::Connection::open(root.join(".rally/facts.db")).unwrap();
+            connection.execute_batch("DROP INDEX rally_events_event_id; DROP INDEX rally_events_session; DROP INDEX rally_events_seq; DROP INDEX rally_events_retraction;").unwrap();
+            drop(connection);
+            store.install_warm_fact_store().unwrap();
+            let repo = canonical_repo_root(&root);
+            let read = |store: &mut DirectRoomStore| {
+                dispatch_one(store, &repo, StoreRequest::new(None, StoreOp::Facts))
+            };
+            store::history_probe::reset();
+            let first = read(&mut store);
+            assert_eq!(serde_json::to_vec(&first).unwrap(), expected);
+            assert_eq!(store::history_probe::counts().facts_materialized, 32);
+            store::history_probe::reset();
+            let second = read(&mut store);
+            assert_eq!(serde_json::to_vec(&second).unwrap(), expected);
+            assert_eq!(store::history_probe::counts().facts_db_full_loads, 0);
+            assert_eq!(store::history_probe::counts().facts_materialized, 0);
+            let retained = store.shared_facts().unwrap();
+            let appended = dispatch_one(
+                &mut store,
+                &repo,
+                StoreRequest::new(
+                    None,
+                    StoreOp::AppendFact {
+                        fact: to_wire_value(&seq_fact(33, 20)).unwrap(),
+                    },
+                ),
+            );
+            assert!(matches!(
+                appended,
+                StoreResponse::Ok(StoreOk::AppendFact { .. })
+            ));
+            store::history_probe::reset();
+            let tailed = read(&mut store);
+            assert_eq!(
+                retained.len(),
+                32,
+                "captured views remain immutable across append"
+            );
+            drop(retained);
+            assert_eq!(store::history_probe::counts().facts_db_full_loads, 0);
+            assert_eq!(store::history_probe::counts().facts_materialized, 1);
+            let page = dispatch_one(
+                &mut store,
+                &repo,
+                StoreRequest::new(
+                    None,
+                    StoreOp::FactsPage {
+                        after_seq: 32,
+                        max_bytes: 1024,
+                    },
+                ),
+            );
+            assert!(
+                matches!(page, StoreResponse::Ok(StoreOk::FactsPage { facts, .. }) if facts.len() == 1 && facts[0]["seq"] == 33)
+            );
+            let at = 1_790_000_000;
+            // Invalidating the existing reconcile signal must invalidate decoded
+            // history even when count and high-water are unchanged.
+            std::fs::remove_file(root.join(".rally/.reconcile-cache.json")).unwrap();
+            store::history_probe::reset();
+            let reloaded = read(&mut store);
+            assert_eq!(
+                serde_json::to_vec(&tailed).unwrap(),
+                serde_json::to_vec(&reloaded).unwrap()
+            );
+            assert!(store::history_probe::counts().facts_db_full_loads > 0);
+            store::history_probe::reset();
+            let _ = read(&mut store);
+            assert_eq!(store::history_probe::counts().facts_materialized, 0);
+            let warm_snapshot = store.test_snapshot_cache_capture_at(false, at).unwrap();
+            let warm_bytes =
+                serde_json::to_vec(&snapshot_to_wire(&warm_snapshot.snapshot).unwrap()).unwrap();
+            store
+                .close_warm_fact_store_bounded(Duration::from_secs(2))
+                .unwrap();
+            let direct = store.facts().unwrap();
+            let expected = StoreResponse::Ok(StoreOk::Facts {
+                facts: to_wire_values(&direct).unwrap(),
+            });
+            assert_eq!(
+                serde_json::to_vec(&tailed).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+            let direct_snapshot = store.test_snapshot_cache_capture_at(false, at).unwrap();
+            assert_eq!(
+                warm_bytes,
+                serde_json::to_vec(&snapshot_to_wire(&direct_snapshot.snapshot).unwrap()).unwrap()
+            );
+            std::fs::remove_dir_all(root).unwrap();
         }
 
         #[test]
