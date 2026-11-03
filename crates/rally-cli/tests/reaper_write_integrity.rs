@@ -696,6 +696,9 @@ fn auto_reap_interval_gate_holds_between_completed_enters() {
             .rally()
             .env_remove("RALLY_NO_AUTO_REAP")
             .env("RALLY_AUTO_REAP_INTERVAL_SECS", "3600")
+            // This grades interval admission, not wall-clock reap capacity.
+            // Match reap_full so host contention cannot consume the pass budget.
+            .env("RALLY_TEST_REAP_CLOCK_STEP_MS", "0")
             .args([
                 "enter",
                 "--tool",
