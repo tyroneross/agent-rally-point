@@ -5053,6 +5053,80 @@ fn session_close_releases_only_the_exact_same_tool_session_claims() {
 }
 
 #[test]
+fn ordinary_command_restarts_coordinator_once_in_approved_room() {
+    let workspace = Workspace::new("ordinary-autostart");
+    // The harness opts every command out of autostart; this one opts back in.
+    let ordinary = |workspace: &Workspace| {
+        let output = Command::new(env!("CARGO_BIN_EXE_rally"))
+            .current_dir(&workspace.cwd)
+            .env("HOME", &workspace.home)
+            .env("RALLY_NO_WORKTREE", "1")
+            .env("RALLY_DAEMON_AUTOSTART", "1")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_RUN_ID")
+            .args(["room", "--json"])
+            .output()
+            .expect("run rally room");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let daemon_live = |workspace: &Workspace| {
+        workspace.json(&["daemon", "status", "--json"])["data"]["daemon"]["live"] == true
+    };
+    let wait_live = |workspace: &Workspace, want: bool| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while daemon_live(workspace) != want && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(100));
+        }
+        daemon_live(workspace) == want
+    };
+    // An unapproved room never starts a coordinator on its own.
+    ordinary(&workspace);
+    thread::sleep(Duration::from_secs(2));
+    assert!(
+        !daemon_live(&workspace),
+        "unapproved room must not start a coordinator"
+    );
+    assert!(!workspace.cwd.join(".rally/rallyd.autostart").exists());
+
+    let plan = workspace.json(&["setup", "--component", "coordinator", "--json"]);
+    let plan_id = plan["data"]["setup"]["plan"]["plan_id"].as_str().unwrap();
+    workspace.json(&[
+        "setup",
+        "--component",
+        "coordinator",
+        "--apply",
+        "--approve-plan",
+        plan_id,
+        "--json",
+    ]);
+    let stopped = workspace.json(&["daemon", "stop", "--json"]);
+    assert_eq!(stopped["data"]["daemon"]["live"], false);
+
+    // The coordinator is down in an approved room: the next ordinary command
+    // starts exactly one, detached, and is not itself blocked.
+    ordinary(&workspace);
+    assert!(
+        wait_live(&workspace, true),
+        "ordinary command must restart the coordinator"
+    );
+    assert!(workspace.cwd.join(".rally/rallyd.autostart").exists());
+
+    // Within the throttle window a crash-looping coordinator is not respawned.
+    let stopped = workspace.json(&["daemon", "stop", "--json"]);
+    assert_eq!(stopped["data"]["daemon"]["live"], false);
+    ordinary(&workspace);
+    thread::sleep(Duration::from_secs(2));
+    assert!(
+        !daemon_live(&workspace),
+        "second start inside the throttle window"
+    );
+}
+
+#[test]
 fn second_fresh_session_activates_rallyd_and_current_view_has_direct_daemon_parity() {
     let workspace = Workspace::new("session-daemon-autostart");
     let ensure = |session_id: &str, tool: &str| {

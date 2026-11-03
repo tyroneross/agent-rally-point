@@ -254,9 +254,23 @@ mod imp {
         fn getuid() -> u32;
     }
 
-    /// Async-signal-safe handler: only touch a lock-free atomic (SIGTERM/SIGINT).
-    extern "C" fn on_signal(_sig: i32) {
+    /// The signal that requested shutdown (0 = none), so the log can tell a
+    /// Ctrl-C or terminal-group SIGINT from a `rally daemon stop` SIGTERM.
+    static SHUTDOWN_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+    /// Async-signal-safe handler: only touch lock-free atomics (SIGTERM/SIGINT).
+    extern "C" fn on_signal(sig: i32) {
+        SHUTDOWN_SIGNAL.store(sig, Ordering::SeqCst);
         SHUTDOWN.store(true, Ordering::SeqCst);
+    }
+
+    fn shutdown_signal_name() -> &'static str {
+        match SHUTDOWN_SIGNAL.load(Ordering::SeqCst) {
+            SIGINT => "SIGINT",
+            SIGTERM => "SIGTERM",
+            0 => "stop flag",
+            _ => "other signal",
+        }
     }
 
     fn install_signal_handlers() {
@@ -1350,6 +1364,7 @@ mod imp {
         // Reset the process-global flag so a prior signal (or test run) does not
         // pre-empt this serve, then install the signal handlers.
         SHUTDOWN.store(false, Ordering::SeqCst);
+        SHUTDOWN_SIGNAL.store(0, Ordering::SeqCst);
         install_signal_handlers();
         let _ = config.foreground; // frozen field; parent handles log redirection.
 
@@ -1473,7 +1488,10 @@ mod imp {
         let reader_threads = Arc::new(AtomicUsize::new(0));
         loop {
             if SHUTDOWN.load(Ordering::SeqCst) || stop.load(Ordering::SeqCst) {
-                log("shutdown signal received; draining");
+                log(&format!(
+                    "shutdown signal received ({}); draining",
+                    shutdown_signal_name()
+                ));
                 break;
             }
             if let Some(secs) = config.idle_exit_secs {
