@@ -7,7 +7,7 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
-## 0.2.9 — 2026-11-02
+## 0.2.9 — 2026-11-03
 
 ### Changed — large room reads no longer hold the mutation dispatcher during projection
 
@@ -35,6 +35,17 @@ approved it. This does not approve a coordinator in a new room, start a terminal
 runtime, or negotiate an incompatible wire version. Released `rally` binaries
 include this store-daemon implementation; `rally daemon start` launches the
 installed executable with `daemon serve`.
+
+### Fixed — explicit coordinator starts survive their launcher
+
+`rally daemon start` now gives the background coordinator its own process group,
+matching automatic startup. A regression test terminates only an isolated test
+launcher's process group and verifies that the coordinator remains available.
+
+### Security
+
+Updated compatible TLS dependency patches to resolve six blocking RustSec
+advisories. Existing allowed warnings remain visible in the dependency audit.
 
 ### Fixed — upgrades, recovery and worktree cleanup preserve their boundaries
 

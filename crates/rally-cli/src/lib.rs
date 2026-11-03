@@ -2327,6 +2327,14 @@ fn command_daemon_start(json: bool, args: cli::DaemonStartArgs) -> Result<Output
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_file_err));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Reparenting alone leaves the daemon in the launcher's process group,
+        // where terminal/tool cleanup can terminate it after start returns.
+        // Match approved-room autostart: the daemon owns its process group.
+        cmd.process_group(0);
+    }
     let child = cmd
         .spawn()
         .map_err(RallyError::io("spawn rally daemon serve"))?;
