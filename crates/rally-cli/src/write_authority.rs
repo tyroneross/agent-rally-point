@@ -471,6 +471,16 @@ fn authorize_claim_removal(
     coord: &CoordinationConfig,
 ) -> Result<()> {
     let claim_id = claim.event_id.as_str();
+    if reaper_marker(fact, "reason") == Some("owner-process-dead") {
+        if is_typed_reaper_close(fact, claim, &["owner-process-dead"])
+            && crate::orphan_claim::owner_process_is_dead(claim)
+        {
+            return Ok(());
+        }
+        return Err(RallyError::Usage(format!(
+            "orphan recovery refused under mutation lock for claim {claim_id}"
+        )));
+    }
     // Age alone grants authority only to the typed manual reaper transition.
     if reaper_marker(fact, "reason") == Some("no-lease-over-age") {
         let lease = claim

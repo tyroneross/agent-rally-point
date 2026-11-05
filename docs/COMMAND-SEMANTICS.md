@@ -204,3 +204,11 @@ Simplify in this order:
    enough to enforce, not just documented.
 4. Only then consider aliases or deprecations, with compatibility warnings and
    envelope-contract tests.
+
+## Recover one claim left by an exited CLI process
+
+Run `rally doctor --orphan-claim <claim-id> --json` to preview recovery, then add `--apply` to append one `claim.expired` fact. This command targets only that exact active claim and does not reap other claims, sessions, or the lead. The ledger retains the original claim and its author.
+
+Recovery accepts only an explicit `sess:proc:<local-host>:<positive-pid>#live` owner whose process probe returns `ESRCH`. Live or reused PIDs, foreign hosts, parent/managed sessions, malformed identities, and permission errors are refused. The store repeats the process check under its mutation lock, so a preview is not authority for a later write. Ordinary release and retraction rules remain unchanged.
+
+Avoid stranding another claim: establish the parent lease with `rally session ensure` before issuing child CLI commands, and reuse its exported environment. In a Codex shell that already provides `CODEX_SESSION_ID`, a manual sequence can consistently export `RALLY_SESSION_ID="$CODEX_SESSION_ID"`; never substitute an old process identity to release it.

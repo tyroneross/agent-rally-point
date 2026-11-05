@@ -145,6 +145,7 @@ mod next;
 mod obligations;
 mod observed_liveness;
 mod open_queue;
+mod orphan_claim;
 mod output;
 mod pickup_threshold;
 pub mod rallyd_core;
@@ -6218,6 +6219,23 @@ fn command_doctor(args: DoctorArgs) -> Result<Output> {
         args.repair_ledger,
         args.schema_floor,
     ];
+    if let Some(claim_id) = args.orphan_claim.as_deref() {
+        if args.migrate_db_only
+            || args.engagement.is_some()
+            || existing_modes.into_iter().any(|mode| mode)
+        {
+            return Err(RallyError::Usage(
+                "--orphan-claim cannot be combined with another doctor mode".into(),
+            ));
+        }
+        let report = orphan_claim::recover(claim_id, args.apply)?;
+        let text = format!(
+            "orphan claim {} applied={}",
+            report.claim_id, report.applied
+        );
+        let body = envelope("doctor", SCHEMA_DOCTOR, DoctorEnvelope { doctor: report })?;
+        return Ok(Output::new(args.json, text, body));
+    }
     if args.migrate_db_only && existing_modes.into_iter().any(|enabled| enabled) {
         return Err(RallyError::Usage(
             "--migrate-db-only cannot be combined with another rally doctor mode".to_string(),

@@ -374,6 +374,8 @@ pub(crate) struct OwnersArgs {
 #[derive(Clone, Debug)]
 pub(crate) struct DoctorArgs {
     pub(crate) json: bool,
+    /// Recover one claim whose recorded local CLI process has exited.
+    pub(crate) orphan_claim: Option<String>,
     /// Inspect or explicitly migrate a repository whose only durable history is facts.db.
     pub(crate) migrate_db_only: bool,
     /// Validated canonical engagement that receives a DB-only migration segment.
@@ -1920,6 +1922,10 @@ fn migrate_legacy_parser() -> impl Parser<MigrateLegacyArgs> {
 
 fn doctor_parser() -> impl Parser<DoctorArgs> {
     let json = json_flag();
+    let orphan_claim = long("orphan-claim")
+        .help("Recover one exited local-process claim by exact id; preview unless --apply is given")
+        .argument::<String>("ID")
+        .optional();
     let migrate_db_only = long("migrate-db-only")
         .help("Inspect DB-only history; add --apply to install one canonical segment offline")
         .switch();
@@ -1961,6 +1967,7 @@ fn doctor_parser() -> impl Parser<DoctorArgs> {
         .switch();
     construct!(DoctorArgs {
         json,
+        orphan_claim,
         migrate_db_only,
         engagement,
         canonical_paths,
