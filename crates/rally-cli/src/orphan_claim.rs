@@ -20,7 +20,7 @@ fn local_host() -> Option<String> {
 fn local_process_id(session: &str, host: &str) -> Option<i32> {
     let endpoint = session.strip_prefix("sess:proc:")?.strip_suffix("#live")?;
     let (owner_host, pid) = endpoint.rsplit_once(':')?;
-    if owner_host != host || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+    if !owner_host.eq_ignore_ascii_case(host) || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
     let pid: i32 = pid.parse().ok()?;
@@ -126,6 +126,10 @@ mod tests {
     fn orphan_identity_rejects_other_hosts_and_non_process_sessions() {
         assert_eq!(
             local_process_id("sess:proc:local:42#live", "local"),
+            Some(42)
+        );
+        assert_eq!(
+            local_process_id("sess:proc:local:42#live", "LOCAL"),
             Some(42)
         );
         for session in [
