@@ -5340,6 +5340,10 @@ fn command_room(args: RoomArgs) -> Result<Output> {
         .map(|rendered| rendered.len() + 1)
         .unwrap_or(usize::MAX)
     };
+    // Tally freshness before composition bounds the roster, so the human line
+    // reports the room, not the bounded page.
+    let freshness = projected.freshness_counts();
+    let squads_total = projected.squads.len();
     let snapshot = store::compose_room_output(
         projected,
         &coord,
@@ -5367,7 +5371,6 @@ fn command_room(args: RoomArgs) -> Result<Output> {
     }
     // Squad freshness on the human line: a room with 380 squads where most are
     // long-gone reads as 380 peers unless the line says how many are current.
-    let freshness = snapshot.freshness_counts();
     let text = format!(
         "room claims={} blockers={} handoffs={} decisions={} risks={} artifacts={} system_health={} resolved_unverified={} squads={} fresh={} stale={}{}",
         snapshot.active_claims.len(),
@@ -5381,7 +5384,7 @@ fn command_room(args: RoomArgs) -> Result<Output> {
         // computed, serialized, and visible only to a caller who already knew
         // the JSON key existed.
         snapshot.resolved_unverified.len(),
-        snapshot.squads.len(),
+        squads_total,
         freshness.fresh,
         freshness.stale,
         if freshness.unknown > 0 {

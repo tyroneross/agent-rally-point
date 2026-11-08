@@ -448,10 +448,19 @@ finds both. Two removal paths, two different signals: read `composition` to
 learn what the budget cut, and read the retraction records to learn what was
 withdrawn.
 
+**Stale presence rows are bounded too.** A long-lived room collects one
+`squads` row per agent that ever joined. The default view keeps every fresh or
+unknown row, every agent holding open work (a claim, blocker, open handoff or
+unconsumed artifact, as author or target), and the 25 newest stale rows. The
+rest are counted under `composition.buckets.squads` with reason
+`stale_presence`; the human line still reports the whole room
+(`squads=N fresh=X stale=Y`). No row is deleted, and authority checks still
+read every agent.
+
 ### Getting the full view
 
 ```bash
-rally room --include-archived --json   # everything, no budget applied
+rally room --include-archived --json   # everything, no budget applied, every presence row
 rally room --tool <you> --path src/store.rs --json   # ranked for your lane
 rally room --budget-bytes 0 --json     # disable the ceiling for this call
 rally locate <event-id> --json         # one item named in composition.omitted_ids

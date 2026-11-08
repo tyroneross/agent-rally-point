@@ -1774,7 +1774,7 @@ fn room_parser() -> impl Parser<RoomArgs> {
         .switch();
     let include_archived = long("include-archived")
         .help(
-            "re-include every recency-decayed fact; disables the configured default ceiling. \
+            "re-include every recency-decayed fact and every stale presence row; disables the configured default ceiling. \
              An explicit --budget-bytes still applies and reports overflow rather than cutting \
              archived facts",
         )

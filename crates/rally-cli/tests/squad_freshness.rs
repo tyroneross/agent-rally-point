@@ -357,3 +357,72 @@ fn say_to_stale_target_warns_and_still_delivers_but_fresh_target_does_not() {
         "broadcast must not warn: {warnings:?}"
     );
 }
+
+/// AGEN-ROSTER (2026-11-08): this repo's room emitted 1,092 squad rows, every
+/// one stale. Default `room` now keeps fresh rows, every tool holding open work
+/// and the newest stale rows, reports the omission in `composition`, and
+/// returns every row under `--include-archived`. Nothing is deleted.
+#[test]
+fn room_bounds_stale_presence_but_keeps_open_work_and_reports_the_omission() {
+    let room = Room::new("roster");
+    let ghosts: Vec<String> = (0..30).map(|i| format!("ghost-{i:02}")).collect();
+    for tool in ghosts.iter().map(String::as_str).chain(["holder", "me"]) {
+        room.say_ok(&["risk", "--tool", tool, "--subject", "hello"]);
+    }
+    // ghost-00 is the newest stale row, ghost-29 the oldest; `holder` is older
+    // than all of them but is the target of open work.
+    for (i, tool) in ghosts.iter().enumerate() {
+        room.backdate(STALE_AGE_SECS + i as i64 * 60, |f| {
+            f["tool"] == tool.as_str()
+        });
+    }
+    room.backdate(STALE_AGE_SECS * 10, |f| f["tool"] == "holder");
+    room.reimport_segments();
+    room.say_ok(&[
+        "handoff",
+        "--tool",
+        "me",
+        "--target",
+        "holder",
+        "--subject",
+        "pick this up",
+        "--deliver",
+        "record",
+    ]);
+
+    let view = room.json(&["room", "--json"]);
+    let rows = view["data"]["room"]["squads"]
+        .as_array()
+        .cloned()
+        .expect("squads");
+    let tools: Vec<&str> = rows.iter().map(|r| r["tool"].as_str().unwrap()).collect();
+    assert!(
+        tools.contains(&"me") && tools.contains(&"holder"),
+        "{tools:?}"
+    );
+    assert!(
+        tools.contains(&"ghost-00") && tools.contains(&"ghost-24"),
+        "{tools:?}"
+    );
+    assert!(
+        !tools.contains(&"ghost-25") && !tools.contains(&"ghost-29"),
+        "oldest stale rows are bounded: {tools:?}"
+    );
+    assert_eq!(rows.len(), 27, "{tools:?}");
+    let bucket = &view["data"]["room"]["composition"]["buckets"]["squads"];
+    assert_eq!(bucket["total"], 32, "{bucket}");
+    assert_eq!(bucket["omitted"], 5, "{bucket}");
+    assert_eq!(bucket["reason"], "stale_presence", "{bucket}");
+
+    let line = room.text(&["room"]);
+    assert!(
+        line.contains("squads=32 fresh=1 stale=31"),
+        "human line reports the room, not the page: {line}"
+    );
+
+    let all = room.json(&["room", "--json", "--include-archived"]);
+    assert_eq!(
+        all["data"]["room"]["squads"].as_array().map(Vec::len),
+        Some(32)
+    );
+}

@@ -1890,7 +1890,8 @@ pub(crate) struct BucketComposition {
     /// the complete count; callers can use `rally locate` for a known id.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) omitted_ids_truncated: bool,
-    /// Why the omission happened: `"budget"` or `"archived"`.
+    /// Why the omission happened: `"budget"`, `"archived"` or, for presence
+    /// rows, `"stale_presence"`.
     pub(crate) reason: String,
 }
 
@@ -2201,10 +2202,11 @@ pub(crate) const MAX_WIRE_SNAPSHOT_INTERNALS_BYTES: usize = 512 * 1_024;
 pub(crate) const WIRE_INTERNALS_KEY: &str = "__internals";
 
 impl RoomSnapshot {
-    /// Return an operational projection without mutating or deleting ledger
-    /// history. It keeps action-bearing buckets and only fresh or participating
-    /// actors; `room` without `--actionable` remains the complete projection.
-    pub(crate) fn into_actionable(mut self) -> Self {
+    /// Tools that author or are addressed by open work: active claims,
+    /// blockers, open handoffs and unconsumed artifacts. Their presence rows
+    /// stay visible however stale, because a reader acting on that work needs
+    /// to see who holds it.
+    pub(crate) fn action_participants(&self) -> BTreeSet<String> {
         let mut participants = BTreeSet::new();
         for fact in self
             .active_claims
@@ -2213,13 +2215,17 @@ impl RoomSnapshot {
             .chain(self.open_handoffs.iter())
             .chain(self.unconsumed_artifacts.iter())
         {
-            if let Some(tool) = &fact.tool {
-                participants.insert(tool.clone());
-            }
-            if let Some(target) = &fact.target {
-                participants.insert(target.clone());
-            }
+            participants.extend(fact.tool.iter().cloned());
+            participants.extend(fact.target.iter().cloned());
         }
+        participants
+    }
+
+    /// Return an operational projection without mutating or deleting ledger
+    /// history. It keeps action-bearing buckets and only fresh or participating
+    /// actors; `room` without `--actionable` remains the complete projection.
+    pub(crate) fn into_actionable(mut self) -> Self {
+        let participants = self.action_participants();
         self.squads.retain(|squad| {
             squad.freshness == FRESHNESS_FRESH || participants.contains(&squad.tool)
         });
@@ -11258,6 +11264,10 @@ where
         );
     }
 
+    if !include_archived {
+        bound_stale_squads(&mut snapshot, &mut buckets);
+    }
+
     // `--include-archived` IS the drill-in. A caller who asks for the full view
     // and receives a budget-truncated one has no way left to see everything, so
     // the ceiling does not apply — an escape hatch that is itself truncated is
@@ -11333,6 +11343,53 @@ where
     snapshot
 }
 
+/// Stale presence rows a default `room` keeps, newest first. Fresh, unknown and
+/// open-work rows are never counted against this.
+pub(crate) const STALE_SQUAD_ROWS: usize = 25;
+
+/// Bound the presence roster for OUTPUT. A long-lived room accumulates one row
+/// per agent that ever joined (1,092 in this repo's own room on 2026-11-08, all
+/// stale), which buried the handful of live peers. Fresh and unknown rows and
+/// every tool holding open work stay; of the remaining stale rows only the
+/// newest [`STALE_SQUAD_ROWS`] are emitted. Nothing is deleted: the ledger and
+/// every authority decision still see every squad, the omission is reported in
+/// `composition.buckets.squads`, and `--include-archived` returns all rows.
+fn bound_stale_squads(
+    snapshot: &mut RoomSnapshot,
+    buckets: &mut BTreeMap<String, BucketComposition>,
+) {
+    let participants = snapshot.action_participants();
+    let mut stale: Vec<(&str, &str)> = snapshot
+        .squads
+        .iter()
+        .filter(|squad| squad.freshness == FRESHNESS_STALE && !participants.contains(&squad.tool))
+        .map(|squad| (squad.tool.as_str(), squad.last_seen_ts.as_str()))
+        .collect();
+    if stale.len() <= STALE_SQUAD_ROWS {
+        return;
+    }
+    stale.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    let dropped: BTreeSet<String> = stale[STALE_SQUAD_ROWS..]
+        .iter()
+        .map(|(tool, _)| (*tool).to_string())
+        .collect();
+    let total = snapshot.squads.len();
+    snapshot
+        .squads
+        .retain(|squad| !dropped.contains(&squad.tool));
+    buckets.insert(
+        "squads".to_string(),
+        BucketComposition {
+            total,
+            emitted: snapshot.squads.len(),
+            omitted: dropped.len(),
+            omitted_ids: Vec::new(),
+            omitted_ids_truncated: false,
+            reason: "stale_presence".to_string(),
+        },
+    );
+}
+
 fn install_composition(
     snapshot: &mut RoomSnapshot,
     budget: Option<usize>,
@@ -11344,10 +11401,11 @@ fn install_composition(
         "rally room --json                     # this view".to_string(),
         "rally locate <event-id> --json        # one omitted item".to_string(),
     ];
-    if buckets.contains_key("stale_facts") {
+    if buckets.contains_key("stale_facts") || buckets.contains_key("squads") {
         drill_in.insert(
             0,
-            "rally room --include-archived --json  # every archived fact".to_string(),
+            "rally room --include-archived --json  # every archived fact and stale presence row"
+                .to_string(),
         );
     }
     let emitted_bytes = snapshot
