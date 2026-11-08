@@ -4722,8 +4722,13 @@ fn resolve_referenced_handoff_binding(
             )));
         }
         (FactKind::Handoff, Some(other)) => {
+            let hint = if referenced.tool.as_deref() == Some(tool) {
+                store::sender_withdraw_hint(ref_id, tool)
+            } else {
+                String::new()
+            };
             return Err(RallyError::Usage(format!(
-                "handoff_reply_state_invalid: {other}; use --handoff-state acked, accepted, or rejected"
+                "handoff_reply_state_invalid: {other}; use --handoff-state acked, accepted, or rejected.{hint}"
             )));
         }
         (_, None | Some("requested")) => (
@@ -4776,15 +4781,21 @@ fn resolve_referenced_handoff_binding(
             store::UnboundDirectiveReceiver::Open { tool: named } => {
                 if referenced.from_session_id.as_deref() == Some(caller_session) {
                     return Err(RallyError::Usage(format!(
-                        "handoff_reply_author_mismatch: ref {ref_id} is your own directive; its receiver must reply"
+                        "handoff_reply_author_mismatch: ref {ref_id} is your own directive; its receiver must reply.{}",
+                        store::sender_withdraw_hint(ref_id, tool)
                     )));
                 }
                 (named.unwrap_or(tool), caller_session)
             }
         };
         if tool != expected_tool || caller_session != expected_session {
+            let hint = if referenced.tool.as_deref() == Some(tool) {
+                store::sender_withdraw_hint(ref_id, tool)
+            } else {
+                String::new()
+            };
             return Err(RallyError::Usage(format!(
-                "handoff_reply_author_mismatch: ref {ref_id} is bound to {expected_tool}/{expected_session}; caller is {tool}/{caller_session}. The bound receiver must author the reply."
+                "handoff_reply_author_mismatch: ref {ref_id} is bound to {expected_tool}/{expected_session}; caller is {tool}/{caller_session}. The bound receiver must author the reply.{hint}"
             )));
         }
         let author_tool = referenced.tool.clone().ok_or_else(|| {

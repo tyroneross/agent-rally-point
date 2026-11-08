@@ -1381,6 +1381,17 @@ pub(crate) fn unbound_directive_receiver<'a>(
     }
 }
 
+/// Guidance appended when the SENDER of a handoff tries to close or answer it.
+///
+/// A sender cannot resolve or reply to its own request: only the receiver's
+/// answer proves the work happened. Withdrawing the request is the sender's
+/// move, and `rally retract` is how it is spelled.
+pub(crate) fn sender_withdraw_hint(ref_id: &str, tool: &str) -> String {
+    format!(
+        " To withdraw your own request instead, run `rally retract {ref_id} --tool {tool} --reason \"<why>\"`; that clears it from the receiver's inbox and keeps the record."
+    )
+}
+
 fn validate_referenced_handoff(fact: &Fact, facts: &[Fact]) -> Result<()> {
     if fact.kind != FactKind::Handoff {
         return Ok(());
@@ -1568,7 +1579,8 @@ fn validate_referenced_handoff(fact: &Fact, facts: &[Fact]) -> Result<()> {
             && protocol_marker(referenced, "to_session_id").is_none()
         {
             return Err(RallyError::Usage(format!(
-                "handoff_reply_author_mismatch: ref {ref_id} is your own directive; its receiver must reply"
+                "handoff_reply_author_mismatch: ref {ref_id} is your own directive; its receiver must reply.{}",
+                sender_withdraw_hint(ref_id, fact.tool.as_deref().unwrap_or("<you>"))
             )));
         }
         if fact.tool.as_deref() != Some(expected_reply_tool)
@@ -5891,8 +5903,13 @@ impl DirectRoomStore {
                     {
                         let target = targeted.target.as_deref().unwrap_or("<untargeted>");
                         let tool = fact.tool.as_deref().unwrap_or("<unknown>");
+                        let hint = if targeted.tool.as_deref() == Some(tool) {
+                            sender_withdraw_hint(ref_id, tool)
+                        } else {
+                            String::new()
+                        };
                         return Err(RallyError::Usage(format!(
-                            "resolve failed: ref {ref_id} is targeted to {target}; tool {tool} cannot resolve it"
+                            "resolve failed: ref {ref_id} is targeted to {target}; tool {tool} cannot resolve it.{hint}"
                         )));
                     }
                 }

@@ -2246,3 +2246,127 @@ fn status_reply_binds_an_unbound_legacy_directive() {
         String::from_utf8_lossy(&hijack.stderr)
     );
 }
+
+/// AGEN-HANDOFF (2026-11-08): a sender that wanted to cancel its own handoff
+/// tried `say resolve`, `--handoff-state withdrawn` and a self-ack, and each
+/// refusal named only who may NOT act. `rally retract` was the right move and
+/// no refusal mentioned it. Every refusal a sender hits now names it, the
+/// sender still cannot resolve or answer its own request, and the retract
+/// the hint names succeeds.
+#[test]
+fn sender_cancel_refusals_point_to_retract_and_retract_succeeds() {
+    let room = Room::new();
+    let sent = room.json(
+        "session-author",
+        &[
+            "say",
+            "handoff",
+            "--tool",
+            "author:a",
+            "--target",
+            "reviewer:r",
+            "--subject",
+            "please review",
+            "--json",
+        ],
+    );
+    assert_eq!(sent["ok"], true, "{sent}");
+    let directive = sent["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let hint = format!("rally retract {directive} --tool author:a");
+
+    let attempts: [&[&str]; 3] = [
+        &[
+            "say",
+            "resolve",
+            "--tool",
+            "author:a",
+            "--ref",
+            &directive,
+            "--subject",
+            "cancel",
+            "--json",
+        ],
+        &[
+            "say",
+            "handoff",
+            "--tool",
+            "author:a",
+            "--ref",
+            &directive,
+            "--handoff-state",
+            "withdrawn",
+            "--subject",
+            "cancel",
+            "--json",
+        ],
+        &[
+            "say",
+            "handoff",
+            "--tool",
+            "author:a",
+            "--ref",
+            &directive,
+            "--handoff-state",
+            "acked",
+            "--subject",
+            "cancel",
+            "--json",
+        ],
+    ];
+    for args in attempts {
+        let out = room.run("session-author", args);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!out.status.success(), "{args:?} must stay refused: {text}");
+        assert!(
+            text.contains(&hint),
+            "{args:?} refusal must name the retract command: {text}"
+        );
+    }
+
+    // A third party is refused without being told to retract someone else's ask.
+    let other = room.run(
+        "session-other",
+        &[
+            "say",
+            "resolve",
+            "--tool",
+            "other:o",
+            "--ref",
+            &directive,
+            "--subject",
+            "x",
+            "--json",
+        ],
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&other.stdout),
+        String::from_utf8_lossy(&other.stderr)
+    );
+    assert!(!other.status.success(), "{text}");
+    assert!(
+        !text.contains("rally retract"),
+        "only the sender is told to retract: {text}"
+    );
+
+    let withdrawn = room.json(
+        "session-author",
+        &[
+            "retract",
+            &directive,
+            "--tool",
+            "author:a",
+            "--reason",
+            "no longer needed",
+            "--json",
+        ],
+    );
+    assert_eq!(withdrawn["ok"], true, "{withdrawn}");
+}
