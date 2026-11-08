@@ -22410,8 +22410,8 @@ fn bound_panes_on(sockets: &[String]) -> Vec<(String, daemon_client::BoundPane)>
 const PINNED_PTYD_SOCKET_ENVS: &[&str] = &["PTYD_SOCKET_PATH", "RALLY_PTYD_SOCKET"];
 
 /// Where a pane wake for one identity may go.
-#[derive(Debug, PartialEq, Eq)]
-enum PaneWakeBinding {
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) enum PaneWakeBinding {
     /// Exactly one live pane, on `socket`.
     One {
         socket: String,
@@ -22428,6 +22428,12 @@ enum PaneWakeBinding {
 /// (see [`PINNED_PTYD_SOCKET_ENVS`]) is the only one consulted when set;
 /// otherwise every candidate socket is, and exactly one binding is required.
 fn pane_wake_binding(identity: &str) -> PaneWakeBinding {
+    select_pane_wake_binding(identity, bound_wake_panes())
+}
+
+/// Every live bound pane a wake may target, queried once. A pinned socket
+/// (see [`PINNED_PTYD_SOCKET_ENVS`]) is the only one consulted when set.
+pub(crate) fn bound_wake_panes() -> Vec<(String, daemon_client::BoundPane)> {
     let pinned = PINNED_PTYD_SOCKET_ENVS
         .iter()
         .find_map(|name| env::var(name).ok().filter(|value| !value.is_empty()));
@@ -22441,10 +22447,94 @@ fn pane_wake_binding(identity: &str) -> PaneWakeBinding {
             existing_unique_paths(&candidates)
         }
     };
-    select_pane_wake_binding(identity, bound_panes_on(&sockets))
+    bound_panes_on(&sockets)
 }
 
-fn select_pane_wake_binding(
+/// The pane-delivery verdict for an identity with no managed session in this
+/// room. `rally routes` and handoff delivery both read this, so the route a
+/// sender is shown is the route a handoff will take. Sender authority (lead or
+/// invitation) is checked separately at send time; it depends on the sender.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PaneRoute {
+    /// Easy Terminal's rally-router owns delivery to this identity.
+    EtRouter,
+    /// Exactly one live pane is bound and it works inside this room.
+    Pane {
+        socket: String,
+        pane: daemon_client::BoundPane,
+    },
+    /// The only bound pane works in another repository.
+    Elsewhere { pane_id: String, cwd: String },
+    /// The only bound pane reports no working directory.
+    NoCwd { pane_id: String },
+    /// More than one pane is bound; waking one would be a guess.
+    Ambiguous(usize),
+    /// No live pane is bound to the identity.
+    Unbound,
+}
+
+impl PaneRoute {
+    /// Stable state name for `rally routes`.
+    pub(crate) fn state(&self) -> &'static str {
+        match self {
+            PaneRoute::EtRouter => "et_router",
+            PaneRoute::Pane { .. } => "pane_inbox",
+            PaneRoute::Elsewhere { .. } | PaneRoute::NoCwd { .. } => "pane_outside_room",
+            PaneRoute::Ambiguous(_) => "pane_ambiguous",
+            PaneRoute::Unbound => "polling_only",
+        }
+    }
+
+    /// Why a pane wake will or will not happen, in the words delivery uses.
+    pub(crate) fn reason(&self) -> String {
+        match self {
+            PaneRoute::EtRouter => {
+                "et-router: ET's rally-router already owns delivery to this identity".to_string()
+            }
+            PaneRoute::Pane { pane, .. } => format!(
+                "bound Easy Terminal pane {}; a handoff queues a wake in its inbox (sender must be lead or invited)",
+                pane.pane_id
+            ),
+            PaneRoute::Elsewhere { pane_id, cwd } => format!(
+                "pane {pane_id} works in {cwd}, outside this room's repository; not waking it"
+            ),
+            PaneRoute::NoCwd { pane_id } => format!(
+                "pane {pane_id} reports no working directory, so it cannot be tied to this room; not waking it"
+            ),
+            PaneRoute::Ambiguous(n) => format!(
+                "ambiguous: {n} live ptyd panes are bound to it; not waking any (pin one with PTYD_SOCKET_PATH)"
+            ),
+            PaneRoute::Unbound => "no live ptyd pane is bound to it".to_string(),
+        }
+    }
+}
+
+pub(crate) fn classify_pane_route(
+    repo_root: &Path,
+    identity: &str,
+    binding: PaneWakeBinding,
+    now_ms: i64,
+) -> PaneRoute {
+    if et_router_health::et_router_owns_delivery(identity, now_ms) {
+        return PaneRoute::EtRouter;
+    }
+    match binding {
+        PaneWakeBinding::None => PaneRoute::Unbound,
+        PaneWakeBinding::Ambiguous(n) => PaneRoute::Ambiguous(n),
+        PaneWakeBinding::One { socket, pane } => match pane.cwd.clone() {
+            Some(cwd) if pane_cwd_in_room(&cwd, repo_root) => PaneRoute::Pane { socket, pane },
+            Some(cwd) => PaneRoute::Elsewhere {
+                pane_id: pane.pane_id,
+                cwd,
+            },
+            None => PaneRoute::NoCwd {
+                pane_id: pane.pane_id,
+            },
+        },
+    }
+}
+
+pub(crate) fn select_pane_wake_binding(
     identity: &str,
     bound: Vec<(String, daemon_client::BoundPane)>,
 ) -> PaneWakeBinding {
@@ -24375,30 +24465,15 @@ fn pane_wake_delivery(
         );
     }
     let binding = prebound.unwrap_or_else(|| pane_wake_binding(target_tool));
-    let (socket, pane) = match binding {
-        PaneWakeBinding::One { socket, pane } => (socket, pane),
-        PaneWakeBinding::None => return Err("no live ptyd pane is bound to it".to_string()),
-        PaneWakeBinding::Ambiguous(n) => {
-            return Err(format!(
-                "ambiguous: {n} live ptyd panes are bound to it; not waking any (pin one with PTYD_SOCKET_PATH)"
-            ));
-        }
+    let (socket, pane) = match classify_pane_route(
+        room.repo_root(),
+        target_tool,
+        binding,
+        et_router_health::now_ms(),
+    ) {
+        PaneRoute::Pane { socket, pane } => (socket, pane),
+        other => return Err(other.reason()),
     };
-    match pane.cwd.as_deref() {
-        Some(cwd) if pane_cwd_in_room(cwd, room.repo_root()) => {}
-        Some(cwd) => {
-            return Err(format!(
-                "pane {} works in {cwd}, outside this room's repository; not waking it",
-                pane.pane_id
-            ));
-        }
-        None => {
-            return Err(format!(
-                "pane {} reports no working directory, so it cannot be tied to this room; not waking it",
-                pane.pane_id
-            ));
-        }
-    }
     let snapshot = room
         .snapshot_for_obligation_target(target_tool, 1)
         .map_err(|e| format!("room snapshot unavailable: {e}"))?;

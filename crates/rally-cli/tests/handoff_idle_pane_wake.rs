@@ -876,3 +876,80 @@ fn routed_handoff_records_scope_root_and_no_base_markers() {
     );
     let _ = std::fs::remove_file(&socket);
 }
+
+// AGEN-DELIVERY (2026-11-08): `rally routes` listed every unmanaged actor as
+// `polling_only` without looking at pane bindings, while `say handoff` woke
+// the same actor through its bound pane. Routes now reads the same verdict
+// delivery uses, so the route shown is the route a handoff takes.
+#[test]
+fn routes_report_the_pane_verdict_handoff_delivery_uses() {
+    let sandbox = ChannelSandbox::spawn();
+    let socket = short_socket("routes");
+    let foreign = std::env::temp_dir().join(unique("hipw-routes-foreign"));
+    std::fs::create_dir_all(&foreign).unwrap();
+    let _log = spawn_daemon(
+        &socket,
+        vec![
+            pane(&sandbox, "pane-r", "easy-terminal:bound"),
+            Pane {
+                id: "pane-x",
+                identity: "easy-terminal:elsewhere".to_string(),
+                cwd: Some(foreign.clone()),
+            },
+        ],
+        EnqueueReply::Queued,
+    );
+    // The sender joins first, so it holds the lead seat a pane wake requires.
+    rally(
+        &sandbox,
+        &socket,
+        &[
+            "status", "post", "--json", "--tool", SENDER, "--state", "idle",
+        ],
+    );
+    for actor in [
+        "easy-terminal:bound",
+        "easy-terminal:elsewhere",
+        "easy-terminal:unbound",
+    ] {
+        rally(
+            &sandbox,
+            &socket,
+            &[
+                "status", "post", "--json", "--tool", actor, "--state", "idle",
+            ],
+        );
+    }
+    let routes = rally(&sandbox, &socket, &["routes", "--json"]);
+    let items = routes["data"]["routes"]["items"]
+        .as_array()
+        .expect("routes items");
+    let state = |actor: &str| {
+        items
+            .iter()
+            .find(|r| r["actor"] == actor)
+            .unwrap_or_else(|| panic!("{actor} missing: {routes}"))
+            .clone()
+    };
+    let bound = state("easy-terminal:bound");
+    assert_eq!(bound["state"], "pane_inbox", "{bound}");
+    assert_eq!(bound["capabilities"]["pane_inbox"], true, "{bound}");
+    assert!(
+        bound["reason"].as_str().unwrap().contains("pane-r"),
+        "{bound}"
+    );
+    assert_eq!(
+        state("easy-terminal:elsewhere")["state"],
+        "pane_outside_room"
+    );
+    assert_eq!(state("easy-terminal:unbound")["state"], "polling_only");
+
+    // The handoff takes the route routes reported.
+    let said = handoff(&sandbox, &socket, "easy-terminal:bound");
+    assert_eq!(
+        said["data"]["delivery"]["status"], "queued_pane_inbox",
+        "{said}"
+    );
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_dir_all(&foreign);
+}

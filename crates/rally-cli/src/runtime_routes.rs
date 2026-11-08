@@ -418,13 +418,32 @@ pub(crate) fn command(args: RoutesArgs) -> Result<Output> {
         .iter()
         .filter(|s| !managed.contains(s.tool.as_str()))
         .count();
-    for s in &snapshot.squads {
+    // Unmanaged actors get the SAME pane verdict handoff delivery uses
+    // (`classify_pane_route`), so a route shown here is the route a handoff
+    // takes. Bound panes are queried once for the whole projection, and the
+    // freshest actors come first so the bounded list keeps the live ones.
+    let bound = crate::bound_wake_panes();
+    let now_ms = crate::et_router_health::now_ms();
+    let mut unmanaged: Vec<_> = snapshot
+        .squads
+        .iter()
+        .filter(|s| !managed.contains(s.tool.as_str()))
+        .collect();
+    unmanaged.sort_by(|a, b| b.last_seen_ts.cmp(&a.last_seen_ts));
+    for s in unmanaged {
         if routes.len() >= MAX_ROUTES {
             break;
         }
-        if !managed.contains(s.tool.as_str()) {
-            routes.push(json!({"actor":s.tool,"role":role_for(&facts,&s.tool,snapshot.lead.as_deref()),"state":"polling_only","reason":"No registered live transport; durable queue only","capabilities":{"ledger_queue":true,"live_prompt":false,"receiver_ack":false},"next_action":{"command":"rally next","tool":s.tool}}));
-        }
+        let binding = crate::select_pane_wake_binding(&s.tool, bound.clone());
+        let pane = crate::classify_pane_route(room.repo_root(), &s.tool, binding, now_ms);
+        let queued = matches!(pane, crate::PaneRoute::Pane { .. });
+        let reason = match pane {
+            crate::PaneRoute::Unbound => {
+                "No registered live transport; durable queue only".to_string()
+            }
+            ref other => other.reason(),
+        };
+        routes.push(json!({"actor":s.tool,"role":role_for(&facts,&s.tool,snapshot.lead.as_deref()),"state":pane.state(),"reason":reason,"capabilities":{"ledger_queue":true,"live_prompt":false,"pane_inbox":queued,"receiver_ack":false},"next_action":{"command":"rally next","tool":s.tool}}));
     }
     let total = views.len() + polling_total;
     let passed = args.probe.as_ref().is_none_or(|target| {
