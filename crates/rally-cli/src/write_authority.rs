@@ -669,8 +669,8 @@ fn claim_lease_expired(claim: &Fact) -> bool {
 ///    reclaim window. Without this, a crashed lead freezes the seat forever and
 ///    the reaper — which legitimately relinquishes a stale lead, stamping
 ///    `reaper:stale-lead=` — could not do its job. The staleness is measured
-///    from the squad projection, exactly as claim takeover is, so there is one
-///    liveness policy.
+///    from durable authored activity, exactly as claim takeover is, so there
+///    is one liveness policy.
 /// 4. **Acknowledged seizure.** The fact carries the [`LEAD_FORCE_MARKER`]
 ///    evidence, written by `rally lead assign --force`.
 ///
@@ -845,7 +845,7 @@ fn assert_lead_retraction_authorized(
 /// 2. **Genuine handoff.** The ACTOR is the incumbent. Handing off your own
 ///    seat, vacating it, or withdrawing the decision you hold it by.
 /// 3. **Stale incumbent.** The incumbent has been silent past the large-work
-///    reclaim window, measured from the squad projection exactly as claim
+///    reclaim window, measured from durable authored activity exactly as claim
 ///    takeover is, so there is one liveness policy.
 /// 4. **Acknowledged seizure.** The fact carries [`LEAD_FORCE_MARKER`].
 ///
@@ -885,25 +885,15 @@ fn lead_seat_change_allowed(
 /// Has the incumbent lead been silent past the large-work reclaim window?
 ///
 /// Large-work window on purpose: the seat is the coarsest thing in the room, so
-/// it gets the most patient timeout. Fail-CLOSED on a missing or unparseable
-/// `last_seen_ts` — an incumbent whose liveness cannot be read is treated as
-/// live, so a bad timestamp never hands the seat away.
+/// it gets the most patient timeout. Measured from the incumbent's durable
+/// authored activity ([`RoomSnapshot::authored_silence_exceeds`]), the same
+/// source claim takeover reads, because adaptive decay drops a long-silent
+/// lead from `squads` and the squad list alone would then read the lead as
+/// live forever. Fail-CLOSED on a missing or unparseable timestamp: an
+/// incumbent whose liveness cannot be read is treated as live.
 fn lead_is_stale(snapshot: &RoomSnapshot, incumbent: &str, coord: &CoordinationConfig) -> bool {
     let timeout = coord.reclaim_large_minutes.saturating_mul(60);
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    snapshot
-        .squads
-        .iter()
-        .find(|sq| sq.tool == incumbent)
-        .and_then(|sq| {
-            chrono::DateTime::parse_from_rfc3339(&sq.last_seen_ts)
-                .ok()
-                .map(|dt| now_secs - dt.timestamp() > timeout)
-        })
-        .unwrap_or(false)
+    snapshot.authored_silence_exceeds(incumbent, timeout)
 }
 
 #[cfg(test)]
@@ -911,6 +901,7 @@ mod tests {
     use super::*;
     use crate::store::Squad;
     use chrono::{Duration, SecondsFormat, Utc};
+    use std::collections::BTreeMap;
 
     fn iso_ago(secs: i64) -> String {
         (Utc::now() - Duration::seconds(secs)).to_rfc3339_opts(SecondsFormat::Secs, true)
@@ -1500,6 +1491,40 @@ mod tests {
 
         let (facts, stale) = room_with_lead("lead:01", 121 * 60);
         authorized_with(&fact, &facts, &stale);
+    }
+
+    /// AGEN-LEAD (2026-11-08): adaptive decay drops a long-silent lead's squad
+    /// from the snapshot. The seat-change gate used to read only `squads`, so a
+    /// lead silent for a day read as LIVE (absence fell through to "not stale")
+    /// and no peer could take the seat without a forced seizure. The durable
+    /// authored timestamp still exists after decay; staleness must read it.
+    #[test]
+    fn a_decayed_leads_seat_is_reclaimable_from_authored_activity() {
+        let fact = retraction_by("codex:peer", "lead-1");
+        let (facts, mut snapshot) = room_with_lead("lead:01", 0);
+        snapshot.squads.clear();
+        snapshot.author_last_seen =
+            BTreeMap::from([("lead:01".to_string(), iso_ago(24 * 60 * 60))]);
+        authorized_with(&fact, &facts, &snapshot);
+
+        snapshot.author_last_seen = BTreeMap::from([("lead:01".to_string(), iso_ago(60))]);
+        assert!(
+            refusal_with(&fact, &facts, &snapshot).contains("retract failed"),
+            "a lead that authored a fact a minute ago is live even with no squad row"
+        );
+    }
+
+    /// The fail-closed half of the same rule: no authored timestamp at all, or
+    /// one that does not parse, is missing evidence, not silence.
+    #[test]
+    fn a_lead_with_no_readable_activity_is_treated_as_live() {
+        let fact = retraction_by("codex:peer", "lead-1");
+        let (facts, mut snapshot) = room_with_lead("lead:01", 0);
+        snapshot.squads.clear();
+        assert!(refusal_with(&fact, &facts, &snapshot).contains("retract failed"));
+        snapshot.author_last_seen =
+            BTreeMap::from([("lead:01".to_string(), "not-a-time".to_string())]);
+        assert!(refusal_with(&fact, &facts, &snapshot).contains("retract failed"));
     }
 
     /// Arm 4. An acknowledged seizure is reachable through this spelling too.

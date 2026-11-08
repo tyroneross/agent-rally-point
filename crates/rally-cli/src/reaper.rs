@@ -926,9 +926,10 @@ fn run_reap_stale_in_room_with_budget(
     }
 
     // --- Lead relinquish ---
-    // Only relinquish the lead when the lead's owning tool is in the
-    // DESTRUCTIVE stale set (>2h silence). This is the same predicate used
-    // for per-claim reclaim, just at the squad level.
+    // Only relinquish the lead when the lead's owning tool has authored
+    // nothing for the DESTRUCTIVE window (>2h silence). Measured from durable
+    // authored activity, not `stale_owners`: adaptive decay drops a long-silent
+    // lead from `squads`, so a squad-based check would never see it as stale.
     //
     // D7: the append result used to be DISCARDED (`let _ = ...`) while the
     // report still named the tool, so a failed durable write produced
@@ -937,7 +938,7 @@ fn run_reap_stale_in_room_with_budget(
     // paths above already got this right; this one now mirrors them exactly —
     // log, count as preserved, omit from the report.
     let lead_relinquished: Option<String> = if let Some(lead_tool) = &snapshot.lead {
-        if stale_owners.contains(lead_tool.as_str()) {
+        if snapshot.authored_silence_exceeds(lead_tool, crate::store::TAKEOVER_STALE_SECS) {
             let budget_spent = budget.is_some_and(|b| budget_clock.elapsed(attempted_actions) >= b)
                 && (mode == ReapMode::LeaseOnly || attempted_actions > 0);
             if auto_candidate_limit_reached(mode, attempted_actions) || budget_spent {

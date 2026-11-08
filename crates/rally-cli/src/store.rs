@@ -2541,29 +2541,42 @@ impl RoomSnapshot {
         let Some(owner) = claim.tool.as_deref() else {
             return (false, size);
         };
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        // Read durable authored activity, not the presentation-only squad
-        // list. Adaptive decay can remove a provably stale squad, while facts
-        // merely TARGETED at the owner must not become owner activity.
-        let owner_last_seen = self
-            .author_last_seen
-            .get(owner)
+        (self.authored_silence_exceeds(owner, timeout), size)
+    }
+
+    /// Newest timestamp of a fact `tool` itself authored.
+    ///
+    /// Reads durable authored activity, not the presentation-only squad list:
+    /// adaptive decay removes a provably stale squad from `squads`, and facts
+    /// merely TARGETED at the tool must not count as its activity. Every
+    /// liveness-gated authority decision (claim takeover, lead seat change,
+    /// reaper lead relinquish) reads this one source so they cannot disagree.
+    pub(crate) fn authored_last_seen(&self, tool: &str) -> Option<&str> {
+        self.author_last_seen
+            .get(tool)
             .map(String::as_str)
             .or_else(|| {
                 // Compatibility for programmatic snapshots constructed before
                 // authored timestamps became a separate internal projection.
                 self.squads
                     .iter()
-                    .find(|squad| squad.tool == owner)
+                    .find(|squad| squad.tool == tool)
                     .map(|squad| squad.last_seen_ts.as_str())
-            });
-        let eligible = owner_last_seen
+            })
+    }
+
+    /// Has `tool` authored nothing for longer than `secs`?
+    ///
+    /// Fail-closed: a tool with no authored timestamp, or one that does not
+    /// parse, is NOT silent. Missing evidence never hands authority away.
+    pub(crate) fn authored_silence_exceeds(&self, tool: &str, secs: i64) -> bool {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.authored_last_seen(tool)
             .and_then(|last_seen| chrono::DateTime::parse_from_rfc3339(last_seen).ok())
-            .is_some_and(|dt| now_secs - dt.timestamp() > timeout);
-        (eligible, size)
+            .is_some_and(|dt| now_secs - dt.timestamp() > secs)
     }
 
     /// Apply the caller's `--tool` / `--path` / `--event` / `--thread` /
