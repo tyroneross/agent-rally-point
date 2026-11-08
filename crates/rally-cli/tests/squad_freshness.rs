@@ -366,7 +366,13 @@ fn say_to_stale_target_warns_and_still_delivers_but_fresh_target_does_not() {
 fn room_bounds_stale_presence_but_keeps_open_work_and_reports_the_omission() {
     let room = Room::new("roster");
     let ghosts: Vec<String> = (0..30).map(|i| format!("ghost-{i:02}")).collect();
-    for tool in ghosts.iter().map(String::as_str).chain(["holder", "me"]) {
+    // ghost-29 joins first, so the oldest stale row is also the lead.
+    for tool in ghosts
+        .iter()
+        .rev()
+        .map(String::as_str)
+        .chain(["holder", "me"])
+    {
         room.say_ok(&["risk", "--tool", tool, "--subject", "hello"]);
     }
     // ghost-00 is the newest stale row, ghost-29 the oldest; `holder` is older
@@ -404,14 +410,19 @@ fn room_bounds_stale_presence_but_keeps_open_work_and_reports_the_omission() {
         tools.contains(&"ghost-00") && tools.contains(&"ghost-24"),
         "{tools:?}"
     );
+    assert_eq!(view["data"]["room"]["lead"], "ghost-29", "{view}");
     assert!(
-        !tools.contains(&"ghost-25") && !tools.contains(&"ghost-29"),
+        tools.contains(&"ghost-29"),
+        "the lead's row is never bounded away: {tools:?}"
+    );
+    assert!(
+        !tools.contains(&"ghost-25") && !tools.contains(&"ghost-28"),
         "oldest stale rows are bounded: {tools:?}"
     );
-    assert_eq!(rows.len(), 27, "{tools:?}");
+    assert_eq!(rows.len(), 28, "{tools:?}");
     let bucket = &view["data"]["room"]["composition"]["buckets"]["squads"];
     assert_eq!(bucket["total"], 32, "{bucket}");
-    assert_eq!(bucket["omitted"], 5, "{bucket}");
+    assert_eq!(bucket["omitted"], 4, "{bucket}");
     assert_eq!(bucket["reason"], "stale_presence", "{bucket}");
 
     let line = room.text(&["room"]);

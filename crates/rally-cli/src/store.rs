@@ -11349,8 +11349,8 @@ pub(crate) const STALE_SQUAD_ROWS: usize = 25;
 
 /// Bound the presence roster for OUTPUT. A long-lived room accumulates one row
 /// per agent that ever joined (1,092 in this repo's own room on 2026-11-08, all
-/// stale), which buried the handful of live peers. Fresh and unknown rows and
-/// every tool holding open work stay; of the remaining stale rows only the
+/// stale), which buried the handful of live peers. Fresh and unknown rows, the
+/// lead and every tool holding open work stay; of the remaining stale rows only the
 /// newest [`STALE_SQUAD_ROWS`] are emitted. Nothing is deleted: the ledger and
 /// every authority decision still see every squad, the omission is reported in
 /// `composition.buckets.squads`, and `--include-archived` returns all rows.
@@ -11358,17 +11358,21 @@ fn bound_stale_squads(
     snapshot: &mut RoomSnapshot,
     buckets: &mut BTreeMap<String, BucketComposition>,
 ) {
-    let participants = snapshot.action_participants();
-    let mut stale: Vec<(&str, &str)> = snapshot
+    // The lead's row stays too: a reader deciding whether to reclaim the seat
+    // needs to see how stale its holder is.
+    let mut keep = snapshot.action_participants();
+    keep.extend(snapshot.lead.iter().cloned());
+    let mut stale: Vec<(&str, i64)> = snapshot
         .squads
         .iter()
-        .filter(|squad| squad.freshness == FRESHNESS_STALE && !participants.contains(&squad.tool))
-        .map(|squad| (squad.tool.as_str(), squad.last_seen_ts.as_str()))
+        .filter(|squad| squad.freshness == FRESHNESS_STALE && !keep.contains(&squad.tool))
+        .map(|squad| (squad.tool.as_str(), squad.last_seen_seq))
         .collect();
     if stale.len() <= STALE_SQUAD_ROWS {
         return;
     }
-    stale.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    // Ledger sequence orders newest-first without parsing timestamp text.
+    stale.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
     let dropped: BTreeSet<String> = stale[STALE_SQUAD_ROWS..]
         .iter()
         .map(|(tool, _)| (*tool).to_string())

@@ -22568,7 +22568,7 @@ pub(crate) fn select_pane_wake_binding(
 /// so a lead in repo A addressing a peer that works in room B used to write
 /// the obligation where the peer never looks (2026-10-31: three Easy Terminal
 /// members idle ~59 min).
-enum HandoffRoomRoute {
+pub(crate) enum HandoffRoomRoute {
     /// The sender's cwd room. `pane_bound` says whether a live pane binding
     /// confirmed it; when false, the recipient's room is simply unknown.
     Sender { pane_bound: bool },
@@ -22611,7 +22611,7 @@ fn route_targeted_handoff(
 
 /// Pure half of [`route_targeted_handoff`]: map a recipient pane's cwd to its
 /// room, the same way `rally` run in that cwd would ([`repo_root_for`]).
-fn route_for_pane_cwd(sender_root: &Path, target: &str, cwd: &str) -> HandoffRoomRoute {
+pub(crate) fn route_for_pane_cwd(sender_root: &Path, target: &str, cwd: &str) -> HandoffRoomRoute {
     let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let recipient_root = canon(&repo_root_for(&canon(Path::new(cwd))));
     if recipient_root == canon(sender_root) {

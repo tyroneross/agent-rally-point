@@ -2375,9 +2375,11 @@ try { nxt = JSON.parse(process.env.RALLY_NEXT_JSON || "{}"); } catch (_) {}
 try { status = JSON.parse(process.env.RALLY_STATUS_JSON || "{}"); } catch (_) {}
 const R = room?.data?.room || {};
 const squads = Array.isArray(R.squads) ? R.squads : [];
-// The Rust room projection already drops only provably-Stale squads. An
-// `idle` squad can therefore be Unknown (not proven stale) and remains visible
-// by design. Do not replace that fail-open verdict with a JS status check.
+// The Rust room projection already drops only provably-Stale squads, and the
+// default `room` output also bounds old stale rows (fresh, unknown, lead and
+// open-work rows always stay; see composition.buckets.squads). An `idle` squad
+// can therefore be Unknown (not proven stale) and remains visible by design.
+// Do not replace that fail-open verdict with a JS status check.
 const visibleTools = new Set(
   squads
     .filter(s => s && s.tool && s.tool !== "rally")

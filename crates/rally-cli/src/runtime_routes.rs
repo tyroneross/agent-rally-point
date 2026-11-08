@@ -429,21 +429,45 @@ pub(crate) fn command(args: RoutesArgs) -> Result<Output> {
         .iter()
         .filter(|s| !managed.contains(s.tool.as_str()))
         .collect();
-    unmanaged.sort_by(|a, b| b.last_seen_ts.cmp(&a.last_seen_ts));
+    // Ledger sequence, not timestamp text: `last_seen_ts` is a verbatim
+    // `created_at`, and mixed offsets or precision misorder as strings.
+    unmanaged.sort_by_key(|s| std::cmp::Reverse(s.last_seen_seq));
     for s in unmanaged {
         if routes.len() >= MAX_ROUTES {
             break;
         }
         let binding = crate::select_pane_wake_binding(&s.tool, bound.clone());
         let pane = crate::classify_pane_route(room.repo_root(), &s.tool, binding, now_ms);
-        let queued = matches!(pane, crate::PaneRoute::Pane { .. });
-        let reason = match pane {
-            crate::PaneRoute::Unbound => {
-                "No registered live transport; durable queue only".to_string()
+        // A pane working in another repository is still woken when that
+        // repository has a room: a new targeted handoff is recorded there and
+        // delivered against it (`route_targeted_handoff`). Report that route.
+        let (state, reason, queued) = match &pane {
+            crate::PaneRoute::Unbound => (
+                pane.state(),
+                "No registered live transport; durable queue only".to_string(),
+                false,
+            ),
+            crate::PaneRoute::Elsewhere { cwd, .. } => {
+                match crate::route_for_pane_cwd(room.repo_root(), &s.tool, cwd) {
+                    crate::HandoffRoomRoute::Recipient { room: other, .. } => (
+                        "pane_inbox_recipient_room",
+                        format!(
+                            "bound pane works in {cwd}; a new handoff is recorded in the room at {} and wakes the pane there (sender must be lead or invited in that room)",
+                            other.repo_root().display()
+                        ),
+                        true,
+                    ),
+                    crate::HandoffRoomRoute::Gap(gap) => (pane.state(), gap, false),
+                    crate::HandoffRoomRoute::Sender { .. } => (pane.state(), pane.reason(), false),
+                }
             }
-            ref other => other.reason(),
+            other => (
+                other.state(),
+                other.reason(),
+                matches!(other, crate::PaneRoute::Pane { .. }),
+            ),
         };
-        routes.push(json!({"actor":s.tool,"role":role_for(&facts,&s.tool,snapshot.lead.as_deref()),"state":pane.state(),"reason":reason,"capabilities":{"ledger_queue":true,"live_prompt":false,"pane_inbox":queued,"receiver_ack":false},"next_action":{"command":"rally next","tool":s.tool}}));
+        routes.push(json!({"actor":s.tool,"role":role_for(&facts,&s.tool,snapshot.lead.as_deref()),"state":state,"reason":reason,"capabilities":{"ledger_queue":true,"live_prompt":false,"pane_inbox":queued,"receiver_ack":false},"next_action":{"command":"rally next","tool":s.tool}}));
     }
     let total = views.len() + polling_total;
     let passed = args.probe.as_ref().is_none_or(|target| {

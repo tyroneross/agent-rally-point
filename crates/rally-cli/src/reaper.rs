@@ -557,8 +557,9 @@ fn run_reap_stale_in_room_with_budget(
     let mut attempted_actions: usize = 0;
 
     // Identify the legacy stale-owner set at snapshot time (squad-level, 2h
-    // bar). Lead relinquish still uses this tool-scoped projection. Sessionful
-    // claim eligibility below instead requires the exact observed session.
+    // bar), reported as `squads_idle_cleared`. Lead relinquish reads durable
+    // authored silence instead (see below). Sessionful claim eligibility
+    // requires the exact observed session.
     let stale_owners = snapshot.takeover_eligible_owners();
 
     let facts = room.facts()?;
@@ -938,7 +939,23 @@ fn run_reap_stale_in_room_with_budget(
     // paths above already got this right; this one now mirrors them exactly —
     // log, count as preserved, omit from the report.
     let lead_relinquished: Option<String> = if let Some(lead_tool) = &snapshot.lead {
-        if snapshot.authored_silence_exceeds(lead_tool, crate::store::TAKEOVER_STALE_SECS) {
+        // Same evidence rules as a claim: an observed live session vetoes in
+        // every mode, and the automatic LeaseOnly pass (run by `rally enter`)
+        // also needs observed death, because authored timestamps come from a
+        // git-tracked ledger and one backdated fact can forge silence.
+        let observed = observed_sessions.for_claim(Some(lead_tool.as_str()), None);
+        let observed_live = crate::liveness::is_live(
+            &crate::liveness::LivenessSignals {
+                observed_alive: observed.as_signal(),
+                ..Default::default()
+            },
+            0,
+        ) == crate::liveness::Liveness::Live;
+        let lead_stale = snapshot
+            .authored_silence_exceeds(lead_tool, crate::store::TAKEOVER_STALE_SECS)
+            && !observed_live
+            && (mode != ReapMode::LeaseOnly || observed.authorizes_automatic_reap());
+        if lead_stale {
             let budget_spent = budget.is_some_and(|b| budget_clock.elapsed(attempted_actions) >= b)
                 && (mode == ReapMode::LeaseOnly || attempted_actions > 0);
             if auto_candidate_limit_reached(mode, attempted_actions) || budget_spent {
@@ -1496,6 +1513,51 @@ mod tests {
 
     /// Lead-only rooms get the same first-action floor as claim-only and
     /// handoff-only rooms.
+    /// Review finding on AGEN-LEAD (2026-11-08): the automatic pass `rally
+    /// enter` runs must not hand the seat away on timestamps alone, because a
+    /// backdated ledger fact can forge silence. It needs observed death, as a
+    /// claim does; the explicit Full pass keeps the timestamp rule.
+    #[test]
+    fn automatic_pass_keeps_a_silent_lead_without_observed_death() {
+        let root = unique_root("lead-lease-only");
+        let room = RoomStore::open_at(root.clone()).unwrap();
+        let stale = 3 * 60 * 60;
+        append_presence(&room, "quiet-lead", stale);
+        append_lead(&room, "quiet-lead", stale);
+
+        let auto =
+            run_reap_stale_in_room_with_mode_as(&room, true, ReapMode::LeaseOnly, &test_actor())
+                .unwrap();
+        assert_eq!(
+            auto.lead_relinquished, None,
+            "automatic pass needs observed death"
+        );
+        assert_eq!(room.snapshot().unwrap().lead.as_deref(), Some("quiet-lead"));
+
+        let full = run_reap_stale_in_room_with_mode_as(&room, true, ReapMode::Full, &test_actor())
+            .unwrap();
+        assert_eq!(full.lead_relinquished.as_deref(), Some("quiet-lead"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Fail-closed: a lead with no authored timestamp is never relinquished.
+    #[test]
+    fn a_lead_with_no_authored_activity_is_kept() {
+        let mut snapshot = crate::store::RoomSnapshot {
+            lead: Some("ghost-lead".to_string()),
+            ..Default::default()
+        };
+        assert!(!snapshot.authored_silence_exceeds("ghost-lead", 0));
+        snapshot
+            .author_last_seen
+            .insert("ghost-lead".to_string(), past_ts(3 * 60 * 60));
+        assert!(snapshot.authored_silence_exceeds("ghost-lead", crate::store::TAKEOVER_STALE_SECS));
+        assert!(
+            snapshot.squads.is_empty(),
+            "staleness is read with no squad row at all"
+        );
+    }
+
     #[test]
     fn zero_budget_lead_only_queue_makes_progress() {
         let root = unique_root("lead-budget-floor");

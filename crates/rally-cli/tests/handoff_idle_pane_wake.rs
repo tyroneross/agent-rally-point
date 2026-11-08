@@ -887,6 +887,23 @@ fn routes_report_the_pane_verdict_handoff_delivery_uses() {
     let socket = short_socket("routes");
     let foreign = std::env::temp_dir().join(unique("hipw-routes-foreign"));
     std::fs::create_dir_all(&foreign).unwrap();
+    // A second repository WITH a room: handoffs to its pane are routed there.
+    let other_repo = std::env::temp_dir().join(unique("hipw-routes-room"));
+    std::fs::create_dir_all(other_repo.join(".git")).unwrap();
+    let mut init = base_command(&sandbox, &Sockets::Pinned(&socket));
+    init.current_dir(&other_repo);
+    run(
+        init,
+        &[
+            "status",
+            "post",
+            "--json",
+            "--tool",
+            "easy-terminal:other-room",
+            "--state",
+            "idle",
+        ],
+    );
     let _log = spawn_daemon(
         &socket,
         vec![
@@ -895,6 +912,11 @@ fn routes_report_the_pane_verdict_handoff_delivery_uses() {
                 id: "pane-x",
                 identity: "easy-terminal:elsewhere".to_string(),
                 cwd: Some(foreign.clone()),
+            },
+            Pane {
+                id: "pane-y",
+                identity: "easy-terminal:other-room".to_string(),
+                cwd: Some(other_repo.clone()),
             },
         ],
         EnqueueReply::Queued,
@@ -910,6 +932,7 @@ fn routes_report_the_pane_verdict_handoff_delivery_uses() {
     for actor in [
         "easy-terminal:bound",
         "easy-terminal:elsewhere",
+        "easy-terminal:other-room",
         "easy-terminal:unbound",
     ] {
         rally(
@@ -943,6 +966,9 @@ fn routes_report_the_pane_verdict_handoff_delivery_uses() {
         "pane_outside_room"
     );
     assert_eq!(state("easy-terminal:unbound")["state"], "polling_only");
+    let other = state("easy-terminal:other-room");
+    assert_eq!(other["state"], "pane_inbox_recipient_room", "{other}");
+    assert_eq!(other["capabilities"]["pane_inbox"], true, "{other}");
 
     // The handoff takes the route routes reported.
     let said = handoff(&sandbox, &socket, "easy-terminal:bound");
@@ -952,4 +978,5 @@ fn routes_report_the_pane_verdict_handoff_delivery_uses() {
     );
     let _ = std::fs::remove_file(&socket);
     let _ = std::fs::remove_dir_all(&foreign);
+    let _ = std::fs::remove_dir_all(&other_repo);
 }
