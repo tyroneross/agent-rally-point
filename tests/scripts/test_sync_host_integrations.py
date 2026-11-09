@@ -806,5 +806,60 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("not json", report["hosts"]["claude_code"]["reason"])
 
 
+class CodexSymlinkedCacheTests(unittest.TestCase):
+    """Codex does not load a plugin whose manifest directory is a symlink."""
+
+    def report(self, symlinked: bool) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            cache = home / ".codex/plugins/cache/canonical-local/agent-rally-point/local/.codex-plugin"
+            cache.parent.mkdir(parents=True)
+            if symlinked:
+                real = home / "checkout/.codex-plugin"
+                real.mkdir(parents=True)
+                cache.symlink_to(real)
+            else:
+                real = cache
+                real.mkdir()
+            (real / "rally-release.json").write_text(json.dumps(identity()))
+            runner = FakeRunner(
+                {
+                    ("codex", "plugin", "list", "--json"): (
+                        0,
+                        {
+                            "installed": [
+                                {
+                                    "name": "agent-rally-point",
+                                    "pluginId": LOCAL_CLAUDE_ID,
+                                    "marketplaceName": "canonical-local",
+                                    "enabled": True,
+                                }
+                            ]
+                        },
+                    )
+                }
+            )
+            return SYNC.reconcile(ROOT, host="codex", apply=False, runner=runner, home=home)
+
+    def test_symlinked_manifest_directory_is_stale_and_refreshed_in_place(self) -> None:
+        report = self.report(symlinked=True)
+        record = report["hosts"]["codex"]
+        self.assertEqual(record["status"], "stale")
+        self.assertIn("symlink", record["reason"])
+        self.assertEqual(
+            report["apply"]["planned_commands"],
+            [
+                ["codex", "plugin", "marketplace", "upgrade", "canonical-local", "--json"],
+                ["codex", "plugin", "remove", LOCAL_CLAUDE_ID, "--json"],
+                ["codex", "plugin", "add", LOCAL_CLAUDE_ID, "--json"],
+            ],
+        )
+
+    def test_real_manifest_directory_with_matching_identity_is_current(self) -> None:
+        report = self.report(symlinked=False)
+        self.assertEqual(report["hosts"]["codex"]["status"], "current")
+        self.assertEqual(report["apply"]["planned_commands"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

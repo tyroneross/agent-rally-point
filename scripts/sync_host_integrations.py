@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -372,14 +373,53 @@ def codex_status(
                 "cache_path": str(cache_path),
                 "identity": identity_at(cache_path),
                 "source_identity": identity_at(source_path),
+                "unloadable": codex_unloadable_reason(cache_path),
             }
         )
-    return host_record(
-        host="codex",
-        providers=providers,
-        canonical_id=config["canonical_id"],
-        expected=expected,
+    return with_codex_loadability(
+        host_record(
+            host="codex",
+            providers=providers,
+            canonical_id=config["canonical_id"],
+            expected=expected,
+        )
     )
+
+
+def codex_unloadable_reason(cache_path: Path) -> str | None:
+    """Why Codex will not load the plugin at `cache_path`, or None.
+
+    Codex does not load a plugin whose manifest directory is a symlink: on
+    2026-11-09 a fresh Codex 0.167.0 session listed skills from the three local
+    plugins with real cache directories and from none of the seven whose
+    `.codex-plugin` was a symlink into a checkout. The files behind the link
+    still read as a matching identity, so identity alone would report current.
+    """
+    if cache_path.is_symlink():
+        return (
+            f"Codex does not load a plugin whose manifest directory is a symlink "
+            f"({cache_path} -> {os.readlink(cache_path)})"
+        )
+    return None
+
+
+def with_codex_loadability(record: dict[str, Any]) -> dict[str, Any]:
+    """An identity match on an unloadable install proves nothing: mark it stale
+    so the provider is refreshed from the marketplace it was installed from."""
+    providers = record.get("providers", [])
+    kept_id = record.get("kept_provider") or (
+        providers[0].get("id") if len(providers) == 1 else None
+    )
+    kept = next((p for p in providers if p.get("id") == kept_id), None)
+    if kept and kept.get("unloadable") and record.get("status") in {"current", "ahead"}:
+        record["status"] = "stale"
+        record["reason"] = (
+            f"{kept['unloadable']}; refresh it from its own marketplace "
+            f"(marketplace {marketplace_of(kept)})"
+        )
+        if "kept_status" in record:
+            record["kept_status"] = "stale"
+    return record
 
 
 def claude_marketplaces_ok(data: Any) -> bool:
