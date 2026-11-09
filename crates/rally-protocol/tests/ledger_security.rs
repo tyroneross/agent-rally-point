@@ -13,22 +13,16 @@
 //!     instead of buffering the whole file.
 
 use std::io::Write;
-use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
 
 use rally_protocol::ledger::{FileInbox, MAX_DIRECTIVE_TEXT_BYTES, validate_agent_id};
 use rally_protocol::{Directive, DirectiveKind, Inbox, InterruptType, now_ts};
 
-fn scratch_root(tag: &str) -> std::path::PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!(
-        "rally-ledger-sec-{tag}-{}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&p).unwrap();
-    p
+fn scratch_root(tag: &str) -> TempRoot {
+    TempRoot::new(tag)
 }
 
 fn directive(to: &str, text: &str) -> Directive {

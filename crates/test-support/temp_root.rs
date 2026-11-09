@@ -249,6 +249,15 @@ impl AsRef<Path> for TempRoot {
     }
 }
 
+/// Lets `&root` stand in wherever a call site passed `&PathBuf` to an
+/// `impl Into<PathBuf>` parameter, so migrating a helper does not have to
+/// rewrite every caller.
+impl From<&TempRoot> for PathBuf {
+    fn from(root: &TempRoot) -> PathBuf {
+        root.path.clone()
+    }
+}
+
 impl std::fmt::Debug for TempRoot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("TempRoot").field(&self.path).finish()

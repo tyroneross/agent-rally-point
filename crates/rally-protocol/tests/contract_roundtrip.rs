@@ -31,35 +31,18 @@ use std::fs;
 use std::process::{Child, Command};
 
 use rally_protocol::ledger::FileInbox;
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 use rally_protocol::{
     DeliveryStatus, Directive, DirectiveKind, Inbox, InterruptType, Receipt, now_ts,
 };
 
-/// Scratch ledger root in a temp dir. RAII via the returned `_guard`.
-fn scratch_root(name: &str) -> (std::path::PathBuf, ScratchGuard) {
-    let mut root = std::env::temp_dir();
-    root.push(format!(
-        "rally-protocol-test-{}-{}-{}",
-        name,
-        std::process::id(),
-        next_seq()
-    ));
-    fs::create_dir_all(&root).unwrap();
-    let guard = ScratchGuard(root.clone());
-    (root, guard)
-}
-
-struct ScratchGuard(std::path::PathBuf);
-impl Drop for ScratchGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn next_seq() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    N.fetch_add(1, Ordering::Relaxed)
+/// Scratch ledger root. The returned guard deletes it when the test ends.
+fn scratch_root(name: &str) -> (std::path::PathBuf, TempRoot) {
+    let guard = TempRoot::new(name);
+    (guard.path().to_path_buf(), guard)
 }
 
 #[test]
@@ -501,11 +484,8 @@ fn ledger_open_refuses_missing_root() {
     // Defensive: a typo'd path silently producing a fresh ledger is the
     // exact class of bug the F plan calls out. open() must NOT mkdir the
     // root; only the inbox/ + receipts/ subdirs.
-    let bogus = std::env::temp_dir().join(format!(
-        "rally-protocol-NOPE-{}-{}",
-        std::process::id(),
-        next_seq()
-    ));
+    let (root, _g) = scratch_root("missing-root");
+    let bogus = root.join("never-created");
     assert!(!bogus.exists());
     let err = FileInbox::open(&bogus).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
