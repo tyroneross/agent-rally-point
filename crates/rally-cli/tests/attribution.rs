@@ -71,6 +71,12 @@ impl TempRoom {
         cmd.current_dir(&self.cwd)
             .env("HOME", &self.home)
             .env("RALLY_NO_AUTO_REAP", "1")
+            // These cases grade attribution, not wall-clock partitioning. On a
+            // loaded host the reaper's 2000 ms budget is spent before its first
+            // append and the automatic pass defers silently, which read as a
+            // missing `claim.expired` fact. reaper_scale grades the budget with
+            // its own deterministic steps.
+            .env("RALLY_TEST_REAP_CLOCK_STEP_MS", "0")
             .env_remove("GITHUB_ACTIONS")
             .env_remove("GITHUB_RUN_ID");
         cmd
@@ -383,6 +389,75 @@ fn a_wake_intent_records_actor_and_target_separately() {
 // =============================================================================
 // reaper
 // =============================================================================
+
+/// A deferred automatic pass must say so.
+///
+/// The reaper never starts an action after its budget is spent, and the budget
+/// clock starts before the ledger read and the liveness probe. On a loaded host
+/// that work alone can spend it, and `enter` then exited 0 with empty stderr —
+/// indistinguishable from a room with nothing to reap. This test spends the
+/// budget on purpose (1 ms against the real clock; the probe spawns `git`
+/// several times) and asserts the deferral is reported and nothing was closed.
+#[test]
+fn a_deferred_auto_reap_is_reported_and_closes_nothing() {
+    let room = TempRoom::new("reap-deferred");
+    room.init_observed_worktree();
+    let owner_enter = room
+        .rally()
+        .env("RALLY_SESSION_ID", "owner-session")
+        .env("RALLY_OBSERVER_PID", "2000000000")
+        .args([
+            "enter",
+            "--tool",
+            "owner:01",
+            "--json",
+            "--timeout-ms",
+            TIMEOUT_MS,
+        ])
+        .output()
+        .expect("spawn owner enter");
+    assert!(
+        owner_enter.status.success(),
+        "owner enter must succeed: {}",
+        String::from_utf8_lossy(&owner_enter.stderr)
+    );
+    seed_expired_claim(&room, "owner:01", "expired work", "file:src/a.rs");
+
+    let enter = room
+        .rally()
+        .env_remove("RALLY_NO_AUTO_REAP")
+        .env_remove("RALLY_TEST_REAP_CLOCK_STEP_MS")
+        .env("RALLY_AUTO_REAP_INTERVAL_SECS", "3600")
+        .env("RALLY_REAP_BUDGET_MS", "1")
+        .args([
+            "enter",
+            "--tool",
+            "reaper-agent:01",
+            "--json",
+            "--timeout-ms",
+            TIMEOUT_MS,
+        ])
+        .output()
+        .expect("spawn budget-starved enter");
+    let stderr = String::from_utf8_lossy(&enter.stderr);
+    assert!(
+        enter.status.success(),
+        "a deferred reap must never fail enter: {stderr}"
+    );
+    assert!(
+        stderr.contains("auto-reap deferred 1 eligible item(s)"),
+        "enter must report the work its automatic pass did not reach: {stderr}"
+    );
+    assert!(
+        room.facts_of_kind("claim.expired").is_empty(),
+        "a pass with no budget must not start a destructive action"
+    );
+    assert_eq!(
+        room.active_claim_count(),
+        1,
+        "the deferred claim must still be live for the next pass"
+    );
+}
 
 /// FALSIFIER A, `claim.expired` half — and the coupling test.
 ///
