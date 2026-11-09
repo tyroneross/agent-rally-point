@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for the test scratch-folder lint.
+
+Run: python3 tests/scripts/test_lint_test_temp_dir.py
+
+Each spelling a test could use to reach the system temp directory is planted
+once and must be flagged. A lint proven on a single spelling would pass while
+the leak came back through another.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+LINT = REPO / "scripts/lint_test_temp_dir.py"
+
+
+def load_lint():
+    spec = importlib.util.spec_from_file_location("lint_test_temp_dir", LINT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class Tree:
+    def __init__(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def write(self, rel: str, text: str) -> None:
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def close(self) -> None:
+        self._tmp.cleanup()
+
+
+class LintTestTempDir(unittest.TestCase):
+    def setUp(self):
+        self.lint = load_lint()
+        self.tree = Tree()
+        self.addCleanup(self.tree.close)
+
+    def flagged(self) -> list[tuple[str, int]]:
+        return [(f["file"], f["line"]) for f in self.lint.scan(self.tree.root)]
+
+    def test_flags_the_full_path_in_an_integration_test(self):
+        self.tree.write("crates/a/tests/t.rs", "fn f() {\n    let d = std::env::temp_dir();\n}\n")
+        self.assertEqual(self.flagged(), [("crates/a/tests/t.rs", 2)])
+
+    def test_flags_the_short_path(self):
+        self.tree.write("crates/a/tests/t.rs", "use std::env;\nfn f() { let d = env::temp_dir(); }\n")
+        self.assertEqual(self.flagged(), [("crates/a/tests/t.rs", 2)])
+
+    def test_flags_a_bare_imported_call(self):
+        self.tree.write("crates/a/tests/t.rs", "use std::env::temp_dir;\nfn f() { let d = temp_dir(); }\n")
+        self.assertEqual(self.flagged(), [("crates/a/tests/t.rs", 2)])
+
+    def test_flags_a_renamed_import(self):
+        self.tree.write(
+            "crates/a/tests/t.rs",
+            "use std::env::temp_dir as scratch;\nfn f() { let d = scratch(); }\n",
+        )
+        self.assertEqual(self.flagged(), [("crates/a/tests/t.rs", 2)])
+
+    def test_flags_a_call_inside_a_cfg_test_module_only(self):
+        self.tree.write(
+            "crates/a/src/lib.rs",
+            "pub fn prod() { let d = std::env::temp_dir(); }\n"
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    fn f() { let d = std::env::temp_dir(); }\n"
+            "}\n",
+        )
+        self.assertEqual(self.flagged(), [("crates/a/src/lib.rs", 4)])
+
+    def test_flags_a_tests_suffixed_source_file(self):
+        self.tree.write("crates/a/src/x_tests.rs", "fn f() { let d = std::env::temp_dir(); }\n")
+        self.assertEqual(self.flagged(), [("crates/a/src/x_tests.rs", 1)])
+
+    def test_ignores_production_code(self):
+        self.tree.write("crates/a/src/lib.rs", "pub fn prod() { let d = std::env::temp_dir(); }\n")
+        self.assertEqual(self.flagged(), [])
+
+    def test_allows_an_annotated_root_read(self):
+        self.tree.write(
+            "crates/a/tests/t.rs",
+            "fn f() { let d = std::env::temp_dir(); } // temp-root-read: containment check\n",
+        )
+        self.assertEqual(self.flagged(), [])
+
+    def test_an_annotation_with_no_reason_does_not_count(self):
+        self.tree.write(
+            "crates/a/tests/t.rs",
+            "fn f() { let d = std::env::temp_dir(); } // temp-root-read:\n",
+        )
+        self.assertEqual(self.flagged(), [("crates/a/tests/t.rs", 1)])
+
+    def test_ignores_comments_and_the_helper_itself(self):
+        self.tree.write("crates/a/tests/t.rs", "// was: std::env::temp_dir()\n/// see temp_dir()\n")
+        self.tree.write("crates/test-support/temp_root.rs", "fn b() { std::env::temp_dir(); }\n")
+        self.assertEqual(self.flagged(), [])
+
+    def test_ignores_build_output(self):
+        self.tree.write("crates/a/target/tests/t.rs", "fn f() { std::env::temp_dir(); }\n")
+        self.assertEqual(self.flagged(), [])
+
+    def test_exit_codes(self):
+        self.tree.write("crates/a/tests/t.rs", "fn f() { std::env::temp_dir(); }\n")
+        root = ["--root", str(self.tree.root)]
+        self.assertEqual(self.lint.main(root), 1)
+        self.assertEqual(self.lint.main(root + ["--warn"]), 0)
+        (self.tree.root / "crates/a/tests/t.rs").write_text("fn f() {}\n", encoding="utf-8")
+        self.assertEqual(self.lint.main(root), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

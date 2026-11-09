@@ -53,6 +53,12 @@ echo "quality-gate: fmt --check (workspace)…" >&2
 # shellcheck disable=SC2086 # $CARGO is an intentional word-split command prefix ("rustup run X cargo" or "cargo")
 $CARGO fmt --all --check
 
+# Test code gets scratch space from crates/test-support/temp_root.rs. While call
+# sites are still being migrated this reports and passes (--warn); drop the flag
+# once the count is zero so a new test cannot bring the leak back.
+echo "quality-gate: test scratch-folder lint (warn mode)…" >&2
+python3 "$(dirname "$0")/lint_test_temp_dir.py" --warn | tail -n 0
+
 echo "quality-gate: clippy (-D warnings)…" >&2
 # shellcheck disable=SC2086
 $CARGO clippy --workspace --all-targets -- -D warnings
