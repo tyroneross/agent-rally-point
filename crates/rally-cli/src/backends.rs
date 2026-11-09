@@ -3020,14 +3020,20 @@ mod tests {
 
     /// Write an executable stub `tmux` that reports a safe binding and exits
     /// with `send_rc` for `send-keys`.
-    fn stub_tmux(tag: &str, send_rc: u8) -> String {
+    fn stub_tmux(tag: &str, send_rc: u8) -> (String, crate::test_temp_root::TempRoot) {
         stub_tmux_with_state(tag, "%1\t1\t1\t/socket\t0\t0\t0\t0", send_rc)
     }
 
-    fn stub_tmux_with_state(tag: &str, state: &str, send_rc: u8) -> String {
+    /// Returns the stub's path and the guard that deletes it; keep the guard
+    /// alive for as long as the stub is used.
+    fn stub_tmux_with_state(
+        tag: &str,
+        state: &str,
+        send_rc: u8,
+    ) -> (String, crate::test_temp_root::TempRoot) {
         use std::os::unix::fs::PermissionsExt;
-        let path =
-            std::env::temp_dir().join(format!("rally-p1a-{}-{}.sh", tag, std::process::id()));
+        let root = crate::test_temp_root::TempRoot::new(&format!("rally-p1a-{tag}"));
+        let path = root.join("tmux.sh");
         let body = format!(
             "#!/bin/sh\nfor a in \"$@\"; do\n  [ \"$a\" = \"display-message\" ] && {{ printf '%s\\n' '{state}'; exit 0; }}\n  [ \"$a\" = \"send-keys\" ] && exit {send_rc}\ndone\nexit 0\n"
         );
@@ -3044,7 +3050,7 @@ mod tests {
                 _ => break,
             }
         }
-        path.to_string_lossy().into_owned()
+        (path.to_string_lossy().into_owned(), root)
     }
 
     fn tmux_runner(bin: &str) -> BackendRunner {
@@ -3080,7 +3086,7 @@ mod tests {
 
     #[test]
     fn inject_and_verify_never_promotes_screen_echo_to_receiver_arrival() {
-        let bin = stub_tmux("stale-echo", 0);
+        let (bin, _stub_root) = stub_tmux("stale-echo", 0);
         let r = tmux_runner(&bin);
         assert!(
             !iv_retry(&r, "rally-verify-token-ABC123 hello").unwrap(),
@@ -3090,7 +3096,7 @@ mod tests {
 
     #[test]
     fn inject_and_verify_reports_unverified_without_capture() {
-        let bin = stub_tmux("no-capture", 0);
+        let (bin, _stub_root) = stub_tmux("no-capture", 0);
         let r = tmux_runner(&bin);
         assert!(
             !iv_retry(&r, "rally-verify-token-ABC123 hello").unwrap(),
@@ -3100,7 +3106,7 @@ mod tests {
 
     #[test]
     fn inject_and_verify_errors_when_send_fails() {
-        let bin = stub_tmux("fail", 1);
+        let (bin, _stub_root) = stub_tmux("fail", 1);
         let r = tmux_runner(&bin);
         assert!(
             iv_retry(&r, "rally-verify-token-ABC123 hello").is_err(),
@@ -3114,7 +3120,7 @@ mod tests {
             ("input-off", "%1\t1\t1\t/socket\t0\t0\t1\t0"),
             ("synchronized", "%1\t1\t1\t/socket\t0\t0\t0\t1"),
         ] {
-            let bin = stub_tmux_with_state(tag, state, 0);
+            let (bin, _stub_root) = stub_tmux_with_state(tag, state, 0);
             let error = tmux_runner(&bin)
                 .inject_and_verify("sess", "rally-write-guard-token")
                 .unwrap_err()
@@ -3183,7 +3189,7 @@ mod tests {
     #[test]
     fn tmux_inject_accepts_new_delimiter_identity() {
         let state = ["%1", "1", "1", "/socket", "0", "0", "0", "0"].join(TMUX_FIELD_SEP);
-        let bin = stub_tmux_with_state("delim", &state, 0);
+        let (bin, _stub_root) = stub_tmux_with_state("delim", &state, 0);
         assert!(iv_retry(&tmux_runner(&bin), "rally-delim-token").is_ok());
     }
 
@@ -3197,7 +3203,8 @@ mod tests {
             return;
         }
         let sock = format!("rally-fix-test-{}", std::process::id());
-        let wrapper = std::env::temp_dir().join(format!("{sock}.sh"));
+        let wrapper_root = crate::test_temp_root::TempRoot::new("rally-fix-test");
+        let wrapper = wrapper_root.join(format!("{sock}.sh"));
         std::fs::write(
             &wrapper,
             format!("#!/bin/sh\nunset TMUX\nexec tmux -L {sock} -f /dev/null \"$@\"\n"),
@@ -3213,7 +3220,6 @@ mod tests {
         let result = started.then(|| tmux_runner(&bin).tmux_identity("probe:0.0"));
         let liveness = started.then(|| probe_tmux_liveness(&bin, &["probe".to_string()]));
         let _ = Command::new(&bin).arg("kill-server").status();
-        let _ = std::fs::remove_file(&wrapper);
         if let Some(Ok(binding)) = &result {
             let _ = std::fs::remove_file(&binding.socket);
         }
@@ -3236,10 +3242,9 @@ mod tests {
     /// Create a temp dir holding one executable stub named `name`, and return
     /// (dir, full path). Used to exercise the "present" branch without putting
     /// anything on the real PATH.
-    fn stub_bin_dir(tag: &str, name: &str) -> (PathBuf, String) {
+    fn stub_bin_dir(tag: &str, name: &str) -> (crate::test_temp_root::TempRoot, String) {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("rally-probe-{}-{}", tag, std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_temp_root::TempRoot::new(&format!("rally-probe-{tag}"));
         let path = dir.join(name);
         std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -3263,7 +3268,6 @@ mod tests {
             resolve_executable("tmux", None).is_none(),
             "no PATH at all => unresolved rather than a panic"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -3285,7 +3289,6 @@ mod tests {
             resolve_executable(&plain.to_string_lossy(), None).is_none(),
             "a non-executable file is not a usable backend binary"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -3314,12 +3317,11 @@ mod tests {
 
     #[test]
     fn ensure_backend_available_passes_when_the_configured_binary_resolves() {
-        let (dir, bin) = stub_bin_dir("present", "tmux");
+        let (_dir, bin) = stub_bin_dir("present", "tmux");
         assert!(
             tmux_runner(&bin).ensure_backend_available().is_ok(),
             "an executable at the configured --tmux-bin path is available"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

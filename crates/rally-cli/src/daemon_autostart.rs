@@ -119,17 +119,8 @@ pub(crate) fn maybe_start(root: &Path, rally_dir: &Path) {
 mod tests {
     use super::*;
 
-    fn tmp(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rally-autostart-{name}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tmp(name: &str) -> crate::test_temp_root::TempRoot {
+        crate::test_temp_root::TempRoot::new(&format!("rally-autostart-{name}"))
     }
 
     #[test]
@@ -164,6 +155,5 @@ mod tests {
             claim_attempt(&dir, now + ATTEMPT_INTERVAL + Duration::from_secs(1)),
             "a crash-looping coordinator is retried once per interval"
         );
-        fs::remove_dir_all(&dir).ok();
     }
 }
