@@ -22,6 +22,14 @@
 //! build-loop working-state) must never make every binary built in this
 //! checkout report as `-dirty`; only build-relevant source changes should.
 //!
+//! Untracked files (`??` lines) are stricter: they count as dirty only when
+//! the path is under a build-input location (`UNTRACKED_BUILD_INPUT_PREFIXES`).
+//! An untracked file can reach the compiler only from a crate or vendor dir
+//! or a cargo config. Anything else, including `docs/` and `skills/` files
+//! that are `include_str!`'d, enters the build only through an edit to a
+//! tracked source file, and that edit already counts. Untracked notes such
+//! as `.designdoc/` or `docs/research/` therefore never add `-dirty`.
+//!
 //! `.agents/` is deliberately NOT excluded (f3, 2026-07-09): unlike the
 //! three dirs above, `.agents/` is not exclusively Rally runtime scratch —
 //! it also holds `.agents/plugins/marketplace.json`, a TRACKED, shipped
@@ -60,6 +68,27 @@ fn main() {
 /// Paths are repo-root-relative, matching `git status --porcelain` output.
 /// `.agents/` is intentionally absent — see the module doc comment (f3).
 const DIRTY_EXCLUDED_PREFIXES: [&str; 3] = [".rally/", ".build-loop/", ".wrangler/"];
+
+/// Build inputs that can make an untracked file reach the compiler. Entries
+/// ending in `/` match by prefix; the others (root files) match by equality.
+/// Any other untracked path is only picked up through an edit to a tracked
+/// source file (for example an `include_str!`'d doc), which already counts.
+const UNTRACKED_BUILD_INPUT_PREFIXES: [&str; 6] = [
+    "crates/",
+    "vendor/",
+    ".cargo/",
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+];
+
+/// Strip the surrounding double quotes git adds around paths with special
+/// characters.
+fn unquote(p: &str) -> &str {
+    let p = p.trim();
+    let p = p.strip_prefix('"').unwrap_or(p);
+    p.strip_suffix('"').unwrap_or(p)
+}
 
 /// The git-internal paths whose change should trigger a rebuild: `HEAD`
 /// (per-worktree), `packed-refs` (common dir), the index (per-worktree), and
@@ -119,17 +148,28 @@ fn has_relevant_dirty_state() -> bool {
 }
 
 /// `git status --porcelain` lines look like `XY path` or, for renames,
-/// `XY old -> new`. Returns true when the line touches at least one path
-/// OUTSIDE the excluded Rally-runtime prefixes (i.e. it should count toward
-/// `-dirty`).
+/// `XY old -> new`. Untracked (`??`) lines count only under a build-input
+/// prefix. Other lines count when they touch at least one path OUTSIDE the
+/// excluded Rally-runtime prefixes (i.e. it should count toward `-dirty`).
 fn is_build_relevant_status_line(line: &str) -> bool {
     // Byte offset 3 is the standard `XY ` status prefix; `.get` (not
     // indexing) keeps this panic-free even on a malformed/short line.
     let path = line.get(3..).unwrap_or("").trim();
     let candidates: Vec<&str> = match path.split_once(" -> ") {
-        Some((old, new)) => vec![old, new],
-        None => vec![path],
+        Some((old, new)) => vec![unquote(old), unquote(new)],
+        None => vec![unquote(path)],
     };
+    if line.get(..2) == Some("??") {
+        return candidates.iter().any(|p| {
+            UNTRACKED_BUILD_INPUT_PREFIXES.iter().any(|entry| {
+                if entry.ends_with('/') {
+                    p.starts_with(entry)
+                } else {
+                    p == entry
+                }
+            })
+        });
+    }
     !candidates.iter().all(|p| {
         DIRTY_EXCLUDED_PREFIXES
             .iter()
@@ -222,6 +262,48 @@ mod tests {
         ));
         assert!(!is_build_relevant_status_line(
             "R  .rally/old.jsonl -> .rally/new.jsonl"
+        ));
+    }
+
+    #[test]
+    fn untracked_non_source_files_are_not_dirty() {
+        let lines = [
+            "?? .designdoc/",
+            "?? .procedural/",
+            "?? docs/research/2026-10-02-message-frame-and-ack.md",
+        ];
+        for line in lines {
+            assert!(!is_build_relevant_status_line(line), "{line}");
+        }
+        let porcelain = lines.join("\n");
+        assert!(!porcelain.lines().any(is_build_relevant_status_line));
+    }
+
+    #[test]
+    fn untracked_build_inputs_are_dirty() {
+        for line in [
+            "?? crates/rally-cli/src/new.rs",
+            "?? vendor/x/src/lib.rs",
+            "?? Cargo.lock",
+            "?? .cargo/config.toml",
+        ] {
+            assert!(is_build_relevant_status_line(line), "{line}");
+        }
+        assert!(!is_build_relevant_status_line("?? Cargo.toml.bak"));
+    }
+
+    #[test]
+    fn tracked_edit_outside_build_inputs_still_dirty() {
+        // Tracked and include_str!'d into the binary.
+        assert!(is_build_relevant_status_line(
+            " M docs/ANY-AGENT-ONBOARDING.md"
+        ));
+    }
+
+    #[test]
+    fn quoted_untracked_source_path_is_dirty() {
+        assert!(is_build_relevant_status_line(
+            "?? \"crates/rally-cli/src/a b.rs\""
         ));
     }
 }
