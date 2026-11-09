@@ -2194,6 +2194,79 @@ pub(crate) const MAX_TARGET_OBLIGATION_BYTES: usize = 256 * 1_024;
 pub(crate) const MAX_WIRE_STALE_AUTHORS: usize = 4_096;
 pub(crate) const MAX_WIRE_SNAPSHOT_INTERNALS_BYTES: usize = 512 * 1_024;
 
+/// Rows one fact bucket may carry in a caller-scoped reply
+/// ([`RoomSnapshot::bound_for_caller`]); far above any count `enter`/`next`
+/// render (`MAX_ENTER_ROWS` = 128), so only a flooded bucket is cut.
+pub(crate) const MAX_CALLER_BUCKET_ROWS: usize = 512;
+/// Serialized bytes one fact bucket may carry in a caller-scoped reply. Eight
+/// bounded fact buckets × 512 KiB = 4 MiB, half the 8 MiB frame.
+pub(crate) const MAX_CALLER_BUCKET_BYTES: usize = 512 * 1_024;
+/// Squad rows in a caller-scoped reply: room for every participant of the
+/// kept fact buckets plus fresh peers, while a room's monotonic squad growth
+/// (one row per per-session tool id) cannot grow the reply.
+pub(crate) const MAX_CALLER_SQUAD_ROWS: usize = 1_024;
+/// Serialized bytes of the squad bucket in a caller-scoped reply.
+pub(crate) const MAX_CALLER_SQUAD_BYTES: usize = 512 * 1_024;
+/// `BucketComposition::reason` for rows a caller-scoped reply left out.
+pub(crate) const CALLER_PROJECTION_REASON: &str = "caller_projection";
+/// Composition key: exact open-queue items for the caller that were omitted.
+pub(crate) const CALLER_OPEN_QUEUE_BUCKET: &str = "open_queue";
+/// Composition keys: omitted squads by heartbeat freshness, so peer tallies
+/// stay exact over a bounded squad list.
+pub(crate) const CALLER_SQUADS_FRESH_BUCKET: &str = "squads_fresh";
+pub(crate) const CALLER_SQUADS_STALE_BUCKET: &str = "squads_stale";
+pub(crate) const CALLER_SQUADS_UNKNOWN_BUCKET: &str = "squads_unknown";
+
+/// Keep the highest-priority rows of one bucket inside a row and byte bound.
+///
+/// Lower `rank` is kept first; within a rank the newer `seq` wins. Kept rows
+/// keep their original relative order (callers rely on recency sort), and the
+/// cut stops at the first row that does not fit so the kept set is a priority
+/// prefix. Returns the omitted rows.
+fn bound_caller_rows<T: Serialize>(
+    rows: &mut Vec<T>,
+    max_rows: usize,
+    max_bytes: usize,
+    rank: impl Fn(&T) -> u8,
+    seq: impl Fn(&T) -> i64,
+) -> Vec<T> {
+    let mut order = (0..rows.len()).collect::<Vec<_>>();
+    order.sort_by(|&a, &b| {
+        rank(&rows[a])
+            .cmp(&rank(&rows[b]))
+            .then_with(|| seq(&rows[b]).cmp(&seq(&rows[a])))
+    });
+    let mut keep = vec![false; rows.len()];
+    let (mut kept, mut bytes) = (0usize, 0usize);
+    for index in order {
+        if kept == max_rows {
+            break;
+        }
+        // `,` separator per row; an unserializable row counts as the whole budget.
+        let row_bytes = serde_json::to_vec(&rows[index]).map_or(max_bytes, |v| v.len() + 1);
+        if bytes.saturating_add(row_bytes) > max_bytes {
+            break;
+        }
+        bytes = bytes.saturating_add(row_bytes);
+        kept += 1;
+        keep[index] = true;
+    }
+    if kept == rows.len() {
+        return Vec::new();
+    }
+    let mut omitted = Vec::with_capacity(rows.len() - kept);
+    let mut retained = Vec::with_capacity(kept);
+    for (row, keep) in std::mem::take(rows).into_iter().zip(keep) {
+        if keep {
+            retained.push(row);
+        } else {
+            omitted.push(row);
+        }
+    }
+    *rows = retained;
+    omitted
+}
+
 /// Key the internals ride under in the wire snapshot object.
 ///
 /// Double-underscored so it cannot collide with a `RoomSnapshot` field name, and
@@ -2436,7 +2509,208 @@ impl RoomSnapshot {
         self.open_obligations_total = total;
         self.open_obligations_handoffs = handoffs;
         self.open_obligations_artifacts = artifacts;
+        self.bound_for_caller(tool)
+    }
+
+    /// Bound every list a caller-scoped reply (`SnapshotForEnter`,
+    /// `SnapshotForObligationTarget`) carries, so the reply cannot grow with
+    /// room history. Runs on the store side in BOTH store modes, so direct and
+    /// routed callers read the same projection.
+    ///
+    /// What `enter`, `next` (incl. `--audit`), `inbox` and `self-exit-check`
+    /// read decides the shape:
+    /// * `stale_facts` and `resolved_unverified`: rows are never read, only
+    ///   counted (`RoomSummary`), so rows are dropped; `totals` stays exact.
+    /// * fact buckets: rows authored by or addressed to `tool` first (owned
+    ///   claims to renew, named handoffs, no-response risk guards), then the
+    ///   caller's open queue, then newest; [`MAX_CALLER_BUCKET_ROWS`] /
+    ///   [`MAX_CALLER_BUCKET_BYTES`] each.
+    /// * `squads`: caller, lead and participants of the kept buckets first,
+    ///   then fresh/active peers, then newest; [`MAX_CALLER_SQUAD_ROWS`] /
+    ///   [`MAX_CALLER_SQUAD_BYTES`]. Omitted squads are tallied by freshness.
+    ///
+    /// `totals` keeps the exact projected counts. Every cut is recorded in
+    /// `composition` (reason [`CALLER_PROJECTION_REASON`]); absence of
+    /// `composition` still means nothing was left out.
+    pub(crate) fn bound_for_caller(mut self, tool: &str) -> Self {
+        let mut buckets = BTreeMap::new();
+        let mut record = |name: &str, total: usize, omitted: usize| {
+            if omitted > 0 {
+                buckets.insert(
+                    name.to_string(),
+                    BucketComposition {
+                        total,
+                        emitted: total - omitted,
+                        omitted,
+                        omitted_ids: Vec::new(),
+                        omitted_ids_truncated: false,
+                        reason: CALLER_PROJECTION_REASON.to_string(),
+                    },
+                );
+            }
+        };
+        let stale = std::mem::take(&mut self.stale_facts).len();
+        record("stale_facts", stale, stale);
+        let unverified = std::mem::take(&mut self.resolved_unverified).len();
+        record("resolved_unverified", unverified, unverified);
+
+        let involves = |fact: &Fact| {
+            fact.tool.as_deref() == Some(tool) || fact.target.as_deref() == Some(tool)
+        };
+        let fact_rank = |fact: &Fact| u8::from(!involves(fact));
+        let fact_seq = |fact: &Fact| fact.seq;
+        let (rows, bytes) = (MAX_CALLER_BUCKET_ROWS, MAX_CALLER_BUCKET_BYTES);
+
+        let open_queue_total = self
+            .open_handoffs
+            .iter()
+            .filter(|fact| crate::open_queue::is_open_queue_item_for(fact, tool))
+            .count();
+        let total = self.open_handoffs.len();
+        let omitted = bound_caller_rows(
+            &mut self.open_handoffs,
+            rows,
+            bytes,
+            |fact| {
+                if involves(fact) {
+                    0
+                } else if crate::open_queue::is_open_queue_item_for(fact, tool) {
+                    1
+                } else {
+                    2
+                }
+            },
+            fact_seq,
+        );
+        record("open_handoffs", total, omitted.len());
+        let open_queue_kept = self
+            .open_handoffs
+            .iter()
+            .filter(|fact| crate::open_queue::is_open_queue_item_for(fact, tool))
+            .count();
+        record(
+            CALLER_OPEN_QUEUE_BUCKET,
+            open_queue_total,
+            open_queue_total - open_queue_kept,
+        );
+        let kept_handoffs = self
+            .open_handoffs
+            .iter()
+            .map(|fact| fact.event_id.clone())
+            .collect::<BTreeSet<_>>();
+        self.open_queue_signals
+            .later_done
+            .retain(|id, _| kept_handoffs.contains(id));
+        self.open_queue_signals
+            .rejected_named
+            .retain(|id| kept_handoffs.contains(id));
+        // A risk guarding one of the caller's own handoffs (`next`'s
+        // no-response escalation) must survive, or `next` re-appends it.
+        let own_handoffs = self
+            .open_handoffs
+            .iter()
+            .filter(|fact| fact.tool.as_deref() == Some(tool))
+            .map(|fact| fact.event_id.clone())
+            .collect::<BTreeSet<_>>();
+
+        for (name, bucket) in [
+            ("active_claims", &mut self.active_claims),
+            ("active_blockers", &mut self.active_blockers),
+            ("current_decisions", &mut self.current_decisions),
+            ("system_health", &mut self.system_health),
+            ("recent_artifacts", &mut self.recent_artifacts),
+            ("unconsumed_artifacts", &mut self.unconsumed_artifacts),
+        ] {
+            let total = bucket.len();
+            let omitted = bound_caller_rows(bucket, rows, bytes, fact_rank, fact_seq);
+            record(name, total, omitted.len());
+        }
+        let total = self.current_risks.len();
+        let omitted = bound_caller_rows(
+            &mut self.current_risks,
+            rows,
+            bytes,
+            |fact| {
+                let guards_own = fact
+                    .ref_id
+                    .as_deref()
+                    .is_some_and(|id| own_handoffs.contains(id));
+                u8::from(!(involves(fact) || guards_own))
+            },
+            fact_seq,
+        );
+        record("current_risks", total, omitted.len());
+
+        let mut participants = self.action_participants();
+        participants.extend(self.lead.iter().cloned());
+        let total = self.squads.len();
+        let omitted = bound_caller_rows(
+            &mut self.squads,
+            MAX_CALLER_SQUAD_ROWS,
+            MAX_CALLER_SQUAD_BYTES,
+            |squad| {
+                if squad.tool == tool {
+                    0
+                } else if participants.contains(&squad.tool) {
+                    1
+                } else if squad.freshness == FRESHNESS_FRESH || squad.status == "active" {
+                    2
+                } else {
+                    3
+                }
+            },
+            |squad| squad.last_seen_seq,
+        );
+        record("squads", total, omitted.len());
+        for (name, freshness) in [
+            (CALLER_SQUADS_FRESH_BUCKET, Some(FRESHNESS_FRESH)),
+            (CALLER_SQUADS_STALE_BUCKET, Some(FRESHNESS_STALE)),
+            (CALLER_SQUADS_UNKNOWN_BUCKET, None),
+        ] {
+            let class = |squad: &&Squad| match freshness {
+                Some(value) => squad.freshness == value,
+                None => squad.freshness != FRESHNESS_FRESH && squad.freshness != FRESHNESS_STALE,
+            };
+            let omitted_class = omitted.iter().filter(class).count();
+            let kept_class = self.squads.iter().filter(class).count();
+            record(name, kept_class + omitted_class, omitted_class);
+        }
+        if !omitted.is_empty() {
+            // Per-tool internals follow the visible squads (plus claim owners),
+            // so they cannot outgrow the squad bound either.
+            let keep_tools = self
+                .squads
+                .iter()
+                .map(|squad| squad.tool.clone())
+                .chain(self.active_claims.iter().filter_map(|c| c.tool.clone()))
+                .collect::<BTreeSet<_>>();
+            self.stale_authors.retain(|tool| keep_tools.contains(tool));
+            self.author_last_seen
+                .retain(|tool, _| keep_tools.contains(tool));
+        }
+
+        if !buckets.is_empty() {
+            self.composition = Some(RoomComposition {
+                budget_bytes: None,
+                // Not measured: a caller-scoped reply is never printed as a room.
+                emitted_bytes: 0,
+                buckets,
+                drill_in: vec!["rally room --json".to_string()],
+                over_budget: false,
+                over_budget_causes: Vec::new(),
+            });
+        }
         self
+    }
+
+    /// Rows a caller-scoped reply omitted from `bucket` (see
+    /// [`RoomSnapshot::bound_for_caller`]); 0 for a complete snapshot.
+    pub(crate) fn caller_projection_omitted(&self, bucket: &str) -> usize {
+        self.composition
+            .as_ref()
+            .and_then(|composition| composition.buckets.get(bucket))
+            .filter(|entry| entry.reason == CALLER_PROJECTION_REASON)
+            .map_or(0, |entry| entry.omitted)
     }
 
     /// ADVISORY tier — tools whose latest presence is liveness-idle (squad
@@ -2875,18 +3149,42 @@ pub(crate) struct RoomSummary {
     pub(crate) stale_facts: usize,
 }
 
+/// Counts come from `totals` (exact at projection) so a caller-scoped reply
+/// whose rows were bounded (`RoomSnapshot::bound_for_caller`) still reports
+/// true counts; `max` covers hand-built snapshots that never set `totals`.
 impl From<&RoomSnapshot> for RoomSummary {
     fn from(snapshot: &RoomSnapshot) -> Self {
         Self {
             max_seq: snapshot.max_seq,
-            active_claims: snapshot.active_claims.len(),
-            active_blockers: snapshot.active_blockers.len(),
-            open_handoffs: snapshot.open_handoffs.len(),
-            current_decisions: snapshot.current_decisions.len(),
-            current_risks: snapshot.current_risks.len(),
-            recent_artifacts: snapshot.recent_artifacts.len(),
-            unconsumed_artifacts: snapshot.unconsumed_artifacts.len(),
-            stale_facts: snapshot.stale_facts.len(),
+            active_claims: snapshot
+                .totals
+                .active_claims
+                .max(snapshot.active_claims.len()),
+            active_blockers: snapshot
+                .totals
+                .active_blockers
+                .max(snapshot.active_blockers.len()),
+            open_handoffs: snapshot
+                .totals
+                .open_handoffs
+                .max(snapshot.open_handoffs.len()),
+            current_decisions: snapshot
+                .totals
+                .current_decisions
+                .max(snapshot.current_decisions.len()),
+            current_risks: snapshot
+                .totals
+                .current_risks
+                .max(snapshot.current_risks.len()),
+            recent_artifacts: snapshot
+                .totals
+                .recent_artifacts
+                .max(snapshot.recent_artifacts.len()),
+            unconsumed_artifacts: snapshot
+                .totals
+                .unconsumed_artifacts
+                .max(snapshot.unconsumed_artifacts.len()),
+            stale_facts: snapshot.totals.stale_facts.max(snapshot.stale_facts.len()),
         }
     }
 }
@@ -10461,7 +10759,8 @@ fn enter_snapshot_context_from_facts(
     });
 
     EnterSnapshotContext {
-        snapshot: snapshot_from_facts_with_policy_at(facts, coord, false, now_secs),
+        snapshot: snapshot_from_facts_with_policy_at(facts, coord, false, now_secs)
+            .bound_for_caller(tool),
         has_other_active_session: enter_has_other_active_session(
             facts,
             tool,

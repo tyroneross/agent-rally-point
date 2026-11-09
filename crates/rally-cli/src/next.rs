@@ -202,7 +202,13 @@ pub(crate) fn peer_targets(snapshot: &RoomSnapshot, tool: &str, limit: usize) ->
         .take(limit)
         .map(|sq| PeerTarget::from_squad(sq))
         .collect();
-    out.truncated = ranked.len().saturating_sub(out.ranked.len());
+    // A caller-scoped reply may bound the squad list; its omitted peers still
+    // count (the caller's own row is never omitted first).
+    out.fresh += snapshot.caller_projection_omitted(crate::store::CALLER_SQUADS_FRESH_BUCKET);
+    out.stale += snapshot.caller_projection_omitted(crate::store::CALLER_SQUADS_STALE_BUCKET);
+    out.unknown += snapshot.caller_projection_omitted(crate::store::CALLER_SQUADS_UNKNOWN_BUCKET);
+    out.truncated = ranked.len().saturating_sub(out.ranked.len())
+        + snapshot.caller_projection_omitted("squads");
     out
 }
 

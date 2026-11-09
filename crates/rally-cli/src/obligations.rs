@@ -254,7 +254,9 @@ pub(crate) fn build_inbox(
         .collect::<Vec<_>>();
 
     let open_queue = OpenQueueSummary {
-        count: open_queue.len(),
+        // Exact even when a caller-scoped reply bounded the open queue rows.
+        count: open_queue.len()
+            + snapshot.caller_projection_omitted(crate::store::CALLER_OPEN_QUEUE_BUCKET),
         revalidate: open_queue
             .iter()
             .filter(|item| item.revalidate_before_claiming)
