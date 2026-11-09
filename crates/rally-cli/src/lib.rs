@@ -5578,10 +5578,19 @@ fn command_inbox(args: cli::InboxArgs) -> Result<Output> {
         RoomStore::Routed(_) => None,
     };
     let mut inboxes = BTreeMap::new();
+    let mut errors = BTreeMap::new();
     for tool in tools {
         let snapshot = match &base {
-            Some(base) => base.clone().for_obligation_target(&tool, row_limit)?,
-            None => room.snapshot_for_obligation_target(&tool, row_limit)?,
+            Some(base) => base.clone().for_obligation_target(&tool, row_limit),
+            None => room.snapshot_for_obligation_target(&tool, row_limit),
+        };
+        // One tool over its own bound must not hide the others' inboxes.
+        let snapshot = match snapshot {
+            Err(error @ RallyError::CallerProjectionTooLarge { .. }) => {
+                errors.insert(tool, error.to_string());
+                continue;
+            }
+            other => other?,
         };
         let inbox = inbox_for(
             &snapshot,
@@ -5595,9 +5604,12 @@ fn command_inbox(args: cli::InboxArgs) -> Result<Output> {
     let text = inboxes
         .iter()
         .map(|(tool, inbox)| inbox_text(tool, inbox))
+        .chain(errors.iter().map(|(tool, error)| {
+            format!("inbox {tool} — error: {}", obligations::single_line(error))
+        }))
         .collect::<Vec<_>>()
         .join("\n");
-    let body = envelope("inbox", SCHEMA_INBOX, InboxManyData { inboxes })?;
+    let body = envelope("inbox", SCHEMA_INBOX, InboxManyData { inboxes, errors })?;
     Ok(Output::new(args.json, text, body))
 }
 
@@ -5627,6 +5639,10 @@ pub(crate) const MAX_INBOX_TOOLS: usize = 128;
 #[derive(JsonSchema, Serialize)]
 struct InboxManyData {
     inboxes: BTreeMap<String, InboxResult>,
+    /// Tools whose own rows exceeded the caller-projection bound
+    /// (`caller-projection-too-large`), keyed by tool; absent when none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    errors: BTreeMap<String, String>,
 }
 
 /// Human render of one tool's inbox. Every peer-authored value goes through

@@ -2194,25 +2194,39 @@ pub(crate) const MAX_TARGET_OBLIGATION_BYTES: usize = 256 * 1_024;
 pub(crate) const MAX_WIRE_STALE_AUTHORS: usize = 4_096;
 pub(crate) const MAX_WIRE_SNAPSHOT_INTERNALS_BYTES: usize = 512 * 1_024;
 
-/// Rows of OPTIONAL (evictable) rows one fact bucket may carry in a
-/// caller-scoped reply ([`RoomSnapshot::bound_for_caller`]); far above any count
-/// `enter`/`next` render (`MAX_ENTER_ROWS` = 128), so only a flooded bucket is cut.
+// ---- Caller-scoped reply budget ([`RoomSnapshot::bound_for_caller`]) ----
+//
+// One budget covers everything a `SnapshotForEnter` / `SnapshotForObligationTarget`
+// reply carries. The tier budgets below decide WHAT is cut first; the final
+// serialized check against [`MAX_CALLER_REPLY_BYTES`] decides WHETHER more must
+// be cut, so the bound holds whatever the scalars, internals and composition
+// weigh.
+
+/// Hard ceiling for the serialized reply (snapshot wire value + response
+/// envelope allowance). 1 MiB margin under the 8 MiB frame ([`MAX_LINE_BYTES`]).
+pub(crate) const MAX_CALLER_REPLY_BYTES: usize = 7 * 1_024 * 1_024;
+/// Allowance for the `{"ok":{"snapshot_for_enter":{...}}}` envelope and its
+/// scalar guards around the snapshot value.
+pub(crate) const MAX_CALLER_ENVELOPE_BYTES: usize = 4 * 1_024;
+/// MUST-KEEP tier: the caller's own decision rows. Over this the command
+/// fails ([`RallyError::CallerProjectionTooLarge`]); the only last resort.
+pub(crate) const MAX_CALLER_MUST_BYTES: usize = 3 * 1_024 * 1_024;
+/// SHOULD-KEEP tier: peer claims and peer blockers (advisory path-collision
+/// input), kept whole when they fit, else newest first; never a failure.
+pub(crate) const MAX_CALLER_SHOULD_BYTES: usize = 1_024 * 1_024;
+/// OPTIONAL tier rows per fact bucket; far above any count `enter`/`next`
+/// render (`MAX_ENTER_ROWS` = 128).
 pub(crate) const MAX_CALLER_BUCKET_ROWS: usize = 512;
-/// Serialized bytes of optional rows per fact bucket: 8 buckets x 384 KiB = 3 MiB.
-pub(crate) const MAX_CALLER_BUCKET_BYTES: usize = 384 * 1_024;
-/// Optional squad rows: room for fresh peers while a room's monotonic squad
-/// growth (one row per per-session tool id) cannot grow the reply.
+/// OPTIONAL tier bytes per fact bucket (6 buckets).
+pub(crate) const MAX_CALLER_BUCKET_BYTES: usize = 256 * 1_024;
+/// OPTIONAL squad rows / bytes beyond the must-keep squads.
 pub(crate) const MAX_CALLER_SQUAD_ROWS: usize = 1_024;
-/// Serialized bytes of optional squad rows.
-pub(crate) const MAX_CALLER_SQUAD_BYTES: usize = 384 * 1_024;
-/// Serialized bytes of GUARANTEED rows (never evicted; see
-/// [`RoomSnapshot::bound_for_caller`]) across all buckets. Guaranteed 3 MiB +
-/// optional 3 MiB + optional squads 384 KiB + internals 512 KiB stays under the
-/// 8 MiB frame with ~1 MiB for scalars. Over this, the projection fails with
-/// [`CALLER_PROJECTION_TOO_LARGE`] instead of evicting a decision input.
-pub(crate) const MAX_CALLER_GUARANTEED_BYTES: usize = 3 * 1_024 * 1_024;
-/// Typed error prefix when guaranteed rows alone exceed their bound.
-pub(crate) const CALLER_PROJECTION_TOO_LARGE: &str = "caller-projection-too-large";
+pub(crate) const MAX_CALLER_SQUAD_BYTES: usize = 256 * 1_024;
+/// Caller's pending wakes, newest kept: dropping an older wake can at worst let
+/// `next` append one duplicate intent.
+pub(crate) const MAX_CALLER_WAKE_BYTES: usize = 128 * 1_024;
+/// Smallest optional/should budget the final check halves to before zeroing.
+const MIN_CALLER_TIER_BYTES: usize = 4 * 1_024;
 /// `BucketComposition::reason` for rows a caller-scoped reply left out.
 pub(crate) const CALLER_PROJECTION_REASON: &str = "caller_projection";
 /// Composition key: exact open-queue items for the caller that were omitted.
@@ -2220,63 +2234,111 @@ pub(crate) const CALLER_OPEN_QUEUE_BUCKET: &str = "open_queue";
 /// Composition key: omitted handoffs `enter` attention counts as open-queue
 /// (untargeted / `all`), so a first `enter` reports the true attention total.
 pub(crate) const CALLER_ATTENTION_OPEN_HANDOFFS_BUCKET: &str = "attention_open_handoffs";
+/// Composition key: caller-authored handoffs omitted together with their
+/// no-response risks (already escalated, so no decision reads them).
+pub(crate) const CALLER_ESCALATED_PAIRS_BUCKET: &str = "escalated_handoffs";
 /// Composition keys: omitted squads by heartbeat freshness, so peer tallies
 /// stay exact over a bounded squad list.
 pub(crate) const CALLER_SQUADS_FRESH_BUCKET: &str = "squads_fresh";
 pub(crate) const CALLER_SQUADS_STALE_BUCKET: &str = "squads_stale";
 pub(crate) const CALLER_SQUADS_UNKNOWN_BUCKET: &str = "squads_unknown";
 
-/// Bound one bucket: rows where `guaranteed` holds are ALWAYS kept (their
-/// bytes are returned so the caller can enforce the shared guaranteed bound);
-/// the remaining rows are kept by lower `rank`, then newer `seq`, inside
-/// `max_rows` / `max_bytes`, stopping at the first that does not fit. Kept rows
-/// keep their original relative order (callers rely on recency sort).
-/// Returns `(omitted rows, guaranteed bytes)`.
+/// Tier budgets for one projection pass; the final check shrinks them.
+#[derive(Clone, Copy, Debug)]
+struct CallerBudgets {
+    optional_rows: usize,
+    optional_bytes: usize,
+    squad_rows: usize,
+    squad_bytes: usize,
+    should_bytes: usize,
+}
+
+impl CallerBudgets {
+    const DEFAULT: Self = Self {
+        optional_rows: MAX_CALLER_BUCKET_ROWS,
+        optional_bytes: MAX_CALLER_BUCKET_BYTES,
+        squad_rows: MAX_CALLER_SQUAD_ROWS,
+        squad_bytes: MAX_CALLER_SQUAD_BYTES,
+        should_bytes: MAX_CALLER_SHOULD_BYTES,
+    };
+
+    /// Halve optional budgets, then should-keep; `false` once both are zero.
+    fn shrink(&mut self) -> bool {
+        let halve = |v: usize| {
+            if v / 2 < MIN_CALLER_TIER_BYTES {
+                0
+            } else {
+                v / 2
+            }
+        };
+        if self.optional_bytes > 0 || self.squad_bytes > 0 {
+            self.optional_bytes = halve(self.optional_bytes);
+            self.squad_bytes = halve(self.squad_bytes);
+            self.optional_rows /= 2;
+            self.squad_rows /= 2;
+            return true;
+        }
+        if self.should_bytes > 0 {
+            self.should_bytes = halve(self.should_bytes);
+            return true;
+        }
+        false
+    }
+}
+
+fn row_bytes<T: Serialize>(row: &T) -> usize {
+    // `,` separator per row; an unserializable row is treated as huge.
+    serde_json::to_vec(row).map_or(usize::MAX / 4, |v| v.len() + 1)
+}
+
+/// Bound one bucket: rows where `keep` holds are ALWAYS kept; the rest are
+/// kept by lower `rank`, then newer `seq`, inside `max_rows` / `max_bytes`,
+/// stopping at the first that does not fit. Kept rows keep their original
+/// relative order (callers rely on recency sort).
+/// Returns `(omitted rows, kept-by-`keep` bytes, kept-by-budget bytes)`.
 fn bound_caller_rows<T: Serialize>(
     rows: &mut Vec<T>,
     max_rows: usize,
     max_bytes: usize,
-    guaranteed: impl Fn(&T) -> bool,
+    keep: impl Fn(&T) -> bool,
     rank: impl Fn(&T) -> u8,
     seq: impl Fn(&T) -> i64,
-) -> (Vec<T>, usize) {
-    // `,` separator per row; an unserializable row counts as the whole budget.
-    let size = |row: &T| serde_json::to_vec(row).map_or(max_bytes, |v| v.len() + 1);
-    let mut keep = vec![false; rows.len()];
-    let mut guaranteed_bytes = 0usize;
-    let mut optional = Vec::new();
+) -> (Vec<T>, usize, usize) {
+    let mut kept_flags = vec![false; rows.len()];
+    let mut keep_bytes = 0usize;
+    let mut candidates = Vec::new();
     for (index, row) in rows.iter().enumerate() {
-        if guaranteed(row) {
-            keep[index] = true;
-            guaranteed_bytes = guaranteed_bytes.saturating_add(size(row));
+        if keep(row) {
+            kept_flags[index] = true;
+            keep_bytes = keep_bytes.saturating_add(row_bytes(row));
         } else {
-            optional.push(index);
+            candidates.push(index);
         }
     }
-    optional.sort_by(|&a, &b| {
+    candidates.sort_by(|&a, &b| {
         rank(&rows[a])
             .cmp(&rank(&rows[b]))
             .then_with(|| seq(&rows[b]).cmp(&seq(&rows[a])))
     });
     let (mut kept, mut bytes) = (0usize, 0usize);
-    for index in optional {
+    for index in candidates {
         if kept == max_rows {
             break;
         }
-        let row_bytes = size(&rows[index]);
-        if bytes.saturating_add(row_bytes) > max_bytes {
+        let size = row_bytes(&rows[index]);
+        if bytes.saturating_add(size) > max_bytes {
             break;
         }
-        bytes = bytes.saturating_add(row_bytes);
+        bytes = bytes.saturating_add(size);
         kept += 1;
-        keep[index] = true;
+        kept_flags[index] = true;
     }
-    if keep.iter().all(|k| *k) {
-        return (Vec::new(), guaranteed_bytes);
+    if kept_flags.iter().all(|k| *k) {
+        return (Vec::new(), keep_bytes, bytes);
     }
     let mut omitted = Vec::new();
     let mut retained = Vec::new();
-    for (row, keep) in std::mem::take(rows).into_iter().zip(keep) {
+    for (row, keep) in std::mem::take(rows).into_iter().zip(kept_flags) {
         if keep {
             retained.push(row);
         } else {
@@ -2284,7 +2346,15 @@ fn bound_caller_rows<T: Serialize>(
         }
     }
     *rows = retained;
-    (omitted, guaranteed_bytes)
+    (omitted, keep_bytes, bytes)
+}
+
+/// Serialized size of a caller-scoped reply carrying `snapshot`, or `None`
+/// when the wire encoding refuses it (internals over their own bound).
+fn caller_reply_bytes(snapshot: &RoomSnapshot) -> Option<usize> {
+    let value = snapshot_to_wire_value(snapshot).ok()?;
+    let bytes = serde_json::to_vec(&value).ok()?.len();
+    Some(bytes + MAX_CALLER_ENVELOPE_BYTES)
 }
 
 /// Key the internals ride under in the wire snapshot object.
@@ -2484,11 +2554,16 @@ impl RoomSnapshot {
         // store modes, so direct and routed stay identical.
         self.pending_wakes
             .retain(|wake| wake.target.as_deref() == Some(tool));
-        if self.pending_wakes.len() > MAX_WIRE_PENDING_WAKES {
-            self.pending_wakes.sort_by_key(|wake| wake.seq);
-            let excess = self.pending_wakes.len() - MAX_WIRE_PENDING_WAKES;
-            self.pending_wakes.drain(..excess);
-        }
+        // Newest wakes within MAX_WIRE_PENDING_WAKES rows and
+        // MAX_CALLER_WAKE_BYTES bytes.
+        bound_caller_rows(
+            &mut self.pending_wakes,
+            MAX_WIRE_PENDING_WAKES,
+            MAX_CALLER_WAKE_BYTES,
+            |_| false,
+            |_| 0,
+            |wake| wake.seq,
+        );
         let accepted_open = crate::obligations::named_work(&self, tool)
             .iter()
             .filter(|(_, state)| *state == crate::obligations::NamedState::AcceptedOpen)
@@ -2499,13 +2574,6 @@ impl RoomSnapshot {
             .filter(|fact| fact.target.as_deref() == Some(tool))
             .collect::<Vec<_>>();
         mine.sort_by_key(|fact| fact.seq);
-        // Every unanswered id, before the row bound below: the caller
-        // projection must tell accepted named work (guaranteed) from
-        // unanswered work (carried, bounded, by `open_obligations`).
-        let unanswered = mine
-            .iter()
-            .map(|fact| fact.event_id.clone())
-            .collect::<BTreeSet<_>>();
         let total = mine.len();
         let handoffs = mine
             .iter()
@@ -2536,42 +2604,58 @@ impl RoomSnapshot {
         self.open_obligations_total = total;
         self.open_obligations_handoffs = handoffs;
         self.open_obligations_artifacts = artifacts;
-        self.bound_for_caller(tool, &unanswered)
+        self.bound_for_caller(tool)
     }
 
     /// Bound every list a caller-scoped reply (`SnapshotForEnter`,
-    /// `SnapshotForObligationTarget`) carries, so the reply cannot grow with
-    /// room history. Runs on the store side in BOTH store modes, so direct and
-    /// routed callers read the same projection.
+    /// `SnapshotForObligationTarget`) carries. Runs on the store side in BOTH
+    /// store modes, so direct and routed callers read the same projection.
     ///
-    /// Rule: a row that a ledger-writing or instructing decision reads is
-    /// GUARANTEED, never evicted; if guaranteed rows alone exceed
-    /// [`MAX_CALLER_GUARANTEED_BYTES`] the projection fails with
-    /// [`CALLER_PROJECTION_TOO_LARGE`]. Guaranteed rows:
-    /// * `active_claims`, `active_blockers`: all (owned-lease renewal,
-    ///   `avoid_claimed_scope` / `claimed_scope` / backlog path filters for any
-    ///   `--path`, owned-blocker and waiting-on decisions).
-    /// * `open_handoffs`: authored by `tool` (overdue escalation, waiting-on)
-    ///   and named to `tool` but not in `unanswered` (accepted named work).
-    /// * `current_risks`: risks whose `ref` is a handoff `tool` authored (the
-    ///   no-response "already escalated" guard).
-    /// * `squads`: `tool`, the lead, and every peer `tool` waits on (targets of
-    ///   its handoffs and blockers), so takeover liveness is exact.
+    /// Tiers (a row a decision reads is never evicted):
+    /// * MUST-KEEP ([`MAX_CALLER_MUST_BYTES`]; over it, and only then, the
+    ///   command fails with [`RallyError::CallerProjectionTooLarge`]):
+    ///   caller-authored handoffs not yet escalated; handoffs and blockers
+    ///   addressed to the caller (incl. accepted-open named work); the
+    ///   caller's own claims and blockers; the newest already-escalated
+    ///   handoff to a live peer (keeps `next`'s `waiting` verdict exact) with
+    ///   its risks; squads of the caller, the lead and every kept waited-on
+    ///   target.
+    /// * ESCALATED PAIRS: other caller-authored handoffs that already have a
+    ///   no-response risk, kept WITH their risks newest first inside what the
+    ///   must budget leaves, else omitted together. An absent handoff is never
+    ///   escalated, so no duplicate risk can be written.
+    /// * SHOULD-KEEP ([`MAX_CALLER_SHOULD_BYTES`]): peer claims, then peer
+    ///   blockers, newest first; never a failure. Their readers are advisory
+    ///   (`avoid_claimed_scope`, attention `claimed_scope`, backlog
+    ///   `claimed_scopes`); the write boundary does not read this projection.
+    /// * OPTIONAL: everything else, involving `tool` first, newest first.
     ///
-    /// Everything else is optional: involving `tool` first (then, for
-    /// handoffs, the caller's open queue), newest first, inside
-    /// [`MAX_CALLER_BUCKET_ROWS`] / [`MAX_CALLER_BUCKET_BYTES`] per bucket and
-    /// [`MAX_CALLER_SQUAD_ROWS`] / [`MAX_CALLER_SQUAD_BYTES`] for squads.
-    /// `stale_facts` and `resolved_unverified` rows have no reader and are
-    /// dropped. `totals` keeps exact counts and every cut is recorded in
+    /// A final check serializes the reply and, while it exceeds
+    /// [`MAX_CALLER_REPLY_BYTES`], halves the optional then should-keep
+    /// budgets. `totals` stays exact and every cut is recorded in
     /// `composition` (reason [`CALLER_PROJECTION_REASON`]).
-    pub(crate) fn bound_for_caller(
-        mut self,
-        tool: &str,
-        unanswered: &BTreeSet<String>,
-    ) -> Result<Self> {
+    pub(crate) fn bound_for_caller(self, tool: &str) -> Result<Self> {
+        let mut budgets = CallerBudgets::DEFAULT;
+        loop {
+            let projected = self.clone().project_for_caller(tool, budgets)?;
+            if caller_reply_bytes(&projected).is_some_and(|bytes| bytes <= MAX_CALLER_REPLY_BYTES) {
+                return Ok(projected);
+            }
+            if !budgets.shrink() {
+                return Err(RallyError::CallerProjectionTooLarge {
+                    detail: format!(
+                        "{tool}'s reply still exceeds {MAX_CALLER_REPLY_BYTES} bytes with only \
+                         its own coordination rows left; resolve or retract handoffs you sent, \
+                         answer handoffs sent to you, release claims you hold, or resolve your \
+                         blockers"
+                    ),
+                });
+            }
+        }
+    }
+
+    fn project_for_caller(mut self, tool: &str, budgets: CallerBudgets) -> Result<Self> {
         let mut buckets = BTreeMap::new();
-        let mut guaranteed_bytes = BTreeMap::<&'static str, usize>::new();
         let mut record = |name: &str, total: usize, omitted: usize| {
             if omitted > 0 {
                 buckets.insert(
@@ -2592,30 +2676,173 @@ impl RoomSnapshot {
         let unverified = std::mem::take(&mut self.resolved_unverified).len();
         record("resolved_unverified", unverified, unverified);
 
-        let involves = |fact: &Fact| {
-            fact.tool.as_deref() == Some(tool) || fact.target.as_deref() == Some(tool)
-        };
+        let mine = |fact: &Fact| fact.tool.as_deref() == Some(tool);
+        let to_me = |fact: &Fact| fact.target.as_deref() == Some(tool);
+        let involves = |fact: &Fact| mine(fact) || to_me(fact);
         let fact_rank = |fact: &Fact| u8::from(!involves(fact));
         let fact_seq = |fact: &Fact| fact.seq;
-        let none = |_: &Fact| false;
-        let all = |_: &Fact| true;
-        let (rows, bytes) = (MAX_CALLER_BUCKET_ROWS, MAX_CALLER_BUCKET_BYTES);
 
+        // --- Escalation pairs: own handoff + the risks that reference it.
+        let own_ids = self
+            .open_handoffs
+            .iter()
+            .filter(|fact| mine(fact))
+            .map(|fact| fact.event_id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut risk_bytes_by_ref = BTreeMap::<String, usize>::new();
+        for risk in &self.current_risks {
+            if let Some(id) = risk.ref_id.as_deref().filter(|id| own_ids.contains(*id)) {
+                *risk_bytes_by_ref.entry(id.to_string()).or_default() += row_bytes(risk);
+            }
+        }
+        let dead = self.takeover_eligible_owners();
+        let mut escalated = self
+            .open_handoffs
+            .iter()
+            .filter(|fact| mine(fact) && risk_bytes_by_ref.contains_key(&fact.event_id))
+            .collect::<Vec<_>>();
+        escalated.sort_by_key(|fact| std::cmp::Reverse(fact.seq));
+        // The newest escalated handoff to a live peer: if any escalated
+        // handoff passes `waiting_on_facts`' age filter, this one does, so
+        // keeping it keeps `next`'s waiting verdict exact.
+        let forced = escalated
+            .iter()
+            .find(|fact| {
+                fact.target.as_deref().is_some_and(|target| {
+                    target != tool && target != "all" && !dead.contains(target)
+                })
+            })
+            .map(|fact| fact.event_id.clone());
+        let is_escalated = |fact: &Fact| risk_bytes_by_ref.contains_key(&fact.event_id);
+        let must_handoff = |fact: &Fact| {
+            to_me(fact)
+                || (mine(fact)
+                    && (!is_escalated(fact) || forced.as_deref() == Some(&fact.event_id)))
+        };
+        let must_blocker = |fact: &Fact| involves(fact);
+
+        let squad_bytes = self
+            .squads
+            .iter()
+            .map(|squad| (squad.tool.clone(), row_bytes(squad)))
+            .collect::<BTreeMap<_, _>>();
+        let mut must_tools = BTreeSet::from([tool.to_string()]);
+        must_tools.extend(self.lead.iter().cloned());
+        for fact in self
+            .open_handoffs
+            .iter()
+            .filter(|fact| mine(fact) && must_handoff(fact))
+            .chain(self.active_blockers.iter().filter(|fact| mine(fact)))
+        {
+            must_tools.extend(fact.target.iter().cloned());
+        }
+        let own_handoff_bytes = self
+            .open_handoffs
+            .iter()
+            .filter(|fact| mine(fact) && must_handoff(fact))
+            .map(|fact| {
+                row_bytes(fact) + risk_bytes_by_ref.get(&fact.event_id).copied().unwrap_or(0)
+            })
+            .sum::<usize>();
+        let addressed_handoff_bytes = self
+            .open_handoffs
+            .iter()
+            .filter(|fact| to_me(fact) && !mine(fact))
+            .map(row_bytes)
+            .sum::<usize>();
+        let own_claim_bytes = self
+            .active_claims
+            .iter()
+            .filter(|f| mine(f))
+            .map(row_bytes)
+            .sum::<usize>();
+        let blocker_bytes = self
+            .active_blockers
+            .iter()
+            .filter(|f| must_blocker(f))
+            .map(row_bytes)
+            .sum::<usize>();
+        let must_squad_bytes = |tools: &BTreeSet<String>| {
+            tools
+                .iter()
+                .filter_map(|t| squad_bytes.get(t))
+                .sum::<usize>()
+        };
+        let must_bytes = own_handoff_bytes
+            + addressed_handoff_bytes
+            + own_claim_bytes
+            + blocker_bytes
+            + must_squad_bytes(&must_tools);
+        if must_bytes > MAX_CALLER_MUST_BYTES {
+            let count = |rows: &[Fact], pred: &dyn Fn(&Fact) -> bool| {
+                rows.iter().filter(|f| pred(f)).count()
+            };
+            return Err(RallyError::CallerProjectionTooLarge {
+                detail: format!(
+                    "{tool}'s own coordination rows need {must_bytes} bytes, over the \
+                     {MAX_CALLER_MUST_BYTES}-byte bound: {} un-escalated handoffs you sent \
+                     ({own_handoff_bytes} B), {} handoffs addressed to you ({addressed_handoff_bytes} B), \
+                     {} claims you hold ({own_claim_bytes} B), {} blockers you raised or that \
+                     name you ({blocker_bytes} B). Resolve or retract handoffs you sent, answer \
+                     handoffs sent to you, release claims, or resolve blockers",
+                    count(&self.open_handoffs, &|f| mine(f) && must_handoff(f)),
+                    count(&self.open_handoffs, &|f| to_me(f) && !mine(f)),
+                    count(&self.active_claims, &|f| mine(f)),
+                    count(&self.active_blockers, &must_blocker),
+                ),
+            });
+        }
+        // Fill what the must budget leaves with escalated pairs, newest first.
+        let mut left = MAX_CALLER_MUST_BYTES - must_bytes;
+        let mut kept_pairs = BTreeSet::new();
+        for fact in escalated
+            .iter()
+            .filter(|f| forced.as_deref() != Some(&f.event_id))
+        {
+            let target_squad = fact
+                .target
+                .as_ref()
+                .filter(|t| !must_tools.contains(*t))
+                .and_then(|t| squad_bytes.get(t))
+                .copied()
+                .unwrap_or(0);
+            let cost = row_bytes(*fact) + risk_bytes_by_ref[&fact.event_id] + target_squad;
+            if cost > left {
+                break;
+            }
+            left -= cost;
+            kept_pairs.insert(fact.event_id.clone());
+            must_tools.extend(fact.target.iter().cloned());
+        }
+        let dropped_pairs = escalated
+            .iter()
+            .filter(|f| forced.as_deref() != Some(&f.event_id) && !kept_pairs.contains(&f.event_id))
+            .map(|f| f.event_id.clone())
+            .collect::<BTreeSet<_>>();
+        drop(escalated);
+        let escalated_total = risk_bytes_by_ref.len();
+        record(
+            CALLER_ESCALATED_PAIRS_BUCKET,
+            escalated_total,
+            dropped_pairs.len(),
+        );
+
+        // --- open_handoffs
         let open_queue_total = self
             .open_handoffs
             .iter()
             .filter(|fact| crate::open_queue::is_open_queue_item_for(fact, tool))
             .count();
         let total = self.open_handoffs.len();
-        let (omitted, guaranteed) = bound_caller_rows(
+        let (handoff_rows, mut omitted) = std::mem::take(&mut self.open_handoffs)
+            .into_iter()
+            .partition::<Vec<_>, _>(|fact| !dropped_pairs.contains(&fact.event_id));
+        self.open_handoffs = handoff_rows;
+        let (more, _, _) = bound_caller_rows(
             &mut self.open_handoffs,
-            rows,
-            bytes,
-            |fact| {
-                fact.tool.as_deref() == Some(tool)
-                    || (fact.target.as_deref() == Some(tool)
-                        && !unanswered.contains(&fact.event_id))
-            },
+            budgets.optional_rows,
+            budgets.optional_bytes,
+            |fact| must_handoff(fact) || kept_pairs.contains(&fact.event_id),
             |fact| {
                 if involves(fact) {
                     0
@@ -2627,7 +2854,7 @@ impl RoomSnapshot {
             },
             fact_seq,
         );
-        guaranteed_bytes.insert("open_handoffs", guaranteed);
+        omitted.extend(more);
         record("open_handoffs", total, omitted.len());
         let open_address = |fact: &&Fact| {
             crate::next::handoff_address(fact, tool) == crate::next::HandoffAddress::OpenQueue
@@ -2660,68 +2887,85 @@ impl RoomSnapshot {
         self.open_queue_signals
             .rejected_named
             .retain(|id| kept_handoffs.contains(id));
-        let own_handoffs = self
-            .open_handoffs
-            .iter()
-            .filter(|fact| fact.tool.as_deref() == Some(tool))
-            .map(|fact| fact.event_id.clone())
-            .collect::<BTreeSet<_>>();
 
-        for (name, bucket, keep_all) in [
-            ("active_claims", &mut self.active_claims, true),
-            ("active_blockers", &mut self.active_blockers, true),
-            ("current_decisions", &mut self.current_decisions, false),
-            ("system_health", &mut self.system_health, false),
-            ("recent_artifacts", &mut self.recent_artifacts, false),
-            (
-                "unconsumed_artifacts",
-                &mut self.unconsumed_artifacts,
-                false,
-            ),
-        ] {
-            let total = bucket.len();
-            let (omitted, guaranteed) = if keep_all {
-                bound_caller_rows(bucket, rows, bytes, all, fact_rank, fact_seq)
-            } else {
-                bound_caller_rows(bucket, rows, bytes, none, fact_rank, fact_seq)
-            };
-            guaranteed_bytes.insert(name, guaranteed);
-            record(name, total, omitted.len());
-        }
+        // --- current_risks: a kept own handoff keeps its risks; a dropped
+        // pair drops them; the rest is optional.
         let total = self.current_risks.len();
-        let (omitted, guaranteed) = bound_caller_rows(
-            &mut self.current_risks,
-            rows,
-            bytes,
-            |fact| {
-                fact.ref_id
+        let (risk_rows, mut omitted) = std::mem::take(&mut self.current_risks)
+            .into_iter()
+            .partition::<Vec<_>, _>(|risk| {
+                !risk
+                    .ref_id
                     .as_deref()
-                    .is_some_and(|id| own_handoffs.contains(id))
+                    .is_some_and(|id| dropped_pairs.contains(id))
+            });
+        self.current_risks = risk_rows;
+        let (more, _, _) = bound_caller_rows(
+            &mut self.current_risks,
+            budgets.optional_rows,
+            budgets.optional_bytes,
+            |risk| {
+                risk.ref_id
+                    .as_deref()
+                    .is_some_and(|id| kept_handoffs.contains(id) && own_ids.contains(id))
             },
             fact_rank,
             fact_seq,
         );
-        guaranteed_bytes.insert("current_risks", guaranteed);
+        omitted.extend(more);
         record("current_risks", total, omitted.len());
 
-        // Peers `tool` waits on (`next::waiting_on_facts`): their liveness is a
-        // decision input, so their squads are guaranteed.
-        let mut waited_on = self
-            .open_handoffs
-            .iter()
-            .chain(self.active_blockers.iter())
-            .filter(|fact| fact.tool.as_deref() == Some(tool))
-            .filter_map(|fact| fact.target.clone())
-            .collect::<BTreeSet<_>>();
-        waited_on.insert(tool.to_string());
-        waited_on.extend(self.lead.iter().cloned());
+        // --- should-keep: peer claims, then peer blockers, newest first.
+        let mut should_left = budgets.should_bytes;
+        let total = self.active_claims.len();
+        let (omitted, _, used) = bound_caller_rows(
+            &mut self.active_claims,
+            usize::MAX,
+            should_left,
+            |fact| mine(fact),
+            |_| 0,
+            fact_seq,
+        );
+        should_left = should_left.saturating_sub(used);
+        record("active_claims", total, omitted.len());
+        let total = self.active_blockers.len();
+        let (omitted, _, _) = bound_caller_rows(
+            &mut self.active_blockers,
+            usize::MAX,
+            should_left,
+            |fact| must_blocker(fact),
+            |_| 0,
+            fact_seq,
+        );
+        record("active_blockers", total, omitted.len());
+
+        // --- optional buckets
+        for (name, bucket) in [
+            ("current_decisions", &mut self.current_decisions),
+            ("system_health", &mut self.system_health),
+            ("recent_artifacts", &mut self.recent_artifacts),
+            ("unconsumed_artifacts", &mut self.unconsumed_artifacts),
+        ] {
+            let total = bucket.len();
+            let (omitted, _, _) = bound_caller_rows(
+                bucket,
+                budgets.optional_rows,
+                budgets.optional_bytes,
+                |_| false,
+                fact_rank,
+                fact_seq,
+            );
+            record(name, total, omitted.len());
+        }
+
+        // --- squads: must-keep tools, then participants, fresh, rest.
         let participants = self.action_participants();
         let total = self.squads.len();
-        let (omitted, guaranteed) = bound_caller_rows(
+        let (omitted, _, _) = bound_caller_rows(
             &mut self.squads,
-            MAX_CALLER_SQUAD_ROWS,
-            MAX_CALLER_SQUAD_BYTES,
-            |squad| waited_on.contains(&squad.tool),
+            budgets.squad_rows,
+            budgets.squad_bytes,
+            |squad| must_tools.contains(&squad.tool),
             |squad| {
                 if participants.contains(&squad.tool) {
                     0
@@ -2733,7 +2977,6 @@ impl RoomSnapshot {
             },
             |squad| squad.last_seen_seq,
         );
-        guaranteed_bytes.insert("squads", guaranteed);
         record("squads", total, omitted.len());
         for (name, freshness) in [
             (CALLER_SQUADS_FRESH_BUCKET, Some(FRESHNESS_FRESH)),
@@ -2749,8 +2992,7 @@ impl RoomSnapshot {
             record(name, kept_class + omitted_class, omitted_class);
         }
         if !omitted.is_empty() {
-            // Per-tool internals follow the visible squads (plus claim owners),
-            // so they cannot outgrow the squad bound either.
+            // Per-tool internals follow the visible squads (plus claim owners).
             let keep_tools = self
                 .squads
                 .iter()
@@ -2762,24 +3004,9 @@ impl RoomSnapshot {
                 .retain(|tool, _| keep_tools.contains(tool));
         }
 
-        let guaranteed_total = guaranteed_bytes.values().sum::<usize>();
-        if guaranteed_total > MAX_CALLER_GUARANTEED_BYTES {
-            let breakdown = guaranteed_bytes
-                .iter()
-                .filter(|(_, bytes)| **bytes > 0)
-                .map(|(name, bytes)| format!("{name}={bytes}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            return Err(RallyError::Command(format!(
-                "{CALLER_PROJECTION_TOO_LARGE}: rows that decisions for {tool} depend on need \
-                 {guaranteed_total} bytes, over the {MAX_CALLER_GUARANTEED_BYTES}-byte bound \
-                 ({breakdown}); release or resolve claims, blockers or handoffs to shrink it"
-            )));
-        }
-
         if !buckets.is_empty() {
             self.composition = Some(RoomComposition {
-                budget_bytes: None,
+                budget_bytes: Some(MAX_CALLER_REPLY_BYTES),
                 // Not measured: a caller-scoped reply is never printed as a room.
                 emitted_bytes: 0,
                 buckets,
@@ -2789,6 +3016,21 @@ impl RoomSnapshot {
             });
         }
         Ok(self)
+    }
+
+    /// Per-bucket omitted counts of a caller-scoped reply, for output.
+    pub(crate) fn caller_projection_omissions(&self) -> BTreeMap<String, usize> {
+        self.composition
+            .as_ref()
+            .map(|composition| {
+                composition
+                    .buckets
+                    .iter()
+                    .filter(|(_, entry)| entry.reason == CALLER_PROJECTION_REASON)
+                    .map(|(name, entry)| (name.clone(), entry.omitted))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Rows a caller-scoped reply omitted from `bucket` (see
@@ -3235,6 +3477,10 @@ pub(crate) struct RoomSummary {
     pub(crate) recent_artifacts: usize,
     pub(crate) unconsumed_artifacts: usize,
     pub(crate) stale_facts: usize,
+    /// Rows a caller-scoped reply left out, per bucket (counts above stay
+    /// exact). Absent when nothing was left out.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) omitted: BTreeMap<String, usize>,
 }
 
 /// Counts come from `totals` (exact at projection) so a caller-scoped reply
@@ -3273,6 +3519,7 @@ impl From<&RoomSnapshot> for RoomSummary {
                 .unconsumed_artifacts
                 .max(snapshot.unconsumed_artifacts.len()),
             stale_facts: snapshot.totals.stale_facts.max(snapshot.stale_facts.len()),
+            omitted: snapshot.caller_projection_omissions(),
         }
     }
 }
@@ -10847,16 +11094,13 @@ fn enter_snapshot_context_from_facts(
     });
 
     Ok(EnterSnapshotContext {
-        snapshot: {
-            let snapshot = snapshot_from_facts_with_policy_at(facts, coord, false, now_secs);
-            let unanswered = snapshot
-                .open_obligations
-                .iter()
-                .filter(|fact| fact.target.as_deref() == Some(tool))
-                .map(|fact| fact.event_id.clone())
-                .collect::<BTreeSet<_>>();
-            snapshot.bound_for_caller(tool, &unanswered)?
-        },
+        // `enter` reads no caller-scoped transport (wakes, obligations; it
+        // re-reads those via `SnapshotForObligationTarget`), and the daemon
+        // strips them from this reply anyway: strip before bounding so the
+        // reply measured is the reply sent, in both store modes.
+        snapshot: snapshot_from_facts_with_policy_at(facts, coord, false, now_secs)
+            .without_caller_scoped_transport()
+            .bound_for_caller(tool)?,
         has_other_active_session: enter_has_other_active_session(
             facts,
             tool,
@@ -24509,7 +24753,11 @@ mod ledger_tests {
         };
 
         let scoped = snapshot.clone().for_obligation_target("codex", 16).unwrap();
-        assert_eq!(scoped.pending_wakes.len(), MAX_WIRE_PENDING_WAKES);
+        // Row bound AND byte bound (MAX_CALLER_WAKE_BYTES), newest kept.
+        let kept = scoped.pending_wakes.len();
+        assert!(kept > 0 && kept <= MAX_WIRE_PENDING_WAKES);
+        let bytes = scoped.pending_wakes.iter().map(row_bytes).sum::<usize>();
+        assert!(bytes <= MAX_CALLER_WAKE_BYTES, "{bytes}");
         assert!(
             scoped
                 .pending_wakes
@@ -24518,8 +24766,9 @@ mod ledger_tests {
         );
         let oldest = scoped.pending_wakes.iter().map(|w| w.seq).min().unwrap();
         assert_eq!(
-            oldest, 7,
-            "the six oldest caller wakes are the ones dropped"
+            oldest as usize,
+            MAX_WIRE_PENDING_WAKES + 6 - kept + 1,
+            "the oldest caller wakes are the ones dropped"
         );
         assert!(
             snapshot_to_wire_value(&scoped).is_ok(),

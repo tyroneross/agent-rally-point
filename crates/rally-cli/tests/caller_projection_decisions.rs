@@ -579,3 +579,175 @@ fn enter_path_sees_the_oldest_peer_claim_past_the_bucket_bound() {
         "the oldest peer claim on --path must be avoided: {do_not:?}"
     );
 }
+
+/// R1: a sender whose already-escalated handoffs (each with its no-response
+/// risk) exceed the must-keep budget still gets `enter` and `next`; `next`
+/// twice appends zero duplicate risks; an older un-escalated overdue handoff
+/// is never evicted and is escalated exactly once.
+#[test]
+fn escalated_pairs_past_the_budget_are_omitted_together_and_never_re_escalated() {
+    const ESCALATED: usize = 1_400;
+    let mut room = Room::new("r1");
+    room.fact(json!({
+        "event_id": "not-yet-escalated",
+        "kind": "handoff",
+        "tool": ME,
+        "target": "slow-peer",
+        "subject": "oldest overdue handoff",
+        "evidence": [format!("ack-by:{}", ago(3_600))],
+        "created_at": ago(7_200),
+    }));
+    for n in 0..ESCALATED {
+        room.fact(json!({
+            "event_id": format!("escalated-{n}"),
+            "kind": "handoff",
+            "tool": ME,
+            "target": format!("peer-{n}"),
+            "subject": format!("escalated handoff {n}"),
+            "summary": padding(2_000),
+            "evidence": [format!("ack-by:{}", ago(3_600))],
+            "created_at": ago(7_200),
+        }));
+        room.fact(json!({
+            "kind": "risk",
+            "tool": ME,
+            "target": ME,
+            "subject": format!("no-response: peer-{n} did not ack handoff escalated-{n}"),
+            "severity": "warn",
+            "scope": [format!("no-response-to:escalated-{n}")],
+            "ref": format!("escalated-{n}"),
+        }));
+    }
+    room.seal();
+    let _daemon = Daemon::start(&room);
+    let enter = room.json(&["enter", "--tool", ME, "--json"]);
+    assert!(
+        enter["data"]["room"]["omitted"]["escalated_handoffs"]
+            .as_u64()
+            .is_some_and(|n| n > 0),
+        "fixture must push escalated pairs past the budget: {}",
+        enter["data"]["room"]
+    );
+    assert_eq!(enter["data"]["room"]["open_handoffs"], json!(ESCALATED + 1));
+    let escalations_of = |room: &Room, id: &str| {
+        room.ledger()
+            .iter()
+            .filter(|f| f["kind"] == "risk" && f["ref"] == id)
+            .count()
+    };
+    for run in 1..=2 {
+        room.json(&["next", "--tool", ME, "--json"]);
+        assert_eq!(
+            no_response_risks(&room),
+            ESCALATED + 1,
+            "run {run}: exactly one new risk overall"
+        );
+        assert_eq!(escalations_of(&room, "not-yet-escalated"), 1, "run {run}");
+    }
+}
+
+/// R2: live peer claims past the old 3 MiB guarantee are should-keep: an
+/// unrelated caller's `enter`, `next` and `inbox` succeed and report the exact
+/// omitted claim count.
+#[test]
+fn peer_claims_past_the_budget_trim_with_an_exact_count_instead_of_failing() {
+    const CLAIMS: usize = 7_000;
+    let mut room = Room::new("r2");
+    for n in 0..CLAIMS {
+        room.fact(json!({
+            "kind": "claim",
+            "tool": format!("claimer-{n}"),
+            "subject": format!("claim {n}"),
+            "scope": [format!("file:src/c{n}.rs")],
+            "summary": padding(450),
+            "evidence": ["lease_expires_at:2099-01-01T00:00:00Z"],
+        }));
+    }
+    room.seal();
+    let _daemon = Daemon::start(&room);
+    for args in [
+        &["enter", "--tool", ME, "--json"][..],
+        &["next", "--audit", "--tool", ME, "--json"][..],
+    ] {
+        let out = room.json(args);
+        let summary = &out["data"]["room"];
+        assert_eq!(summary["active_claims"], json!(CLAIMS), "{args:?}");
+        let omitted = summary["omitted"]["active_claims"].as_u64().unwrap_or(0);
+        assert!(
+            omitted > 0,
+            "{args:?} must report omitted claims: {summary}"
+        );
+    }
+    room.json(&["inbox", "--tool", ME, "--json"]);
+}
+
+const FLOODED: &str = "flooded-01";
+const FLOODED_OWN: usize = 1_700;
+
+/// A room where `FLOODED`'s OWN un-escalated handoffs exceed the must-keep
+/// bound, and `ME` has one ordinary handoff.
+fn over_limit_room(name: &str) -> Room {
+    let mut room = Room::new(name);
+    room.fact(json!({
+        "event_id": "for-me",
+        "kind": "handoff",
+        "tool": "lead-01",
+        "target": ME,
+        "subject": "work for worker-01",
+    }));
+    for n in 0..FLOODED_OWN {
+        room.fact(json!({
+            "kind": "handoff",
+            "tool": FLOODED,
+            "target": format!("peer-{n}"),
+            "subject": format!("own {n}"),
+            "summary": padding(2_000),
+        }));
+    }
+    room.seal();
+    room
+}
+
+/// R5: the over-limit tool gets the typed `caller-projection-too-large`
+/// error through the daemon, naming only its own rows.
+#[test]
+fn over_limit_tool_gets_a_typed_error_naming_only_its_own_rows() {
+    let room = over_limit_room("r5");
+    let _daemon = Daemon::start(&room);
+    let out = room.run(&["next", "--audit", "--tool", FLOODED, "--json"]);
+    assert!(!out.status.success());
+    let body = if out.stdout.is_empty() {
+        &out.stderr
+    } else {
+        &out.stdout
+    };
+    let err: Value = serde_json::from_slice(body).unwrap();
+    let message = err["error"].as_str().unwrap_or_default();
+    assert!(
+        message.starts_with("caller-projection-too-large: "),
+        "{err}"
+    );
+    assert!(
+        message.contains(&format!("{FLOODED_OWN} un-escalated handoffs you sent")),
+        "message must name the caller's own rows: {message}"
+    );
+    assert!(!message.contains("peer-"), "no peer rows named: {message}");
+}
+
+/// R4: multi-tool `inbox` reports the over-limit tool's error in its own
+/// entry and returns the other tools normally.
+#[test]
+fn multi_tool_inbox_returns_the_others_when_one_tool_is_over_the_limit() {
+    let room = over_limit_room("r4");
+    let _daemon = Daemon::start(&room);
+    let inbox = room.json(&["inbox", "--tool", FLOODED, "--tool", ME, "--json"]);
+    let data = &inbox["data"];
+    assert_eq!(data["inboxes"][ME]["count"], json!(1), "{data}");
+    assert!(
+        data["errors"][FLOODED]
+            .as_str()
+            .is_some_and(|e| e.starts_with("caller-projection-too-large")),
+        "{data}"
+    );
+    assert!(data["inboxes"].get(FLOODED).is_none());
+}

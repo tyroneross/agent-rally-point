@@ -961,7 +961,9 @@ mod imp {
                 let kind = match other {
                     RallyError::Usage(_) => StoreErrorKind::Usage,
                     RallyError::NotFound(_) => StoreErrorKind::NotFound,
-                    RallyError::Command(_) => StoreErrorKind::Command,
+                    RallyError::Command(_) | RallyError::CallerProjectionTooLarge { .. } => {
+                        StoreErrorKind::Command
+                    }
                     RallyError::Message(_) => StoreErrorKind::Message,
                     RallyError::NotStarted(_) => StoreErrorKind::NotStarted,
                     RallyError::IncompatibleWire { .. } => StoreErrorKind::IncompatibleWire,
@@ -3337,6 +3339,215 @@ mod imp {
             assert!(context.snapshot.squads.iter().any(|s| s.tool == me));
             drop(room);
 
+            stop.store(true, Ordering::SeqCst);
+            handle.join().unwrap().unwrap();
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        /// R3: one room that hits every caller-reply bound at once (caller
+        /// wakes, caller obligations, must-keep own handoffs, should-keep peer
+        /// claims, optional handoffs/decisions/squads). Both ops must answer
+        /// under `MAX_CALLER_REPLY_BYTES`, measured on the serialized reply,
+        /// and through a real routed daemon.
+        #[test]
+        fn caller_reply_stays_under_one_budget_when_every_bound_is_hit() {
+            use crate::store::{Fact, FactKind, MAX_CALLER_REPLY_BYTES};
+            let me = "worker-01";
+            let repo_root = unique_repo_root("caller-reply-every-bound");
+            let rally_dir = repo_root.join(".rally");
+            let engagement = "caller-reply-every-bound";
+            std::fs::create_dir_all(&rally_dir).unwrap();
+            std::fs::write(
+                rally_dir.join(crate::store::ACTIVE_ENGAGEMENT_FILENAME),
+                format!("{engagement}\n"),
+            )
+            .unwrap();
+            let log_dir = rally_dir.join(crate::store::LOG_DIRNAME);
+            std::fs::create_dir_all(&log_dir).unwrap();
+            let mut segment =
+                std::fs::File::create(log_dir.join(format!("{engagement}.jsonl"))).unwrap();
+            let now = crate::now_string();
+            let mut seq = 0i64;
+            let mut write = |mut fact: Fact| {
+                seq += 1;
+                fact.seq = seq;
+                fact.schema = crate::FACT_SCHEMA.to_string();
+                fact.event_id = format!("bound-{seq}");
+                fact.thread_id = format!("bound-thread-{seq}");
+                if fact.created_at.is_empty() {
+                    fact.created_at = now.clone();
+                }
+                let event_type = serde_json::to_value(&fact.kind).unwrap();
+                writeln!(
+                    segment,
+                    "{}",
+                    serde_json::json!({
+                        "seq": seq,
+                        "occurred_at": fact.created_at,
+                        "event_type": event_type,
+                        "payload": fact,
+                        "engagement": engagement
+                    })
+                )
+                .unwrap();
+            };
+            let pad = |n: usize| Some("p".repeat(n));
+            // Caller wakes past MAX_CALLER_WAKE_BYTES.
+            for n in 0..1_000 {
+                write(Fact {
+                    kind: FactKind::Wake,
+                    target: Some(me.to_string()),
+                    subject: format!("wake intent for {me}: {n}"),
+                    status: Some("pending".to_string()),
+                    summary: pad(200),
+                    ..Fact::default()
+                });
+            }
+            // Caller obligations past MAX_TARGET_OBLIGATION_BYTES (must-keep:
+            // addressed to the caller).
+            for n in 0..400 {
+                write(Fact {
+                    kind: FactKind::Handoff,
+                    tool: Some(format!("asker-{n}")),
+                    target: Some(me.to_string()),
+                    subject: format!("ask {n}"),
+                    summary: pad(800),
+                    ..Fact::default()
+                });
+            }
+            // Must-keep own un-escalated handoffs (~2.4 MB).
+            for n in 0..1_200 {
+                write(Fact {
+                    kind: FactKind::Handoff,
+                    tool: Some(me.to_string()),
+                    target: Some(format!("helper-{n}")),
+                    subject: format!("own {n}"),
+                    summary: pad(1_800),
+                    ..Fact::default()
+                });
+            }
+            // Should-keep peer claims (~1.5 MB).
+            for n in 0..1_500 {
+                write(Fact {
+                    kind: FactKind::Claim,
+                    tool: Some(format!("claimer-{n}")),
+                    subject: format!("claim {n}"),
+                    scope: vec![format!("file:src/c{n}.rs")],
+                    evidence: vec!["lease_expires_at:2099-01-01T00:00:00Z".to_string()],
+                    summary: pad(800),
+                    ..Fact::default()
+                });
+            }
+            // Optional: peer handoffs (and their squads) and decisions.
+            for n in 0..6_000 {
+                write(Fact {
+                    kind: FactKind::Handoff,
+                    tool: Some(format!("p-{n}")),
+                    target: Some(format!("p-{}", n + 1)),
+                    subject: format!("peer {n}"),
+                    summary: pad(1_000),
+                    ..Fact::default()
+                });
+            }
+            for n in 0..1_000 {
+                write(Fact {
+                    kind: FactKind::Decision,
+                    tool: Some("decider".to_string()),
+                    subject: format!("decision {n}"),
+                    summary: pad(1_000),
+                    ..Fact::default()
+                });
+            }
+            // A 3 MiB mission: a scalar no tier budget sees, so only the final
+            // serialized check can keep the reply under budget.
+            write(Fact {
+                kind: FactKind::Mission,
+                tool: Some("lead-01".to_string()),
+                subject: "m".repeat(3 * 1024 * 1024),
+                scope: vec!["mission".to_string()],
+                ..Fact::default()
+            });
+            segment.sync_all().unwrap();
+            drop(segment);
+
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let root_str = canonical_repo_root(&repo_root);
+            for (kind, op) in [
+                (
+                    "snapshot_for_obligation_target",
+                    StoreOp::SnapshotForObligationTarget {
+                        tool: me.to_string(),
+                        row_limit: 1_024,
+                        include_archived: false,
+                    },
+                ),
+                (
+                    "snapshot_for_enter",
+                    StoreOp::SnapshotForEnter {
+                        tool: me.to_string(),
+                        build_id: "build".to_string(),
+                        from_session_id: "sess:worker-01#live".to_string(),
+                        presence_evidence: Vec::new(),
+                        session_alias: None,
+                    },
+                ),
+            ] {
+                let response = dispatch_one(
+                    &mut store,
+                    root_str.as_str(),
+                    StoreRequest::new(Some(engagement.to_string()), op),
+                );
+                assert!(
+                    matches!(response, StoreResponse::Ok(_)),
+                    "{kind} failed: {response:?}"
+                );
+                let bytes = serde_json::to_vec(&response).unwrap().len();
+                eprintln!("{kind} reply bytes: {bytes} (budget {MAX_CALLER_REPLY_BYTES})");
+                assert!(
+                    bytes <= MAX_CALLER_REPLY_BYTES,
+                    "{kind} reply {bytes} bytes exceeds {MAX_CALLER_REPLY_BYTES}"
+                );
+            }
+            drop(store);
+
+            let cfg = ServeConfig {
+                repo_root: repo_root.clone(),
+                idle_exit_secs: Some(60),
+                foreground: true,
+            };
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_for_serve = Arc::clone(&stop);
+            let handle = thread::spawn(move || super::serve_unix_with_stop(cfg, stop_for_serve));
+            let socket = wait_for_addr(&rally_dir);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline && !ping_ok(&socket) {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(ping_ok(&socket), "daemon never answered a ping");
+            let room = crate::store::RoomStore::open_at(repo_root.clone()).unwrap();
+            assert!(
+                matches!(room, crate::store::RoomStore::Routed(_)),
+                "fixture must exercise the routed client"
+            );
+            let snap = room.snapshot_for_obligation_target(me, 1_024).unwrap();
+            assert_eq!(
+                snap.open_handoffs
+                    .iter()
+                    .filter(|f| f.tool.as_deref() == Some(me))
+                    .count(),
+                1_200,
+                "must-keep own handoffs are never evicted"
+            );
+            assert_eq!(snap.totals.active_claims, 1_500);
+            assert_eq!(
+                snap.caller_projection_omitted("active_claims"),
+                1_500 - snap.active_claims.len()
+            );
+            assert_eq!(snap.open_obligations_total, 400);
+            assert!(!snap.pending_wakes.is_empty());
+            room.snapshot_for_enter(me, "build", "sess:worker-01#live", &[], None)
+                .unwrap();
+            drop(room);
             stop.store(true, Ordering::SeqCst);
             handle.join().unwrap().unwrap();
             std::fs::remove_dir_all(repo_root).ok();

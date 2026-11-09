@@ -2120,38 +2120,45 @@ mod tests {
         );
     }
 
-    /// Guaranteed rows (here: claims, which every `--path` filter reads) are
-    /// never evicted; when they alone exceed their bound the caller projection
-    /// fails with the typed `caller-projection-too-large` error.
+    /// Peer claims are should-keep: trimmed newest first with an exact omitted
+    /// count, never a failure. The caller's OWN claims are must-keep: when
+    /// they alone exceed the bound the projection fails with the typed
+    /// `CallerProjectionTooLarge` error, naming only the caller's rows.
     #[test]
-    fn guaranteed_rows_over_their_bound_fail_loudly_instead_of_evicting() {
-        let claim = |n: usize, pad: usize| Fact {
+    fn peer_claims_trim_but_own_claims_over_the_bound_fail_loudly() {
+        let claim = |n: usize, owner: &str| Fact {
             event_id: format!("claim-{n}"),
             seq: n as i64 + 1,
             kind: FactKind::Claim,
-            tool: Some(format!("peer-{n}")),
+            tool: Some(owner.replace("{n}", &n.to_string())),
             scope: vec![format!("file:src/f{n}.rs")],
-            summary: Some("p".repeat(pad)),
+            summary: Some("p".repeat(1_000)),
             ..Fact::default()
         };
-        // 700 claims x ~1 KB: past the optional row/byte bound, under the
-        // guaranteed bound -> every claim kept.
         let snapshot = RoomSnapshot {
-            active_claims: (0..700).map(|n| claim(n, 1_000)).collect(),
+            active_claims: (0..4_000).map(|n| claim(n, "peer-{n}")).collect(),
             ..RoomSnapshot::default()
         };
         let kept = snapshot.for_obligation_target("codex", 16).unwrap();
-        assert_eq!(kept.active_claims.len(), 700);
-        // 4,000 claims x ~1 KB: guaranteed rows alone exceed 3 MiB.
+        assert!(kept.active_claims.len() < 4_000);
+        assert_eq!(
+            kept.caller_projection_omitted("active_claims"),
+            4_000 - kept.active_claims.len()
+        );
+        assert_eq!(kept.active_claims.last().unwrap().event_id, "claim-3999");
+
         let snapshot = RoomSnapshot {
-            active_claims: (0..4_000).map(|n| claim(n, 1_000)).collect(),
+            active_claims: (0..4_000).map(|n| claim(n, "codex")).collect(),
             ..RoomSnapshot::default()
         };
         let err = snapshot.for_obligation_target("codex", 16).unwrap_err();
         assert!(
-            err.to_string()
-                .contains(crate::store::CALLER_PROJECTION_TOO_LARGE),
+            matches!(
+                err,
+                crate::error::RallyError::CallerProjectionTooLarge { .. }
+            ),
             "{err}"
         );
+        assert!(err.to_string().contains("4000 claims you hold"), "{err}");
     }
 }
