@@ -13,6 +13,10 @@
 //! result channel reaches watchdog recovery without a startup/sleep race;
 //! the pre-commit case below separately exercises a real deadline expiry.
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 #[path = "support/rally_cmd.rs"]
 mod rally_cmd;
 
@@ -27,6 +31,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 struct TempRoom {
     cwd: PathBuf,
     home: PathBuf,
+    _roots: Vec<TempRoot>,
 }
 
 impl TempRoom {
@@ -35,7 +40,11 @@ impl TempRoom {
         let home = temp_path(&format!("watchdog-durability-{name}-home"));
         fs::create_dir_all(cwd.join(".git")).expect("create temp .git");
         fs::create_dir_all(&home).expect("create temp HOME");
-        Self { cwd, home }
+        Self {
+            cwd: cwd.to_path_buf(),
+            home: home.to_path_buf(),
+            _roots: vec![cwd, home],
+        }
     }
 
     fn rally(&self) -> Command {
@@ -59,21 +68,8 @@ impl TempRoom {
     }
 }
 
-impl Drop for TempRoom {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.cwd).ok();
-        fs::remove_dir_all(&self.home).ok();
-    }
-}
-
-fn temp_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "{name}-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
+fn temp_path(name: &str) -> TempRoot {
+    TempRoot::new(name)
 }
 
 fn stdout_json(output: &Output) -> Value {

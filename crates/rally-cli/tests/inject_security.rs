@@ -20,6 +20,7 @@
 //!     both sides against one fixture list.
 
 mod support;
+use support::temp_root::TempRoot;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -842,7 +843,7 @@ fn arp_r11_the_python_wake_path_has_one_chokepoint() {
     let (ok, report) = analyze(&script);
     assert!(ok, "rally_wake.py routes around its chokepoint: {report}");
 
-    let scratch = std::env::temp_dir().join(unique_name("rally-wake-mutant"));
+    let scratch = TempRoot::new("rally-wake-mutant");
     std::fs::create_dir_all(&scratch).expect("scratch dir");
     let mutant = scratch.join("mutant_rally_wake.py");
     let source = std::fs::read_to_string(&script).expect("read rally_wake.py");
@@ -855,7 +856,6 @@ fn arp_r11_the_python_wake_path_has_one_chokepoint() {
     )
     .expect("write mutant");
     let (mutant_ok, mutant_report) = analyze(&mutant);
-    let _ = std::fs::remove_dir_all(&scratch);
     assert!(
         !mutant_ok,
         "the analyzer accepted a re-added raw send-keys — it has no teeth: {mutant_report}"

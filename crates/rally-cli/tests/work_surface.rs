@@ -7,29 +7,33 @@
 //! - board projects lanes
 //! - route-findings maps a finding to the claim owner
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 struct Workspace {
     cwd: PathBuf,
     home: PathBuf,
+    _roots: Vec<TempRoot>,
 }
 
 impl Workspace {
     fn new(name: &str) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let cwd = std::env::temp_dir().join(format!("ws-{name}-{nanos}-cwd"));
-        let home = std::env::temp_dir().join(format!("ws-{name}-{nanos}-home"));
+        let cwd = TempRoot::new(&format!("ws-{name}-cwd"));
+        let home = TempRoot::new(&format!("ws-{name}-home"));
         fs::create_dir_all(&cwd).unwrap();
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(cwd.join(".git")).unwrap();
-        Self { cwd, home }
+        Self {
+            cwd: cwd.to_path_buf(),
+            home: home.to_path_buf(),
+            _roots: vec![cwd, home],
+        }
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -53,10 +57,7 @@ impl Workspace {
         serde_json::from_slice(&out.stdout).unwrap()
     }
 
-    fn cleanup(self) {
-        fs::remove_dir_all(self.cwd).ok();
-        fs::remove_dir_all(self.home).ok();
-    }
+    fn cleanup(self) {}
 }
 
 // ─── Backlog add / list ───────────────────────────────────────────────────────

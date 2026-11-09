@@ -11,16 +11,17 @@ mod common;
 mod support;
 use common::test_git_fixture::fixture_git;
 use support::rally_cmd::rally_command;
+use support::temp_root::TempRoot;
 
 struct Fixture {
     root: PathBuf,
     repo: PathBuf,
+    _root: TempRoot,
 }
 
 impl Fixture {
     fn new() -> Self {
-        let root =
-            std::env::temp_dir().join(format!("rally-worktree-plan-{}", uuid::Uuid::new_v4()));
+        let root = TempRoot::new("rally-worktree-plan");
         let repo = root.join("repo");
         fs::create_dir_all(&repo).unwrap();
         fixture_git(&repo, &["init", "-q", "-b", "main"]);
@@ -28,6 +29,7 @@ impl Fixture {
         Self {
             root: root.canonicalize().unwrap(),
             repo: repo.canonicalize().unwrap(),
+            _root: root,
         }
     }
 
@@ -63,12 +65,6 @@ impl Fixture {
             String::from_utf8_lossy(&output.stderr)
         );
         serde_json::from_slice(&output.stdout).unwrap()
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
     }
 }
 

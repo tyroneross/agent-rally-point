@@ -3,14 +3,17 @@
 
 #![cfg(unix)]
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Child, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 // The rally binary is spawned through the shared choke point so this file
 // cannot silently inherit the production 3s watchdog budget again. Included
@@ -28,26 +31,24 @@ struct Room {
     cwd: PathBuf,
     home: PathBuf,
     bin: PathBuf,
+    _roots: Vec<TempRoot>,
 }
-
-static ROOM_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 impl Room {
     fn new() -> Self {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let unique = ROOM_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let pid = std::process::id();
-        let cwd = std::env::temp_dir().join(format!("rht-{pid}-{n}-{unique}-cwd"));
-        let home = std::env::temp_dir().join(format!("rht-{pid}-{n}-{unique}-home"));
+        let cwd = TempRoot::new("rht-cwd");
+        let home = TempRoot::new("rht-home");
         fs::create_dir_all(cwd.join(".git")).unwrap();
         fs::create_dir_all(cwd.join(".rally")).unwrap();
         fs::create_dir_all(&home).unwrap();
         let bin = home.join("bin");
         fs::create_dir_all(&bin).unwrap();
-        let room = Self { cwd, home, bin };
+        let room = Self {
+            cwd: cwd.to_path_buf(),
+            home: home.to_path_buf(),
+            bin,
+            _roots: vec![cwd, home],
+        };
         room.set_tmux_live(true);
         room
     }
@@ -189,13 +190,6 @@ impl Room {
             .as_str()
             .expect("adopt session id")
             .to_string()
-    }
-}
-
-impl Drop for Room {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.cwd).ok();
-        fs::remove_dir_all(&self.home).ok();
     }
 }
 
