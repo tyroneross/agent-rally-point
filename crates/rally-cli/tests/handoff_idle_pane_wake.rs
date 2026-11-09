@@ -19,6 +19,7 @@
 //! candidate.
 
 mod support;
+use support::temp_root::TempRoot;
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
@@ -52,18 +53,9 @@ struct Pane {
     cwd: Option<PathBuf>,
 }
 
-fn unique(tag: &str) -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    format!(
-        "{tag}{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
-fn short_socket(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("hipw-{}.sock", unique(tag)))
+fn short_socket(tag: &str) -> (PathBuf, TempRoot) {
+    let root = TempRoot::new(&format!("hipw-{tag}"));
+    (root.join("s.sock"), root)
 }
 
 fn spawn_daemon(socket: &Path, panes: Vec<Pane>, reply: EnqueueReply) -> RequestLog {
@@ -239,7 +231,7 @@ fn handoff_id(said: &Value) -> String {
 #[test]
 fn handoff_to_unmanaged_bound_pane_queues_a_pane_inbox_wake() {
     let sandbox = ChannelSandbox::spawn();
-    let socket = short_socket("ok");
+    let (socket, _socket_root) = short_socket("ok");
     let target = "easy-terminal:idle-a";
     let log = spawn_daemon(
         &socket,
@@ -312,7 +304,7 @@ fn handoff_to_unmanaged_bound_pane_queues_a_pane_inbox_wake() {
 #[test]
 fn non_lead_sender_without_consent_never_enqueues() {
     let sandbox = ChannelSandbox::spawn();
-    let socket = short_socket("auth");
+    let (socket, _socket_root) = short_socket("auth");
     let target = "easy-terminal:idle-auth";
     let log = spawn_daemon(
         &socket,
@@ -369,7 +361,7 @@ fn non_lead_sender_without_consent_never_enqueues() {
 #[test]
 fn pending_pane_wake_coalesces_later_handoffs() {
     let sandbox = ChannelSandbox::spawn();
-    let socket = short_socket("coal");
+    let (socket, _socket_root) = short_socket("coal");
     let target = "easy-terminal:idle-co";
     let log = spawn_daemon(
         &socket,
@@ -421,7 +413,7 @@ fn pending_pane_wake_coalesces_later_handoffs() {
 #[test]
 fn lead_handoff_after_a_non_lead_wake_is_enqueued() {
     let sandbox = ChannelSandbox::spawn();
-    let socket = short_socket("lead");
+    let (socket, _socket_root) = short_socket("lead");
     let target = "easy-terminal:idle-ld";
     let log = spawn_daemon(
         &socket,
@@ -460,7 +452,7 @@ fn lead_handoff_after_a_non_lead_wake_is_enqueued() {
 #[test]
 fn two_panes_bound_to_one_identity_are_ambiguous() {
     let sandbox = ChannelSandbox::spawn();
-    let socket = short_socket("amb");
+    let (socket, _socket_root) = short_socket("amb");
     let target = "easy-terminal:twin";
     let log = spawn_daemon(
         &socket,
@@ -483,7 +475,7 @@ fn two_panes_bound_to_one_identity_are_ambiguous() {
 fn two_sockets_for_one_identity_need_a_pin() {
     let sandbox = ChannelSandbox::spawn();
     let target = "easy-terminal:dual";
-    let base = std::env::temp_dir().join(unique("hx"));
+    let base = TempRoot::new("hx");
     let xdg = base.join("x");
     let home = base.join("h");
     let xdg_socket = xdg.join("ptyd.sock");
@@ -526,7 +518,6 @@ fn two_sockets_for_one_identity_need_a_pin() {
         enqueues(&home_log).is_empty(),
         "the unpinned daemon is never used"
     );
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 // S2: a pane working outside this room's repository is not woken, and neither
@@ -534,8 +525,8 @@ fn two_sockets_for_one_identity_need_a_pin() {
 #[test]
 fn pane_outside_the_room_repository_is_not_woken() {
     let sandbox = ChannelSandbox::spawn();
-    let socket = short_socket("repo");
-    let foreign = std::env::temp_dir().join(unique("hipw-foreign"));
+    let (socket, _socket_root) = short_socket("repo");
+    let foreign = TempRoot::new("hipw-foreign");
     std::fs::create_dir_all(&foreign).unwrap();
     let log = spawn_daemon(
         &socket,
@@ -543,7 +534,7 @@ fn pane_outside_the_room_repository_is_not_woken() {
             Pane {
                 id: "pane-f",
                 identity: "easy-terminal:foreign".to_string(),
-                cwd: Some(foreign.clone()),
+                cwd: Some(foreign.to_path_buf()),
             },
             Pane {
                 id: "pane-n",
@@ -561,7 +552,6 @@ fn pane_outside_the_room_repository_is_not_woken() {
     assert!(detail(&said).contains("no working directory"), "{said}");
     assert!(enqueues(&log).is_empty());
     let _ = std::fs::remove_file(&socket);
-    let _ = std::fs::remove_dir_all(&foreign);
 }
 
 // A7: ET's router owning the identity suppresses the wake even with a bound
@@ -569,7 +559,7 @@ fn pane_outside_the_room_repository_is_not_woken() {
 #[test]
 fn router_owned_target_with_a_bound_pane_never_enqueues() {
     let sandbox = ChannelSandbox::spawn();
-    let socket = short_socket("rt");
+    let (socket, _socket_root) = short_socket("rt");
     let target = "easy-terminal:routed";
     let log = spawn_daemon(
         &socket,
@@ -612,7 +602,7 @@ fn failed_enqueues_fall_back_to_record_only_with_reason() {
         ("hg", EnqueueReply::Hang, "inbox.enqueue call failed"),
     ] {
         let sandbox = ChannelSandbox::spawn();
-        let socket = short_socket(tag);
+        let (socket, _socket_root) = short_socket(tag);
         let target = format!("easy-terminal:fail-{tag}");
         let log = spawn_daemon(&socket, vec![pane(&sandbox, "pane-x", &target)], reply);
         let said = handoff(&sandbox, &socket, &target);
@@ -632,7 +622,7 @@ fn failed_enqueues_fall_back_to_record_only_with_reason() {
 #[test]
 fn unbound_target_records_only_and_never_enqueues() {
     let sandbox = ChannelSandbox::spawn();
-    let socket = short_socket("unb");
+    let (socket, _socket_root) = short_socket("unb");
     let log = spawn_daemon(
         &socket,
         vec![pane(&sandbox, "pane-o", "easy-terminal:someone-else")],
@@ -652,7 +642,7 @@ fn unbound_target_records_only_and_never_enqueues() {
 #[test]
 fn deliver_record_never_touches_the_pane_inbox() {
     let sandbox = ChannelSandbox::spawn();
-    let socket = short_socket("rec");
+    let (socket, _socket_root) = short_socket("rec");
     let target = "easy-terminal:idle-d";
     let log = spawn_daemon(
         &socket,
@@ -686,7 +676,7 @@ fn open_handoff_ids(room: &Value) -> String {
 #[test]
 fn targeted_handoff_from_another_room_lands_in_the_recipient_room() {
     let sandbox = ChannelSandbox::spawn();
-    let socket = short_socket("xroom");
+    let (socket, _socket_root) = short_socket("xroom");
     let target = "easy-terminal:xroom";
     // Room B: a second repository with an existing room, where the sender
     // holds the lead (as the team lead did in the home room).
@@ -735,7 +725,7 @@ fn targeted_handoff_from_another_room_lands_in_the_recipient_room() {
 #[test]
 fn targeted_handoff_to_a_pane_without_a_room_warns_and_stays_here() {
     let sandbox = ChannelSandbox::spawn();
-    let socket = short_socket("xgap");
+    let (socket, _socket_root) = short_socket("xgap");
     let target = "easy-terminal:xgap";
     let elsewhere = sandbox.root().join("no-room");
     std::fs::create_dir_all(elsewhere.join(".git")).unwrap();
@@ -772,8 +762,8 @@ fn routed_room(
     tag: &str,
     target: &str,
     setup: &[&[&str]],
-) -> (PathBuf, PathBuf, RequestLog) {
-    let socket = short_socket(tag);
+) -> (PathBuf, PathBuf, RequestLog, TempRoot) {
+    let (socket, _socket_root) = short_socket(tag);
     let room_b = sandbox.root().join(format!("room-{tag}"));
     std::fs::create_dir_all(room_b.join(".git")).unwrap();
     let log = spawn_daemon(
@@ -788,7 +778,7 @@ fn routed_room(
     for args in setup {
         rally_in(sandbox, &room_b, &socket, args);
     }
-    (socket, room_b, log)
+    (socket, room_b, log, _socket_root)
 }
 
 fn lead_of(sandbox: &ChannelSandbox, dir: &Path, socket: &Path) -> Value {
@@ -802,7 +792,7 @@ fn routed_handoff_never_takes_the_recipient_rooms_open_lead_seat() {
     let sandbox = ChannelSandbox::spawn();
     let target = "easy-terminal:xopen";
     // An executing-tier agent creates room B without taking the lead seat.
-    let (socket, room_b, _log) = routed_room(
+    let (socket, room_b, _log, _socket_root) = routed_room(
         &sandbox,
         "xopen",
         target,
@@ -843,7 +833,7 @@ fn routed_handoff_never_takes_the_recipient_rooms_open_lead_seat() {
 fn routed_handoff_into_a_room_with_another_lead_is_record_only() {
     let sandbox = ChannelSandbox::spawn();
     let target = "easy-terminal:xother";
-    let (socket, room_b, log) = routed_room(
+    let (socket, room_b, log, _socket_root) = routed_room(
         &sandbox,
         "xother",
         target,
@@ -870,7 +860,7 @@ fn routed_handoff_into_a_room_with_another_lead_is_record_only() {
 fn routed_handoff_records_scope_root_and_no_base_markers() {
     let sandbox = ChannelSandbox::spawn();
     let target = "easy-terminal:xpath";
-    let (socket, _room_b, _log) = routed_room(
+    let (socket, _room_b, _log, _socket_root) = routed_room(
         &sandbox,
         "xpath",
         target,
@@ -896,11 +886,11 @@ fn routed_handoff_records_scope_root_and_no_base_markers() {
 #[test]
 fn routes_report_the_pane_verdict_handoff_delivery_uses() {
     let sandbox = ChannelSandbox::spawn();
-    let socket = short_socket("routes");
+    let (socket, _socket_root) = short_socket("routes");
     let foreign = sandbox.root().join("empty-room");
     std::fs::create_dir_all(foreign.join(".rally")).unwrap();
     // A second repository WITH a room: handoffs to its pane are routed there.
-    let other_repo = std::env::temp_dir().join(unique("hipw-routes-room"));
+    let other_repo = TempRoot::new("hipw-routes-room");
     std::fs::create_dir_all(other_repo.join(".git")).unwrap();
     let mut init = base_command(&sandbox, &Sockets::Pinned(&socket));
     init.current_dir(&other_repo);
@@ -923,12 +913,12 @@ fn routes_report_the_pane_verdict_handoff_delivery_uses() {
             Pane {
                 id: "pane-x",
                 identity: "easy-terminal:elsewhere".to_string(),
-                cwd: Some(foreign.clone()),
+                cwd: Some(foreign.to_path_buf()),
             },
             Pane {
                 id: "pane-y",
                 identity: "easy-terminal:other-room".to_string(),
-                cwd: Some(other_repo.clone()),
+                cwd: Some(other_repo.to_path_buf()),
             },
         ],
         EnqueueReply::Queued,
@@ -1002,8 +992,6 @@ fn routes_report_the_pane_verdict_handoff_delivery_uses() {
         "{said}"
     );
     let _ = std::fs::remove_file(&socket);
-    let _ = std::fs::remove_dir_all(&foreign);
-    let _ = std::fs::remove_dir_all(&other_repo);
 }
 
 struct RoomDaemon(Child);
@@ -1046,8 +1034,8 @@ fn concurrent_routes_resolve_nested_rooms_in_direct_and_daemon_modes() {
     let inner = outer.join("nested");
     std::fs::create_dir_all(inner.join(".git")).unwrap();
     for routed in [false, true] {
-        let outer_socket = short_socket("route-a");
-        let inner_socket = short_socket("route-b");
+        let (outer_socket, _outer_socket_root) = short_socket("route-a");
+        let (inner_socket, _inner_socket_root) = short_socket("route-b");
         let rooms = [
             (&outer, &outer_socket, "easy-terminal:inner", &inner),
             (&inner, &inner_socket, "easy-terminal:outer", &outer),

@@ -18,28 +18,26 @@
 //! Every test here performs the hostile action and asserts REJECTION. A test
 //! that merely exercises the happy path would not have caught this.
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 use serde_json::Value;
 use std::fs;
-use std::path::PathBuf;
 use std::process::Output;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[path = "support/rally_cmd.rs"]
 mod rally_cmd;
 
 struct Workspace {
-    cwd: PathBuf,
-    home: PathBuf,
+    cwd: TempRoot,
+    home: TempRoot,
 }
 
 impl Workspace {
     fn new(name: &str) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let cwd = std::env::temp_dir().join(format!("cta-{name}-{nanos}-cwd"));
-        let home = std::env::temp_dir().join(format!("cta-{name}-{nanos}-home"));
+        let cwd = TempRoot::new(&format!("cta-{name}-cwd"));
+        let home = TempRoot::new(&format!("cta-{name}-home"));
         fs::create_dir_all(&cwd).unwrap();
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(cwd.join(".git")).unwrap();
@@ -49,7 +47,7 @@ impl Workspace {
     fn run(&self, args: &[&str]) -> Output {
         rally_cmd::rally_command()
             .current_dir(&self.cwd)
-            .env("HOME", &self.home)
+            .env("HOME", self.home.path())
             .env("RALLY_HOOKS", "off")
             .args(args)
             .output()
@@ -59,7 +57,7 @@ impl Workspace {
     fn run_as_session(&self, session_id: &str, args: &[&str]) -> Output {
         rally_cmd::rally_command()
             .current_dir(&self.cwd)
-            .env("HOME", &self.home)
+            .env("HOME", self.home.path())
             .env("RALLY_HOOKS", "off")
             // The fixture is explicitly managed; an ambient CI identity must
             // not outrank the session under test.
@@ -153,10 +151,7 @@ impl Workspace {
             .collect()
     }
 
-    fn cleanup(self) {
-        fs::remove_dir_all(self.cwd).ok();
-        fs::remove_dir_all(self.home).ok();
-    }
+    fn cleanup(self) {}
 }
 
 fn error_text(v: &Value) -> String {

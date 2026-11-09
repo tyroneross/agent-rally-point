@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 struct Workspace {
     cwd: PathBuf,
@@ -14,6 +17,7 @@ struct Workspace {
     /// tests that exercise cross-repo status).
     global_index: bool,
     workspace_root: Option<PathBuf>,
+    _roots: Vec<TempRoot>,
 }
 
 impl Workspace {
@@ -24,10 +28,11 @@ impl Workspace {
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(cwd.join(".git")).unwrap();
         Self {
-            cwd,
-            home,
+            cwd: cwd.to_path_buf(),
+            home: home.to_path_buf(),
             global_index: false,
             workspace_root: None,
+            _roots: vec![cwd, home],
         }
     }
 
@@ -37,10 +42,11 @@ impl Workspace {
         fs::create_dir_all(&cwd).unwrap();
         fs::create_dir_all(cwd.join(".git")).unwrap();
         Self {
-            cwd,
+            cwd: cwd.to_path_buf(),
             home,
             global_index: false,
             workspace_root: None,
+            _roots: vec![cwd],
         }
     }
 
@@ -54,6 +60,7 @@ impl Workspace {
             home,
             global_index: false,
             workspace_root: None,
+            _roots: vec![],
         }
     }
 
@@ -93,20 +100,11 @@ impl Workspace {
         cmd.args(args).output().unwrap()
     }
 
-    fn cleanup(self) {
-        fs::remove_dir_all(&self.cwd).ok();
-        fs::remove_dir_all(&self.home).ok();
-    }
+    fn cleanup(self) {}
 }
 
-fn temp_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "{name}-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
+fn temp_path(name: &str) -> TempRoot {
+    TempRoot::new(name)
 }
 
 fn json_error(output: &Output) -> Value {
@@ -399,8 +397,8 @@ fn status_global_aggregates_two_repos_without_writing_facts() {
     // --- Repo A ---
     // B17: global index is opt-in; set RALLY_GLOBAL_INDEX=1 so enter writes to
     // the cross-repo index and status --global can see both repos.
-    let repo_a =
-        Workspace::new_with_home("rally-status-global-repo-a", home.clone()).with_global_index();
+    let repo_a = Workspace::new_with_home("rally-status-global-repo-a", home.to_path_buf())
+        .with_global_index();
     // Enter as tool_a (first enter → lead)
     let enter_a = repo_a.json(&["enter", "--tool", "tool_a", "--json"]);
     assert_eq!(
@@ -428,8 +426,8 @@ fn status_global_aggregates_two_repos_without_writing_facts() {
     ]);
 
     // --- Repo B ---
-    let repo_b =
-        Workspace::new_with_home("rally-status-global-repo-b", home.clone()).with_global_index();
+    let repo_b = Workspace::new_with_home("rally-status-global-repo-b", home.to_path_buf())
+        .with_global_index();
     // Enter as tool_b (first enter → lead)
     let enter_b = repo_b.json(&["enter", "--tool", "tool_b", "--json"]);
     assert_eq!(
@@ -572,7 +570,6 @@ fn status_global_aggregates_two_repos_without_writing_facts() {
     // Cleanup.
     repo_a.cleanup();
     repo_b.cleanup();
-    fs::remove_dir_all(&home).ok();
 }
 
 #[test]
@@ -584,12 +581,12 @@ fn status_global_filters_to_current_workspace_boundary() {
     fs::create_dir_all(&workspace_a_root).unwrap();
     fs::create_dir_all(&workspace_b_root).unwrap();
 
-    let repo_a = Workspace::new_with_home_in("repo-a", &workspace_a_root, home.clone())
+    let repo_a = Workspace::new_with_home_in("repo-a", &workspace_a_root, home.to_path_buf())
         .with_global_index()
-        .with_workspace_root(workspace_a_root.clone());
-    let repo_b = Workspace::new_with_home_in("repo-b", &workspace_b_root, home.clone())
+        .with_workspace_root(workspace_a_root.to_path_buf());
+    let repo_b = Workspace::new_with_home_in("repo-b", &workspace_b_root, home.to_path_buf())
         .with_global_index()
-        .with_workspace_root(workspace_b_root.clone());
+        .with_workspace_root(workspace_b_root.to_path_buf());
 
     repo_a.json(&["enter", "--tool", "tool_a", "--json"]);
     repo_b.json(&["enter", "--tool", "tool_b", "--json"]);
@@ -616,7 +613,7 @@ fn status_global_filters_to_current_workspace_boundary() {
         .to_string_lossy()
         .to_string();
     let workspace_a_canonical = fs::canonicalize(&workspace_a_root)
-        .unwrap_or_else(|_| workspace_a_root.clone())
+        .unwrap_or_else(|_| workspace_a_root.to_path_buf())
         .to_string_lossy()
         .to_string();
 
@@ -640,9 +637,6 @@ fn status_global_filters_to_current_workspace_boundary() {
 
     repo_a.cleanup();
     repo_b.cleanup();
-    fs::remove_dir_all(&workspace_a_root).ok();
-    fs::remove_dir_all(&workspace_b_root).ok();
-    fs::remove_dir_all(&home).ok();
 }
 
 // ── DX: the first command a new user types ──────────────────────────────────

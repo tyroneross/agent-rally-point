@@ -1,15 +1,17 @@
 // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 use serde_json::Value;
 use std::fs;
-use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 struct Workspace {
-    cwd: PathBuf,
-    home: PathBuf,
+    cwd: TempRoot,
+    home: TempRoot,
 }
 
 impl Workspace {
@@ -56,27 +58,18 @@ impl Workspace {
     fn output(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_rally"))
             .current_dir(&self.cwd)
-            .env("HOME", &self.home)
+            .env("HOME", self.home.path())
             .env("RALLY_OBSERVER_PID", std::process::id().to_string())
             .args(args)
             .output()
             .unwrap()
     }
 
-    fn cleanup(self) {
-        fs::remove_dir_all(self.cwd).ok();
-        fs::remove_dir_all(self.home).ok();
-    }
+    fn cleanup(self) {}
 }
 
-fn temp_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "{name}-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
+fn temp_path(name: &str) -> TempRoot {
+    TempRoot::new(name)
 }
 
 #[test]

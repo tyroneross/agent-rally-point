@@ -18,10 +18,13 @@
 //! 3. `assert_fixture_root` rejects paths outside the process temp dir as
 //!    defense in depth against a separate bad-root hazard.
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 mod common;
 use common::test_git_fixture::{
@@ -72,14 +75,8 @@ fn apply_hostile_git_scope(command: &mut Command, decoy: &std::path::Path) {
     }
 }
 
-fn tmp_dir(label: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("rally-fixture-isolation-{label}-{nanos}"));
-    fs::create_dir_all(&p).unwrap();
-    p
+fn tmp_dir(label: &str) -> TempRoot {
+    TempRoot::new(&format!("rally-fixture-isolation-{label}"))
 }
 
 /// A path that is outside the process temp dir on every platform this builds
@@ -133,7 +130,6 @@ fn fixture_git_rejects_config_subcommand() {
         result.is_err(),
         "fixture_git must make config writes unavailable through its normal API"
     );
-    fs::remove_dir_all(&root).ok();
 }
 
 #[test]
@@ -173,8 +169,6 @@ fn fixture_git_writes_no_identity_config() {
         !config_text.contains("user.email") && !config_text.contains("user.name"),
         "fixture_git must never write user.email/user.name into .git/config; got:\n{config_text}"
     );
-
-    fs::remove_dir_all(&root).ok();
 }
 
 /// The load-bearing proof: run `fixture_git` against a root that ALREADY
@@ -234,8 +228,6 @@ fn fixture_git_leaves_decoy_real_repo_config_untouched() {
         "fixture_git's commit must carry FIXTURE_EMAIL even though the decoy \
          repo has its own configured identity"
     );
-
-    fs::remove_dir_all(&decoy).ok();
 }
 
 /// The regression test for RC-064's ACTUAL mechanism, corrected 2026-08-05.
@@ -319,7 +311,7 @@ fn fixture_git_ignores_inherited_git_dir_pointing_at_another_repo() {
         .arg("fixture_git_ignores_inherited_git_dir_pointing_at_another_repo")
         .arg("--test-threads=1")
         .env(HOSTILE_ENV_CHILD, "1")
-        .env(HOSTILE_ENV_SCRATCH, &scratch)
+        .env(HOSTILE_ENV_SCRATCH, scratch.path())
         .env(HOSTILE_ENV_HEAD_OUT, &head_out);
     apply_hostile_git_scope(&mut child_command, &decoy);
     let child = child_command
@@ -360,9 +352,6 @@ fn fixture_git_ignores_inherited_git_dir_pointing_at_another_repo() {
         scratch_head, decoy_head_after,
         "the fixture commit must live in the fixture repo, not the decoy"
     );
-
-    fs::remove_dir_all(&decoy).ok();
-    fs::remove_dir_all(&scratch).ok();
 }
 
 /// Launch the complete integration-test binary with every repository-scoping
@@ -429,6 +418,4 @@ fn fixture_test_binary_is_hermetic_under_inherited_git_scope() {
         repo_git(&decoy, &["rev-parse", "HEAD"]).stdout,
         "the hostile whole-suite run must not move the decoy HEAD"
     );
-
-    fs::remove_dir_all(&decoy).ok();
 }

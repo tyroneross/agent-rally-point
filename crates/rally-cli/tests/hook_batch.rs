@@ -8,32 +8,36 @@
 //! newline), ops run in order, `--gate-hooks` stops after a disabled `hooks
 //! status`, and anything outside the hook-sized allowlist is refused.
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const BIN: &str = env!("CARGO_BIN_EXE_rally");
 
 struct Room {
     repo: PathBuf,
     home: PathBuf,
+    _root: TempRoot,
 }
 
 impl Room {
     fn new(name: &str) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let base = std::env::temp_dir().join(format!("hook-batch-{name}-{nanos}"));
+        let base = TempRoot::new(&format!("hook-batch-{name}"));
         let repo = base.join("repo");
         let home = base.join("home");
         fs::create_dir_all(repo.join(".git")).unwrap();
         fs::create_dir_all(repo.join(".rally")).unwrap();
         fs::create_dir_all(&home).unwrap();
-        let room = Self { repo, home };
+        let room = Self {
+            repo,
+            home,
+            _root: base,
+        };
         let seeded = room.run(&["enter", "--tool", "codex:peer", "--json"], &[]);
         assert!(seeded.status.success(), "seed enter: {seeded:?}");
         let claim = room.run(
@@ -70,9 +74,7 @@ impl Room {
         cmd.output().expect("spawn rally")
     }
 
-    fn cleanup(self) {
-        let _ = fs::remove_dir_all(self.repo.parent().unwrap());
-    }
+    fn cleanup(self) {}
 }
 
 /// Split `RALLY-HOOK-BATCH/1 rc:len ...\n<outputs>` into (rc, output) pairs.

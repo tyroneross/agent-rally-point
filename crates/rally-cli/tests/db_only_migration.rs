@@ -10,6 +10,10 @@
 
 #![cfg(unix)]
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,8 +25,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 static NEXT_ROOM: AtomicU64 = AtomicU64::new(1);
 
 struct Room {
-    cwd: PathBuf,
-    home: PathBuf,
+    cwd: TempRoot,
+    home: TempRoot,
     session_id: String,
 }
 
@@ -33,14 +37,8 @@ impl Room {
             .expect("system time is after the Unix epoch")
             .as_nanos();
         let nonce = NEXT_ROOM.fetch_add(1, Ordering::Relaxed);
-        let cwd = std::env::temp_dir().join(format!(
-            "rally-db-only-cli-{name}-{}-{nanos}-{nonce}-cwd",
-            std::process::id()
-        ));
-        let home = std::env::temp_dir().join(format!(
-            "rally-db-only-cli-{name}-{}-{nanos}-{nonce}-home",
-            std::process::id()
-        ));
+        let cwd = TempRoot::new(&format!("db-only-{name}-cwd"));
+        let home = TempRoot::new(&format!("db-only-{name}-home"));
         fs::create_dir_all(cwd.join(".git")).unwrap();
         fs::create_dir_all(&home).unwrap();
         Self {
@@ -54,7 +52,7 @@ impl Room {
         let mut command = Command::new(env!("CARGO_BIN_EXE_rally"));
         command
             .current_dir(&self.cwd)
-            .env("HOME", &self.home)
+            .env("HOME", self.home.path())
             .env("RALLY_HOOKS", "off")
             .env("RALLY_GLOBAL_INDEX", "0")
             .env_remove("GITHUB_ACTIONS")
@@ -156,13 +154,6 @@ impl Room {
             .collect::<Vec<_>>();
         paths.sort();
         paths
-    }
-}
-
-impl Drop for Room {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.cwd).ok();
-        fs::remove_dir_all(&self.home).ok();
     }
 }
 
