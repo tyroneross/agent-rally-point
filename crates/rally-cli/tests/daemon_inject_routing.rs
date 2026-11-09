@@ -79,9 +79,19 @@ impl Drop for DoubleDaemon {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         // Wake accept so the thread can release its listener before scratch cleanup.
-        let _ = UnixStream::connect(&self.socket);
+        let woke = UnixStream::connect(&self.socket).is_ok();
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            // Bounded on purpose. A test double must never hang the test that
+            // owns it: if the wake-up did not land, or the thread is still
+            // busy with a client, leave it detached, as it was before this
+            // teardown existed.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while woke && !thread.is_finished() && std::time::Instant::now() < deadline {
+                thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
         }
     }
 }
