@@ -475,7 +475,25 @@ def render_skill(
     if metadata.get("user-invocable") is False:
         lines.append("user-invocable: false")
     lines.extend(["---", "", body.lstrip("\n")])
-    return "\n".join(lines)
+    rendered = "\n".join(lines)
+    check_skill_body_limit(config, path, body)
+    return rendered
+
+
+def check_skill_body_limit(config: dict[str, Any], path: Path, body: str) -> None:
+    """Fail when a skill body exceeds the smallest host limit in the contract.
+
+    Hosts silently truncate (or, under strict validation, reject) a body past
+    their limit, so the tail of the skill would never load. Detail belongs in
+    ``references/`` files, which the host reads on demand.
+    """
+    limit = config["skill_body_limit"]["bytes"]
+    size = len(body.encode("utf-8"))
+    if size > limit:
+        raise GenerationError(
+            f"{path}: skill body is {size} bytes; hosts load only the first {limit} "
+            f"({config['skill_body_limit']['binding_host']}). Move detail into references/."
+        )
 
 
 def write_text(path: Path, content: str) -> None:

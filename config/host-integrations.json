@@ -55,6 +55,11 @@
       ]
     }
   },
+  "skill_body_limit": {
+    "bytes": 24000,
+    "binding_host": "antigravity",
+    "source": "agy 1.5.3 `agy plugin validate plugins/antigravity --json` warns 'the body is 25481 bytes; only the first 24000 are loaded'; strict validation fails on that warning. Smallest skill-body limit of any supported host."
+  },
   "providers": {
     "claude_code": {
       "canonical_id": "agent-rally-point@agent-rally-point",
