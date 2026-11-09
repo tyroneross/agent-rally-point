@@ -33,6 +33,8 @@ JSON_SURFACES = (
 )
 GENERATED_DIRS = (Path("plugins/codex/.codex-plugin"),)
 SKILL_ROOT = Path("skills")
+# Claude Code accepts a path or an array of paths for `skills`; Muse accepts only an array.
+CLAUDE_MANIFEST_SKILL_PATHS = ["./skills"]
 CODEX_ARTIFACT = Path("plugins/codex/.codex-plugin")
 CODEX_WORKFLOW_RUNTIME_FILES = (
     "is-main.mjs",
@@ -121,7 +123,7 @@ def render_plugin_surfaces(config: dict[str, Any], version: str) -> dict[Path, s
         "repository": repository,
         "license": license_name,
         "keywords": merged_keywords(config, "claude_code"),
-        "skills": "./skills",
+        "skills": list(CLAUDE_MANIFEST_SKILL_PATHS),
     }
     claude_marketplace = {
         "name": name,

@@ -19,5 +19,7 @@
     "codex",
     "gemini"
   ],
-  "skills": "./skills"
+  "skills": [
+    "./skills"
+  ]
 }
