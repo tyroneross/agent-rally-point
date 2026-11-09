@@ -1,28 +1,35 @@
 // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+
+use temp_root::TempRoot;
+
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 struct Workspace {
     cwd: PathBuf,
     home: PathBuf,
+    _roots: [TempRoot; 2],
 }
 
 impl Workspace {
     fn new() -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let cwd = std::env::temp_dir().join(format!("rally-admission-cwd-{nonce}"));
-        let home = std::env::temp_dir().join(format!("rally-admission-home-{nonce}"));
+        let cwd_guard = TempRoot::new("rally-admission-cwd");
+        let home_guard = TempRoot::new("rally-admission-home");
+        let cwd = cwd_guard.path().to_path_buf();
+        let home = home_guard.path().to_path_buf();
         fs::create_dir_all(cwd.join(".git")).unwrap();
         fs::create_dir_all(&home).unwrap();
-        Self { cwd, home }
+        Self {
+            cwd,
+            home,
+            _roots: [cwd_guard, home_guard],
+        }
     }
 
     fn run(&self, session_id: Option<&str>, close_token: Option<&str>, args: &[&str]) -> Output {
@@ -54,13 +61,6 @@ impl Workspace {
             String::from_utf8_lossy(&output.stdout)
         );
         serde_json::from_slice(&output.stdout).unwrap()
-    }
-}
-
-impl Drop for Workspace {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.cwd).ok();
-        fs::remove_dir_all(&self.home).ok();
     }
 }
 
