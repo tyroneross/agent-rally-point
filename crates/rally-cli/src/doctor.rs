@@ -4060,12 +4060,8 @@ mod compact_log_tests {
 mod ledger_health_tests {
     use super::*;
 
-    fn fixture(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rally-ledger-{label}-{nanos}"));
+    fn fixture(label: &str) -> crate::test_temp_root::TempRoot {
+        let dir = crate::test_temp_root::TempRoot::new(&format!("rally-ledger-{label}"));
         fs::create_dir_all(dir.join(LOG_DIRNAME)).unwrap();
         dir
     }
@@ -4102,7 +4098,6 @@ mod ledger_health_tests {
         assert!(report.healthy, "findings: {:?}", report.findings);
         assert!(report.conflicting_seqs.is_empty());
         assert_eq!(report.segments[0].rows, 3);
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// The exact shape that bricked a real room: two DIFFERENT rows at one seq.
@@ -4132,7 +4127,6 @@ mod ledger_health_tests {
                 .contains("--repair-ledger"),
             "the finding must hand over the fixing command"
         );
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// An IDENTICAL repeated row is benign — the store's own rule. Flagging it
@@ -4147,7 +4141,6 @@ mod ledger_health_tests {
         );
         let report = ledger_health_in_dir(&dir);
         assert!(report.conflicting_seqs.is_empty(), "{:?}", report.findings);
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -4157,7 +4150,6 @@ mod ledger_health_tests {
         let report = ledger_health_in_dir(&dir);
         assert!(!report.healthy);
         assert_eq!(report.segments[0].unparseable_lines, vec![2]);
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// Real incident: a test stub appended a row shaped like this (`"subject":
@@ -4190,7 +4182,6 @@ mod ledger_health_tests {
         // Error severity alone must not claim `--repair-ledger` can fix this
         // mechanically — it can't, and must not try.
         assert!(!report.repairable);
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// A fully valid segment must not trip the new canonical-row check —
@@ -4214,7 +4205,6 @@ mod ledger_health_tests {
         );
         assert!(report.segments[0].invalid_row_lines.is_empty());
         assert!(report.healthy);
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// The whole point: this mode must answer without opening the store or the
@@ -4227,12 +4217,12 @@ mod ledger_health_tests {
         let report = ledger_health_in_dir(&dir);
         assert!(report.healthy);
         assert!(!report.derived_db_present);
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn missing_rally_dir_reports_instead_of_erroring() {
-        let dir = std::env::temp_dir().join("rally-ledger-absent-xyz-does-not-exist");
+        let root = crate::test_temp_root::TempRoot::new("rally-ledger-absent");
+        let dir = root.join("does-not-exist");
         let report = ledger_health_in_dir(&dir);
         assert!(!report.rally_dir_exists);
         assert!(report.findings.iter().any(|f| f.code == "no_rally_dir"));
@@ -4240,14 +4230,7 @@ mod ledger_health_tests {
 
     #[test]
     fn missing_host_hooks_are_an_info_finding_not_an_error() {
-        let dir = std::env::temp_dir().join(format!(
-            "rally-install-surface-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = crate::test_temp_root::TempRoot::new("rally-install-surface");
         fs::create_dir_all(dir.join(".rally")).unwrap();
         fs::write(dir.join(".rally/manifest.json"), "{}").unwrap();
         let findings = install_surface_findings(&dir);
@@ -4267,7 +4250,6 @@ mod ledger_health_tests {
             wired.iter().all(|f| f.code != "missing_host_hooks"),
             "{wired:?}"
         );
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -4288,7 +4270,6 @@ mod ledger_health_tests {
             "dry run must not touch the segment"
         );
         assert!(!report.archive_dir.exists(), "dry run creates no archive");
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -4326,7 +4307,6 @@ mod ledger_health_tests {
         // Repair is idempotent: re-running finds nothing left to do.
         let again = repair_ledger_in_dir(&dir, true, "stamp2").unwrap();
         assert_eq!(again.rows_renumbered, 0);
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// Content other than `seq` must survive the rewrite untouched.
@@ -4339,7 +4319,6 @@ mod ledger_health_tests {
         assert!(after.contains("keep-me"));
         assert!(after.contains("and-me"));
         assert!(after.contains("\"event_type\":\"artifact\""));
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// A segment we cannot fully parse is left completely alone. Renumbering
@@ -4365,7 +4344,6 @@ mod ledger_health_tests {
             before,
             fs::read_to_string(dir.join(LOG_DIRNAME).join("a.jsonl")).unwrap()
         );
-        fs::remove_dir_all(&dir).ok();
     }
 }
 
@@ -4373,14 +4351,8 @@ mod ledger_health_tests {
 mod sweep_tests {
     use super::*;
 
-    fn unique_dir(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rally-sweep-{label}-{nanos}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn unique_dir(label: &str) -> crate::test_temp_root::TempRoot {
+        crate::test_temp_root::TempRoot::new(&format!("rally-sweep-{label}"))
     }
 
     /// Plant a corrupt snapshot group (base + shm + wal siblings) at `stamp_ns`.
@@ -4480,8 +4452,6 @@ mod sweep_tests {
                 "archived bytes are the original bytes"
             );
         }
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// No file may vanish. Counting live + archived before and after is the
@@ -4500,7 +4470,6 @@ mod sweep_tests {
         assert_eq!(before, after, "sweep deleted {} file(s)", before - after);
         assert!(report.swept.len() >= 2);
         assert!(report.warnings.is_empty());
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// Recursive file list, so archived files under subdirectories are counted.
@@ -4534,13 +4503,13 @@ mod sweep_tests {
         assert_eq!(r.swept.len(), 0, "age window retains all three");
         assert_eq!(r.kept.len(), 3);
         assert_eq!(snapshot_bases(&dir).len(), 9, "nothing removed");
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// Missing directory → empty report, never errors.
     #[test]
     fn sweep_missing_dir_is_empty() {
-        let dir = std::env::temp_dir().join("rally-sweep-does-not-exist-xyz");
+        let root = crate::test_temp_root::TempRoot::new("rally-sweep-absent");
+        let dir = root.join("does-not-exist");
         let r = sweep_corrupt_in_dir(&dir, 1, 7, true, 100 * DAY_NS);
         assert!(r.swept.is_empty() && r.kept.is_empty());
         assert!(r.warnings.is_empty());
@@ -4571,19 +4540,9 @@ mod o26_db_only_migration_tests {
     };
     use std::collections::BTreeMap;
     use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
-
-    fn unique_root(label: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "rally-o26-db-only-{label}-{}-{}",
-            std::process::id(),
-            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::remove_dir_all(&root).ok();
-        fs::create_dir_all(&root).unwrap();
-        root
+    fn unique_root(label: &str) -> crate::test_temp_root::TempRoot {
+        crate::test_temp_root::TempRoot::new(&format!("o26-{label}"))
     }
 
     fn fact(event_id: &str, seq_hint: i64) -> Fact {
@@ -4610,11 +4569,13 @@ mod o26_db_only_migration_tests {
         }
     }
 
-    fn db_only_room(label: &str) -> (PathBuf, Vec<Fact>) {
+    fn db_only_room(label: &str) -> (crate::test_temp_root::TempRoot, Vec<Fact>) {
         let root = unique_root(label);
-        let store =
-            DirectRoomStore::open_direct_at_with_engagement(root.clone(), Some("seed".to_string()))
-                .unwrap();
+        let store = DirectRoomStore::open_direct_at_with_engagement(
+            root.path().to_path_buf(),
+            Some("seed".to_string()),
+        )
+        .unwrap();
         let expected = vec![fact("db-only-a", 0), fact("db-only-b", 0)];
         for item in &expected {
             store.append_fact(item).unwrap();
@@ -4695,7 +4656,6 @@ mod o26_db_only_migration_tests {
         assert!(!report.applied);
         assert_eq!(report.row_count, Some(2));
         assert_eq!(file_tree(&root), before, "dry-run must be byte-inert");
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -4725,9 +4685,6 @@ mod o26_db_only_migration_tests {
                 .any(|blocker| blocker.contains("WAL"))
         );
         assert_eq!(file_tree(&wal_root), before);
-
-        fs::remove_dir_all(owned_root).ok();
-        fs::remove_dir_all(wal_root).ok();
     }
 
     #[test]
@@ -4759,7 +4716,6 @@ mod o26_db_only_migration_tests {
         let retry = run_db_only_migration_at(&root, "alpha", true).unwrap();
         assert_eq!(retry.state, DbOnlyMigrationState::AlreadyCommitted);
         assert_eq!(jsonl_files(&root).len(), 1, "successful retry is singleton");
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -4817,10 +4773,6 @@ mod o26_db_only_migration_tests {
         assert!(error.to_string().contains("migration target"), "{error}");
         assert!(!missing.target_path.exists());
         assert_eq!(fs::read(&missing.receipt_path).unwrap(), receipt_before);
-
-        fs::remove_dir_all(root).ok();
-        fs::remove_dir_all(divergent_root).ok();
-        fs::remove_dir_all(missing_root).ok();
     }
 
     #[test]
@@ -4858,7 +4810,6 @@ mod o26_db_only_migration_tests {
         assert!(!marker_path.exists());
         assert!(!temp.exists());
         assert_eq!(jsonl_files(&root), vec![target]);
-        fs::remove_dir_all(root).ok();
 
         let (divergent_root, _) = db_only_room("receipt-divergent-temp");
         let divergent_rally = divergent_root.join(".rally");
@@ -4886,7 +4837,6 @@ mod o26_db_only_migration_tests {
         assert_eq!(fs::read(&divergent_target).unwrap(), target_before);
         assert_eq!(fs::read(&divergent_receipt_path).unwrap(), receipt_before);
         assert!(divergent_marker_path.is_file());
-        fs::remove_dir_all(divergent_root).ok();
     }
 
     #[test]
@@ -4910,8 +4860,6 @@ mod o26_db_only_migration_tests {
         assert!(jsonl_files(&busy_root).is_empty());
         assert!(!busy_rally.join(DB_ONLY_MIGRATION_MARKER_FILENAME).exists());
         drop(direct);
-        fs::remove_dir_all(live_root).ok();
-        fs::remove_dir_all(busy_root).ok();
     }
 
     #[test]
@@ -4936,7 +4884,6 @@ mod o26_db_only_migration_tests {
         assert!(!rally.join(DB_ONLY_MIGRATION_MARKER_FILENAME).exists());
         assert!(!rally.join(DB_ONLY_MIGRATION_MARKER_STAGE_FILENAME).exists());
         assert!(jsonl_files(&root).is_empty());
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -4963,8 +4910,6 @@ mod o26_db_only_migration_tests {
                 .join(DB_ONLY_MIGRATION_MARKER_FILENAME)
                 .exists()
         );
-        fs::remove_dir_all(wal_root).ok();
-        fs::remove_dir_all(canonical_root).ok();
     }
 
     #[test]
@@ -4983,7 +4928,6 @@ mod o26_db_only_migration_tests {
                 !root.join(".rally").exists(),
                 "{case}: invalid identity must fail before creating migration state"
             );
-            fs::remove_dir_all(root).ok();
         }
     }
 
@@ -5004,7 +4948,6 @@ mod o26_db_only_migration_tests {
                     .join(DB_ONLY_MIGRATION_MARKER_FILENAME)
                     .exists()
             );
-            fs::remove_dir_all(root).ok();
         }
     }
 
@@ -5031,7 +4974,8 @@ mod o26_db_only_migration_tests {
         assert!(jsonl_files(&changing_root).is_empty());
 
         let (symlink_root, _) = db_only_room("symlink-shm");
-        let external = unique_root("symlink-shm-external").join("shm");
+        let external_root = unique_root("symlink-shm-external");
+        let external = external_root.join("shm");
         fs::write(&external, b"external shm").unwrap();
         std::os::unix::fs::symlink(&external, symlink_root.join(".rally/facts.db-shm")).unwrap();
         let external_before = fs::read(&external).unwrap();
@@ -5039,11 +4983,6 @@ mod o26_db_only_migration_tests {
         assert!(error.to_string().contains("symlink"), "{error}");
         assert_eq!(fs::read(&external).unwrap(), external_before);
         assert!(jsonl_files(&symlink_root).is_empty());
-
-        fs::remove_dir_all(stable_root).ok();
-        fs::remove_dir_all(changing_root).ok();
-        fs::remove_dir_all(symlink_root).ok();
-        fs::remove_dir_all(external.parent().unwrap()).ok();
     }
 
     #[test]
@@ -5056,8 +4995,6 @@ mod o26_db_only_migration_tests {
         let error = run_db_only_migration_at(&root, "alpha", true).unwrap_err();
         assert!(error.to_string().contains("symlink"));
         assert!(file_tree(&external).is_empty());
-        fs::remove_dir_all(root).ok();
-        fs::remove_dir_all(external).ok();
 
         let (root, _) = db_only_room("log-symlink");
         let external = unique_root("log-symlink-external");
@@ -5068,47 +5005,42 @@ mod o26_db_only_migration_tests {
         let error = run_db_only_migration_at(&root, "alpha", true).unwrap_err();
         assert!(error.to_string().contains("symlink"));
         assert_eq!(file_tree(&external), before);
-        fs::remove_dir_all(root).ok();
-        fs::remove_dir_all(external).ok();
 
         let (root, _) = db_only_room("db-symlink");
         let db = root.join(".rally/facts.db");
-        let external = unique_root("db-symlink-external").join("preserved.db");
+        let external_root = unique_root("db-symlink-external");
+        let external = external_root.join("preserved.db");
         fs::rename(&db, &external).unwrap();
         symlink(&external, &db).unwrap();
         let before = fs::read(&external).unwrap();
         let error = run_db_only_migration_at(&root, "alpha", true).unwrap_err();
         assert!(error.to_string().contains("symlink"));
         assert_eq!(fs::read(&external).unwrap(), before);
-        fs::remove_dir_all(root).ok();
-        fs::remove_dir_all(external.parent().unwrap()).ok();
 
         for filename in [
             DB_ONLY_MIGRATION_MARKER_FILENAME,
             DB_ONLY_MIGRATION_RECEIPT_FILENAME,
         ] {
             let (root, _) = db_only_room(filename);
-            let external = unique_root("metadata-symlink-external").join("evidence");
+            let external_root = unique_root("metadata-symlink-external");
+            let external = external_root.join("evidence");
             fs::write(&external, b"external evidence").unwrap();
             symlink(&external, root.join(".rally").join(filename)).unwrap();
             let before = fs::read(&external).unwrap();
             let error = run_db_only_migration_at(&root, "alpha", true).unwrap_err();
             assert!(error.to_string().contains("symlink"));
             assert_eq!(fs::read(&external).unwrap(), before);
-            fs::remove_dir_all(root).ok();
-            fs::remove_dir_all(external.parent().unwrap()).ok();
         }
 
         let (root, _) = db_only_room("target-symlink");
-        let external = unique_root("target-symlink-external").join("target");
+        let external_root = unique_root("target-symlink-external");
+        let external = external_root.join("target");
         fs::write(&external, b"external target").unwrap();
         symlink(&external, root.join(".rally/log/alpha.jsonl")).unwrap();
         let before = fs::read(&external).unwrap();
         let error = run_db_only_migration_at(&root, "alpha", true).unwrap_err();
         assert!(error.to_string().contains("symlink"));
         assert_eq!(fs::read(&external).unwrap(), before);
-        fs::remove_dir_all(root).ok();
-        fs::remove_dir_all(external.parent().unwrap()).ok();
 
         let (root, _) = db_only_room("temp-symlink");
         let rally = root.join(".rally");
@@ -5119,15 +5051,14 @@ mod o26_db_only_migration_tests {
         )
         .unwrap();
         let temp = root.join(marker["temp_relative_path"].as_str().unwrap());
-        let external = unique_root("temp-symlink-external").join("temp");
+        let external_root = unique_root("temp-symlink-external");
+        let external = external_root.join("temp");
         fs::write(&external, b"external temp").unwrap();
         symlink(&external, &temp).unwrap();
         let before = fs::read(&external).unwrap();
         let error = run_db_only_migration_at(&root, "alpha", true).unwrap_err();
         assert!(error.to_string().contains("symlink"));
         assert_eq!(fs::read(&external).unwrap(), before);
-        fs::remove_dir_all(root).ok();
-        fs::remove_dir_all(external.parent().unwrap()).ok();
     }
 
     #[test]
@@ -5140,7 +5071,6 @@ mod o26_db_only_migration_tests {
         assert!(error.to_string().contains("marker"));
         assert_eq!(fs::read(&marker).unwrap(), marker_before);
         assert!(jsonl_files(&root).is_empty());
-        fs::remove_dir_all(root).ok();
 
         let (root, _) = db_only_room("marker-binding");
         arm_db_only_migration_fault(
@@ -5158,7 +5088,6 @@ mod o26_db_only_migration_tests {
         assert!(error.to_string().contains("binding mismatch"));
         assert_eq!(fs::read(&marker).unwrap(), altered);
         assert!(jsonl_files(&root).is_empty());
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -5182,7 +5111,6 @@ mod o26_db_only_migration_tests {
             let report = run_db_only_migration_at(&root, "alpha", true).unwrap();
             assert_eq!(report.state, DbOnlyMigrationState::Committed);
             assert_eq!(jsonl_files(&root).len(), 1);
-            fs::remove_dir_all(root).ok();
         }
     }
 
@@ -5231,9 +5159,6 @@ mod o26_db_only_migration_tests {
         assert!(error.to_string().contains("target"), "{error}");
         assert_eq!(fs::read(&target).unwrap(), before);
         assert_eq!(fs::read(&temp).unwrap(), before);
-
-        fs::remove_dir_all(root).ok();
-        fs::remove_dir_all(linked_root).ok();
     }
 
     #[test]
@@ -5253,7 +5178,6 @@ mod o26_db_only_migration_tests {
         assert_eq!(report.state, DbOnlyMigrationState::Committed);
         assert_eq!(jsonl_files(&root).len(), 1);
         assert_eq!(fs::read(&report.target_path).unwrap(), first);
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -5285,7 +5209,6 @@ mod o26_db_only_migration_tests {
             assert!(!report.marker_path.exists());
             assert!(report.receipt_path.is_file());
             assert_eq!(jsonl_files(&root).len(), 1);
-            fs::remove_dir_all(root).ok();
         }
     }
 
@@ -5308,7 +5231,7 @@ mod o26_db_only_migration_tests {
             let before = file_tree(&root);
 
             let error = match DirectRoomStore::open_direct_at_with_engagement(
-                root.clone(),
+                root.path().to_path_buf(),
                 Some("alpha".to_string()),
             ) {
                 Ok(_) => panic!("ordinary direct open must defer to doctor while a marker exists"),
@@ -5331,7 +5254,7 @@ mod o26_db_only_migration_tests {
             assert!(!recovered.marker_path.exists());
 
             let direct = DirectRoomStore::open_direct_at_with_engagement(
-                root.clone(),
+                root.path().to_path_buf(),
                 Some("alpha".to_string()),
             )
             .unwrap();
@@ -5340,7 +5263,6 @@ mod o26_db_only_migration_tests {
                 .unwrap();
             assert!(appended.committed);
             drop(direct);
-            fs::remove_dir_all(root).ok();
         }
     }
 
@@ -5348,7 +5270,7 @@ mod o26_db_only_migration_tests {
     fn db_only_migration_marker_or_stage_fences_direct_open() {
         let root = unique_root("malformed-marker-fence");
         let store = DirectRoomStore::open_direct_at_with_engagement(
-            root.clone(),
+            root.path().to_path_buf(),
             Some("alpha".to_string()),
         )
         .unwrap();
@@ -5357,7 +5279,7 @@ mod o26_db_only_migration_tests {
         let marker = root.join(".rally").join(DB_ONLY_MIGRATION_MARKER_FILENAME);
         fs::write(&marker, b"not valid marker JSON").unwrap();
         let before = file_tree(&root);
-        let error = match DirectRoomStore::open_direct_at(root.clone()) {
+        let error = match DirectRoomStore::open_direct_at(root.path().to_path_buf()) {
             Ok(_) => panic!("malformed marker must fence direct open"),
             Err(error) => error,
         };
@@ -5369,7 +5291,7 @@ mod o26_db_only_migration_tests {
         fs::write(&outside, b"external evidence").unwrap();
         std::os::unix::fs::symlink(&outside, &marker).unwrap();
         let before = file_tree(&root);
-        let error = match DirectRoomStore::open_direct_at(root.clone()) {
+        let error = match DirectRoomStore::open_direct_at(root.path().to_path_buf()) {
             Ok(_) => panic!("symlink marker must fence direct open"),
             Err(error) => error,
         };
@@ -5383,7 +5305,7 @@ mod o26_db_only_migration_tests {
             .join(DB_ONLY_MIGRATION_MARKER_STAGE_FILENAME);
         fs::write(&marker_stage, b"prepared marker staging evidence").unwrap();
         let before = file_tree(&root);
-        let error = match DirectRoomStore::open_direct_at(root.clone()) {
+        let error = match DirectRoomStore::open_direct_at(root.path().to_path_buf()) {
             Ok(_) => panic!("marker staging evidence must fence direct open"),
             Err(error) => error,
         };
@@ -5393,7 +5315,6 @@ mod o26_db_only_migration_tests {
             before,
             "the stage-file fence must not reconcile the DB or mutate recovery evidence"
         );
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -5418,7 +5339,6 @@ mod o26_db_only_migration_tests {
         assert!(error.to_string().contains("temp"));
         assert_eq!(fs::read(&temp).unwrap(), b"wrong temp evidence");
         assert!(jsonl_files(&temp_root).is_empty());
-        fs::remove_dir_all(temp_root).ok();
 
         let (receipt_root, _) = db_only_room("receipt-mismatch");
         let rally = receipt_root.join(".rally");
@@ -5431,6 +5351,5 @@ mod o26_db_only_migration_tests {
         assert!(error.to_string().contains("receipt"));
         assert_eq!(fs::read(&receipt).unwrap(), before);
         assert_eq!(jsonl_files(&receipt_root).len(), 1);
-        fs::remove_dir_all(receipt_root).ok();
     }
 }
