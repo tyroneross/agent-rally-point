@@ -1112,7 +1112,6 @@ fn warning_count(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn batch_projection_preserves_single_reply_states_and_original_withdrawal() {
@@ -1275,12 +1274,11 @@ mod tests {
         assert_eq!(row.reply.as_ref().unwrap().receiver_answered, Some(false));
     }
 
-    fn tmp_path(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("rally-discovery-{label}-{nanos}.json"))
+    /// A file path inside a fresh folder. Keep the guard alive while the file is used.
+    fn tmp_path(label: &str) -> (crate::test_temp_root::TempRoot, PathBuf) {
+        let root = crate::test_temp_root::TempRoot::new(&format!("rally-discovery-{label}"));
+        let path = root.join("index.json");
+        (root, path)
     }
 
     fn make_known_room(repo: &str) -> KnownRoom {
@@ -1299,7 +1297,7 @@ mod tests {
     /// A clean (non-torn) index still parses correctly.
     #[test]
     fn read_room_index_clean_round_trips() {
-        let path = tmp_path("clean");
+        let (_root, path) = tmp_path("clean");
         let room = make_known_room("/home/user/my-repo");
         let index = RoomIndex {
             schema: ROOM_INDEX_SCHEMA.to_string(),
@@ -1313,14 +1311,13 @@ mod tests {
             result.rooms[0].repo_root,
             PathBuf::from("/home/user/my-repo")
         );
-        let _ = fs::remove_file(&path);
     }
 
     /// A torn file (valid JSON + trailing garbage) returns the rooms from the
     /// first valid document instead of erroring.
     #[test]
     fn read_room_index_torn_file_recovers_rooms() {
-        let path = tmp_path("torn");
+        let (_root, path) = tmp_path("torn");
         let room = make_known_room("/home/user/agent-rally-point");
         let index = RoomIndex {
             schema: ROOM_INDEX_SCHEMA.to_string(),
@@ -1341,7 +1338,6 @@ mod tests {
             result.rooms[0].repo_root,
             PathBuf::from("/home/user/agent-rally-point")
         );
-        let _ = fs::remove_file(&path);
     }
 
     /// Multiple stale registry entries must produce exactly one `rooms_missing`
@@ -1436,14 +1432,8 @@ mod tests {
     // B17 — migrate_legacy idempotency tests
     // =========================================================================
 
-    fn tmp_dir(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rally-migrate-{label}-{nanos}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tmp_dir(label: &str) -> crate::test_temp_root::TempRoot {
+        crate::test_temp_root::TempRoot::new(&format!("rally-migrate-{label}"))
     }
 
     /// Build a minimal rally fact JSON line for the legacy store.
@@ -1497,7 +1487,7 @@ mod tests {
         )
         .unwrap();
 
-        let room = RoomStore::open_at(root.clone()).unwrap();
+        let room = RoomStore::open_at(root.to_path_buf()).unwrap();
 
         // First run: should migrate both facts.
         let result = migrate_legacy_from(&room, "my-repo", &apps_root).unwrap();
@@ -1532,9 +1522,6 @@ mod tests {
             channel.exists(),
             "migrate_legacy must not delete the legacy file"
         );
-
-        fs::remove_dir_all(&root).ok();
-        fs::remove_dir_all(&home).ok();
     }
 
     #[test]
@@ -1563,7 +1550,7 @@ mod tests {
                 format!("{}\n", make_rally_fact_line(&event_id, label)),
             )
             .unwrap();
-            let room = RoomStore::open_at(root.clone()).unwrap();
+            let room = RoomStore::open_at(root.to_path_buf()).unwrap();
             crate::store::fail_o26_once(&room.rally_dir(), fault);
 
             let result = migrate_legacy_from(&room, "my-repo", &apps_root).unwrap();
@@ -1595,8 +1582,6 @@ mod tests {
                 );
             }
             drop(room);
-            fs::remove_dir_all(&root).ok();
-            fs::remove_dir_all(&home).ok();
         }
     }
 
@@ -1624,7 +1609,7 @@ mod tests {
         )
         .unwrap();
 
-        let room = RoomStore::open_at(root.clone()).unwrap();
+        let room = RoomStore::open_at(root.to_path_buf()).unwrap();
 
         let result = migrate_legacy_from(&room, "my-repo", &apps_root).unwrap();
         assert_eq!(
@@ -1632,9 +1617,6 @@ mod tests {
             "only the rally-schema record is counted as facts_read"
         );
         assert_eq!(result.facts_migrated, 1, "the rally fact is migrated");
-
-        fs::remove_dir_all(&root).ok();
-        fs::remove_dir_all(&home).ok();
     }
 
     /// B17.migrate: recent and locate do NOT return legacy-only facts (flag retired).
@@ -1660,7 +1642,7 @@ mod tests {
         .unwrap();
 
         // Write one fact in the real repo ledger.
-        let room = RoomStore::open_at(root.clone()).unwrap();
+        let room = RoomStore::open_at(root.to_path_buf()).unwrap();
         let live_fact = crate::store::Fact {
             from_session_id: None,
             schema: crate::FACT_SCHEMA.to_string(),
@@ -1687,7 +1669,7 @@ mod tests {
 
         // Verify via the room facts API: the legacy-only fact is NOT in the ledger
         // (discover::recent/locate no longer reads the legacy store).
-        let reader = RoomStore::open_at(root.clone()).unwrap();
+        let reader = RoomStore::open_at(root.to_path_buf()).unwrap();
         let facts = reader.facts().unwrap();
         assert!(
             facts.iter().any(|f| f.event_id == "evt_b17_live"),
@@ -1699,7 +1681,7 @@ mod tests {
         );
 
         // After migrate_legacy_from, the legacy fact IS in the ledger.
-        let room2 = RoomStore::open_at(root.clone()).unwrap();
+        let room2 = RoomStore::open_at(root.to_path_buf()).unwrap();
         migrate_legacy_from(&room2, "my-repo", &apps_root).unwrap();
         let facts_after = room2.facts().unwrap();
         assert!(
@@ -1714,9 +1696,6 @@ mod tests {
             channel.exists(),
             "legacy file must not be deleted by migrator"
         );
-
-        fs::remove_dir_all(&root).ok();
-        fs::remove_dir_all(&home).ok();
     }
 
     /// B17: room_index_path() must default to None (global index off by default).

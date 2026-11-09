@@ -242,16 +242,11 @@ mod tests {
     use super::*;
     use crate::store::{Fact, FactKind, RoomStore};
     use crate::{FACT_SCHEMA, new_id, now_string};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn test_room() -> (RoomStore, std::path::PathBuf) {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("rally-rf-test-{nanos}"));
+    fn test_room() -> (RoomStore, crate::test_temp_root::TempRoot) {
+        let root = crate::test_temp_root::TempRoot::new("rally-rf-test");
         std::fs::create_dir_all(root.join(".git")).unwrap();
-        let room = RoomStore::open_at(root.clone()).unwrap();
+        let room = RoomStore::open_at(root.path().to_path_buf()).unwrap();
         (room, root)
     }
 
@@ -282,7 +277,7 @@ mod tests {
 
     #[test]
     fn route_findings_refuses_without_verified() {
-        let (room, root) = test_room();
+        let (room, _root) = test_room();
         let findings = vec![Finding {
             file: "src/lib.rs".to_string(),
             severity: "error".to_string(),
@@ -296,12 +291,11 @@ mod tests {
             msg.contains("--verified"),
             "error should mention --verified: {msg}"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn route_findings_maps_finding_to_claim_owner() {
-        let (room, root) = test_room();
+        let (room, _root) = test_room();
         add_claim(&room, "tool-a", "src/lib.rs");
 
         let findings = vec![Finding {
@@ -319,13 +313,11 @@ mod tests {
         assert_eq!(rf.routed_to.as_deref(), Some("tool-a"));
         assert_eq!(rf.fact_kind, "handoff");
         assert!(!rf.unowned);
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn route_findings_emits_risk_for_unclaimed_path() {
-        let (room, root) = test_room();
+        let (room, _root) = test_room();
         // No claim for src/main.rs
 
         let findings = vec![Finding {
@@ -343,13 +335,11 @@ mod tests {
         assert!(rf.unowned);
         assert_eq!(rf.fact_kind, "risk");
         assert!(rf.routed_to.is_none());
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn route_findings_suffix_match_routes_to_owner() {
-        let (room, root) = test_room();
+        let (room, _root) = test_room();
         // Claim covers the longer canonical path
         add_claim(&room, "tool-b", "crates/rally-cli/src/lib.rs");
 
@@ -368,13 +358,11 @@ mod tests {
             summary.routed_findings[0].routed_to.as_deref(),
             Some("tool-b")
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn o26_route_findings_surfaces_every_outcome_in_canonical_order() {
-        let (room, root) = test_room();
+        let (room, _root) = test_room();
         let _ = crate::drain_pending_append_outcomes();
         let _ = crate::drain_pending_append_issues();
         crate::store::fail_o26_once(
@@ -441,12 +429,11 @@ mod tests {
                 .len(),
             3
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn o26_route_findings_later_unknown_is_a_queryable_partial_commit() {
-        let (room, root) = test_room();
+        let (room, _root) = test_room();
         let _ = crate::drain_pending_append_outcomes();
         let _ = crate::drain_pending_append_issues();
         crate::store::skip_o26_once(
@@ -509,6 +496,5 @@ mod tests {
             1
         );
         assert!(facts.iter().all(|fact| fact.kind != FactKind::Artifact));
-        std::fs::remove_dir_all(root).ok();
     }
 }

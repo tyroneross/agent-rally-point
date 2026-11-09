@@ -387,20 +387,16 @@ mod tests {
 
     use crate::store::RoomStore;
 
-    fn test_room() -> (RoomStore, std::path::PathBuf) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("rally-backlog-test-{id}-{}", std::process::id()));
+    fn test_room() -> (RoomStore, crate::test_temp_root::TempRoot) {
+        let root = crate::test_temp_root::TempRoot::new("rally-backlog-test");
         std::fs::create_dir_all(root.join(".git")).unwrap();
-        let room = RoomStore::open_at(root.clone()).unwrap();
+        let room = RoomStore::open_at(root.path().to_path_buf()).unwrap();
         (room, root)
     }
 
     #[test]
     fn backlog_add_stores_and_list_returns_item() {
-        let (room, root) = test_room();
+        let (room, _root) = test_room();
 
         let fact = add_backlog_item(
             &room,
@@ -426,13 +422,11 @@ mod tests {
         assert_eq!(item.status, "planned");
         assert_eq!(item.target.as_deref(), Some("codex"));
         assert_eq!(item.expected_by.as_deref(), Some("2026-07-02T12:00:00Z"));
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn backlog_add_rejects_invalid_status() {
-        let (room, root) = test_room();
+        let (room, _root) = test_room();
         let err = add_backlog_item(
             &room,
             "t",
@@ -468,12 +462,11 @@ mod tests {
             )
             .unwrap_or_else(|_| panic!("valid status {status:?} must be accepted"));
         }
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn backlog_update_rejects_invalid_status() {
-        let (room, root) = test_room();
+        let (room, _root) = test_room();
         add_backlog_item(&room, "t", "task-1", "do it", &[], &[], None, None, None).unwrap();
         let err = update_backlog_item(
             &room,
@@ -498,12 +491,11 @@ mod tests {
             .find(|i| i.id == "task-1")
             .unwrap();
         assert_eq!(item.status, "open");
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn backlog_list_open_excludes_done_items() {
-        let (room, root) = test_room();
+        let (room, _root) = test_room();
 
         add_backlog_item(
             &room,
@@ -560,13 +552,11 @@ mod tests {
         // dep-1 is done so only task-2 should be open
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].id, "task-2");
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn backlog_update_preserves_omitted_plan_fields() {
-        let (room, root) = test_room();
+        let (room, _root) = test_room();
 
         add_backlog_item(
             &room,
@@ -604,13 +594,11 @@ mod tests {
         assert_eq!(item.target.as_deref(), Some("codex"));
         assert_eq!(item.status, "in_progress");
         assert_eq!(item.expected_by.as_deref(), Some("next checkpoint"));
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn backlog_satisfied_ids_includes_done() {
-        let (room, root) = test_room();
+        let (room, _root) = test_room();
 
         add_backlog_item(
             &room,
@@ -650,7 +638,5 @@ mod tests {
         let all = list_backlog_items(&room).unwrap();
         let sat = satisfied_ids(&all);
         assert!(sat.contains("finished"));
-
-        std::fs::remove_dir_all(root).ok();
     }
 }
