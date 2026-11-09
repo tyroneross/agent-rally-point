@@ -2,7 +2,7 @@
 
 **Rally Point turns your coding agents into a team: they delegate tasks, hand off work and solve problems together.**
 
-Works across Claude, Codex, Gemini, Cursor and any agent that can run a shell command.
+Works across Claude, Codex, Muse, Gemini, Cursor and any agent that can run a shell command.
 
 - **A lead agent delegates.** It assigns work to other agents or launches new ones, each in its own git worktree.
 - **Agents hand off work when done.** A handoff counts only when the receiving agent confirms it, and finished work comes with proof it was checked.
@@ -162,7 +162,8 @@ The CLI is enough for a manual pilot. Automatic hooks run code at session start 
 |------|-----------------------|
 | Claude Code | Install the plugin below, or opt into the global hook install from the Rally clone. |
 | Codex | Install the plugin for Rally skills. Automatic hooks in another repo require merged project configuration plus the hook script. |
-| Cursor | Merge the project hook configuration plus the hook script; path-specific enforcement remains best-effort pending live-host validation. |
+| Muse | Generated `plugins/muse` bundle carries three skills and four Claude-compatible hooks; validate that bundle rather than the multi-manifest repository root. |
+| Cursor | Generated `.cursor-plugin/plugin.json` carries skills and portable plugin hooks. Project configuration remains available; path-specific enforcement still needs live-host validation. |
 | Gemini and other hosts | Use the CLI loop manually. No automatic-hook integration is published today. |
 
 To inspect and then opt into the Claude Code global install, run these from any directory after step 1. They change only `~/.claude/settings.json` and reference the source checkout; they do not copy hook configuration into `your-repo`.
@@ -181,6 +182,8 @@ claude plugin install agent-rally-point@agent-rally-point
 ```
 
 For Codex skills, run `codex plugin add agent-rally-point@agent-rally-point --json` and restart Codex. The bundled `.claude/settings.json`, `.codex/hooks.json`, and `.cursor/hooks.json` configure this repository; `rally init` does not copy them—or `hooks/rally-coordination-hook.sh`—into an adopting repository. Merge the configuration you need and copy that hook script into the target before expecting automatic hooks. The exact consumer-repo setup and host limits are in [Auto-Coordination Hooks](docs/AUTO-COORDINATION-HOOKS.md). Any host that can run a shell command can participate through the `rally` CLI with no hooks at all.
+
+Muse and Cursor plugin layouts, validation commands, and the Codex symlink-cache discovery limit are documented in [Host plugin surfaces](docs/HOST-PLUGIN-SURFACES.md). Packaging validation proves discovery; activation and hook execution require separate host checks.
 
 **Check it:**
 
@@ -348,7 +351,7 @@ The implementation lives in [`dynamic-workflows/`](dynamic-workflows/README.md).
 
 ## Security and host hooks
 
-This repo includes Claude Code, Codex and Cursor hook configurations, plus a plugin hook manifest. A compatible host must load the relevant configuration before automatic checks can run. Adopting repositories need the setup described above; `rally init` alone does not enable hooks. Trusting a host configuration permits its hook code to run.
+This repo includes Claude Code, Codex and Cursor project hook configurations, Claude and Cursor plugin hooks, and a separate Muse plugin bundle. A compatible host must load the relevant configuration before automatic checks can run. Adopting repositories need the setup described above; `rally init` alone does not enable hooks. Trusting a host configuration permits its hook code to run.
 
 | Event | What the hook does |
 |-------|--------------------|
@@ -462,7 +465,7 @@ The [trust model](docs/security/TRUST-MODEL.md) documents the concrete boundary:
 
 ## Keeping hosts on one release
 
-Rally generates every host manifest, hook setting, skill frontmatter, and packaged Codex artifact from `config/host-integrations.json` plus the CLI version in `crates/rally-cli/Cargo.toml`. Generated files carry the same release identity and content digest, and the release gate rejects drift.
+Rally generates Claude Code, Codex, Muse, and Cursor manifests, hook settings, skill frontmatter, and packaged artifacts from `config/host-integrations.json` plus the CLI version in `crates/rally-cli/Cargo.toml`. The release digest covers the Cursor manifest and hooks and the complete Muse and Codex payloads. Both bundles carry the same release identity, and the release gate rejects drift.
 
 ```bash
 python3 scripts/generate_host_surfaces.py --check
@@ -472,7 +475,7 @@ python3 scripts/sync_host_integrations.py --apply --json  # reconcile installed 
 
 The reconciler manages installed plugin providers; it does not maintain hook scripts manually copied into adopting repositories. Review and merge those project-local copies when upgrading, preserve unrelated settings, and repeat the host activation check.
 
-The reconciler requires exactly one enabled provider per host. It removes stale duplicates, updates from the canonical marketplace, and reports when Claude Code or Codex must restart to load new content. It changes nothing without `--apply`.
+The reconciler manages Claude Code and Codex and requires exactly one enabled provider per managed host. It removes stale duplicates, updates from the canonical marketplace, and reports when those hosts must restart to load new content. It changes nothing without `--apply`. Muse and Cursor entries describe generated surfaces only; they do not authorize host installation or reconciliation.
 
 Published releases remain immutable. New versions reconcile the CLI, generated host surfaces, and marketplace artifacts from the same canonical integration configuration.
 

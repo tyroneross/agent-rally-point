@@ -22,7 +22,9 @@
     ],
     "descriptions": {
       "claude_code": "Agent Rally Point — repo-local coordination surface for parallel coding agents. Claude Code has a plugin integration; Codex has Rally skills and needs project hook configuration; Cursor uses project hook configuration; Gemini and other hosts use the CLI loop. Records claims, checks write boundaries, routes handoffs, and exposes room state via the rally CLI. Skills: agent-rally-point (per-session loop), rally-workflows (fan-out + dynamic-workflows protocol), mini-loop (per-task quality gate). Hooks auto-fire only in supported, configured projects on SessionStart + PreToolUse to surface room awareness and deconflict before edits; advisory by default (the edit goes through), with opt-in strict and fail-closed switches that block. Backend: rally CLI (cargo install --path crates/rally-cli).",
-      "codex": "Agent Rally Point coordination skills (agent-rally-point, rally-workflows, mini-loop) for Codex. Repo-local coordination via the rally CLI: claims, write-boundary checks, handoffs, dynamic-workflow task packets."
+      "codex": "Agent Rally Point coordination skills (agent-rally-point, rally-workflows, mini-loop) for Codex. Repo-local coordination via the rally CLI: claims, write-boundary checks, handoffs, dynamic-workflow task packets.",
+      "muse": "Agent Rally Point coordination skills and Muse-compatible hooks. Records claims, checks write boundaries, routes handoffs, and exposes room state through the rally CLI.",
+      "cursor": "Agent Rally Point coordination skills and Cursor plugin hooks. Records claims, checks write boundaries, routes handoffs, and exposes room state through the rally CLI."
     },
     "host_keywords": {
       "claude_code": [
@@ -32,6 +34,9 @@
       ],
       "codex": [
         "codex"
+      ],
+      "cursor": [
+        "cursor"
       ]
     },
     "codex_interface": {
@@ -82,6 +87,13 @@
         "--json"
       ],
       "restart_required": true
+    },
+    "muse": {
+      "plugin_root": "plugins/muse",
+      "manifest": "plugins/muse/.claude-plugin/plugin.json"
+    },
+    "cursor": {
+      "manifest": ".cursor-plugin/plugin.json"
     }
   },
   "skills": {
@@ -158,7 +170,8 @@
         "events": {
           "claude_code": "SessionStart",
           "codex": "SessionStart",
-          "cursor": "sessionStart"
+          "cursor": "sessionStart",
+          "muse": "SessionStart"
         }
       },
       {
@@ -167,7 +180,8 @@
         "events": {
           "claude_code": "UserPromptSubmit",
           "codex": "UserPromptSubmit",
-          "cursor": "beforeSubmitPrompt"
+          "cursor": "beforeSubmitPrompt",
+          "muse": "UserPromptSubmit"
         }
       },
       {
@@ -176,24 +190,28 @@
         "events": {
           "claude_code": "PreToolUse",
           "codex": "PreToolUse",
-          "cursor": "preToolUse"
+          "cursor": "preToolUse",
+          "muse": "PreToolUse"
         },
         "matchers": {
           "claude_code": "Edit|Write|MultiEdit|NotebookEdit",
           "codex": null,
-          "cursor": "Write|Edit|StrReplace|Delete|EditNotebook"
+          "cursor": "Write|Edit|StrReplace|Delete|EditNotebook",
+          "muse": "Edit|Write|MultiEdit|NotebookEdit"
         }
       },
       {
         "phase": "after-write",
         "timeout_ms": 30000,
         "async": {
-          "claude_code": true
+          "claude_code": true,
+          "muse": true
         },
         "events": {
           "claude_code": "Stop",
           "codex": "Stop",
-          "cursor": "stop"
+          "cursor": "stop",
+          "muse": "Stop"
         }
       }
     ]

@@ -1,0 +1,307 @@
+---
+name: rally-workflows
+description: Use when fanning out work across multiple agents, running a dynamic workflow, or splitting a workstream across hosts, terminals, or machines through Agent Rally Point. NOT for one session's own coordination loop (use `agent-rally-point`), and NOT the per-task quality gate (use `mini-loop`). Defines the workstream descriptor + task-packet protocol and the per-task rally coordination loop; host-neutral.
+user-invocable: false
+---
+
+<!--
+SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# Rally Flow — host-neutral skill
+
+Rally facilitates; the host executes. Rally records claims, checks write boundaries, routes
+handoffs, and exposes room state — it never spawns, schedules, or retries agents. This skill turns a
+goal into a *workstream descriptor*, lints its structure and write boundaries, then fans out agents that
+coordinate through `rally`. The same protocol runs on any coding host; the host supplies the few
+runtime values below. Canonical wire spec: [`../../dynamic-workflows/PROTOCOL.md`](../../dynamic-workflows/PROTOCOL.md).
+
+## Host adapter (resolve these for your runtime)
+
+This skill names no specific agent. Before running, resolve three host values:
+
+| Knob | How to resolve |
+|------|----------------|
+| `<TOOL>` | Your host's rally tool id — the value you pass to `rally enter --tool …`. Use one stable id per terminal/role, e.g. `<host>:<role>:<n>`. The model belongs in the id, not in a separate registration. |
+| Fan-out authorization | Tier-1 in-process fan-out is allowed when the work is parallelizable **and** the descriptor lints clean — **unless your host requires explicit user authorization before spawning subagents/delegating**. If it does, gate Tier-1 on that explicit request; otherwise fan out by default. The rally loop is always active either way; only fan-out is conditional. |
+| Flag conventions | If your host parses structured output, pass `--json` on every `rally` command. Add `--severity` on `rally say blocker` when your host distinguishes severities. |
+| Fan-out width | Your own resource ceiling, passed to `resolveFanout({ hostCap })` (§2). Rally has no model, token, or CPU picture — it never spawns — so it owns only the hard ceiling and the ready-task count. A host with no resource picture omits `hostCap` and takes the default. |
+
+Do not hard-code another agent's identity in a descriptor or command — each host supplies its own
+`<TOOL>` at runtime. Substitute `<TOOL>` wherever it appears below.
+
+Resolve the Rally Flow module directory once, before running any command in this skill, and export
+its absolute path as `RALLY_FLOW_CORE`:
+
+- Repository checkout: `<repo-root>/dynamic-workflows/core`.
+- Generated Codex plugin: `<directory-containing-this-SKILL.md>/core`. Resolve this from the
+  loaded skill file, not from the consumer repository's current working directory.
+
+The linter, fan-out resolver, limiter, and packet generator below all use that same absolute path.
+
+## Joining a team
+
+When your launch instructions name a shared team memory directory, you are a team member (any agent, any provider):
+
+1. Read `team-memory.json` there first. If it is missing, its `digest` differs from the digest in your instructions, or a file it lists is missing, write an `abstain` receipt and do not start work. Never fill a gap by guessing.
+2. Otherwise read `CHARTER.md` (if listed) and `project.md`, then write your receipt JSON to the exact `receipts/<token>.json` path you were given, using the capability ids listed in the instructions. You get team tasks only after the coordinator scores that receipt as an exact match.
+3. Clear every rally obligation addressed to you with your own `rally say receipt --tool <you> --ref <event>`; nobody else can clear it for you.
+4. Report status on a directive with `rally say handoff --tool <you> --ref <directive> --handoff-state acked|accepted|rejected`. Your first reply binds an unbound directive to your session; after that only you can reply to it. For new work, send a NEW `rally say handoff --to <coordinator> --evidence directive:<event>`. Escalate blockers with `rally say blocker --to <coordinator> --severity high`.
+5. On rally 0.2.7 or older a `--ref` reply to an unbound directive fails with `handoff_reply_unbound_legacy`; use the NEW-handoff form from step 4 instead.
+
+## 1 · Decompose — author the descriptor
+
+Write a JSON workstream descriptor per `../../dynamic-workflows/PROTOCOL.md` (§1). Required
+top-level fields: `workstream` (objective), `description` (drop-in context), `tasks` (non-empty).
+Each task needs `id` (unique), `intent`, `owns`, `validation`, `output`.
+
+To go from a *vague goal* to this descriptor host-neutrally (pick the partition axis, derive
+disjoint `owns` from each task's output path, write deterministic `validation`, defer to the
+target repo's domain skill for task content), follow [`references/decomposition.md`](references/decomposition.md)
+— it ends with a copy-pasteable worked example.
+
+- `owns` — either `"read-only"` or a non-empty array of path strings. Paths across write-tasks must
+  be **disjoint** (no prefix overlap). That MECE guarantee is what lets agents run in parallel.
+- `validation` — a plain-language description of how to verify the task. **Descriptive prose, not
+  a command.** It renders into the packet as non-executable text; the agent translates it into a
+  command it takes responsibility for, under its own host's approval policy.
+- `validation_recipe` — optional. Names an entry in the local recipe registry
+  (`cargo-test`, `cargo-clippy`, `npm-test`, `node-test`, `pytest`, `go-test`, `shellcheck`,
+  `none`). When present, the renderer emits that recipe's fixed argv — command text comes from
+  this repo, never from the descriptor. Use this when you want a real command in the packet.
+- `output` — the expected artifact shape (what a reviewer would confirm).
+- `depends_on` — optional; ids must resolve; no cycles permitted.
+
+**Pick one `run_id` per workstream** (any stable string — e.g. the descriptor filename or a UUID
+minted at batch start). It is the lineage handle: every fact a fanned-out agent emits carries
+`--run <run_id>`, each task's `id` becomes its `--step`, and each `depends_on` entry becomes a
+`--parent-step`. That is what lets the orchestrator reconstruct the whole fan-out with
+`rally dag --run <run_id>` (see §7). The `run_id` is not a descriptor field — it is generated/chosen
+at fan-out time and threaded through the loop below.
+
+**Lint before any fan-out.** The linter enforces all four rules (structure, MECE, determinism,
+dependency integrity):
+
+```bash
+node "$RALLY_FLOW_CORE/workstream-lint.mjs" my.workstream.json
+# exit 0 → valid · 1 → violations · 2 → parse error
+```
+
+Do not dispatch agents until the linter exits 0.
+
+## 2 · Tier 1 (default) — host-native fan-out
+
+Use the host's native subagent/delegation tool. One agent per task packet. Prompt each subagent with
+its `owns`, `validation`, and `output` only — minimal context.
+
+**Resolve the width; do not assume a number.** `fanout.mjs` returns both the count and the
+constraint that produced it, so a host nowhere near its ceiling can say so. With the absolute
+`RALLY_FLOW_CORE` resolved above, these imports execute in either layout:
+
+```js
+import { pathToFileURL } from "node:url";
+
+const flowCore = process.env.RALLY_FLOW_CORE;
+if (!flowCore) throw new Error("RALLY_FLOW_CORE must name the Rally Flow core directory");
+const { resolveFanout, liveAgentsFromRoom } = await import(
+  pathToFileURL(`${flowCore}/fanout.mjs`).href,
+);
+const { createLimiter } = await import(pathToFileURL(`${flowCore}/limiter.mjs`).href);
+
+// `rally room --json` — peers already working hold capacity you cannot use.
+const live = liveAgentsFromRoom(roomSnapshot, { excludeTools: [myTool, ...myTaskTools] });
+
+const { effective_max, limiting_factors } = resolveFanout({
+  hostCap: <your CPU- or token-derived ceiling>,  // omit if you have no resource picture
+  readyTasks: tasks.filter(dispatchable).length,
+  liveAgents: live.count,
+  roomOverBudget: live.over_budget,
+});
+const run = createLimiter(effective_max);
+```
+
+`liveAgentsFromRoom` counts squads that are `fresh` **and** `active` — a stale squad is a session
+that ended without stopping, and an idle one holds nothing. **Pass your own tool ids in
+`excludeTools`**: the orchestrator and every id it fans out under are fresh+active squads too, so
+omitting them makes a fan-out subtract itself. This is the one input the host cannot supply — your
+process cannot see the two peers another terminal started ten minutes ago.
+
+`live.over_budget` is true only when the typed `room.composition.over_budget` boolean is true. In
+that state the resolver adds the `room_output_pressure` limiting factor and serializes new work at
+one task until the pressure clears. Missing, false, or malformed pressure data fails open to the
+other caps, so older room envelopes retain their previous behavior.
+
+Default width is **10**, hard ceiling **12** — the ceiling exists for coordination overhead (each
+hook fire writes ledger lines back into the ledger), not for write safety. Write safety comes from
+disjoint `owns`, which the linter proves before dispatch at any N. Report `limiting_factors`
+alongside the count when you log a fan-out; "we ran 4 because the host capped us" and "we ran 4
+because there were only 4 tasks" are different facts.
+
+**Subagent prompt discipline:** the subagent's final action is ONE structured result:
+
+```
+{ "task": "<id>", "changed_files": [...], "validation_result": "<verbatim output>" }
+```
+
+No prose after that block. The orchestrating agent collects results; it does not trust them
+without re-running validation for any shared-impact change.
+
+## 2.5 · Generate packets — descriptor → ready-to-paste prompts
+
+Don't hand-write each subagent prompt. Once the descriptor lints clean, render one packet per task
+mechanically:
+
+```bash
+node "$RALLY_FLOW_CORE/packet.mjs" my.workstream.json --run <run_id>            # all tasks → stdout
+node "$RALLY_FLOW_CORE/packet.mjs" my.workstream.json --run <run_id> --task p01 # one task
+node "$RALLY_FLOW_CORE/packet.mjs" my.workstream.json --run <run_id> --out ./packets --tool-prefix <prefix>
+```
+
+Each packet embeds the task intent, its `owns` boundary, the per-task rally loop with
+`--run`/`--step`/`--parent-step` already filled in, the `validation` command, the output contract,
+and the one-JSON-result discipline (§2) — the mechanical version of what an orchestrator did by hand.
+The packet is **host-agnostic text**: your host's own spawn mechanism (subagent tool, a new
+terminal, or a paste to a human) consumes it. `packet.mjs` re-lints and refuses a descriptor that
+isn't clean, so it is also a second guardrail. The rally `<TOOL>` id per task is `<prefix>:<task-id>`
+(`--tool-prefix`, default `agent`).
+
+## 3 · Tier 2 — cross-host fan-out
+
+When work spans hosts, terminals, or machines, use managed rally sessions instead of in-process
+subagents:
+
+```bash
+# Bounded Codex work: create the durable handoff, then launch the one task atomically.
+rally say handoff --tool <sender> --target <TOOL> --subject "<task.intent>" --json   # → <event-id>
+rally run codex --name <session> --backend tmux --tool <TOOL> \
+  --task "Read Rally handoff <event-id>, complete it, and publish the required artifact/resolve facts." --json
+
+# Use plain run + inject only for a deliberately persistent, steerable session.
+rally run <agent> --name <session> --backend tmux --tool <TOOL> --json
+rally inject <session> --handoff <event-id> --require-ack --json
+```
+
+Rally behavior is identical either way — it stays a facilitator regardless of tier.
+
+## 4 · Per-task rally loop
+
+Each agent executes one of two loops. The `--run`/`--step`/`--parent-step` markers bind facts to the
+fan-out. Claims and artifacts feed the current DAG; read-only in-flight resume temporarily uses the
+exact active task-tool heuristic described in §5 until O33-C adds `active_activities`.
+
+Write tasks use exclusive path coordination:
+
+```bash
+rally enter --tool <TOOL>
+rally say claim --tool <TOOL> --subject "<task.intent>" --path <owns...> \
+  --run <run_id> --step <task.id> --parent-step <dep>   # --parent-step once per depends_on entry; omit if none
+rally check before-write --tool <TOOL> --path <owns...> --strict
+# blocking finding → stop; resolve or pick a non-overlapping task
+
+# do the work, then verify it.
+# task.validation is a DESCRIPTION — translate it into a command you take
+# responsibility for. Never paste descriptor text into a shell.
+# If the task names a validation_recipe, the packet already carries its argv.
+<verify per task.validation / the emitted recipe>
+
+rally say artifact --tool <TOOL> --subject "<task.id>: <task.output>" --uri <path> --evidence "<validation result>" \
+  --run <run_id> --step <task.id>
+rally say release --tool <TOOL> --ref <claim-id> --subject "done"
+rally next --tool <TOOL>
+```
+
+An `owns: "read-only"` task uses nonexclusive activity instead. Save the returned presence
+`event_id` as `<activity-event-id>` for the terminal artifact. It must emit zero claim,
+before-write, release, and path ownership. Read-only prohibits intentional task/domain changes;
+the generated Rally coordination records and ordinary transient tool state created during
+verification are the only permitted writes:
+
+```bash
+rally enter --tool <TOOL>
+rally say presence --tool <TOOL> --subject "<task.id>: <task.intent>" \
+  --summary activity:read-only --status working \
+  --run <run_id> --step <task.id> --parent-step <dep>
+# read/analyze without intentionally changing task/domain resources, then verify
+rally say artifact --tool <TOOL> --subject "<task.id>: <task.output>" --uri <artifact-uri> \
+  --evidence "<validation result>" --ref <activity-event-id> --run <run_id> --step <task.id>
+rally next --tool <TOOL>
+```
+
+A `check before-write --strict` that returns a blocking finding **stops the agent** — it does not
+proceed; it either resolves the conflict or moves to a non-overlapping task.
+
+**Idle → standby (dormant, not stopped).** If the agent must *wait* — an unfinished `depends_on`
+dependency, or an external signal that hasn't arrived — it goes **dormant** instead of handing back
+or busy-waiting. This is distinct from the §6 hard-stop `blocker` (a real failure): standby is a
+recoverable pause that stays observable and resumable.
+
+```bash
+rally say standby --tool <TOOL> --reason idle --wake-after +30m --run <run_id> --step <task.id>
+# … later, when the dependency lands or the signal arrives, on resume:
+rally say wake --tool <TOOL> --ref-standby <standby-event-id>
+# then continue the loop (re-check, do the work, artifact, release)
+```
+
+A standby surfaces the agent in `rally wake-due` once `--wake-after` passes; the external runner
+(`rally watch`, §7) is what fires the resume. Rally signals; it never wakes the agent itself.
+
+**Quality wrapper (recommended):** run each task's *do the work* step through
+[`mini-loop`](../mini-loop/SKILL.md) — a zero-dependency assess → plan → execute → mini-judge loop
+that checks the result against the task's own `validation` and `output` contract before it posts an
+artifact. It catches a wrong-but-plausible result at the task instead of at integration.
+
+## 5 · Aggregate
+
+```bash
+rally room --tool <TOOL> --json
+```
+
+Confirm every task posted an artifact **with evidence** before declaring the workstream done.
+Re-run `task.validation` for any change with shared impact. Never auto-trust a subagent result.
+
+For resume, run `workstream-status.mjs` with the same `--tool-prefix` used to generate packets.
+Before O33-C exposes run-scoped `active_activities`, its `active` state is only a transitional
+exact `<tool-prefix>:<task.id>` plus fresh-squad heuristic. It never becomes `claimed`; A+B remain
+branch-held and inactive until the combined A+B+C gate passes.
+
+## 6 · Stop conditions
+
+**Hard stop** (hand back to the user) when any of:
+
+- `rally next` returns `requires_human: true`
+- `rally check before-write --strict` blocks and cannot be resolved
+- A task hits a real blocker → `rally say blocker --tool <TOOL> --subject "<reason>"`
+
+A hard stop is a *failure* the user must resolve. Do not use it for *waiting* — a recoverable wait
+(unmet dependency, pending external signal) is a `standby` (§4), not a `blocker`.
+
+## 7 · Observe & resume
+
+The orchestrator watches a running fan-out and resumes idle agents through three read-only views.
+The hard rule holds throughout: **Rally observes and signals; the external runner fires the work.**
+
+```bash
+# Progress: every step as landed | in-flight | stalled, edges from parent-step/ref lineage.
+rally dag --run <run_id> --json
+
+# Resumable agents: standby facts whose --wake-after has passed (trust-gated to room squads).
+# Each entry carries a `suggested_command` STRING — Rally never runs it.
+rally wake-due --json
+
+# The runner that actually fires: polls wake-due / new activity and invokes the suggestion.
+rally watch --on-activity 'rally next --tool <TOOL> --json'
+```
+
+Split of responsibility, never blurred:
+- `rally dag` / `rally wake-due` — **Rally**: read-only projections over the ledger. They report and
+  suggest; they start nothing.
+- `rally watch` — the **runner**: the only piece that executes a `suggested_command`. Substitute a
+  LaunchAgent / cron / Build Loop here if you prefer; Rally's contract is unchanged.
+
+Full event vocabulary, lineage encoding, and the runner contract:
+[`../../docs/ORCHESTRATOR_SEAM.md`](../../docs/ORCHESTRATOR_SEAM.md).
+
+Reference: canonical spec [`../../dynamic-workflows/PROTOCOL.md`](../../dynamic-workflows/PROTOCOL.md) ·
+coordination doctrine [`../../dynamic-workflows/COORDINATION.md`](../../dynamic-workflows/COORDINATION.md) ·
+model tiers [`../../dynamic-workflows/MODEL-TIERS.md`](../../dynamic-workflows/MODEL-TIERS.md)

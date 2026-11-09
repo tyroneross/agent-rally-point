@@ -17,10 +17,15 @@ from typing import Any
 
 
 CONFIG_PATH = Path("config/host-integrations.json")
+# Separate Muse payload avoids ambiguous root manifests and install-rejected symlinks.
+MUSE_ARTIFACT = Path("plugins/muse")
+# Cursor overrides Claude's default hooks/hooks.json with its native event schema.
+CURSOR_PLUGIN_HOOKS = Path("hooks/cursor.json")
 IDENTITY_PATHS = (
     Path("rally-release.json"),
     Path("plugins/codex/rally-release.json"),
     Path("plugins/codex/.codex-plugin/rally-release.json"),
+    MUSE_ARTIFACT / "rally-release.json",
 )
 JSON_SURFACES = (
     Path(".claude-plugin/plugin.json"),
@@ -31,8 +36,10 @@ JSON_SURFACES = (
     Path(".claude/settings.json"),
     Path(".codex/hooks.json"),
     Path(".cursor/hooks.json"),
+    Path(".cursor-plugin/plugin.json"),
+    CURSOR_PLUGIN_HOOKS,
 )
-GENERATED_DIRS = (Path("plugins/codex/.codex-plugin"),)
+GENERATED_DIRS = (Path("plugins/codex/.codex-plugin"), MUSE_ARTIFACT)
 SKILL_ROOT = Path("skills")
 # Claude Code accepts a path or an array of paths for `skills`; Muse accepts only an array.
 CLAUDE_MANIFEST_SKILL_PATHS = ["./skills"]
@@ -180,22 +187,42 @@ def render_plugin_surfaces(config: dict[str, Any], version: str) -> dict[Path, s
             }
         ],
     }
+    cursor_manifest = {
+        "name": name,
+        "version": version,
+        "description": plugin["descriptions"]["cursor"],
+        "author": author,
+        "repository": repository,
+        "license": license_name,
+        "keywords": merged_keywords(config, "cursor"),
+        "skills": [f"./skills/{skill}" for skill in sorted(config["skills"])],
+        "hooks": "./" + CURSOR_PLUGIN_HOOKS.as_posix(),
+    }
+    # Muse's Claude adapter supports shared hook scripts, matchers, and async Stop.
+    muse_manifest = {
+        "name": name,
+        "version": version,
+        "description": plugin["descriptions"]["muse"],
+        "skills": [f"./skills/{skill}" for skill in sorted(config["skills"])],
+    }
     return {
         Path(".claude-plugin/plugin.json"): json_text(claude_manifest),
         Path(".claude-plugin/marketplace.json"): json_text(claude_marketplace),
         Path(".codex-plugin/plugin.json"): json_text(codex_manifest),
         Path(".agents/plugins/marketplace.json"): json_text(codex_marketplace),
+        Path(config["providers"]["cursor"]["manifest"]): json_text(cursor_manifest),
+        Path(config["providers"]["muse"]["manifest"]): json_text(muse_manifest),
     }
 
 
 def command_for(host: str, source: str, phase: str, timeout_ms: int) -> str:
     allowance = hook_timeout_seconds({"phase": phase, "timeout_ms": timeout_ms}) * 1000
     declaration = f"RALLY_HOOK_HOST_TIMEOUT_MS={allowance} "
-    if host == "claude_code" and source == "plugin":
+    if host in {"claude_code", "muse"} and source == "plugin":
         return (
             "RALLY_HOOK_SOURCE=plugin "
             + declaration
-            + f'"${{CLAUDE_PLUGIN_ROOT}}/hooks/rally-coordination-hook.sh" {phase} claude_code'
+            + f'"${{CLAUDE_PLUGIN_ROOT}}/hooks/rally-coordination-hook.sh" {phase} {host}'
         )
     if host == "claude_code":
         return (
@@ -211,6 +238,12 @@ def command_for(host: str, source: str, phase: str, timeout_ms: int) -> str:
             f'/hooks/rally-coordination-hook.sh" {phase} codex'
         )
     if host == "cursor":
+        if source == "plugin":
+            return (
+                "RALLY_HOOK_SOURCE=plugin "
+                + declaration
+                + f'bash "${{CURSOR_PLUGIN_ROOT}}/hooks/rally-coordination-hook.sh" {phase} cursor'
+            )
         return (
             "RALLY_HOOK_SOURCE=project "
             + declaration
@@ -221,21 +254,21 @@ def command_for(host: str, source: str, phase: str, timeout_ms: int) -> str:
 
 
 def claude_hook_group(
-    phase: dict[str, Any], source: str, *, include_timeout: bool
+    phase: dict[str, Any], source: str, *, include_timeout: bool, host: str = "claude_code"
 ) -> tuple[str, dict[str, Any]]:
-    event = phase["events"]["claude_code"]
+    event = phase["events"][host]
     hook: dict[str, Any] = {
         "type": "command",
-        "command": command_for("claude_code", source, phase["phase"], phase["timeout_ms"]),
+        "command": command_for(host, source, phase["phase"], phase["timeout_ms"]),
     }
     if include_timeout:
         hook["timeout"] = hook_timeout_seconds(phase)
     # Stop never blocks and its message is advisory, so Claude runs it in the
     # background instead of making every turn end wait on Rally reads.
-    if phase.get("async", {}).get("claude_code") is True:
+    if phase.get("async", {}).get(host) is True:
         hook["async"] = True
     group: dict[str, Any] = {"hooks": [hook]}
-    matcher = phase.get("matchers", {}).get("claude_code")
+    matcher = phase.get("matchers", {}).get(host)
     if matcher:
         group["matcher"] = matcher
     return event, group
@@ -308,6 +341,8 @@ def render_hook_surfaces(config: dict[str, Any]) -> dict[Path, str]:
     claude_project_hooks: dict[str, list[dict[str, Any]]] = {}
     codex_hooks: dict[str, list[dict[str, Any]]] = {}
     cursor_hooks: dict[str, list[dict[str, Any]]] = {}
+    cursor_plugin_hooks: dict[str, list[dict[str, Any]]] = {}
+    muse_hooks: dict[str, list[dict[str, Any]]] = {}
 
     for phase in phases:
         events = phase["events"]
@@ -316,6 +351,9 @@ def render_hook_surfaces(config: dict[str, Any]) -> dict[Path, str]:
             claude_plugin_hooks.setdefault(event, []).append(group)
             event, group = claude_hook_group(phase, "project", include_timeout=True)
             claude_project_hooks.setdefault(event, []).append(group)
+        if "muse" in events:
+            event, group = claude_hook_group(phase, "plugin", include_timeout=True, host="muse")
+            muse_hooks.setdefault(event, []).append(group)
         if "codex" in events:
             event, group = codex_hook_group(phase)
             codex_hooks.setdefault(event, []).append(group)
@@ -329,6 +367,10 @@ def render_hook_surfaces(config: dict[str, Any]) -> dict[Path, str]:
             if matcher:
                 entry["matcher"] = matcher
             cursor_hooks.setdefault(cursor_event, []).append(entry)
+            cursor_plugin_hooks.setdefault(cursor_event, []).append({
+                **entry,
+                "command": command_for("cursor", "plugin", phase["phase"], phase["timeout_ms"]),
+            })
 
     plugin_comment = (
         "GENERATED from config/host-integrations.json. Claude plugin hooks are "
@@ -375,6 +417,8 @@ def render_hook_surfaces(config: dict[str, Any]) -> dict[Path, str]:
         Path(".cursor/hooks.json"): json_text(
             {"$comment": cursor_comment, "version": 1, "hooks": cursor_hooks}
         ),
+        CURSOR_PLUGIN_HOOKS: json_text({"version": 1, "hooks": cursor_plugin_hooks}),
+        MUSE_ARTIFACT / "hooks/hooks.json": json_text({"hooks": muse_hooks}),
     }
 
 
@@ -413,6 +457,9 @@ def render_skill(
 
 
 def write_text(path: Path, content: str) -> None:
+    # Unchanged host settings may be read-only; regeneration needs no write there.
+    if path.is_file() and path.read_bytes() == content.encode("utf-8"):
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
 
@@ -551,10 +598,34 @@ def copy_codex_artifact(
     return dest
 
 
+def copy_muse_artifact(
+    source_root: Path,
+    dest_root: Path,
+    config: dict[str, Any],
+    codex_artifact: Path,
+    manifest: str,
+    hooks: str,
+) -> Path:
+    """Reuse the self-contained skill/reference payload without Codex metadata."""
+    dest = dest_root / config["providers"]["muse"]["plugin_root"]
+    if dest.exists():
+        shutil.rmtree(dest)
+    for directory in ("skills", "docs", "dynamic-workflows"):
+        shutil.copytree(codex_artifact / directory, dest / directory)
+    for skill in sorted(config["skills"]):
+        write_text(dest / SKILL_ROOT / skill / "SKILL.md", render_skill(source_root, config, skill, "muse"))
+    write_text(dest / ".claude-plugin/plugin.json", manifest)
+    write_text(dest / "hooks/hooks.json", hooks)
+    shutil.copy2(source_root / "hooks/rally-coordination-hook.sh", dest / "hooks/rally-coordination-hook.sh")
+    return dest
+
+
 def digest_inputs(
     surfaces: dict[Path, str],
     skills: dict[Path, str],
     codex_artifact: Path,
+    *,
+    bundles: dict[Path, Path] | None = None,
 ) -> str:
     digest = hashlib.sha256()
     for path, content in sorted({**surfaces, **skills}.items(), key=lambda item: str(item[0])):
@@ -562,15 +633,17 @@ def digest_inputs(
         digest.update(b"\0")
         digest.update(content.encode())
         digest.update(b"\0")
-    if codex_artifact.is_dir():
+    for prefix, artifact in {CODEX_ARTIFACT: codex_artifact, **(bundles or {})}.items():
+        if not artifact.is_dir():
+            continue
         for path in sorted(
             p
-            for p in codex_artifact.rglob("*")
+            for p in artifact.rglob("*")
             if p.is_file()
             and p.name not in {".DS_Store", "rally-release.json"}
         ):
             digest.update(
-                str(CODEX_ARTIFACT / path.relative_to(codex_artifact)).encode()
+                str(prefix / path.relative_to(artifact)).encode()
             )
             digest.update(b"\0")
             digest.update(path.read_bytes())
@@ -621,6 +694,11 @@ def generate(
         surfaces[Path(".codex-plugin/plugin.json")],
         artifact_dest=artifact_dest,
     )
+    muse_artifact = copy_muse_artifact(
+        source_root, dest_root, config, artifact,
+        surfaces[MUSE_ARTIFACT / ".claude-plugin/plugin.json"],
+        surfaces[MUSE_ARTIFACT / "hooks/hooks.json"],
+    )
 
     identity = {
         "schema": "agent-rally.release-identity.v1",
@@ -631,6 +709,7 @@ def generate(
             surfaces,
             skills,
             artifact,
+            bundles={MUSE_ARTIFACT: muse_artifact},
         ),
     }
     identity_text = json_text(identity)
