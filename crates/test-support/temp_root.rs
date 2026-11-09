@@ -157,7 +157,10 @@ fn create_area(base: &Path) -> ProcessArea {
         {
             Ok(file) => file,
             Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
-            Err(err) => panic!("test temp root: cannot create {}: {err}", lock_path.display()),
+            Err(err) => panic!(
+                "test temp root: cannot create {}: {err}",
+                lock_path.display()
+            ),
         };
         if lock.try_lock().is_err() {
             continue;
