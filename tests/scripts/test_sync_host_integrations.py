@@ -476,30 +476,238 @@ class LocalMarketplaceIdentityTests(unittest.TestCase):
         self.assertEqual(SYNC.compare_versions("1.0.0-rc1", "1.0.0"), -1)
         self.assertIsNone(SYNC.compare_versions("local", "0.2.9"))
 
-    def test_two_enabled_providers_stay_a_duplicate(self) -> None:
+
+CANONICAL_CLAUDE_ID = "agent-rally-point@agent-rally-point"
+OTHER_CLAUDE_ID = "agent-rally-point@ross-labs-local"
+
+
+def uninstall(plugin_id: str) -> list[str]:
+    return ["claude", "plugin", "uninstall", plugin_id, "--yes"]
+
+
+class DuplicateProviderTests(unittest.TestCase):
+    """Two or more providers: keep exactly one by version, remove the rest."""
+
+    def plan(self, providers: list[tuple[str, dict[str, str]]]) -> tuple[dict, list]:
         with tempfile.TemporaryDirectory() as tmp:
-            install = Path(tmp)
-            (install / "rally-release.json").write_text(json.dumps(identity()))
+            entries = []
+            for index, (plugin_id, installed) in enumerate(providers):
+                install = Path(tmp) / str(index)
+                install.mkdir()
+                (install / "rally-release.json").write_text(json.dumps(installed))
+                entries.append(
+                    {"id": plugin_id, "enabled": True, "installPath": str(install)}
+                )
             runner = FakeRunner(
-                {
-                    ("claude", "plugin", "list", "--json"): (
-                        0,
-                        [
-                            {"id": LOCAL_CLAUDE_ID, "enabled": True, "installPath": str(install)},
-                            {
-                                "id": "agent-rally-point@agent-rally-point",
-                                "enabled": True,
-                                "installPath": str(install),
-                            },
-                        ],
-                    )
-                }
+                {("claude", "plugin", "list", "--json"): (0, entries)}
             )
             report = SYNC.reconcile(
-                ROOT, host="claude_code", apply=False, runner=runner, home=install
+                ROOT, host="claude_code", apply=False, runner=runner, home=Path(tmp)
             )
-        self.assertEqual(report["hosts"]["claude_code"]["status"], "duplicate_provider")
-        self.assertTrue(report["apply"]["planned_commands"])
+        return report["hosts"]["claude_code"], report["apply"]["planned_commands"]
+
+    def test_newer_local_beats_older_canonical(self) -> None:
+        record, planned = self.plan(
+            [
+                (CANONICAL_CLAUDE_ID, {**identity(), "version": "0.0.1"}),
+                (LOCAL_CLAUDE_ID, {**identity(), "version": "99.0.0"}),
+            ]
+        )
+        self.assertEqual(record["status"], "duplicate_provider")
+        self.assertEqual(record["kept_provider"], LOCAL_CLAUDE_ID)
+        self.assertEqual(planned, [uninstall(CANONICAL_CLAUDE_ID)])
+
+    def test_newer_canonical_beats_older_local(self) -> None:
+        record, planned = self.plan(
+            [
+                (LOCAL_CLAUDE_ID, {**identity(), "version": "0.0.1"}),
+                (CANONICAL_CLAUDE_ID, {**identity(), "version": "99.0.0"}),
+            ]
+        )
+        self.assertEqual(record["kept_provider"], CANONICAL_CLAUDE_ID)
+        self.assertEqual(planned, [uninstall(LOCAL_CLAUDE_ID)])
+
+    def test_two_noncanonical_providers_keep_the_newer_and_refresh_it(self) -> None:
+        record, planned = self.plan(
+            [
+                (OTHER_CLAUDE_ID, {**identity(), "version": "0.0.1"}),
+                (LOCAL_CLAUDE_ID, {**identity(), "version": "0.0.5"}),
+            ]
+        )
+        self.assertEqual(record["kept_provider"], LOCAL_CLAUDE_ID)
+        self.assertEqual(
+            planned,
+            [uninstall(OTHER_CLAUDE_ID), ["claude", "plugin", "update", LOCAL_CLAUDE_ID]],
+        )
+
+    def test_two_noncanonical_providers_never_leave_zero(self) -> None:
+        _, planned = self.plan(
+            [(OTHER_CLAUDE_ID, identity()), (LOCAL_CLAUDE_ID, identity())]
+        )
+        removed = [c[3] for c in planned if c[:3] == ["claude", "plugin", "uninstall"]]
+        self.assertEqual(len(removed), 1)
+
+    def test_version_tie_keeps_the_identity_matching_provider(self) -> None:
+        record, planned = self.plan(
+            [
+                (
+                    CANONICAL_CLAUDE_ID,
+                    {**identity(), "generated_surface_digest": "sha256:other"},
+                ),
+                (LOCAL_CLAUDE_ID, identity()),
+            ]
+        )
+        self.assertEqual(record["kept_provider"], LOCAL_CLAUDE_ID)
+        self.assertEqual(planned, [uninstall(CANONICAL_CLAUDE_ID)])
+
+    def test_full_tie_keeps_the_canonical_id(self) -> None:
+        record, planned = self.plan(
+            [(LOCAL_CLAUDE_ID, identity()), (CANONICAL_CLAUDE_ID, identity())]
+        )
+        self.assertEqual(record["status"], "duplicate_provider")
+        self.assertEqual(planned, [uninstall(LOCAL_CLAUDE_ID)])
+
+    def test_unparseable_version_ranks_lowest(self) -> None:
+        _, planned = self.plan(
+            [
+                (CANONICAL_CLAUDE_ID, {**identity(), "version": "local"}),
+                (LOCAL_CLAUDE_ID, {**identity(), "version": "0.0.1"}),
+            ]
+        )
+        self.assertEqual(
+            planned,
+            [
+                uninstall(CANONICAL_CLAUDE_ID),
+                ["claude", "plugin", "update", LOCAL_CLAUDE_ID],
+            ],
+        )
+
+
+class VersionPrecedenceTests(unittest.TestCase):
+    def test_prerelease_precedence(self) -> None:
+        cmp = SYNC.compare_versions
+        self.assertEqual(cmp("0.3.0-rc.2", "0.3.0-rc.1"), 1)
+        self.assertEqual(cmp("1.0.0-rc.1", "1.0.0"), -1)
+        self.assertEqual(cmp("1.0.0-alpha", "1.0.0-alpha.1"), -1)
+        self.assertEqual(cmp("1.0.0-alpha.1", "1.0.0-beta"), -1)
+        self.assertEqual(cmp("1.0.0-rc.10", "1.0.0-rc.9"), 1)
+        self.assertEqual(cmp("1.0.0-1", "1.0.0-alpha"), -1)
+        self.assertEqual(cmp("1.0.0+build.5", "1.0.0+build.9"), 0)
+        self.assertEqual(cmp("1.0.0-rc.1+x", "1.0.0-rc.1"), 0)
+
+    def test_non_semver_suffixes_are_unparseable(self) -> None:
+        for text in ("0.3.0rc1", "0.3.0.dev1", "local", "", None, "1.0.0-"):
+            self.assertIsNone(SYNC.parse_version(text), text)
+        self.assertIsNone(SYNC.compare_versions("0.3.0rc1", "0.3.0"))
+
+
+class UnreadableIdentityTests(unittest.TestCase):
+    """A missing or unparseable identity never becomes a swap to another marketplace."""
+
+    def plan(self, plugin_id: str, installed: dict | None) -> list[list[str]]:
+        with tempfile.TemporaryDirectory() as tmp:
+            install = Path(tmp)
+            if installed is not None:
+                (install / "rally-release.json").write_text(json.dumps(installed))
+            report = SYNC.reconcile(
+                ROOT,
+                host="claude_code",
+                apply=False,
+                runner=claude_list_with(install, plugin_id),
+                home=install,
+            )
+        return report["apply"]["planned_commands"]
+
+    def test_local_provider_without_identity_is_refreshed_in_place(self) -> None:
+        self.assertEqual(
+            self.plan(LOCAL_CLAUDE_ID, None),
+            [["claude", "plugin", "update", LOCAL_CLAUDE_ID]],
+        )
+
+    def test_local_provider_with_unparseable_version_is_refreshed_in_place(self) -> None:
+        self.assertEqual(
+            self.plan(LOCAL_CLAUDE_ID, {**identity(), "version": "local"}),
+            [["claude", "plugin", "update", LOCAL_CLAUDE_ID]],
+        )
+
+    def test_canonical_provider_without_identity_takes_the_canonical_update(self) -> None:
+        config = json.loads((ROOT / "config/host-integrations.json").read_text())
+        self.assertEqual(
+            self.plan(CANONICAL_CLAUDE_ID, None),
+            [list(config["providers"]["claude_code"]["update_command"])],
+        )
+
+
+class StatefulClaudeRunner(FakeRunner):
+    """Claude host whose installed version changes when `plugin update` runs."""
+
+    def __init__(self, install: Path, before: dict, after: dict) -> None:
+        super().__init__(
+            {
+                ("codex", "plugin", "list", "--json"): (0, {"installed": []}),
+            }
+        )
+        self.install, self.after = install, after
+        (install / "rally-release.json").write_text(json.dumps(before))
+
+    def __call__(self, command: list[str]) -> SYNC.CommandResult:
+        if command[:3] == ["claude", "plugin", "list"]:
+            self.commands.append(list(command))
+            entry = [{"id": LOCAL_CLAUDE_ID, "enabled": True, "installPath": str(self.install)}]
+            return SYNC.CommandResult(list(command), 0, json.dumps(entry), "")
+        if command[:3] == ["claude", "plugin", "update"]:
+            (self.install / "rally-release.json").write_text(json.dumps(self.after))
+        return super().__call__(command)
+
+
+class InPlaceApplyTests(unittest.TestCase):
+    def test_apply_refreshes_in_place_then_requires_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = StatefulClaudeRunner(
+                Path(tmp), {**identity(), "version": "0.0.1"}, identity()
+            )
+            report = SYNC.reconcile(
+                ROOT, host="claude_code", apply=True, runner=runner, home=Path(tmp)
+            )
+        self.assertEqual(
+            runner.commands,
+            [
+                ["claude", "plugin", "list", "--json"],
+                ["claude", "plugin", "update", LOCAL_CLAUDE_ID],
+                ["claude", "plugin", "list", "--json"],
+            ],
+        )
+        record = report["hosts"]["claude_code"]
+        self.assertEqual(record["status"], "restart_required")
+        self.assertTrue(record["restart_required"])
+        self.assertEqual(report["apply"]["failed"], 0)
+
+    def test_main_exit_codes_for_ahead_and_diverged(self) -> None:
+        import contextlib
+        import io
+        import subprocess
+        from unittest import mock
+
+        def exit_code(installed: dict) -> int:
+            with tempfile.TemporaryDirectory() as tmp:
+                install = Path(tmp)
+                (install / "rally-release.json").write_text(json.dumps(installed))
+                runner = claude_list_with(install)
+
+                def fake_run(command, **_kwargs):
+                    result = runner(command)
+                    return subprocess.CompletedProcess(
+                        command, result.returncode, result.stdout, result.stderr
+                    )
+
+                with mock.patch.object(SYNC.subprocess, "run", fake_run), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    return SYNC.main(["--root", str(ROOT), "--host", "claude_code"])
+
+        self.assertEqual(exit_code({**identity(), "version": "99.0.0"}), 0)
+        self.assertEqual(
+            exit_code({**identity(), "generated_surface_digest": "sha256:other"}), 2
+        )
 
 
 if __name__ == "__main__":

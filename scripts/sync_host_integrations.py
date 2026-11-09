@@ -31,7 +31,13 @@ STATUS_ORDER = {
 NO_ACTION_STATUSES = frozenset({"current", "ahead", "unknown"})
 # Statuses that exit 0 from the CLI (nothing to reconcile).
 EXIT_OK_STATUSES = frozenset({"current", "ahead", "restart_required"})
-VERSION_NUMBER = re.compile(r"^v?(\d+(?:\.\d+)*)(.*)$")
+# Semantic-version shape: numeric core, optional `-` pre-release, optional `+` build.
+_IDENT = r"[0-9A-Za-z-]+"
+VERSION_PATTERN = re.compile(
+    rf"^v?(\d+(?:\.\d+)*)(?:-({_IDENT}(?:\.{_IDENT})*))?(?:\+{_IDENT}(?:\.{_IDENT})*)?$"
+)
+# Rank of a missing/unparseable version: below every parseable one.
+UNPARSEABLE_RANK = (0, ())
 
 
 @dataclass(frozen=True)
@@ -124,20 +130,32 @@ def identity_matches(actual: dict[str, Any], expected: dict[str, Any]) -> bool:
     )
 
 
-def parse_version(value: Any) -> tuple[tuple[int, ...], bool] | None:
-    """Return (numeric components, is_release) or None when unparseable.
+VersionKey = tuple[tuple[int, ...], int, tuple[tuple[int, Any], ...]]
 
-    A pre-release suffix (``-rc1``) sorts below the same numeric release.
-    Trailing zero components are ignored so 0.2 equals 0.2.0.
+
+def parse_version(value: Any) -> VersionKey | None:
+    """Semantic-version precedence key, or None when the text is not a version.
+
+    Core numbers compare numerically (trailing zeros ignored, so 0.2 == 0.2.0).
+    A pre-release ranks below the plain release; its dot-separated identifiers
+    compare left to right, numeric ones numerically and below alphanumeric
+    ones, and a shorter identifier list ranks lower when all earlier ones are
+    equal. Build metadata after ``+`` is ignored. Anything else (``0.3.0rc1``,
+    ``0.3.0.dev1``, ``local``) is unparseable: no guessing.
     """
-    match = VERSION_NUMBER.match(str(value or "").strip())
+    match = VERSION_PATTERN.match(str(value or "").strip())
     if not match:
         return None
     numbers = [int(part) for part in match.group(1).split(".")]
     while len(numbers) > 1 and numbers[-1] == 0:
         numbers.pop()
-    suffix = match.group(2).strip()
-    return tuple(numbers), not suffix.startswith("-")
+    pre = match.group(2)
+    if pre is None:
+        return tuple(numbers), 1, ()
+    identifiers = tuple(
+        (0, int(part)) if part.isdigit() else (1, part) for part in pre.split(".")
+    )
+    return tuple(numbers), 0, identifiers
 
 
 def compare_versions(installed: Any, canonical: Any) -> int | None:
@@ -146,6 +164,33 @@ def compare_versions(installed: Any, canonical: Any) -> int | None:
     if left is None or right is None:
         return None
     return (left > right) - (left < right)
+
+
+def provider_rank(
+    provider: dict[str, Any], canonical_id: str, expected: dict[str, Any]
+) -> tuple:
+    """Sort key for choosing which duplicate to keep (higher wins).
+
+    Highest version, then identity equal to canonical, then the canonical id.
+    An unparseable or missing version ranks lowest.
+    """
+    identity = provider.get("identity") or {}
+    key = parse_version(identity.get("version"))
+    version_rank = UNPARSEABLE_RANK if key is None else (1, key)
+    return (
+        version_rank,
+        identity_matches(identity, expected),
+        provider.get("id") == canonical_id,
+    )
+
+
+def choose_kept_provider(
+    providers: list[dict[str, Any]], canonical_id: str, expected: dict[str, Any]
+) -> dict[str, Any] | None:
+    """The one provider to keep among installed ones; the rest are removed."""
+    if not providers:
+        return None
+    return max(providers, key=lambda p: provider_rank(p, canonical_id, expected))
 
 
 def marketplace_of(provider: dict[str, Any]) -> str:
@@ -176,29 +221,22 @@ def host_record(
             "restart_required": False,
             "reason": "agent-rally-point is not installed",
         }
-    if len(providers) != 1:
+    kept = choose_kept_provider(providers, canonical_id, expected)
+    assert kept is not None
+    status, reason = classify_provider(kept, expected)
+    if len(providers) > 1:
         return {
             "host": host,
             "status": "duplicate_provider",
             "providers": providers,
+            "kept_provider": kept["id"],
+            "kept_status": status,
             "restart_required": True,
-            "reason": f"expected exactly one enabled provider; found {len(providers)}",
+            "reason": (
+                f"found {len(providers)} enabled providers; keep {kept['id']} "
+                f"(highest version) and remove the rest. Kept provider: {reason}"
+            ),
         }
-    provider = providers[0]
-    marketplace = marketplace_of(provider)
-    installed_identity = provider.get("identity") or {}
-    source_identity = provider.get("source_identity") or {}
-    if identity_matches(installed_identity, expected):
-        status = "current"
-        reason = (
-            "installed plugin identity matches canonical generated surfaces "
-            f"(marketplace {marketplace})"
-        )
-    elif identity_matches(source_identity, expected):
-        status = "restart_required"
-        reason = "marketplace source is current but installed cache is stale"
-    else:
-        status, reason = classify_mismatch(installed_identity, expected, marketplace)
     return {
         "host": host,
         "status": status,
@@ -206,6 +244,23 @@ def host_record(
         "restart_required": status == "restart_required",
         "reason": reason,
     }
+
+
+def classify_provider(
+    provider: dict[str, Any], expected: dict[str, Any]
+) -> tuple[str, str]:
+    """Status and reason for one installed provider against the canonical identity."""
+    marketplace = marketplace_of(provider)
+    installed_identity = provider.get("identity") or {}
+    source_identity = provider.get("source_identity") or {}
+    if identity_matches(installed_identity, expected):
+        return "current", (
+            "installed plugin identity matches canonical generated surfaces "
+            f"(marketplace {marketplace})"
+        )
+    if identity_matches(source_identity, expected):
+        return "restart_required", "marketplace source is current but installed cache is stale"
+    return classify_mismatch(installed_identity, expected, marketplace)
 
 
 def classify_mismatch(
@@ -360,79 +415,59 @@ def diagnose(
     }
 
 
-def sole_other_marketplace_provider(
-    record: dict[str, Any], canonical_id: str
-) -> dict[str, Any] | None:
-    """The single installed provider when it came from another marketplace.
-
-    Such a provider is refreshed from the marketplace it was installed from. It
-    is never uninstalled in favor of the canonical marketplace: a local
-    directory marketplace is a legitimate source and is often the newer one.
-    """
-    providers = record.get("providers", [])
-    if len(providers) == 1 and providers[0].get("id") != canonical_id:
-        return providers[0]
-    return None
-
-
 def apply_commands(
     report: dict[str, Any], config: dict[str, Any], host: str
 ) -> list[list[str]]:
+    """Plan one host at a time: drop the duplicates that lose, then refresh the kept one.
+
+    The kept provider is never removed in favor of another marketplace. A kept
+    provider from another marketplace is refreshed from its own marketplace; a
+    canonical one takes the canonical update path.
+    """
     commands: list[list[str]] = []
-    if host in {"all", "claude_code"}:
-        record = report["hosts"].get("claude_code", {})
-        canonical_id = config["providers"]["claude_code"]["canonical_id"]
-        in_place = sole_other_marketplace_provider(record, canonical_id)
+    for name in ("claude_code", "codex"):
+        if host not in {"all", name}:
+            continue
+        record = report["hosts"].get(name, {})
         if record.get("status") in NO_ACTION_STATUSES:
-            pass
-        elif in_place is not None:
-            commands.append(["claude", "plugin", "update", str(in_place["id"])])
-        else:
-            for provider in record.get("providers", []):
-                if provider.get("id") != canonical_id:
-                    commands.append(
-                        [
-                            "claude",
-                            "plugin",
-                            "uninstall",
-                            str(provider["id"]),
-                            "--yes",
-                        ]
-                    )
-            commands.append(list(config["providers"]["claude_code"]["update_command"]))
-    if host in {"all", "codex"}:
-        record = report["hosts"].get("codex", {})
-        if record.get("status") in NO_ACTION_STATUSES:
-            return commands
-        canonical_id = config["providers"]["codex"]["canonical_id"]
-        in_place = sole_other_marketplace_provider(record, canonical_id)
-        if in_place is not None:
-            provider_id = str(in_place["id"])
-            # Same order as the canonical path: refresh the marketplace
-            # snapshot first, then replace the installed copy from it.
-            commands.extend(
-                [
-                    ["codex", "plugin", "marketplace", "upgrade", marketplace_of(in_place), "--json"],
-                    ["codex", "plugin", "remove", provider_id, "--json"],
-                    ["codex", "plugin", "add", provider_id, "--json"],
-                ]
-            )
-            return commands
+            continue
+        provider_config = config["providers"][name]
+        canonical_id = provider_config["canonical_id"]
+        kept = choose_kept_provider(
+            record.get("providers", []), canonical_id, report.get("canonical", {})
+        )
+        kept_id = kept.get("id") if kept else None
         for provider in record.get("providers", []):
-            if provider.get("id") != canonical_id:
-                commands.append(
-                    ["codex", "plugin", "remove", str(provider["id"]), "--json"]
-                )
-        commands.append(list(config["providers"]["codex"]["upgrade_command"]))
-        if any(
-            provider.get("id") == canonical_id
-            for provider in record.get("providers", [])
-        ):
-            commands.append(
-                ["codex", "plugin", "remove", canonical_id, "--json"]
-            )
-        commands.append(list(config["providers"]["codex"]["install_command"]))
+            if provider.get("id") != kept_id:
+                commands.append(REMOVE_COMMANDS[name](str(provider["id"])))
+        if record.get("kept_status", record["status"]) in NO_ACTION_STATUSES:
+            continue
+        if kept is not None and kept_id != canonical_id:
+            commands.extend(IN_PLACE_COMMANDS[name](kept))
+        elif name == "claude_code":
+            commands.append(list(provider_config["update_command"]))
+        else:
+            commands.append(list(provider_config["upgrade_command"]))
+            if kept is not None:
+                commands.append(REMOVE_COMMANDS[name](canonical_id))
+            commands.append(list(provider_config["install_command"]))
     return commands
+
+
+REMOVE_COMMANDS: dict[str, Callable[[str], list[str]]] = {
+    "claude_code": lambda plugin_id: ["claude", "plugin", "uninstall", plugin_id, "--yes"],
+    "codex": lambda plugin_id: ["codex", "plugin", "remove", plugin_id, "--json"],
+}
+# Claude's `plugin update` refreshes the marketplace itself; Codex needs an
+# explicit snapshot refresh, then a remove and add (it has no replace command).
+IN_PLACE_COMMANDS: dict[str, Callable[[dict[str, Any]], list[list[str]]]] = {
+    "claude_code": lambda provider: [["claude", "plugin", "update", str(provider["id"])]],
+    "codex": lambda provider: [
+        ["codex", "plugin", "marketplace", "upgrade", marketplace_of(provider), "--json"],
+        ["codex", "plugin", "remove", str(provider["id"]), "--json"],
+        ["codex", "plugin", "add", str(provider["id"]), "--json"],
+    ],
+}
 
 
 def reconcile(
