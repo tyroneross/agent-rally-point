@@ -478,7 +478,8 @@ mod imp {
                     let snapshot = project()
                         .map_err(rally_to_wire)?
                         .snapshot
-                        .for_obligation_target(&tool, row_limit);
+                        .for_obligation_target(&tool, row_limit)
+                        .map_err(rally_to_wire)?;
                     Ok(StoreOk::Snapshot {
                         snapshot: snapshot_to_wire(&snapshot)?,
                         fingerprint: None,
@@ -3242,7 +3243,11 @@ mod imp {
                     "{kind} reply {bytes} bytes exceeds {REPLY_BOUND}"
                 );
             }
-            let direct = store.snapshot().unwrap().for_obligation_target(me, 128);
+            let direct = store
+                .snapshot()
+                .unwrap()
+                .for_obligation_target(me, 128)
+                .unwrap();
             drop(store);
 
             let cfg = ServeConfig {

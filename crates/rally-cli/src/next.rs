@@ -1190,6 +1190,7 @@ pub(crate) fn build_attention(
 pub(crate) fn bound_enter_attention(
     snapshot: &RoomSnapshot,
     tool: &str,
+    cursor_before: i64,
     mut items: Vec<AttentionItem>,
 ) -> (Vec<AttentionItem>, usize, usize, usize) {
     let visible_obligation_ids = snapshot
@@ -1222,7 +1223,26 @@ pub(crate) fn bound_enter_attention(
             .max(built_obligations)
     };
     let non_obligation_items = items.len().saturating_sub(built_obligations);
-    let total = non_obligation_items.saturating_add(exact_obligations);
+    // Rows a caller-scoped reply left out of the cursor-gated buckets. Every
+    // ledger seq is > 0, so with no cursor they all count and the total is
+    // exact; above a cursor the omitted rows' seqs are not carried, so the
+    // total is a lower bound (named work and claims are never omitted).
+    let projection_omitted = if cursor_before <= 0 {
+        [
+            crate::store::CALLER_ATTENTION_OPEN_HANDOFFS_BUCKET,
+            "current_decisions",
+            "current_risks",
+            "unconsumed_artifacts",
+        ]
+        .iter()
+        .map(|bucket| snapshot.caller_projection_omitted(bucket))
+        .sum()
+    } else {
+        0
+    };
+    let total = non_obligation_items
+        .saturating_add(exact_obligations)
+        .saturating_add(projection_omitted);
     items.truncate(MAX_ENTER_ROWS);
     let emitted = items.len();
     let omitted = total.saturating_sub(emitted);
@@ -1256,7 +1276,8 @@ mod tests {
             open_obligations: vec![a, b],
             ..Default::default()
         }
-        .for_obligation_target("receiver", 1);
+        .for_obligation_target("receiver", 1)
+        .unwrap();
         let candidates = next_candidates(
             &snapshot,
             "receiver",
@@ -1606,6 +1627,7 @@ mod tests {
         let (attention, total, emitted, omitted) = bound_enter_attention(
             &snapshot,
             "codex",
+            0,
             build_attention(&snapshot, "codex", 0, &[]),
         );
         assert_eq!(total, MAX_ENTER_ROWS + 12);
@@ -1648,6 +1670,7 @@ mod tests {
         let (attention, total, emitted, omitted) = bound_enter_attention(
             &snapshot,
             "codex",
+            i64::MAX,
             build_attention(&snapshot, "codex", i64::MAX, &[]),
         );
         assert_eq!(attention.len(), MAX_ENTER_ROWS);
@@ -2094,6 +2117,41 @@ mod tests {
             !attention
                 .iter()
                 .any(|item| item.reason == "handoff_assigned" && item.event_id == "pool")
+        );
+    }
+
+    /// Guaranteed rows (here: claims, which every `--path` filter reads) are
+    /// never evicted; when they alone exceed their bound the caller projection
+    /// fails with the typed `caller-projection-too-large` error.
+    #[test]
+    fn guaranteed_rows_over_their_bound_fail_loudly_instead_of_evicting() {
+        let claim = |n: usize, pad: usize| Fact {
+            event_id: format!("claim-{n}"),
+            seq: n as i64 + 1,
+            kind: FactKind::Claim,
+            tool: Some(format!("peer-{n}")),
+            scope: vec![format!("file:src/f{n}.rs")],
+            summary: Some("p".repeat(pad)),
+            ..Fact::default()
+        };
+        // 700 claims x ~1 KB: past the optional row/byte bound, under the
+        // guaranteed bound -> every claim kept.
+        let snapshot = RoomSnapshot {
+            active_claims: (0..700).map(|n| claim(n, 1_000)).collect(),
+            ..RoomSnapshot::default()
+        };
+        let kept = snapshot.for_obligation_target("codex", 16).unwrap();
+        assert_eq!(kept.active_claims.len(), 700);
+        // 4,000 claims x ~1 KB: guaranteed rows alone exceed 3 MiB.
+        let snapshot = RoomSnapshot {
+            active_claims: (0..4_000).map(|n| claim(n, 1_000)).collect(),
+            ..RoomSnapshot::default()
+        };
+        let err = snapshot.for_obligation_target("codex", 16).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(crate::store::CALLER_PROJECTION_TOO_LARGE),
+            "{err}"
         );
     }
 }

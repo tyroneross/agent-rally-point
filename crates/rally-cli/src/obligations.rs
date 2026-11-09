@@ -498,7 +498,10 @@ mod tests {
             ..Default::default()
         };
         for limit in [0, 1] {
-            let scoped = full.clone().for_obligation_target("receiver", limit);
+            let scoped = full
+                .clone()
+                .for_obligation_target("receiver", limit)
+                .unwrap();
             let mut wire = crate::store::snapshot_to_wire_value(&scoped).unwrap();
             let restored = crate::store::snapshot_from_wire_value(wire.clone()).unwrap();
             let inbox = super::build_inbox(&restored, "receiver", limit, 300, vec![]);

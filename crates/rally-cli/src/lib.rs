@@ -3798,6 +3798,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     let (attention, attention_total, attention_emitted, attention_omitted) = bound_enter_attention(
         &snapshot,
         &tool,
+        cursor_before,
         build_attention(&snapshot, &tool, cursor_before, &paths),
     );
     let entry = build_entry(&snapshot, &tool, role.as_deref(), &paths);
@@ -5436,8 +5437,11 @@ fn command_next(args: NextArgs) -> Result<Output> {
     } else {
         append_next_wake_intent(&room, &snapshot, &tool, &paths, &next)?
     };
+    // Re-read through the same bounded caller projection: a full
+    // `room.snapshot()` here grows with the room and failed every actionable
+    // routed `next` once the room passed the frame (AGEN-ENTER-m6ztgb9h6p7barc8cr79q).
     let snapshot = if wake_intent.is_some() {
-        room.snapshot()?
+        room.snapshot_for_obligation_target(&tool, 128)?
     } else {
         snapshot
     };
@@ -5576,7 +5580,7 @@ fn command_inbox(args: cli::InboxArgs) -> Result<Output> {
     let mut inboxes = BTreeMap::new();
     for tool in tools {
         let snapshot = match &base {
-            Some(base) => base.clone().for_obligation_target(&tool, row_limit),
+            Some(base) => base.clone().for_obligation_target(&tool, row_limit)?,
             None => room.snapshot_for_obligation_target(&tool, row_limit)?,
         };
         let inbox = inbox_for(
