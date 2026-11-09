@@ -303,6 +303,31 @@ class GenerateHostSurfacesTests(unittest.TestCase):
             )
             self.assertIn("user-invocable: false", on_disk.split("---")[1])
 
+    def test_every_shipped_skill_body_fits_the_smallest_host_limit(self) -> None:
+        config = GEN.load_config(ROOT)
+        limit = config["skill_body_limit"]["bytes"]
+        self.assertTrue(config["skill_body_limit"]["source"])
+        for skill_id in sorted(config["skills"]):
+            path = ROOT / GEN.SKILL_ROOT / skill_id / "SKILL.md"
+            _, body = GEN.split_frontmatter(path.read_text(encoding="utf-8"), path)
+            self.assertLessEqual(len(body.encode("utf-8")), limit, skill_id)
+            for host in ("claude_code", "codex", "muse", "cursor", "antigravity"):
+                GEN.render_skill(ROOT, config, skill_id, host)
+
+    def test_oversized_skill_body_fails_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shutil.copytree(ROOT / "config", root / "config")
+            config = GEN.load_config(root)
+            skill = root / GEN.SKILL_ROOT / "agent-rally-point" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            limit = config["skill_body_limit"]["bytes"]
+            skill.write_text("---\nname: x\n---\n" + "a" * (limit + 1), encoding="utf-8")
+            with self.assertRaisesRegex(GEN.GenerationError, "skill body is"):
+                GEN.render_skill(root, config, "agent-rally-point", "antigravity")
+            skill.write_text("---\nname: x\n---\n" + "a" * limit, encoding="utf-8")
+            GEN.render_skill(root, config, "agent-rally-point", "antigravity")
+
     def test_repository_surfaces_are_current(self) -> None:
         self.assertEqual(GEN.check(ROOT), [])
 
@@ -579,8 +604,8 @@ class GenerateHostSurfacesTests(unittest.TestCase):
                     if resolved.suffix.lower() == ".md" and resolved not in visited:
                         pending.append(resolved)
             self.assertEqual(unresolved, [])
-            self.assertEqual(len(visited), 11)
-            self.assertEqual(local_edges, 19)
+            self.assertEqual(len(visited), 14)
+            self.assertEqual(local_edges, 22)
 
     def test_packaged_workflow_commands_run_from_empty_consumer_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -757,6 +782,7 @@ class GenerateHostSurfacesTests(unittest.TestCase):
             plugin_skills.mkdir(parents=True)
             (plugin_skills / "demo").symlink_to("../../skills/demo")
             config = {
+                "skill_body_limit": {"bytes": 24000, "binding_host": "test", "source": "test"},
                 "skills": {
                     "demo": {
                         "name": "demo",

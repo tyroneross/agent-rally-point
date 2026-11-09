@@ -1862,7 +1862,7 @@ fn documented_receiver_ack_executes_against_bound_handoff() {
     let handoff = sent["data"]["say"]["fact"]["event_id"].as_str().unwrap();
     // Execute the actual documentation, so a stale example cannot pass merely
     // because a separately maintained test command is correct.
-    let doc = include_str!("../../../skills/agent-rally-point/SKILL.md");
+    let doc = include_str!("../../../skills/agent-rally-point/references/handoffs.md");
     let receiving = doc.split("## Receiving a Handoff").nth(1).unwrap();
     let example = receiving
         .split("```bash\n")
