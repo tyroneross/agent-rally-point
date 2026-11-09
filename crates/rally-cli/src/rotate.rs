@@ -657,16 +657,9 @@ mod tests {
     use crate::FACT_SCHEMA;
     use crate::now_string;
     use crate::store::{Fact, FactKind, RoomStore, with_mutation_deadline};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn unique_root(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("rally-rotate-{label}-{nanos}"));
-        fs::create_dir_all(&root).unwrap();
-        root
+    fn unique_root(label: &str) -> crate::test_temp_root::TempRoot {
+        crate::test_temp_root::TempRoot::new(&format!("rally-rotate-{label}"))
     }
 
     fn make_fact(seq: i64, subject: &str) -> Fact {
@@ -767,12 +760,11 @@ mod tests {
         original.extend_from_slice(br#"{"seq":2,"occurred_at":"#);
         fs::write(&source, &original).unwrap();
 
-        let error = run_rotate(root.clone(), Some(90), false)
+        let error = run_rotate(root.path().to_path_buf(), Some(90), false)
             .expect_err("an incomplete canonical tail must block rotation");
         assert!(error.to_string().contains("canonical"));
         assert_eq!(fs::read(&source).unwrap(), original);
         assert!(!root.join(".rally/archive/alpha.jsonl").exists());
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -788,12 +780,11 @@ mod tests {
         corrupt_bytes.extend_from_slice(b"not-json\n");
         fs::write(&corrupt, &corrupt_bytes).unwrap();
 
-        run_rotate(root.clone(), Some(90), false)
+        run_rotate(root.path().to_path_buf(), Some(90), false)
             .expect_err("completed corruption must fail before moving alpha");
         assert!(log_dir.join("alpha.jsonl").exists());
         assert_eq!(fs::read(&corrupt).unwrap(), corrupt_bytes);
         assert!(!root.join(".rally/archive").exists());
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -809,14 +800,13 @@ mod tests {
         assert_eq!(source_bytes.pop(), Some(b'\n'));
         fs::write(&source, &source_bytes).unwrap();
 
-        let outcome = run_rotate(root.clone(), Some(90), false).unwrap();
+        let outcome = run_rotate(root.path().to_path_buf(), Some(90), false).unwrap();
         assert_eq!(outcome.rotated.len(), 1);
         assert!(!source.exists());
         assert_eq!(
             fs::read(archive_dir.join("alpha.jsonl")).unwrap(),
             source_bytes
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -837,12 +827,11 @@ mod tests {
         let corrupt_bytes = value.to_string().into_bytes();
         fs::write(&corrupt, &corrupt_bytes).unwrap();
 
-        let error = run_rotate(root.clone(), Some(90), false)
+        let error = run_rotate(root.path().to_path_buf(), Some(90), false)
             .expect_err("a complete wrong-schema archive row must block rotation");
         assert!(error.to_string().contains("unsupported fact schema"));
         assert_eq!(fs::read(&live).unwrap(), live_bytes);
         assert_eq!(fs::read(&corrupt).unwrap(), corrupt_bytes);
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -863,12 +852,11 @@ mod tests {
         let corrupt_bytes = format!("{}\n", value).into_bytes();
         fs::write(&corrupt, &corrupt_bytes).unwrap();
 
-        let error = run_rotate(root.clone(), Some(90), false)
+        let error = run_rotate(root.path().to_path_buf(), Some(90), false)
             .expect_err("an invalid archive timestamp must block every live move");
         assert!(error.to_string().contains("invalid occurred_at"));
         assert_eq!(fs::read(&live).unwrap(), live_bytes);
         assert_eq!(fs::read(&corrupt).unwrap(), corrupt_bytes);
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -881,7 +869,7 @@ mod tests {
         write_segment(&archive_dir, "alpha", &old_ts, &[1]);
         write_segment(&log_dir, "alpha", &old_ts, &[2]);
 
-        let outcome = run_rotate(root.clone(), Some(90), false).unwrap();
+        let outcome = run_rotate(root.path().to_path_buf(), Some(90), false).unwrap();
         assert_eq!(outcome.rotated.len(), 1);
         assert_eq!(outcome.rotated[0].segment, "alpha.jsonl");
         assert_eq!(
@@ -897,7 +885,7 @@ mod tests {
         // A later segment with the same engagement must advance again instead
         // of treating the first collision as a permanent skip condition.
         write_segment(&log_dir, "alpha", &old_ts, &[3]);
-        let second = run_rotate(root.clone(), Some(90), false).unwrap();
+        let second = run_rotate(root.path().to_path_buf(), Some(90), false).unwrap();
         assert_eq!(second.rotated.len(), 1);
         assert_eq!(
             Path::new(&second.rotated[0].to)
@@ -906,7 +894,6 @@ mod tests {
             Some("alpha.rotated-0002.jsonl")
         );
         assert!(archive_dir.join("alpha.rotated-0002.jsonl").exists());
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -926,7 +913,7 @@ mod tests {
             &[1],
         );
 
-        let outcome = run_rotate(root.clone(), Some(90), false).unwrap();
+        let outcome = run_rotate(root.path().to_path_buf(), Some(90), false).unwrap();
         assert_eq!(outcome.rotated.len(), 1);
         assert_eq!(
             Path::new(&outcome.rotated[0].to)
@@ -935,7 +922,7 @@ mod tests {
             Some("ledger-pre-segment.rotated-0001.jsonl")
         );
         assert!(!archive_dir.join(ARCHIVED_MONOLITH_FILENAME).exists());
-        let store = RoomStore::open_at(root.clone()).unwrap();
+        let store = RoomStore::open_at(root.path().to_path_buf()).unwrap();
         assert!(
             store
                 .facts()
@@ -951,7 +938,6 @@ mod tests {
                 .iter()
                 .any(|fact| fact.event_id == "e1")
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -969,7 +955,7 @@ mod tests {
             &[2],
         );
 
-        let store = RoomStore::open_at(root.clone()).unwrap();
+        let store = RoomStore::open_at(root.path().to_path_buf()).unwrap();
         assert!(
             store
                 .snapshot_scoped("legacy", None, None, false, false)
@@ -988,7 +974,6 @@ mod tests {
                 .all(|fact| fact.event_id != "e2"),
             "an explicit alpha stamp must override its generational filename"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -1006,7 +991,7 @@ mod tests {
             &[1],
         );
 
-        let store = RoomStore::open_at(root.clone()).unwrap();
+        let store = RoomStore::open_at(root.path().to_path_buf()).unwrap();
         let snapshot = store
             .snapshot_scoped("alpha", None, None, false, false)
             .unwrap();
@@ -1017,7 +1002,6 @@ mod tests {
                 .any(|fact| fact.event_id == "e1"),
             "scoped replay must select generational archives by LedgerLine.engagement"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -1033,17 +1017,17 @@ mod tests {
         let source_bytes = fs::read(&source).unwrap();
 
         fail_rotation_after_archive_sync_once(&rally_dir);
-        run_rotate(root.clone(), Some(90), false)
+        run_rotate(root.path().to_path_buf(), Some(90), false)
             .expect_err("injected crash must stop before source unlink");
         let target = archive_dir.join("alpha.jsonl");
         assert_eq!(fs::read(&source).unwrap(), source_bytes);
         assert_eq!(fs::read(&target).unwrap(), source_bytes);
 
-        let retry = run_rotate(root.clone(), Some(90), false).unwrap();
+        let retry = run_rotate(root.path().to_path_buf(), Some(90), false).unwrap();
         assert_eq!(retry.rotated.len(), 1);
         assert!(!source.exists());
         assert_eq!(fs::read(&target).unwrap(), source_bytes);
-        let store = RoomStore::open_at(root.clone()).unwrap();
+        let store = RoomStore::open_at(root.path().to_path_buf()).unwrap();
         assert_eq!(
             store
                 .facts()
@@ -1053,7 +1037,6 @@ mod tests {
                 .count(),
             1
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -1071,14 +1054,14 @@ mod tests {
         .unwrap();
 
         let (rotation_reached, resume_rotation) = pause_rotation_before_install_once(&rally_dir);
-        let rotate_root = root.clone();
+        let rotate_root = root.path().to_path_buf();
         let rotate_handle = std::thread::spawn(move || run_rotate(rotate_root, Some(90), false));
         rotation_reached
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
 
         let append_fact = make_fact(2, "append serialized behind rotation");
-        let append_root = root.clone();
+        let append_root = root.path().to_path_buf();
         let append_fact_for_thread = append_fact.clone();
         let (append_started_tx, append_started_rx) = std::sync::mpsc::channel();
         let (append_done_tx, append_done_rx) = std::sync::mpsc::channel();
@@ -1106,13 +1089,16 @@ mod tests {
             .unwrap()
             .unwrap();
         append_handle.join().unwrap();
-        let retry = RoomStore::open_at(root.clone())
+        let retry = RoomStore::open_at(root.path().to_path_buf())
             .unwrap()
             .append_fact(&append_fact)
             .unwrap();
         assert_eq!(retry.fact.seq, appended.fact.seq);
 
-        let facts = RoomStore::open_at(root.clone()).unwrap().facts().unwrap();
+        let facts = RoomStore::open_at(root.path().to_path_buf())
+            .unwrap()
+            .facts()
+            .unwrap();
         assert_eq!(facts.len(), 2, "rotation+append must preserve the union");
         assert_eq!(
             facts
@@ -1122,7 +1108,6 @@ mod tests {
             1,
             "same-id retry must remain singleton across rotation"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -1137,7 +1122,7 @@ mod tests {
         let source_bytes = fs::read(&source).unwrap();
 
         let (rotation_reached, resume_rotation) = pause_rotation_before_install_once(&rally_dir);
-        let rotate_root = root.clone();
+        let rotate_root = root.path().to_path_buf();
         let rotate_handle = std::thread::spawn(move || {
             with_mutation_deadline(std::time::Duration::from_millis(40), || {
                 run_rotate(rotate_root, Some(90), false)
@@ -1156,7 +1141,6 @@ mod tests {
         assert!(matches!(error, RallyError::NotStarted(_)));
         assert_eq!(fs::read(&source).unwrap(), source_bytes);
         assert!(!rally_dir.join(ARCHIVE_DIRNAME).exists());
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -1173,7 +1157,7 @@ mod tests {
         let source_bytes = fs::read(&source).unwrap();
 
         let (link_reached, resume_link) = pause_rotation_before_link_once(&rally_dir);
-        let rotate_root = root.clone();
+        let rotate_root = root.path().to_path_buf();
         let rotate_handle = std::thread::spawn(move || {
             with_mutation_deadline(std::time::Duration::from_millis(40), || {
                 run_rotate(rotate_root, Some(90), false)
@@ -1192,7 +1176,6 @@ mod tests {
         assert!(matches!(error, RallyError::NotStarted(_)));
         assert_eq!(fs::read(&source).unwrap(), source_bytes);
         assert!(!archive_dir.join("alpha.jsonl").exists());
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -1211,7 +1194,7 @@ mod tests {
 
         let (second_link_reached, resume_second_link) =
             pause_rotation_before_source_link_once(&beta_source);
-        let rotate_root = root.clone();
+        let rotate_root = root.path().to_path_buf();
         // The budget only needs to survive real setup work that precedes the
         // pause point — archive_dir creation/fsync plus segment alpha's own
         // durable install (link + 2 fsyncs) — none of which this test is
@@ -1259,14 +1242,16 @@ mod tests {
         assert!(!beta_source.exists());
         assert!(archive_dir.join("beta.jsonl").exists());
         assert!(
-            run_rotate(root.clone(), Some(90), false)
+            run_rotate(root.path().to_path_buf(), Some(90), false)
                 .unwrap()
                 .rotated
                 .is_empty()
         );
-        let facts = RoomStore::open_at(root.clone()).unwrap().facts().unwrap();
+        let facts = RoomStore::open_at(root.path().to_path_buf())
+            .unwrap()
+            .facts()
+            .unwrap();
         assert_eq!(facts.len(), 2);
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -1282,21 +1267,20 @@ mod tests {
         let source_bytes = fs::read(&source).unwrap();
 
         fail_rotation_parent_sync_once(&rally_dir);
-        run_rotate(root.clone(), Some(90), false)
+        run_rotate(root.path().to_path_buf(), Some(90), false)
             .expect_err("first parent sync failure must stop before archive install");
         assert!(archive_dir.is_dir());
         assert_eq!(fs::read(&source).unwrap(), source_bytes);
 
         fail_rotation_parent_sync_once(&rally_dir);
-        run_rotate(root.clone(), Some(90), false)
+        run_rotate(root.path().to_path_buf(), Some(90), false)
             .expect_err("retry must resync the pre-existing archive parent before unlink");
         assert_eq!(fs::read(&source).unwrap(), source_bytes);
         assert!(!archive_dir.join("alpha.jsonl").exists());
 
-        let retry = run_rotate(root.clone(), Some(90), false).unwrap();
+        let retry = run_rotate(root.path().to_path_buf(), Some(90), false).unwrap();
         assert_eq!(retry.rotated.len(), 1);
         assert!(!source.exists());
-        fs::remove_dir_all(&root).ok();
     }
 
     /// Rotate an old segment, keep a recent one, confirm replay still
@@ -1315,7 +1299,7 @@ mod tests {
 
         // Bootstrap a real room first so facts.db exists and is consistent,
         // then layer the synthetic segments on top.
-        let store = RoomStore::open_at(root.clone()).unwrap();
+        let store = RoomStore::open_at(root.path().to_path_buf()).unwrap();
         store.append_fact(&make_fact(1, "real append")).unwrap();
         drop(store);
 
@@ -1346,7 +1330,7 @@ mod tests {
         assert!(pre_archive.is_empty());
 
         // Rotate with 90-day threshold (default).
-        let outcome = run_rotate(root.clone(), None, false).unwrap();
+        let outcome = run_rotate(root.path().to_path_buf(), None, false).unwrap();
         assert_eq!(outcome.threshold_days, DEFAULT_THRESHOLD_DAYS);
         assert_eq!(outcome.threshold_source, "default");
         assert_eq!(outcome.rotated.len(), 1, "old segment should rotate");
@@ -1361,11 +1345,9 @@ mod tests {
         assert!(log_dir.join("today.jsonl").exists());
 
         // Replay still reconstructs full history (4 events).
-        let store = RoomStore::open_at(root.clone()).unwrap();
+        let store = RoomStore::open_at(root.path().to_path_buf()).unwrap();
         let facts = store.facts().unwrap();
         assert_eq!(facts.len(), 4, "replay must see archive + live");
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// A segment with at least one fresh line stays live (no partial rotation).
@@ -1398,15 +1380,13 @@ mod tests {
         }).to_string();
         fs::write(&path, format!("{line_old}\n{line_new}\n")).unwrap();
 
-        let outcome = run_rotate(root.clone(), Some(90), false).unwrap();
+        let outcome = run_rotate(root.path().to_path_buf(), Some(90), false).unwrap();
         assert!(
             outcome.rotated.is_empty(),
             "mixed segment must not rotate; got {:?}",
             outcome.rotated
         );
         assert!(path.exists(), "mixed segment must remain live");
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// `--dry-run` reports without moving.
@@ -1428,14 +1408,12 @@ mod tests {
             (Utc::now() - Duration::days(200)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         write_segment(&log_dir, "old-only", &old_ts, &[1]);
 
-        let outcome = run_rotate(root.clone(), None, true).unwrap();
+        let outcome = run_rotate(root.path().to_path_buf(), None, true).unwrap();
         assert!(outcome.dry_run);
         assert_eq!(outcome.rotated.len(), 1);
         assert_eq!(outcome.rotated[0].reason, "would_rotate");
         // File untouched.
         assert!(log_dir.join("old-only.jsonl").exists());
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// Idempotent — running twice on already-rotated state is a no-op.
@@ -1457,16 +1435,14 @@ mod tests {
             (Utc::now() - Duration::days(200)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         write_segment(&log_dir, "old", &old_ts, &[1]);
 
-        let r1 = run_rotate(root.clone(), None, false).unwrap();
+        let r1 = run_rotate(root.path().to_path_buf(), None, false).unwrap();
         assert_eq!(r1.rotated.len(), 1);
-        let r2 = run_rotate(root.clone(), None, false).unwrap();
+        let r2 = run_rotate(root.path().to_path_buf(), None, false).unwrap();
         assert!(r2.rotated.is_empty(), "second run rotates nothing");
         assert!(
             r2.skipped.is_empty(),
             "no leftover live segments → no skips"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// Threshold-source precedence: flag > env > manifest > default.
@@ -1483,7 +1459,7 @@ mod tests {
         fs::create_dir_all(root.join(".rally")).unwrap();
 
         // Default → 90.
-        let r = run_rotate(root.clone(), None, true).unwrap();
+        let r = run_rotate(root.path().to_path_buf(), None, true).unwrap();
         assert_eq!(r.threshold_days, 90);
         assert_eq!(r.threshold_source, "default");
 
@@ -1493,7 +1469,7 @@ mod tests {
             serde_json::json!({"rotate_threshold_days": 30}).to_string(),
         )
         .unwrap();
-        let r = run_rotate(root.clone(), None, true).unwrap();
+        let r = run_rotate(root.path().to_path_buf(), None, true).unwrap();
         assert_eq!(r.threshold_days, 30);
         assert_eq!(r.threshold_source, "manifest");
 
@@ -1502,12 +1478,12 @@ mod tests {
         unsafe {
             env::set_var(THRESHOLD_ENV_VAR, "15");
         }
-        let r = run_rotate(root.clone(), None, true).unwrap();
+        let r = run_rotate(root.path().to_path_buf(), None, true).unwrap();
         assert_eq!(r.threshold_days, 15);
         assert_eq!(r.threshold_source, "env");
 
         // Flag → 7 (beats env).
-        let r = run_rotate(root.clone(), Some(7), true).unwrap();
+        let r = run_rotate(root.path().to_path_buf(), Some(7), true).unwrap();
         assert_eq!(r.threshold_days, 7);
         assert_eq!(r.threshold_source, "flag");
 
@@ -1515,6 +1491,5 @@ mod tests {
         unsafe {
             env::remove_var(THRESHOLD_ENV_VAR);
         }
-        fs::remove_dir_all(&root).ok();
     }
 }

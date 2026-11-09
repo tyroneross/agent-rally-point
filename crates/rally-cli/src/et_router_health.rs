@@ -170,16 +170,8 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    fn scratch_dir(tag: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "rally-et-router-health-test-{tag}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
+    fn scratch_dir(tag: &str) -> crate::test_temp_root::TempRoot {
+        crate::test_temp_root::TempRoot::new(&format!("rally-et-router-health-{tag}"))
     }
 
     fn write_health_json(path: &Path, body: &str) {
@@ -332,7 +324,6 @@ mod tests {
         let path = dir.join("health.json");
         write_health_json(&path, &health_json(1_000, false, &["claude:01"]));
         assert!(et_router_owns_delivery_at(&path, "claude:01", 1_000));
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -349,7 +340,6 @@ mod tests {
             .to_string(),
         );
         assert!(!et_router_owns_delivery_at(&path, "claude:01", 1_000));
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -357,7 +347,6 @@ mod tests {
         let dir = scratch_dir("missing");
         let path = dir.join("does-not-exist.json");
         assert!(!et_router_owns_delivery_at(&path, "claude:01", 1_000));
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -368,7 +357,6 @@ mod tests {
         let link = dir.join("health-link.json");
         std::os::unix::fs::symlink(&real, &link).expect("create symlink");
         assert!(!et_router_owns_delivery_at(&link, "claude:01", 1_000));
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -380,7 +368,6 @@ mod tests {
         let body = format!("{padding}{}", health_json(1_000, false, &["claude:01"]));
         write_health_json(&path, &body);
         assert!(!et_router_owns_delivery_at(&path, "claude:01", 1_000));
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -389,7 +376,6 @@ mod tests {
         let path = dir.join("health.json");
         write_health_json(&path, "{ not json ");
         assert!(!et_router_owns_delivery_at(&path, "claude:01", 1_000));
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -398,7 +384,6 @@ mod tests {
         let path = dir.join("health-as-dir");
         fs::create_dir_all(&path).expect("create dir standing in for the health file");
         assert!(!et_router_owns_delivery_at(&path, "claude:01", 1_000));
-        let _ = fs::remove_dir_all(&dir);
     }
 
     // ---- et_router_routed_identities_at() ------------------------------
@@ -415,7 +400,6 @@ mod tests {
             et_router_routed_identities_at(&path, 1_000),
             vec!["claude:01".to_string(), "codex:07".to_string()]
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -435,7 +419,6 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).expect("create symlink");
         assert!(et_router_routed_identities_at(&link, 1_000).is_empty());
         assert!(et_router_routed_identities_at(&dir.join("missing.json"), 1_000).is_empty());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     // `et_router_owns_delivery`'s env-reading branch (unset vs set) is
@@ -456,6 +439,5 @@ mod tests {
         perms.set_mode(0o600);
         fs::set_permissions(&path, perms).unwrap();
         assert!(et_router_owns_delivery_at(&path, "claude:01", 1_000));
-        let _ = fs::remove_dir_all(&dir);
     }
 }

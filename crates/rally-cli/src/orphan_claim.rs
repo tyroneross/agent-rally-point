@@ -172,9 +172,8 @@ mod tests {
 
     #[test]
     fn orphan_recovery_previews_then_closes_only_the_exact_dead_claim() {
-        let root = std::env::temp_dir().join(format!("rally-orphan-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let room = RoomStore::open_at(root.clone()).unwrap();
+        let root = crate::test_temp_root::TempRoot::new("rally-orphan-test");
+        let room = RoomStore::open_at(root.path().to_path_buf()).unwrap();
         let mut child = std::process::Command::new("sh")
             .args(["-c", "exit 0"])
             .spawn()
@@ -223,6 +222,5 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].event_id, "live-target");
         assert!(recover_in_room(&room, "orphan-target", true).is_err());
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -108,24 +108,15 @@ pub(crate) fn ungrounded_paths(
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn tmp_dir(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rally-sg-{label}-{nanos}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tmp_dir(label: &str) -> crate::test_temp_root::TempRoot {
+        crate::test_temp_root::TempRoot::new(&format!("rally-sg-{label}"))
     }
 
     #[test]
     fn hash_file_returns_none_for_missing_file() {
         let dir = tmp_dir("hash-missing");
         assert!(hash_file(&dir.join("nonexistent.rs")).is_none());
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -136,7 +127,6 @@ mod tests {
         let h1 = hash_file(&path).unwrap();
         let h2 = hash_file(&path).unwrap();
         assert_eq!(h1, h2);
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -148,7 +138,6 @@ mod tests {
         fs::write(&path, b"after").unwrap();
         let h2 = hash_file(&path).unwrap();
         assert_ne!(h1, h2);
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -160,7 +149,6 @@ mod tests {
             result.is_empty(),
             "missing file must produce no hash marker"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -171,7 +159,6 @@ mod tests {
         let result = claim_hashes(&root, &paths);
         assert_eq!(result.len(), 1);
         assert!(result[0].starts_with("claimhash:lib.rs="));
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -195,7 +182,6 @@ mod tests {
         let hashes = [("a.rs".to_string(), original)].into();
         let result = ungrounded_paths(&root, &hashes);
         assert_eq!(result, vec!["a.rs".to_string()]);
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -207,6 +193,5 @@ mod tests {
         let hashes = [("b.rs".to_string(), original)].into();
         let result = ungrounded_paths(&root, &hashes);
         assert!(result.is_empty(), "changed file must not be flagged");
-        fs::remove_dir_all(&root).ok();
     }
 }

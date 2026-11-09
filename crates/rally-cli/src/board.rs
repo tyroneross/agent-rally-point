@@ -299,14 +299,10 @@ mod tests {
     use crate::store::{Fact, FactKind, RoomStore};
     use crate::{FACT_SCHEMA, new_id, now_string};
 
-    fn test_room() -> (RoomStore, std::path::PathBuf) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("rally-board-test-{id}-{}", std::process::id()));
+    fn test_room() -> (RoomStore, crate::test_temp_root::TempRoot) {
+        let root = crate::test_temp_root::TempRoot::new("rally-board-test");
         std::fs::create_dir_all(root.join(".git")).unwrap();
-        let room = RoomStore::open_at(root.clone()).unwrap();
+        let room = RoomStore::open_at(root.path().to_path_buf()).unwrap();
         (room, root)
     }
 
@@ -337,18 +333,17 @@ mod tests {
 
     #[test]
     fn board_projects_in_flight_claim() {
-        let (room, root) = test_room();
+        let (room, _root) = test_room();
         append_fact(&room, FactKind::Claim, "active work", "tool-a");
         let board = build_board(&room).unwrap();
         assert_eq!(board.lanes.len(), 1);
         assert!(matches!(board.lanes[0].status, LaneStatus::InFlight));
         assert_eq!(board.lanes[0].owner.as_deref(), Some("tool-a"));
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn board_projects_landed_unverified_when_artifact_present() {
-        let (room, root) = test_room();
+        let (room, _root) = test_room();
         let claim = append_fact(&room, FactKind::Claim, "claim with artifact", "tool-b");
 
         let artifact = Fact {
@@ -380,7 +375,6 @@ mod tests {
             board.lanes[0].status,
             LaneStatus::LandedUnverified
         ));
-        std::fs::remove_dir_all(root).ok();
     }
 
     /// Verifies the liveness-aware projection: when a tool claimed a path 2 days
@@ -392,7 +386,7 @@ mod tests {
     #[test]
     fn board_surfaces_stale_owner_claim_as_auto_releasable() {
         use crate::store::FactKind;
-        let (room, root) = test_room();
+        let (room, _root) = test_room();
 
         // Make a stale claim by hand-writing the created_at (the helper uses
         // now_string()). Override via direct append.
@@ -470,14 +464,12 @@ mod tests {
             .find(|s| s.tool == "stale-tool")
             .expect("stale-tool must appear in agent_states");
         assert!(stale_state.stale, "stale-tool must be marked stale");
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     /// A fresh agent's claim must NOT surface in auto_releasable_claims.
     #[test]
     fn board_does_not_mark_fresh_owner_claim_as_auto_releasable() {
-        let (room, root) = test_room();
+        let (room, _root) = test_room();
         append_fact(&room, FactKind::Claim, "fresh work", "fresh-tool");
         // Add a fresh presence too, so projection has a state to work with.
         append_fact(
@@ -499,12 +491,11 @@ mod tests {
             .find(|s| s.tool == "fresh-tool")
             .expect("fresh-tool must appear");
         assert!(!fresh.stale);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn board_backlog_includes_open_and_dep_blocked() {
-        let (room, root) = test_room();
+        let (room, _root) = test_room();
 
         add_backlog_item(
             &room,
@@ -537,6 +528,5 @@ mod tests {
         assert_eq!(board.backlog.open[0].id, "dep-task");
         assert_eq!(board.backlog.dep_blocked.len(), 1);
         assert_eq!(board.backlog.dep_blocked[0].id, "main-task");
-        std::fs::remove_dir_all(root).ok();
     }
 }

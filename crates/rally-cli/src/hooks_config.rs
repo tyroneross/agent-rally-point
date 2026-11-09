@@ -673,8 +673,7 @@ mod hooks_tests {
             .unwrap_or_else(|p| p.into_inner());
         unsafe { env::remove_var("RALLY_HOOK_ROOM_DETAIL") };
 
-        let dir =
-            std::env::temp_dir().join(format!("rally-hooks-room-detail-{}", std::process::id()));
+        let dir = crate::test_temp_root::TempRoot::new("rally-hooks-room-detail");
         let home = dir.join("home");
         let _ = fs::create_dir_all(dir.join(".rally"));
         let _ = fs::create_dir_all(&home);
@@ -703,7 +702,6 @@ mod hooks_tests {
         );
 
         unsafe { env::remove_var("RALLY_HOOK_ROOM_DETAIL") };
-        let _ = fs::remove_dir_all(&dir);
     }
 }
 
@@ -764,7 +762,7 @@ mod coordination_tests {
         ] {
             unsafe { env::remove_var(k) };
         }
-        let dir = std::env::temp_dir().join(format!("rally-coord-def-{}", std::process::id()));
+        let dir = crate::test_temp_root::TempRoot::new("rally-coord-def");
         let _ = fs::create_dir_all(&dir);
         for k in [
             "RALLY_DEFAULT_CADENCE_SECS",
@@ -783,7 +781,6 @@ mod coordination_tests {
         assert_eq!(cfg.default_cadence_secs, 300);
         assert_eq!(cfg.miss_multiplier, 6);
         assert_eq!(cfg.grace_secs, 60);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -797,7 +794,7 @@ mod coordination_tests {
         ] {
             unsafe { env::remove_var(k) };
         }
-        let dir = std::env::temp_dir().join(format!("rally-coord-live-{}", std::process::id()));
+        let dir = crate::test_temp_root::TempRoot::new("rally-coord-live");
         let _ = fs::create_dir_all(dir.join(".rally"));
         fs::write(
             dir.join(".rally").join("config.json"),
@@ -813,7 +810,6 @@ mod coordination_tests {
         let cfg2 = resolve_coordination(&dir).unwrap();
         assert_eq!(cfg2.default_cadence_secs, 900, "env beats repo");
         unsafe { env::remove_var("RALLY_DEFAULT_CADENCE_SECS") };
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -828,7 +824,7 @@ mod coordination_tests {
         ] {
             unsafe { env::remove_var(k) };
         }
-        let dir = std::env::temp_dir().join(format!("rally-coord-repo-{}", std::process::id()));
+        let dir = crate::test_temp_root::TempRoot::new("rally-coord-repo");
         let _ = fs::create_dir_all(dir.join(".rally"));
         fs::write(
             dir.join(".rally").join("config.json"),
@@ -840,14 +836,13 @@ mod coordination_tests {
         assert_eq!(cfg.archive_floor_weight, 0.1);
         assert_eq!(cfg.reclaim_small_minutes, 10);
         assert_eq!(cfg.reclaim_large_minutes, 60);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn env_overrides_repo() {
         let _g = env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _cfg_env = ConfigEnvGuard;
-        let dir = std::env::temp_dir().join(format!("rally-coord-env-{}", std::process::id()));
+        let dir = crate::test_temp_root::TempRoot::new("rally-coord-env");
         let _ = fs::create_dir_all(dir.join(".rally"));
         fs::write(
             dir.join(".rally").join("config.json"),
@@ -858,7 +853,6 @@ mod coordination_tests {
         let cfg = resolve_coordination(&dir).unwrap();
         assert_eq!(cfg.half_life_hours, 72.0, "env beats repo");
         unsafe { env::remove_var("RALLY_HALF_LIFE_HOURS") };
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -873,7 +867,7 @@ mod coordination_tests {
         ] {
             unsafe { env::remove_var(k) };
         }
-        let dir = std::env::temp_dir().join(format!("rally-coord-bad-{}", std::process::id()));
+        let dir = crate::test_temp_root::TempRoot::new("rally-coord-bad");
         let _ = fs::create_dir_all(dir.join(".rally"));
         // negative half-life + out-of-range floor must be ignored → defaults kept.
         fs::write(
@@ -883,7 +877,6 @@ mod coordination_tests {
         .unwrap();
         let cfg = resolve_coordination(&dir).unwrap();
         assert_eq!(cfg, CoordinationConfig::default());
-        let _ = fs::remove_dir_all(&dir);
     }
 }
 
@@ -898,11 +891,7 @@ mod wake_ttl_config_tests {
         let _g = crate::PROCESS_ENV_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let dir = std::env::temp_dir().join(format!(
-            "rally-wake-ttl-scope-{}-{}",
-            std::process::id(),
-            crate::store::DEFAULT_WAKE_TTL_SECS
-        ));
+        let dir = crate::test_temp_root::TempRoot::new("rally-wake-ttl-scope");
         let home = dir.join("home");
         fs::create_dir_all(home.join(".config/rally")).unwrap();
         fs::create_dir_all(dir.join(".rally")).unwrap();
@@ -926,7 +915,6 @@ mod wake_ttl_config_tests {
                 None => env::remove_var("HOME"),
             }
         }
-        let _ = fs::remove_dir_all(&dir);
         assert_eq!(
             user_only.unwrap(),
             crate::store::DEFAULT_WAKE_TTL_SECS,
