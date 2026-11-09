@@ -38,12 +38,16 @@
 // real (no orphaned daemons past a test); the lint is scoped off for this fixture.
 #![allow(clippy::zombie_processes)]
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 use std::fs;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use rally_protocol::store_wire::WIRE_VERSION;
 use serde_json::Value;
@@ -73,6 +77,7 @@ fn send_signal(pid: u32, sig: i32) {
 struct TempRoom {
     cwd: PathBuf,
     home: PathBuf,
+    _roots: Vec<TempRoot>,
 }
 
 impl TempRoom {
@@ -82,7 +87,11 @@ impl TempRoom {
         fs::create_dir_all(cwd.join(".git")).expect("create temp .git");
         fs::create_dir_all(cwd.join(".rally")).expect("create temp .rally");
         fs::create_dir_all(&home).expect("create temp HOME");
-        Self { cwd, home }
+        Self {
+            cwd: cwd.to_path_buf(),
+            home: home.to_path_buf(),
+            _roots: vec![cwd, home],
+        }
     }
 
     fn rally_dir(&self) -> PathBuf {
@@ -97,21 +106,8 @@ impl TempRoom {
     }
 }
 
-impl Drop for TempRoom {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.cwd).ok();
-        fs::remove_dir_all(&self.home).ok();
-    }
-}
-
-fn temp_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "{name}-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
+fn temp_path(name: &str) -> TempRoot {
+    TempRoot::new(name)
 }
 
 // ── Daemon fixture: spawn `rally daemon serve` as a DETACHED child (do NOT
@@ -701,13 +697,8 @@ fn spawn_one_ping_then_die(
     use std::os::unix::net::UnixListener;
 
     // Short absolute socket path (well under the 103-byte sun_path limit).
-    let socket_path = std::env::temp_dir().join(format!(
-        "rally-t09-{}.sock",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let socket_root = TempRoot::new("rally-t09");
+    let socket_path = socket_root.join("s.sock");
     let _ = fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path).expect("bind fake rallyd socket");
     fs::write(
@@ -734,7 +725,7 @@ fn spawn_one_ping_then_die(
             let _ = w.flush();
         }
         drop(listener);
-        let _ = fs::remove_file(&socket_path);
+        drop(socket_root);
     })
 }
 

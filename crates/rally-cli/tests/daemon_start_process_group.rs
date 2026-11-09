@@ -5,13 +5,18 @@
 
 #![cfg(unix)]
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+
+use temp_root::TempRoot;
+
 use serde_json::Value;
 use std::cell::Cell;
 use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 #[path = "support/rally_cmd.rs"]
 mod rally_cmd;
@@ -20,16 +25,13 @@ struct Room {
     root: PathBuf,
     home: PathBuf,
     may_stop: Cell<bool>,
+    _roots: [TempRoot; 1],
 }
 
 impl Room {
     fn new() -> Self {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("rally-start-group-{}-{unique}", std::process::id()));
+        let root_guard = TempRoot::new("rally-start-group");
+        let root = root_guard.path().to_path_buf();
         let home = root.join("home");
         fs::create_dir_all(root.join(".git")).unwrap();
         fs::create_dir_all(&home).unwrap();
@@ -37,6 +39,7 @@ impl Room {
             root,
             home,
             may_stop: Cell::new(false),
+            _roots: [root_guard],
         }
     }
 
@@ -84,7 +87,6 @@ impl Drop for Room {
         if self.may_stop.get() {
             let _ = self.command().args(["daemon", "stop", "--json"]).output();
         }
-        let _ = fs::remove_dir_all(&self.root);
     }
 }
 

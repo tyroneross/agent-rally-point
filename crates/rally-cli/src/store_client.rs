@@ -1334,13 +1334,10 @@ mod tests {
     #[test]
     fn probe_rejects_a_v8_daemon_after_paged_facts_cutover() {
         assert_eq!(WIRE_VERSION, 9, "this control grades the v8 to v9 cutover");
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let rally_dir = std::env::temp_dir().join(format!("rally-wire-v2-{nonce}"));
+        let wire_root = crate::test_temp_root::TempRoot::new("rally-wire-v2");
+        let rally_dir = wire_root.join("rally");
         std::fs::create_dir_all(&rally_dir).unwrap();
-        let socket = std::env::temp_dir().join(format!("rally-wire-v2-{nonce}.sock"));
+        let socket = wire_root.join("s.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         std::fs::write(
             rally_dir.join(ADDR_FILENAME),
@@ -1370,8 +1367,6 @@ mod tests {
         assert!(error.to_string().contains("client speaks 9"));
         assert!(error.to_string().contains("daemon speaks 8"));
         server.join().unwrap();
-        std::fs::remove_file(&socket).ok();
-        std::fs::remove_dir_all(&rally_dir).ok();
     }
 
     #[test]
@@ -1452,13 +1447,9 @@ mod tests {
             writer.flush().unwrap();
         });
 
-        let cache_root = std::env::temp_dir().join(format!(
-            "routed-snapshot-cache-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        // The cache folder must not exist yet; only its holder is created.
+        let cache_holder = crate::test_temp_root::TempRoot::new("routed-snapshot-cache");
+        let cache_root = cache_holder.join("repo");
         let routed = RoutedRoomStore {
             socket: socket.clone(),
             repo_root: cache_root.clone(),
@@ -1481,7 +1472,5 @@ mod tests {
         );
 
         server.join().unwrap();
-        std::fs::remove_file(&socket).ok();
-        std::fs::remove_dir_all(&cache_root).ok();
     }
 }

@@ -24,11 +24,15 @@
 
 #![cfg(unix)]
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+
+use temp_root::TempRoot;
+
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Cadence 300 s × 1 miss + 60 s grace → 360 s window. A 3 600 s-old
 /// heartbeat is unambiguously stale; a wall-clock-now one is fresh.
@@ -39,20 +43,23 @@ const WATCHDOG_MS: &str = "30000";
 struct Room {
     cwd: PathBuf,
     home: PathBuf,
+    _roots: [TempRoot; 2],
 }
 
 impl Room {
     fn new(name: &str) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let cwd = std::env::temp_dir().join(format!("sqf-{name}-{nanos}-cwd"));
-        let home = std::env::temp_dir().join(format!("sqf-{name}-{nanos}-home"));
+        let cwd_guard = TempRoot::new(&format!("sqf-{name}-cwd"));
+        let home_guard = TempRoot::new(&format!("sqf-{name}-home"));
+        let cwd = cwd_guard.path().to_path_buf();
+        let home = home_guard.path().to_path_buf();
         fs::create_dir_all(cwd.join(".git")).unwrap();
         fs::create_dir_all(cwd.join(".rally")).unwrap();
         fs::create_dir_all(&home).unwrap();
-        Self { cwd, home }
+        Self {
+            cwd,
+            home,
+            _roots: [cwd_guard, home_guard],
+        }
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -164,13 +171,6 @@ impl Room {
         ] {
             fs::remove_file(rally.join(name)).ok();
         }
-    }
-}
-
-impl Drop for Room {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.cwd).ok();
-        fs::remove_dir_all(&self.home).ok();
     }
 }
 

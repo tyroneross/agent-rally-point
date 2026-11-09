@@ -870,16 +870,9 @@ mod tests {
     use super::*;
     use crate::FACT_SCHEMA;
     use crate::now_string;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn unique_root(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("rally-retro-{label}-{nanos}"));
-        fs::create_dir_all(&root).unwrap();
-        root
+    fn unique_root(label: &str) -> crate::test_temp_root::TempRoot {
+        crate::test_temp_root::TempRoot::new(&format!("rally-retro-{label}"))
     }
 
     fn make_fact(event_id: &str, kind: FactKind, scope: &str, summary: &str) -> Fact {
@@ -918,7 +911,7 @@ mod tests {
             std::env::remove_var(crate::store::ENGAGEMENT_ENV_VAR);
         }
         let root = unique_root("groups");
-        let mut store = RoomStore::open_at(root.clone()).unwrap();
+        let mut store = RoomStore::open_at(root.path().to_path_buf()).unwrap();
 
         store.set_active_engagement_for_test("alpha");
         store
@@ -949,7 +942,7 @@ mod tests {
         store.append_fact(&artifact).unwrap();
         drop(store);
 
-        let outcome = run_retrospective(root.clone(), None, None).unwrap();
+        let outcome = run_retrospective(root.path().to_path_buf(), None, None).unwrap();
         assert_eq!(outcome.total_facts, 6);
         assert_eq!(outcome.total_engagements, 2);
         assert_eq!(outcome.action, "created");
@@ -972,8 +965,6 @@ mod tests {
         assert!(md.contains("### Artifacts"));
         assert!(md.contains("docs/output.md"));
         assert!(md.contains("evidence: cargo test green"));
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// Regenerating without changes yields byte-identical markdown
@@ -988,7 +979,7 @@ mod tests {
             std::env::remove_var(crate::store::ENGAGEMENT_ENV_VAR);
         }
         let root = unique_root("idempotent");
-        let store = RoomStore::open_at(root.clone()).unwrap();
+        let store = RoomStore::open_at(root.path().to_path_buf()).unwrap();
         store
             .append_fact(&make_fact("e1", FactKind::Decision, "src/", "first"))
             .unwrap();
@@ -997,16 +988,14 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let outcome1 = run_retrospective(root.clone(), None, None).unwrap();
+        let outcome1 = run_retrospective(root.path().to_path_buf(), None, None).unwrap();
         let body1 = fs::read_to_string(&outcome1.output_path).unwrap();
         assert_eq!(outcome1.action, "created");
 
-        let outcome2 = run_retrospective(root.clone(), None, None).unwrap();
+        let outcome2 = run_retrospective(root.path().to_path_buf(), None, None).unwrap();
         let body2 = fs::read_to_string(&outcome2.output_path).unwrap();
         assert_eq!(outcome2.action, "unchanged");
         assert_eq!(body1, body2);
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// `--engagement` filter limits the output to one section.
@@ -1020,7 +1009,7 @@ mod tests {
             std::env::remove_var(crate::store::ENGAGEMENT_ENV_VAR);
         }
         let root = unique_root("filter");
-        let mut store = RoomStore::open_at(root.clone()).unwrap();
+        let mut store = RoomStore::open_at(root.path().to_path_buf()).unwrap();
         store.set_active_engagement_for_test("alpha");
         store
             .append_fact(&make_fact("e1", FactKind::Decision, "src/", "alpha"))
@@ -1031,12 +1020,10 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let outcome = run_retrospective(root.clone(), Some("alpha"), None).unwrap();
+        let outcome = run_retrospective(root.path().to_path_buf(), Some("alpha"), None).unwrap();
         assert_eq!(outcome.total_engagements, 1);
         let md = fs::read_to_string(&outcome.output_path).unwrap();
         assert!(md.contains("## Engagement: `alpha`"));
         assert!(!md.contains("## Engagement: `beta`"));
-
-        fs::remove_dir_all(&root).ok();
     }
 }

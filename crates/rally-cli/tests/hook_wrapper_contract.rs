@@ -11,19 +11,16 @@
 //! raw panic/backtrace into the host, even when every internal mutating rally
 //! call fails closed.
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-fn temp_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "{name}-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
+fn temp_path(name: &str) -> TempRoot {
+    TempRoot::new(name)
 }
 
 fn hook_script() -> PathBuf {
@@ -33,6 +30,7 @@ fn hook_script() -> PathBuf {
 struct TempRoom {
     cwd: PathBuf,
     home: PathBuf,
+    _roots: Vec<TempRoot>,
 }
 
 impl TempRoom {
@@ -41,7 +39,11 @@ impl TempRoom {
         let home = temp_path(&format!("hook-contract-{name}-home"));
         fs::create_dir_all(cwd.join(".git")).expect("create temp .git");
         fs::create_dir_all(&home).expect("create temp HOME");
-        Self { cwd, home }
+        Self {
+            cwd: cwd.to_path_buf(),
+            home: home.to_path_buf(),
+            _roots: vec![cwd, home],
+        }
     }
 
     /// Seed a real room (no block armed) so the hook's self-gate finds .rally/.
@@ -65,13 +67,6 @@ impl TempRoom {
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(self.cwd.join(".rally").exists(), "seed must create .rally/");
-    }
-}
-
-impl Drop for TempRoom {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.cwd).ok();
-        fs::remove_dir_all(&self.home).ok();
     }
 }
 

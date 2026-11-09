@@ -1,16 +1,20 @@
 // SPDX-FileCopyrightText: 2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 #![cfg(unix)]
+
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+
+use temp_root::TempRoot;
 #[path = "support/rally_cmd.rs"]
 mod rally_cmd;
 use serde_json::{Value, json};
-use std::{fs, path::PathBuf, process::Output};
+use std::{fs, process::Output};
 
-struct Room(PathBuf);
+struct Room(TempRoot);
 impl Room {
     fn new() -> Self {
-        let path =
-            std::env::temp_dir().join(format!("rally-optimization-{}", uuid::Uuid::new_v4()));
+        let path = TempRoot::new("rally-optimization");
         fs::create_dir_all(path.join(".git")).unwrap();
         Self(path)
     }
@@ -30,11 +34,6 @@ impl Room {
         assert_eq!(value["ok"], true, "{value}");
         assert_ne!(value["command"], "watchdog", "{value}");
         value
-    }
-}
-impl Drop for Room {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 

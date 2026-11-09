@@ -1078,20 +1078,16 @@ mod tests {
     use crate::store::RoomStore;
     use std::collections::BTreeSet;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
 
-    fn unique_root(label: &str) -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("rally-reaper-{label}-{nanos}"));
-        fs::create_dir_all(&root).unwrap();
-        root
+    /// Returns the folder path and the guard that deletes it. Keep the guard
+    /// alive (bind it to `_guard`) for as long as the path is used.
+    fn unique_root(label: &str) -> (std::path::PathBuf, crate::test_temp_root::TempRoot) {
+        let guard = crate::test_temp_root::TempRoot::new(&format!("rally-reaper-{label}"));
+        (guard.path().to_path_buf(), guard)
     }
 
     /// Build a backdated RFC-3339 timestamp `ago_secs` seconds in the past.
@@ -1316,7 +1312,7 @@ mod tests {
     /// in `run_reap_stale_in_room` and this fails.
     #[test]
     fn over_ttl_handoff_is_expired_and_leaves_open_handoffs() {
-        let root = unique_root("handoff-ttl");
+        let (root, _guard) = unique_root("handoff-ttl");
         let room = RoomStore::open_at(root.clone()).unwrap();
 
         let ago = DEFAULT_HANDOFF_EXPIRY_SECS + 24 * 60 * 60;
@@ -1332,15 +1328,13 @@ mod tests {
             room.snapshot().unwrap().open_handoffs.is_empty(),
             "an expired handoff must leave open_handoffs"
         );
-
-        fs::remove_dir_all(root).ok();
     }
 
     /// A handoff inside the window is untouched — expiry closes obligations
     /// that are over, not ones nobody has gotten to yet.
     #[test]
     fn fresh_handoff_is_not_expired() {
-        let root = unique_root("handoff-fresh");
+        let (root, _guard) = unique_root("handoff-fresh");
         let room = RoomStore::open_at(root.clone()).unwrap();
 
         append_handoff(&room, "handoff-fresh", "author", 60 * 60);
@@ -1348,15 +1342,13 @@ mod tests {
 
         assert!(report.handoffs_expired.is_empty());
         assert_eq!(room.snapshot().unwrap().open_handoffs.len(), 1);
-
-        fs::remove_dir_all(root).ok();
     }
 
     /// Fail-closed, same contract as claims: an unparseable `created_at`
     /// yields no age, so it yields no expiry verdict.
     #[test]
     fn handoff_with_unparseable_timestamp_is_never_expired() {
-        let root = unique_root("handoff-bad-ts");
+        let (root, _guard) = unique_root("handoff-bad-ts");
         let room = RoomStore::open_at(root.clone()).unwrap();
 
         let mut fact = append_handoff(&room, "handoff-bad", "author", 60);
@@ -1372,15 +1364,13 @@ mod tests {
                 .any(|h| h.handoff_id == "handoff-bad-2"),
             "an unparseable timestamp must never produce an expiry verdict"
         );
-
-        fs::remove_dir_all(root).ok();
     }
 
     /// Dry-run reports the verdict and writes nothing — the property that made
     /// `--reap-stale` safe to run must survive handoff expiry.
     #[test]
     fn handoff_expiry_dry_run_writes_nothing() {
-        let root = unique_root("handoff-dry");
+        let (root, _guard) = unique_root("handoff-dry");
         let room = RoomStore::open_at(root.clone()).unwrap();
 
         append_handoff(
@@ -1398,8 +1388,6 @@ mod tests {
             1,
             "a dry run must not close the handoff"
         );
-
-        fs::remove_dir_all(root).ok();
     }
 
     /// A zero-duration budget models a projection that has already consumed
@@ -1408,7 +1396,7 @@ mod tests {
     /// `remaining` count forever.
     #[test]
     fn zero_budget_handoff_only_queue_makes_global_progress() {
-        let root = unique_root("handoff-budget-floor");
+        let (root, _guard) = unique_root("handoff-budget-floor");
         let room = RoomStore::open_at(root.clone()).unwrap();
         let ago = DEFAULT_HANDOFF_EXPIRY_SECS + 60;
         append_handoff(&room, "handoff-budget-a", "author-a", ago);
@@ -1454,8 +1442,6 @@ mod tests {
         assert_eq!(no_op.attempted_writes, 0);
         assert!(!no_op.applied, "a no-op did not apply a durable write");
         assert!(no_op.complete, "a no-op queue is fully drained");
-
-        fs::remove_dir_all(root).ok();
     }
 
     /// Claims, handoffs, and lead cleanup share one budget. A zero budget must
@@ -1463,7 +1449,7 @@ mod tests {
     /// three unbounded appends in one pass.
     #[test]
     fn zero_budget_is_global_across_claim_handoff_and_lead() {
-        let root = unique_root("mixed-budget-floor");
+        let (root, _guard) = unique_root("mixed-budget-floor");
         let room = RoomStore::open_at(root.clone()).unwrap();
         let stale = 3 * 60 * 60;
         append_presence(&room, "stale-owner", stale);
@@ -1517,8 +1503,6 @@ mod tests {
         assert_eq!(third.remaining, 0);
         assert!(third.complete);
         assert!(room.snapshot().unwrap().lead.is_none());
-
-        fs::remove_dir_all(root).ok();
     }
 
     /// Lead-only rooms get the same first-action floor as claim-only and
@@ -1529,7 +1513,7 @@ mod tests {
     /// claim does; the explicit Full pass keeps the timestamp rule.
     #[test]
     fn automatic_pass_keeps_a_silent_lead_without_observed_death() {
-        let root = unique_root("lead-lease-only");
+        let (root, _guard) = unique_root("lead-lease-only");
         let room = RoomStore::open_at(root.clone()).unwrap();
         let stale = 3 * 60 * 60;
         append_presence(&room, "quiet-lead", stale);
@@ -1547,7 +1531,6 @@ mod tests {
         let full = run_reap_stale_in_room_with_mode_as(&room, true, ReapMode::Full, &test_actor())
             .unwrap();
         assert_eq!(full.lead_relinquished.as_deref(), Some("quiet-lead"));
-        fs::remove_dir_all(root).ok();
     }
 
     /// Fail-closed: a lead with no authored timestamp is never relinquished.
@@ -1570,7 +1553,7 @@ mod tests {
 
     #[test]
     fn zero_budget_lead_only_queue_makes_progress() {
-        let root = unique_root("lead-budget-floor");
+        let (root, _guard) = unique_root("lead-budget-floor");
         let room = RoomStore::open_at(root.clone()).unwrap();
         let stale = 3 * 60 * 60;
         append_presence(&room, "stale-lead", stale);
@@ -1589,8 +1572,6 @@ mod tests {
         assert_eq!(report.remaining, 0);
         assert!(report.applied);
         assert!(report.complete);
-
-        fs::remove_dir_all(root).ok();
     }
 
     // -------------------------------------------------------------------------
@@ -1610,7 +1591,7 @@ mod tests {
         // so this test opts in explicitly. It grades the rate limit, not the
         // default.
         unsafe { std::env::set_var("RALLY_AUTO_REAP_INTERVAL_SECS", "3600") };
-        let root = unique_root("auto-reap");
+        let (root, _guard) = unique_root("auto-reap");
         init_observed_worktree(&root);
         let room = RoomStore::open_at(root.clone()).unwrap();
 
@@ -1632,12 +1613,11 @@ mod tests {
         );
 
         unsafe { std::env::remove_var("RALLY_AUTO_REAP_INTERVAL_SECS") };
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn concurrent_auto_reap_admission_is_single_flight() {
-        let root = unique_root("auto-reap-single-flight");
+        let (root, _guard) = unique_root("auto-reap-single-flight");
         let contenders = 12;
         let start = std::sync::Arc::new(std::sync::Barrier::new(contenders));
         let hold = std::sync::Arc::new(std::sync::Barrier::new(contenders));
@@ -1663,12 +1643,11 @@ mod tests {
             .filter(|admitted| *admitted)
             .count();
         assert_eq!(admitted, 1, "exactly one overlapping enter may reap");
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn stale_auto_reap_lock_file_does_not_block_recovery() {
-        let root = unique_root("auto-reap-crash-recovery");
+        let (root, _guard) = unique_root("auto-reap-crash-recovery");
         let room = RoomStore::open_at(root.clone()).unwrap();
         let lock_path = root.join(".rally").join(AUTO_REAP_FLIGHT);
         fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
@@ -1680,7 +1659,6 @@ mod tests {
             "file existence must not masquerade as a live holder after a crash"
         );
         drop(flight);
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1701,7 +1679,7 @@ mod tests {
 
     #[test]
     fn automatic_pass_starts_no_action_after_budget_is_spent() {
-        let root = unique_root("auto-reap-zero-budget");
+        let (root, _guard) = unique_root("auto-reap-zero-budget");
         init_observed_worktree(&root);
         let room = RoomStore::open_at(root.clone()).unwrap();
         append_observed_presence(&room, "owner", &root, 2_000_000_000);
@@ -1725,12 +1703,11 @@ mod tests {
                 .any(|active| active.event_id == claim.event_id),
             "budget exhaustion must preserve the claim"
         );
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn automatic_pass_preserves_quiet_live_agent_and_reaps_crashed_agent() {
-        let root = unique_root("observed-live-and-crashed");
+        let (root, _guard) = unique_root("observed-live-and-crashed");
         init_observed_worktree(&root);
         let room = RoomStore::open_at(root.clone()).unwrap();
 
@@ -1756,12 +1733,11 @@ mod tests {
                 .iter()
                 .any(|claim| claim.event_id == crashed_claim.event_id)
         );
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn automatic_pass_only_processes_observer_eligible_expired_claims() {
-        let root = unique_root("automatic-claims-only");
+        let (root, _guard) = unique_root("automatic-claims-only");
         init_observed_worktree(&root);
         let room = RoomStore::open_at(root.clone()).unwrap();
 
@@ -1807,12 +1783,11 @@ mod tests {
                 .any(|open| open.event_id == handoff.event_id)
         );
         assert_eq!(snapshot.lead.as_deref(), Some("stale-lead"));
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn live_same_tool_sibling_does_not_protect_dead_claim_owner() {
-        let root = unique_root("session-observed-sibling");
+        let (root, _guard) = unique_root("session-observed-sibling");
         init_observed_worktree(&root);
         let room = RoomStore::open_at(root.clone()).unwrap();
 
@@ -1875,7 +1850,6 @@ mod tests {
                 .any(|claim| claim.event_id == live_claim.event_id),
             "the live sibling must remain active after the same applied pass"
         );
-        fs::remove_dir_all(root).ok();
     }
 
     /// The automatic reap decision is THREE-way on the external observation,
@@ -1920,7 +1894,7 @@ mod tests {
     /// observation rule doing work rather than an inert fixture.
     #[test]
     fn automatic_reap_decision_is_three_way_on_observation() {
-        let root = unique_root("observed-three-way");
+        let (root, _guard) = unique_root("observed-three-way");
         init_observed_worktree(&root);
         let room = RoomStore::open_at(root.clone()).unwrap();
 
@@ -2008,8 +1982,6 @@ mod tests {
             "observed live is a veto in BOTH modes — a human pass must not close it \
              either"
         );
-
-        fs::remove_dir_all(root).ok();
     }
 
     /// End-to-end grade of the observer fail-open fix (task 2914419f, F4):
@@ -2028,7 +2000,7 @@ mod tests {
     ///    age.
     #[test]
     fn unstamped_observer_session_fails_closed_after_takeover_bar() {
-        let root = unique_root("unstamped-observer-takeover");
+        let (root, _guard) = unique_root("unstamped-observer-takeover");
         init_observed_worktree(&root);
         // The probe now counts untracked non-ignored files as activity, and
         // this very test writes ledger facts into `<root>/.rally/` — ignore
@@ -2169,8 +2141,6 @@ mod tests {
                 .any(|claim| claim.event_id == busy_claim.event_id),
             "a fresh authored fact must preserve the same-shaped session"
         );
-
-        fs::remove_dir_all(root).ok();
     }
 
     /// RESIDUAL-RISK CONTROL for the observer fail-open fix (task 2914419f,
@@ -2205,7 +2175,7 @@ mod tests {
     /// end-to-end pair in `tests/attribution.rs` covers that wiring.
     #[test]
     fn automatic_reap_preserves_a_silent_unstamped_session_on_an_unexpired_lease() {
-        let root = unique_root("unstamped-observer-automatic");
+        let (root, _guard) = unique_root("unstamped-observer-automatic");
         init_observed_worktree(&root);
         // Same quiescent-worktree fixture as the Full-mode sibling: ignore the
         // ledger this test writes, then backdate the fixture files so nothing
@@ -2323,8 +2293,6 @@ mod tests {
                 .any(|claim| claim.event_id == quiet_claim.event_id),
             "the claim must still be active after the automatic pass"
         );
-
-        fs::remove_dir_all(root).ok();
     }
 
     /// THE control the residual-risk argument actually needs.
@@ -2343,7 +2311,7 @@ mod tests {
     /// no operator anywhere in the sequence. Reds without the gate.
     #[test]
     fn automatic_reap_preserves_a_silent_unstamped_session_whose_lease_expired() {
-        let root = unique_root("unstamped-observer-expired");
+        let (root, _guard) = unique_root("unstamped-observer-expired");
         init_observed_worktree(&root);
         fs::write(root.join(".gitignore"), ".rally/\n").unwrap();
         crate::test_git_fixture::fixture_git(&root, &["add", ".gitignore"]);
@@ -2449,13 +2417,11 @@ mod tests {
                 .any(|claim| claim.event_id == quiet_claim.event_id),
             "the claim must still be active after the automatic pass"
         );
-
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn expired_lease_authorizes_typed_cleanup_but_not_an_ordinary_peer_release() {
-        let root = unique_root("typed-expiry-authority");
+        let (root, _guard) = unique_root("typed-expiry-authority");
         init_observed_worktree(&root);
         let room = RoomStore::open_at(root.clone()).unwrap();
         let expired = past_ts(3600);
@@ -2587,7 +2553,6 @@ mod tests {
                     .any(|item| item == &format!("reaper:observed={observed}"))
             );
         }
-        fs::remove_dir_all(root).ok();
     }
 
     /// Auto-reap must be OFF unless someone opts in. It shipped on for one
@@ -2599,7 +2564,7 @@ mod tests {
         let _guard = crate::PROCESS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let root = unique_root("auto-reap-default");
+        let (root, _guard) = unique_root("auto-reap-default");
         let room = RoomStore::open_at(root.clone()).unwrap();
 
         append_presence(&room, "owner", 5);
@@ -2618,8 +2583,6 @@ mod tests {
             1,
             "a claim must survive `enter` under default configuration"
         );
-
-        fs::remove_dir_all(root).ok();
     }
 
     /// Auto-reap is opt-out, and the opt-out is checked before any work.
@@ -2628,7 +2591,7 @@ mod tests {
         let _guard = crate::PROCESS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let root = unique_root("auto-reap-off");
+        let (root, _guard) = unique_root("auto-reap-off");
         let room = RoomStore::open_at(root.clone()).unwrap();
 
         append_presence(&room, "stale-tool", 3 * 60 * 60);
@@ -2644,8 +2607,6 @@ mod tests {
             1,
             "the claim must survive when auto-reap is off"
         );
-
-        fs::remove_dir_all(root).ok();
     }
 
     // -------------------------------------------------------------------------
@@ -2654,7 +2615,7 @@ mod tests {
 
     #[test]
     fn over_ttl_claim_is_reaped_and_leaves_active_claims() {
-        let root = unique_root("over-ttl");
+        let (root, _guard) = unique_root("over-ttl");
         let room = RoomStore::open_at(root.clone()).unwrap();
 
         // Owner has been silent for 3 hours (> 2h LARGE bar).
@@ -2675,8 +2636,6 @@ mod tests {
             .iter()
             .any(|c| c.event_id == claim.event_id);
         assert!(!still_active, "reaped claim must leave active_claims");
-
-        fs::remove_dir_all(&root).ok();
     }
 
     // -------------------------------------------------------------------------
@@ -2685,7 +2644,7 @@ mod tests {
 
     #[test]
     fn unparseable_owner_ts_is_never_staged() {
-        let root = unique_root("bad-ts");
+        let (root, _guard) = unique_root("bad-ts");
         let room = RoomStore::open_at(root.clone()).unwrap();
 
         // Step 1: append the claim first (lower seq).
@@ -2731,8 +2690,6 @@ mod tests {
             report.preserved_future_or_active, 1,
             "bad-ts claim must be counted as preserved"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     // -------------------------------------------------------------------------
@@ -2741,7 +2698,7 @@ mod tests {
 
     #[test]
     fn fresh_owner_claim_is_not_staged() {
-        let root = unique_root("fresh-owner");
+        let (root, _guard) = unique_root("fresh-owner");
         let room = RoomStore::open_at(root.clone()).unwrap();
 
         // Owner is fresh (1 minute old) — well under any reclaim bar.
@@ -2760,8 +2717,6 @@ mod tests {
             "claim with fresh owner must not be reaped"
         );
         assert_eq!(report.preserved_future_or_active, 1);
-
-        fs::remove_dir_all(&root).ok();
     }
 
     // -------------------------------------------------------------------------
@@ -2770,7 +2725,7 @@ mod tests {
 
     #[test]
     fn idempotent_second_run_finds_nothing() {
-        let root = unique_root("idempotent");
+        let (root, _guard) = unique_root("idempotent");
         let room = RoomStore::open_at(root.clone()).unwrap();
 
         let ago = 3 * 60 * 60_i64;
@@ -2789,13 +2744,11 @@ mod tests {
             "second run must find nothing eligible (idempotent)"
         );
         assert_eq!(second.preserved_future_or_active, 0);
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_reaper_surfaces_committed_projection_warning() {
-        let root = unique_root("o26-projection-warning");
+        let (root, _guard) = unique_root("o26-projection-warning");
         let room = RoomStore::open_at(root.clone()).unwrap();
         append_presence(&room, "stale-tool", 3 * 60 * 60);
         let claim = append_claim(&room, "claim-o26-projection", "stale-tool");
@@ -2826,12 +2779,11 @@ mod tests {
             .filter(|fact| fact.event_id == outcome.fact.event_id)
             .count();
         assert_eq!(matching, 1, "the degraded canonical close is a singleton");
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_reaper_unknown_is_queryable_and_next_pass_does_not_duplicate() {
-        let root = unique_root("o26-outcome-unknown");
+        let (root, _guard) = unique_root("o26-outcome-unknown");
         let room = RoomStore::open_at(root.clone()).unwrap();
         append_presence(&room, "stale-tool", 3 * 60 * 60);
         let claim = append_claim(&room, "claim-o26-unknown", "stale-tool");
@@ -2865,7 +2817,6 @@ mod tests {
             .filter(|fact| fact.event_id == unknown.event_id)
             .count();
         assert_eq!(matching, 1, "lost reply plus next pass must append once");
-        fs::remove_dir_all(&root).ok();
     }
 
     // -------------------------------------------------------------------------
@@ -2874,7 +2825,7 @@ mod tests {
 
     #[test]
     fn stop_self_release_only_releases_stopping_tool_claims() {
-        let root = unique_root("self-release");
+        let (root, _guard) = unique_root("self-release");
         let room = RoomStore::open_at(root.clone()).unwrap();
 
         // Two fresh tools; each holds a claim.
@@ -2938,8 +2889,6 @@ mod tests {
 
         // Suppress unused-variable warning for claim_b event_id which is checked above.
         let _ = claim_b;
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// Append a small single-file claim owned by `tool` and authored by the
@@ -2980,7 +2929,7 @@ mod tests {
         // session A must release only A's claim; B's claim (a live sibling) must
         // survive. The fix matches on the claim's `from_session_id`, not just
         // the tool, so a shared tool no longer over-releases.
-        let root = unique_root("session-scoped-release");
+        let (root, _guard) = unique_root("session-scoped-release");
         let room = RoomStore::open_at(root.clone()).unwrap();
 
         append_presence(&room, "claude_code", 10);
@@ -3042,8 +2991,6 @@ mod tests {
             b_live,
             "a live sibling session (B) of the SAME tool must NOT be released"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     // -------------------------------------------------------------------------
@@ -3110,7 +3057,7 @@ mod tests {
 
     #[test]
     fn dry_run_does_not_write_facts() {
-        let root = unique_root("dry-run");
+        let (root, _guard) = unique_root("dry-run");
         let room = RoomStore::open_at(root.clone()).unwrap();
 
         let ago = 3 * 60 * 60_i64;
@@ -3136,8 +3083,6 @@ mod tests {
             "dry-run must not change active_claims"
         );
         let _ = claim;
-
-        fs::remove_dir_all(&root).ok();
     }
 
     // -------------------------------------------------------------------------
@@ -3146,7 +3091,7 @@ mod tests {
 
     #[test]
     fn squads_idle_cleared_enumerates_stale_owners() {
-        let root = unique_root("idle-cleared");
+        let (root, _guard) = unique_root("idle-cleared");
         let room = RoomStore::open_at(root.clone()).unwrap();
 
         // One stale tool (3h silent) and one fresh tool (1m).
@@ -3165,8 +3110,6 @@ mod tests {
             !cleared.contains("fresh-tool"),
             "fresh-tool must NOT appear in squads_idle_cleared"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     // -------------------------------------------------------------------------
@@ -3276,8 +3219,12 @@ mod tests {
         }
     }
 
-    fn no_lease_fixture(label: &str, created_at: &str, lease: Option<&str>) -> RoomStore {
-        let root = unique_root(label);
+    fn no_lease_fixture(
+        label: &str,
+        created_at: &str,
+        lease: Option<&str>,
+    ) -> (RoomStore, crate::test_temp_root::TempRoot) {
+        let (root, guard) = unique_root(label);
         let room = RoomStore::open_at(root).unwrap();
         let mut claim = append_claim_ago(&room, "seed", "seed-owner", 0);
         // Distinct owner/scope; leave the seed fresh so it is never a candidate.
@@ -3291,12 +3238,12 @@ mod tests {
         room.append_fact_verified(&claim).unwrap();
         // Fresh squad activity isolates age eligibility from owner staleness.
         append_presence(&room, "no-lease-owner", 0);
-        room
+        (room, guard)
     }
 
     #[test]
     fn empty_scope_renew_expired_lease_preserves_live_presence_after_boundary() {
-        let root = unique_root("empty-scope-live-after-boundary");
+        let (root, _guard) = unique_root("empty-scope-live-after-boundary");
         init_observed_worktree(&root);
         let room = RoomStore::open_at(root.clone()).unwrap();
         let mut claim = append_claim_with_lease(&room, "seed", "seed-owner", &past_ts(3600));
@@ -3341,12 +3288,11 @@ mod tests {
                     .any(|row| row.event_id == claim.event_id)
             );
         }
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn empty_scope_renew_lease_only_reaps_expired_observed_dead_owner() {
-        let root = unique_root("empty-scope-dead-expired");
+        let (root, _guard) = unique_root("empty-scope-dead-expired");
         init_observed_worktree(&root);
         let room = RoomStore::open_at(root.clone()).unwrap();
         let mut claim = append_claim_with_lease(&room, "seed", "seed-owner", &past_ts(3600));
@@ -3383,7 +3329,6 @@ mod tests {
                 .iter()
                 .any(|row| row.event_id == claim.event_id)
         );
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3405,7 +3350,8 @@ mod tests {
                 ),
                 (Some(past_ts(-86_400)), None),
             ] {
-                let room = RoomStore::open_at(unique_root("empty-scope-session")).unwrap();
+                let (session_root, _guard) = unique_root("empty-scope-session");
+                let room = RoomStore::open_at(session_root).unwrap();
                 let mut claim = append_claim_ago(&room, "seed", "seed-owner", 0);
                 claim.event_id = "no-lease-claim".to_string();
                 claim.tool = Some("no-lease-owner".to_string());
@@ -3457,7 +3403,6 @@ mod tests {
                         .claims_reaped
                         .is_empty()
                 );
-                fs::remove_dir_all(room.repo_root()).unwrap();
             }
         }
     }
@@ -3465,7 +3410,8 @@ mod tests {
     #[test]
     fn reap_empty_scope_no_lease_claim_preserves_observed_live_owner() {
         let _env = NoLeaseEnv::new(None);
-        let room = RoomStore::open_at(unique_root("empty-scope-live-renewal")).unwrap();
+        let (room_root, _guard) = unique_root("empty-scope-live-renewal");
+        let room = RoomStore::open_at(room_root).unwrap();
         init_observed_worktree(room.repo_root());
         let session = "sess:proc:host:94916#live";
         let mut claim = append_claim_ago(&room, "seed", "seed-owner", 0);
@@ -3496,18 +3442,17 @@ mod tests {
                 .claims_reaped
                 .is_empty()
         );
-        fs::remove_dir_all(room.repo_root()).unwrap();
     }
 
     #[test]
     fn reap_no_lease_old_stale_owner_keeps_owner_stale_precedence() {
         let _env = NoLeaseEnv::new(None);
-        let room = RoomStore::open_at(unique_root("no-lease-precedence")).unwrap();
+        let (room_root, _guard) = unique_root("no-lease-precedence");
+        let room = RoomStore::open_at(room_root).unwrap();
         append_claim_ago(&room, "old-stale", "stale-owner", 84 * 86_400);
         let preview = run_reap_stale_in_room_with_mode(&room, false, ReapMode::Full).unwrap();
         assert_eq!(preview.claims_reaped.len(), 1);
         assert_eq!(preview.claims_reaped[0].reason, "owner-stale");
-        fs::remove_dir_all(room.repo_root()).unwrap();
     }
 
     #[test]
@@ -3551,7 +3496,7 @@ mod tests {
     #[test]
     fn reap_no_lease_old_full_preview_and_apply() {
         let _env = NoLeaseEnv::new(None);
-        let room = no_lease_fixture("no-lease-full", &past_ts(84 * 86_400), None);
+        let (room, _guard) = no_lease_fixture("no-lease-full", &past_ts(84 * 86_400), None);
         let preview = run_reap_stale_in_room_with_mode(&room, false, ReapMode::Full).unwrap();
         assert_eq!(preview.claims_reaped.len(), 1);
         assert_eq!(preview.claims_reaped[0].reason, "no-lease-over-age");
@@ -3586,13 +3531,12 @@ mod tests {
                 .iter()
                 .any(|c| c.event_id == "no-lease-claim")
         );
-        fs::remove_dir_all(room.repo_root()).unwrap();
     }
 
     #[test]
     fn reap_no_lease_old_not_eligible_in_lease_only() {
         let _env = NoLeaseEnv::new(None);
-        let room = no_lease_fixture("no-lease-auto", &past_ts(84 * 86_400), None);
+        let (room, _guard) = no_lease_fixture("no-lease-auto", &past_ts(84 * 86_400), None);
         let report = run_reap_stale_in_room_with_mode(&room, true, ReapMode::LeaseOnly).unwrap();
         assert!(report.claims_reaped.is_empty());
         assert!(
@@ -3602,26 +3546,24 @@ mod tests {
                 .iter()
                 .any(|c| c.event_id == "no-lease-claim")
         );
-        fs::remove_dir_all(room.repo_root()).unwrap();
     }
 
     #[test]
     fn reap_no_lease_young_not_eligible() {
         let _env = NoLeaseEnv::new(None);
-        let room = no_lease_fixture("no-lease-young", &past_ts(7 * 86_400), None);
+        let (room, _guard) = no_lease_fixture("no-lease-young", &past_ts(7 * 86_400), None);
         assert!(
             run_reap_stale_in_room(&room, false)
                 .unwrap()
                 .claims_reaped
                 .is_empty()
         );
-        fs::remove_dir_all(room.repo_root()).unwrap();
     }
 
     #[test]
     fn reap_no_lease_live_owner_vetoes() {
         let _env = NoLeaseEnv::new(None);
-        let room = no_lease_fixture("no-lease-live", &past_ts(84 * 86_400), None);
+        let (room, _guard) = no_lease_fixture("no-lease-live", &past_ts(84 * 86_400), None);
         init_observed_worktree(room.repo_root());
         append_observed_presence(
             &room,
@@ -3638,20 +3580,18 @@ mod tests {
                 .iter()
                 .any(|c| c.event_id == "no-lease-claim")
         );
-        fs::remove_dir_all(room.repo_root()).unwrap();
     }
 
     #[test]
     fn reap_no_lease_env_zero_disables() {
         let _env = NoLeaseEnv::new(Some("0"));
-        let room = no_lease_fixture("no-lease-disabled", &past_ts(84 * 86_400), None);
+        let (room, _guard) = no_lease_fixture("no-lease-disabled", &past_ts(84 * 86_400), None);
         assert!(
             run_reap_stale_in_room(&room, false)
                 .unwrap()
                 .claims_reaped
                 .is_empty()
         );
-        fs::remove_dir_all(room.repo_root()).unwrap();
     }
 
     #[test]
@@ -3664,7 +3604,7 @@ mod tests {
 
     #[test]
     fn reap_no_lease_env_override_changes_threshold() {
-        let room = no_lease_fixture("no-lease-override", &past_ts(7 * 86_400), None);
+        let (room, _guard) = no_lease_fixture("no-lease-override", &past_ts(7 * 86_400), None);
         {
             let _env = NoLeaseEnv::new(Some("10"));
             assert!(
@@ -3681,39 +3621,36 @@ mod tests {
                 "no-lease-over-age"
             );
         }
-        fs::remove_dir_all(room.repo_root()).unwrap();
     }
 
     #[test]
     fn reap_no_lease_unparseable_created_at_never_eligible() {
         let _env = NoLeaseEnv::new(None);
-        let room = no_lease_fixture("no-lease-bad-created", "not-a-time", None);
+        let (room, _guard) = no_lease_fixture("no-lease-bad-created", "not-a-time", None);
         assert!(
             run_reap_stale_in_room(&room, false)
                 .unwrap()
                 .claims_reaped
                 .is_empty()
         );
-        fs::remove_dir_all(room.repo_root()).unwrap();
     }
 
     #[test]
     fn reap_no_lease_unparseable_lease_is_eligible() {
         let _env = NoLeaseEnv::new(None);
-        let room = no_lease_fixture(
+        let (room, _guard) = no_lease_fixture(
             "no-lease-bad-lease",
             &past_ts(84 * 86_400),
             Some("not-a-time"),
         );
         let report = run_reap_stale_in_room(&room, false).unwrap();
         assert_eq!(report.claims_reaped[0].reason, "no-lease-over-age");
-        fs::remove_dir_all(room.repo_root()).unwrap();
     }
 
     #[test]
     fn reap_no_lease_valid_future_lease_blocks_age_reason() {
         let _env = NoLeaseEnv::new(None);
-        let room = no_lease_fixture(
+        let (room, _guard) = no_lease_fixture(
             "no-lease-future",
             &past_ts(84 * 86_400),
             Some(&past_ts(-86_400)),
@@ -3724,7 +3661,6 @@ mod tests {
                 .claims_reaped
                 .is_empty()
         );
-        fs::remove_dir_all(room.repo_root()).unwrap();
     }
 
     #[test]
@@ -3732,7 +3668,7 @@ mod tests {
         // This is the 76-claim case the old logic missed: the owner squad IS
         // active (fresh presence), but the claim's own lease_expires_at is in
         // the past. The dual-signal fix must reap it via the lease signal.
-        let root = unique_root("lease-expired-live-owner");
+        let (root, _guard) = unique_root("lease-expired-live-owner");
         let room = RoomStore::open_at(root.clone()).unwrap();
 
         // Owner is fresh (just now) — squad is NOT stale.
@@ -3766,13 +3702,11 @@ mod tests {
                 .any(|c| c.event_id == claim.event_id),
             "reaped claim must leave active_claims"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn durable_renewal_after_original_expiry_survives_reap() {
-        let root = unique_root("durable-renewal-survives-reap");
+        let (root, _guard) = unique_root("durable-renewal-survives-reap");
         let room = RoomStore::open_at(root.clone()).unwrap();
         append_presence(&room, "live-owner", 5);
         let past_lease = past_ts(3600);
@@ -3813,7 +3747,6 @@ mod tests {
                 .iter()
                 .any(|item| item == &format!("lease_expires_at:{renewed_until}"))
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     // -------------------------------------------------------------------------
@@ -3824,7 +3757,7 @@ mod tests {
     fn future_lease_with_live_owner_is_preserved() {
         // The owner is active AND the lease is in the future: neither signal
         // fires → claim must be kept.
-        let root = unique_root("future-lease-live-owner");
+        let (root, _guard) = unique_root("future-lease-live-owner");
         let room = RoomStore::open_at(root.clone()).unwrap();
 
         // Owner is fresh.
@@ -3859,7 +3792,5 @@ mod tests {
                 .any(|c| c.event_id == claim.event_id),
             "future-lease claim must remain in active_claims"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 }

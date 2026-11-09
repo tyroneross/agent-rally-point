@@ -8,7 +8,7 @@
 //! of them opens a live `.rally/`.
 
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use serde_json::{Value, json};
 
@@ -16,22 +16,14 @@ use crate::store::history_probe;
 
 pub(crate) struct SyntheticRoom {
     pub(crate) root: PathBuf,
+    /// Deletes the folder when the room drops. Declared last so it drops last.
+    _guard: crate::test_temp_root::TempRoot,
 }
 
-impl Drop for SyntheticRoom {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
-
-fn unique_root(label: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!("rally-s0-{label}-{nanos}"));
-    std::fs::create_dir_all(root.join(".git")).unwrap();
-    root
+fn unique_root(label: &str) -> crate::test_temp_root::TempRoot {
+    let guard = crate::test_temp_root::TempRoot::new(&format!("rally-s0-{label}"));
+    std::fs::create_dir_all(guard.join(".git")).unwrap();
+    guard
 }
 
 /// Small deterministic PRNG (xorshift64*) so the generator needs no new
@@ -67,7 +59,8 @@ fn ts(secs_ago: i64) -> String {
 /// hundreds of long-departed tools, presence, claims (mostly released),
 /// handoffs (mostly resolved), decisions, risks, artifacts.
 pub(crate) fn synthetic_room(label: &str, events: usize, segments: usize) -> SyntheticRoom {
-    let root = unique_root(label);
+    let guard = unique_root(label);
+    let root = guard.path().to_path_buf();
     let rally = root.join(".rally");
     let log = rally.join("log");
     std::fs::create_dir_all(&log).unwrap();
@@ -196,7 +189,10 @@ pub(crate) fn synthetic_room(label: &str, events: usize, segments: usize) -> Syn
     for (name, body) in files {
         std::fs::write(log.join(format!("{name}.jsonl")), body).unwrap();
     }
-    SyntheticRoom { root }
+    SyntheticRoom {
+        root,
+        _guard: guard,
+    }
 }
 
 /// Serialize on the crate-wide env lock, enter `dir`, scrub session env, and

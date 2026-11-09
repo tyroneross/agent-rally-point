@@ -33,25 +33,35 @@
 //!     committed ledger on every local test run. A temp room keeps the
 //!     production ledger pristine.
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+
+use temp_root::TempRoot;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 /// A throwaway rally room: a temp cwd with a bare `.git/` plus an isolated HOME.
 /// Drop cleans up both directories.
 struct TempRoom {
     cwd: PathBuf,
     home: PathBuf,
+    _roots: Vec<TempRoot>,
 }
 
 impl TempRoom {
     fn new(name: &str) -> Self {
-        let cwd = temp_path(&format!("watchdog-{name}-cwd"));
-        let home = temp_path(&format!("watchdog-{name}-home"));
+        let (cwd, cwd_guard) = temp_path(&format!("watchdog-{name}-cwd"));
+        let (home, home_guard) = temp_path(&format!("watchdog-{name}-home"));
         fs::create_dir_all(cwd.join(".git")).expect("create temp room .git");
         fs::create_dir_all(&home).expect("create temp home");
-        Self { cwd, home }
+        Self {
+            cwd,
+            home,
+            _roots: vec![cwd_guard, home_guard],
+        }
     }
 
     /// A `rally` command rooted in this hermetic room (isolated cwd + HOME).
@@ -62,21 +72,9 @@ impl TempRoom {
     }
 }
 
-impl Drop for TempRoom {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.cwd).ok();
-        fs::remove_dir_all(&self.home).ok();
-    }
-}
-
-fn temp_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "{name}-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
+fn temp_path(name: &str) -> (PathBuf, TempRoot) {
+    let root = TempRoot::new(name);
+    (root.path().to_path_buf(), root)
 }
 
 fn assert_matches_schema(schema_name: &str, value: &serde_json::Value) {

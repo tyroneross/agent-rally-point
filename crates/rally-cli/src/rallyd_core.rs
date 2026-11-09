@@ -1817,12 +1817,20 @@ mod imp {
         use super::*;
         use std::io::{BufRead, BufReader, Write};
 
-        fn unique_repo_root(tag: &str) -> PathBuf {
-            let dir = std::env::temp_dir().join(format!(
-                "rallyd-core-{tag}-{}-{}",
-                std::process::id(),
-                now_millis()
-            ));
+        /// A repo root that must outlive the test that made it. The timeout
+        /// tests deliberately leave an owner lock (and, in one, a sleeping
+        /// store-open worker) alive until the process exits; deleting the
+        /// folder at test return would unlink the lock file they still hold.
+        /// The next test process removes it.
+        fn process_lifetime_repo_root(tag: &str) -> &'static std::path::Path {
+            let dir =
+                crate::test_temp_root::TempRoot::process_scoped(&format!("rallyd-core-{tag}"));
+            std::fs::create_dir_all(dir.join(".rally")).unwrap();
+            dir
+        }
+
+        fn unique_repo_root(tag: &str) -> crate::test_temp_root::TempRoot {
+            let dir = crate::test_temp_root::TempRoot::new(&format!("rallyd-core-{tag}"));
             std::fs::create_dir_all(dir.join(".rally")).unwrap();
             dir
         }
@@ -1913,7 +1921,7 @@ mod imp {
             let rally_dir = root.join(".rally");
             let stop = Arc::new(AtomicBool::new(false));
             let server_stop = Arc::clone(&stop);
-            let server_root = root.clone();
+            let server_root = root.path().to_path_buf();
             let (finished, completion) = mpsc::channel();
             let server = thread::spawn(move || {
                 let result = serve_unix_with_stop(
@@ -1935,7 +1943,6 @@ mod imp {
                 stop.store(true, Ordering::SeqCst);
             }
             let result = server.join().unwrap();
-            std::fs::remove_dir_all(root).unwrap();
             assert!(matches!(read, StoreResponse::Ok(StoreOk::Facts { .. })));
             assert!(
                 idled.is_ok(),
@@ -1948,7 +1955,7 @@ mod imp {
         fn paused_daemon_snapshot_does_not_block_a_write_or_indexed_read() {
             let root = unique_repo_root("detached-read-write-progress");
             let rally_dir = root.join(".rally");
-            let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+            let store = DirectRoomStore::open_direct_at(root.path().to_path_buf()).unwrap();
             let before = store
                 .append_fact(&store::Fact {
                     schema: crate::FACT_SCHEMA.to_string(),
@@ -1966,7 +1973,7 @@ mod imp {
             let (captured, release) = store::test_pause_next_snapshot_projection(rally_dir.clone());
             let stop = Arc::new(AtomicBool::new(false));
             let server_stop = Arc::clone(&stop);
-            let server_root = root.clone();
+            let server_root = root.path().to_path_buf();
             let server = thread::spawn(move || {
                 serve_unix_with_stop(
                     ServeConfig {
@@ -2074,7 +2081,6 @@ mod imp {
                 }
                 other => panic!("snapshot failed: {other:?}"),
             }
-            std::fs::remove_dir_all(root).unwrap();
         }
 
         /// One line-delimited round trip against the daemon (mirrors the client
@@ -2140,11 +2146,8 @@ mod imp {
         }
 
         fn assert_real_socket_response_complete(line_len: usize) {
-            let socket = std::env::temp_dir().join(format!(
-                "rallyd-large-reply-{}-{line_len}.sock",
-                now_millis()
-            ));
-            std::fs::remove_file(&socket).ok();
+            let socket_root = crate::test_temp_root::TempRoot::new("rallyd-large-reply");
+            let socket = socket_root.join(format!("{line_len}.sock"));
             let listener = UnixListener::bind(&socket).unwrap();
             listener.set_nonblocking(true).unwrap();
             let response = facts_response_with_line_len(line_len);
@@ -2182,14 +2185,11 @@ mod imp {
                 serde_json::to_value(expected).unwrap()
             );
             server.join().unwrap();
-            std::fs::remove_file(&socket).ok();
         }
 
         #[test]
         fn failed_accept_backs_off_even_when_listener_stays_ready() {
-            let dir =
-                std::env::temp_dir().join(format!("rally-accept-backoff-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
+            let dir = crate::test_temp_root::TempRoot::new("rally-accept-backoff");
             let socket = dir.join("socket");
             let listener = UnixListener::bind(&socket).unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -2201,7 +2201,6 @@ mod imp {
             assert!(start.elapsed() >= delay);
             assert!(wait_after_accept(&listener, Duration::ZERO, false).unwrap());
             drop(listener);
-            std::fs::remove_dir_all(dir).unwrap();
         }
 
         #[test]
@@ -2275,7 +2274,7 @@ mod imp {
         #[test]
         fn daemon_facts_reuse_decoded_history_and_tail_appends_with_byte_parity() {
             let root = unique_repo_root("decoded-history");
-            let mut store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
+            let mut store = DirectRoomStore::open_direct_at(root.path().to_path_buf()).unwrap();
             for n in 1..=32 {
                 store.append_fact(&seq_fact(n, 20)).unwrap();
             }
@@ -2374,13 +2373,13 @@ mod imp {
                 warm_bytes,
                 serde_json::to_vec(&snapshot_to_wire(&direct_snapshot.snapshot).unwrap()).unwrap()
             );
-            std::fs::remove_dir_all(root).unwrap();
         }
 
         #[test]
         fn facts_page_op_and_session_presence_op_are_served_by_the_daemon() {
             let repo_root = unique_repo_root("facts-page-ops");
-            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut store =
+                DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             for (event_id, kind, session) in [
                 ("p-a", store::FactKind::Presence, "sess:a"),
                 ("p-b", store::FactKind::Presence, "sess:b"),
@@ -2440,7 +2439,6 @@ mod imp {
                 }
                 other => panic!("unexpected facts page reply: {other:?}"),
             }
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
@@ -2529,7 +2527,8 @@ mod imp {
         fn daemon_rejects_v8_requests_after_paged_facts_cutover() {
             assert_eq!(WIRE_VERSION, 9, "this control grades the v8 to v9 cutover");
             let repo_root = unique_repo_root("reject-v8");
-            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut store =
+                DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             let request = StoreRequest {
                 wire_version: 8,
                 engagement: None,
@@ -2548,13 +2547,13 @@ mod imp {
                 }
                 other => panic!("v7 request was not rejected: {other:?}"),
             }
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
         fn o26_routed_snapshot_carries_server_captured_fingerprint() {
             let repo_root = unique_repo_root("o26-routed-snapshot-capture");
-            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut store =
+                DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             let fact = crate::store::Fact {
                 from_session_id: None,
                 schema: crate::FACT_SCHEMA.to_string(),
@@ -2610,13 +2609,13 @@ mod imp {
                 }
                 other => panic!("unexpected routed snapshot capture: {other:?}"),
             }
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
         fn routed_repo_wide_claim_lifecycle_query_crosses_engagements() {
             let repo_root = unique_repo_root("repo-wide-claim-lifecycle");
-            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut store =
+                DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             for (engagement, event_id, path) in [
                 ("engagement-alpha", "claim-alpha", "src/alpha.rs"),
                 ("engagement-beta", "claim-beta", "src/beta.rs"),
@@ -2658,13 +2657,13 @@ mod imp {
                 }
                 other => panic!("unexpected repository-wide lifecycle reply: {other:?}"),
             }
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
         fn raw_routed_writes_cannot_extend_a_closed_session_history() {
             let repo_root = unique_repo_root("closed-session-raw-wire");
-            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut store =
+                DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             let token = "close-token";
             let presence = crate::store::Fact {
                 schema: crate::FACT_SCHEMA.to_string(),
@@ -2742,7 +2741,6 @@ mod imp {
                     .count(),
                 1
             );
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
@@ -2791,7 +2789,8 @@ mod imp {
             }
             segment.sync_all().unwrap();
 
-            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut store =
+                DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             let enter = dispatch_one(
                 &mut store,
                 canonical_repo_root(&repo_root).as_str(),
@@ -2880,7 +2879,6 @@ mod imp {
                     panic!("targeted routed snapshot failed under obligation flood: {other:?}")
                 }
             }
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
@@ -2888,7 +2886,8 @@ mod imp {
             // Exercise the daemon dispatcher and wire serialization without
             // requiring a Unix socket (some sandboxes forbid bind).
             let repo_root = unique_repo_root("enter-identity-dispatch");
-            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut store =
+                DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             let evidence = vec![
                 "observer_pid:4242".to_string(),
                 "worktree_path:/tmp/checkout".to_string(),
@@ -2975,7 +2974,6 @@ mod imp {
                 }
             }
             drop(store);
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
@@ -3050,7 +3048,7 @@ mod imp {
                         agent: "codex".to_string(),
                         tool: "worker-01".to_string(),
                         backend: "tmux".to_string(),
-                        cwd: repo_root.clone(),
+                        cwd: repo_root.path().to_path_buf(),
                         target: "rally-worker-01".to_string(),
                         ..crate::backends::ManagedSession::default()
                     });
@@ -3076,7 +3074,7 @@ mod imp {
             );
 
             let cfg = ServeConfig {
-                repo_root: repo_root.clone(),
+                repo_root: repo_root.path().to_path_buf(),
                 idle_exit_secs: Some(20),
                 foreground: true,
             };
@@ -3090,7 +3088,7 @@ mod imp {
             }
             assert!(ping_ok(&socket), "daemon never answered a ping");
 
-            let room = crate::store::RoomStore::open_at(repo_root.clone()).unwrap();
+            let room = crate::store::RoomStore::open_at(repo_root.path().to_path_buf()).unwrap();
             assert!(
                 matches!(room, crate::store::RoomStore::Routed(_)),
                 "fixture must exercise the routed client"
@@ -3115,7 +3113,6 @@ mod imp {
 
             stop.store(true, Ordering::SeqCst);
             handle.join().unwrap().unwrap();
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         /// AGEN-ENTER-m6ztgb9h6p7barc8cr79q: a room whose FULL snapshot is
@@ -3261,7 +3258,8 @@ mod imp {
             drop(segment);
 
             // Precondition: the FULL projection is past the frame, carried by rows.
-            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut store =
+                DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             let full = store.snapshot().unwrap();
             let full_bytes = serde_json::to_vec(&full).unwrap().len();
             assert!(
@@ -3320,7 +3318,7 @@ mod imp {
             drop(store);
 
             let cfg = ServeConfig {
-                repo_root: repo_root.clone(),
+                repo_root: repo_root.path().to_path_buf(),
                 idle_exit_secs: Some(30),
                 foreground: true,
             };
@@ -3333,7 +3331,7 @@ mod imp {
                 thread::sleep(Duration::from_millis(20));
             }
             assert!(ping_ok(&socket), "daemon never answered a ping");
-            let room = crate::store::RoomStore::open_at(repo_root.clone()).unwrap();
+            let room = crate::store::RoomStore::open_at(repo_root.path().to_path_buf()).unwrap();
             assert!(
                 matches!(room, crate::store::RoomStore::Routed(_)),
                 "fixture must exercise the routed client"
@@ -3408,7 +3406,6 @@ mod imp {
 
             stop.store(true, Ordering::SeqCst);
             handle.join().unwrap().unwrap();
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         /// R3: one room that hits every caller-reply bound at once (caller
@@ -3537,7 +3534,8 @@ mod imp {
             segment.sync_all().unwrap();
             drop(segment);
 
-            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut store =
+                DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             let root_str = canonical_repo_root(&repo_root);
             for (kind, op) in [
                 (
@@ -3579,7 +3577,7 @@ mod imp {
             drop(store);
 
             let cfg = ServeConfig {
-                repo_root: repo_root.clone(),
+                repo_root: repo_root.path().to_path_buf(),
                 idle_exit_secs: Some(60),
                 foreground: true,
             };
@@ -3592,7 +3590,7 @@ mod imp {
                 thread::sleep(Duration::from_millis(20));
             }
             assert!(ping_ok(&socket), "daemon never answered a ping");
-            let room = crate::store::RoomStore::open_at(repo_root.clone()).unwrap();
+            let room = crate::store::RoomStore::open_at(repo_root.path().to_path_buf()).unwrap();
             assert!(
                 matches!(room, crate::store::RoomStore::Routed(_)),
                 "fixture must exercise the routed client"
@@ -3618,14 +3616,13 @@ mod imp {
             drop(room);
             stop.store(true, Ordering::SeqCst);
             handle.join().unwrap().unwrap();
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
         fn o26_fresh_daemon_repairs_canonical_ahead_db_before_warm_install() {
             let repo_root = unique_repo_root("o26-fresh-daemon-repair");
             let rally_dir = repo_root.join(".rally");
-            let seed = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let seed = DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             let fact = crate::store::Fact {
                 from_session_id: None,
                 schema: crate::FACT_SCHEMA.to_string(),
@@ -3653,11 +3650,13 @@ mod imp {
             assert!(!degraded.projection_complete);
             drop(seed);
 
-            let mut daemon =
-                match open_direct_store_bounded(repo_root.clone(), Duration::from_secs(5)) {
-                    Ok(store) => store,
-                    Err(failure) => panic!("fresh daemon open failed: {}", failure.error),
-                };
+            let mut daemon = match open_direct_store_bounded(
+                repo_root.path().to_path_buf(),
+                Duration::from_secs(5),
+            ) {
+                Ok(store) => store,
+                Err(failure) => panic!("fresh daemon open failed: {}", failure.error),
+            };
             let response = dispatch_one(
                 &mut daemon,
                 canonical_repo_root(&repo_root).as_str(),
@@ -3694,20 +3693,16 @@ mod imp {
             daemon
                 .close_warm_fact_store_bounded(Duration::from_secs(2))
                 .unwrap();
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
         fn o26_routed_lost_reply_then_same_id_retry_appends_once() {
             let repo_root = unique_repo_root("o26-lost-reply");
             let rally_dir = repo_root.join(".rally");
-            let socket = std::env::temp_dir().join(format!(
-                "r26-lost-{}-{}.sock",
-                std::process::id(),
-                now_millis()
-            ));
+            let socket_root = crate::test_temp_root::TempRoot::new("r26-lost");
+            let socket = socket_root.join("s.sock");
             let listener = UnixListener::bind(&socket).unwrap();
-            let store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let store = DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             let canonical_root = canonical_repo_root(&repo_root);
             let (job_tx, job_rx) = mpsc::channel::<Job>();
             let dispatcher = thread::spawn(move || {
@@ -3733,7 +3728,7 @@ mod imp {
             });
             let routed = crate::store_client::RoutedRoomStore::for_test(
                 socket.clone(),
-                repo_root.clone(),
+                repo_root.path().to_path_buf(),
                 "default",
             );
             let candidate = crate::store::Fact {
@@ -3784,21 +3779,17 @@ mod imp {
                 1
             );
             drop(store);
-            std::fs::remove_file(&socket).ok();
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
         fn o26_routed_renewal_and_checkpoint_retry_the_exact_lost_request_once() {
             let repo_root = unique_repo_root("o26-renew-checkpoint-lost-reply");
             let rally_dir = repo_root.join(".rally");
-            let socket = std::env::temp_dir().join(format!(
-                "r26-rc-{}-{}.sock",
-                std::process::id(),
-                now_millis()
-            ));
+            let socket_root = crate::test_temp_root::TempRoot::new("r26-rc");
+            let socket = socket_root.join("s.sock");
             let listener = UnixListener::bind(&socket).unwrap();
-            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut store =
+                DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             let claim = crate::store::Fact {
                 from_session_id: Some("sess:o26".to_string()),
                 schema: crate::FACT_SCHEMA.to_string(),
@@ -3845,7 +3836,7 @@ mod imp {
             });
             let routed = crate::store_client::RoutedRoomStore::for_test(
                 socket.clone(),
-                repo_root.clone(),
+                repo_root.path().to_path_buf(),
                 "default",
             );
 
@@ -3946,8 +3937,6 @@ mod imp {
                 );
             }
             drop(store);
-            std::fs::remove_file(&socket).ok();
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
@@ -3966,13 +3955,11 @@ mod imp {
             ] {
                 let repo_root = unique_repo_root(&format!("o26-routed-{label}"));
                 let rally_dir = repo_root.join(".rally");
-                let socket = std::env::temp_dir().join(format!(
-                    "r26-{label}-{}-{}.sock",
-                    std::process::id(),
-                    now_millis()
-                ));
+                let socket_root = crate::test_temp_root::TempRoot::new(&format!("r26-{label}"));
+                let socket = socket_root.join("s.sock");
                 let listener = UnixListener::bind(&socket).unwrap();
-                let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+                let mut store =
+                    DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
                 let target = crate::store::Fact {
                     from_session_id: None,
                     schema: crate::FACT_SCHEMA.to_string(),
@@ -4019,7 +4006,7 @@ mod imp {
                 });
                 let routed = crate::store_client::RoutedRoomStore::for_test(
                     socket.clone(),
-                    repo_root.clone(),
+                    repo_root.path().to_path_buf(),
                     "default",
                 );
                 let close = crate::store::Fact {
@@ -4068,8 +4055,6 @@ mod imp {
                     1
                 );
                 drop(store);
-                std::fs::remove_file(&socket).ok();
-                std::fs::remove_dir_all(repo_root).ok();
             }
         }
 
@@ -4091,13 +4076,13 @@ mod imp {
         fn daemon_store_open_honors_the_mutation_lock_deadline() {
             let repo_root = unique_repo_root("bounded-store-open");
             let rally_dir = repo_root.join(".rally");
-            let seed = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let seed = DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             drop(seed);
             let held = store::acquire_room_mutation_lock(&rally_dir).unwrap();
 
             let bound = Duration::from_millis(75);
             let started = Instant::now();
-            let result = open_direct_store_bounded(repo_root.clone(), bound);
+            let result = open_direct_store_bounded(repo_root.path().to_path_buf(), bound);
             let elapsed = started.elapsed();
             assert_wait_bounded(elapsed, bound, "daemon store open");
             let failure = match result {
@@ -4108,14 +4093,13 @@ mod imp {
             assert!(!failure.retain_owner_until_exit);
 
             drop(held);
-            let reopened = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let reopened = DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             drop(reopened);
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
         fn daemon_store_total_open_timeout_retains_owner_for_late_worker() {
-            let repo_root = unique_repo_root("total-open-timeout-owner-retained");
+            let repo_root = process_lifetime_repo_root("total-open-timeout-owner-retained");
             let rally_dir = repo_root.join(".rally");
             let mut owner = Some(
                 store::acquire_owner_exclusive_bounded(&rally_dir, Duration::from_millis(75))
@@ -4124,7 +4108,7 @@ mod imp {
 
             let bound = Duration::from_millis(50);
             let started = Instant::now();
-            let result = open_direct_store_bounded_with(repo_root, bound, || {
+            let result = open_direct_store_bounded_with(repo_root.to_path_buf(), bound, || {
                 thread::sleep(BLOCKER_OUTLASTS_CEILING)
             });
             let elapsed = started.elapsed();
@@ -4161,7 +4145,7 @@ mod imp {
 
         #[test]
         fn dispatcher_close_timeout_retains_owner_until_process_exit() {
-            let repo_root = unique_repo_root("close-timeout-owner-retained");
+            let repo_root = process_lifetime_repo_root("close-timeout-owner-retained");
             let rally_dir = repo_root.join(".rally");
             let owner =
                 store::acquire_owner_exclusive_bounded(&rally_dir, Duration::from_millis(75))
@@ -4269,7 +4253,8 @@ mod imp {
             );
 
             let repo_root = unique_repo_root("far-future-mutation-deadline");
-            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut store =
+                DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             let mut request = StoreRequest::new(None, StoreOp::RebuildClaimIndex);
             request.deadline_unix_ms = Some(u64::MAX);
             request.mutation_budget_ms = Some(u64::MAX);
@@ -4280,13 +4265,13 @@ mod imp {
                 matches!(response, Ok(StoreResponse::Ok(StoreOk::RebuildClaimIndex))),
                 "far-future raw deadline panicked or failed: {response:?}"
             );
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
         fn expired_routed_mutation_is_typed_not_started_and_never_appends() {
             let repo_root = unique_repo_root("expired-routed-mutation");
-            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut store =
+                DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             let fact = crate::store::Fact {
                 from_session_id: Some("sess:o25".to_string()),
                 schema: crate::FACT_SCHEMA.to_string(),
@@ -4333,13 +4318,13 @@ mod imp {
                     .all(|row| row.event_id != fact.event_id),
                 "expired routed mutation appended after NotStarted"
             );
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
         fn routed_dispatch_pause_does_not_rebase_receipt_deadline() {
             let repo_root = unique_repo_root("dispatch-pause-deadline-anchor");
-            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut store =
+                DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             let fact = crate::store::Fact {
                 schema: crate::FACT_SCHEMA.to_string(),
                 event_id: "o25-routed-dispatch-pause-no-late-commit".to_string(),
@@ -4384,14 +4369,14 @@ mod imp {
                     .all(|row| row.event_id != fact.event_id),
                 "routed mutation committed after its receipt-anchored deadline"
             );
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[cfg(unix)]
         #[test]
         fn routed_mutation_rechecks_deadline_after_flock_success() {
             let repo_root = unique_repo_root("routed-post-flock-deadline");
-            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut store =
+                DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             let fact = crate::store::Fact {
                 schema: crate::FACT_SCHEMA.to_string(),
                 event_id: "o25-routed-post-flock-no-late-commit".to_string(),
@@ -4437,14 +4422,14 @@ mod imp {
                     .all(|row| row.event_id != fact.event_id),
                 "routed mutation committed after its post-flock deadline"
             );
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
         fn routed_lock_contention_returns_not_started_and_never_commits_late() {
             let repo_root = unique_repo_root("routed-lock-contention");
             let rally_dir = repo_root.join(".rally");
-            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut store =
+                DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             let held = store::acquire_room_mutation_lock(&rally_dir).unwrap();
             let fact = crate::store::Fact {
                 from_session_id: Some("sess:o25".to_string()),
@@ -4499,7 +4484,7 @@ mod imp {
                 other => panic!("contended routed mutation was not rejected: {other:?}"),
             }
 
-            let reopened = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let reopened = DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             assert!(
                 reopened
                     .facts()
@@ -4508,13 +4493,13 @@ mod imp {
                     .all(|row| row.event_id != fact.event_id),
                 "routed NotStarted mutation committed after lock release"
             );
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
         fn scoped_snapshot_dispatch_requires_engagement_and_matches_direct_projection() {
             let repo_root = unique_repo_root("scoped-snapshot-parity");
-            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut store =
+                DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             store.set_engagement_scope(Some("engagement-alpha".to_string()));
             let artifact = crate::store::Fact {
                 from_session_id: Some("sess:alpha".to_string()),
@@ -4613,13 +4598,13 @@ mod imp {
                     other => panic!("unexpected scoped snapshot reply: {other:?}"),
                 }
             }
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
         fn scoped_path_collision_stops_direct_and_routed_writers_with_nonoverlap_control() {
             let repo_root = unique_repo_root("scoped-path-collision-parity");
-            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut store =
+                DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             store.set_engagement_scope(Some("engagement-alpha".to_string()));
             let artifact = crate::store::Fact {
                 from_session_id: Some("sess:alpha".to_string()),
@@ -4733,13 +4718,13 @@ mod imp {
                     "{mode} non-overlap control must not invent a collision: {nonoverlap:?}"
                 );
             }
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
         fn routed_renewal_appends_the_same_durable_fact_as_direct_mode() {
             let repo_root = unique_repo_root("renewal-parity");
-            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut store =
+                DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             let claim = crate::store::Fact {
                 from_session_id: Some("sess:test".to_string()),
                 schema: crate::FACT_SCHEMA.to_string(),
@@ -4799,13 +4784,13 @@ mod imp {
                 facts.last().unwrap().ref_id.as_deref(),
                 Some(claim.event_id.as_str())
             );
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
         fn raw_routed_sibling_cannot_renew_another_sessions_claim() {
             let repo_root = unique_repo_root("renewal-sibling-auth");
-            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut store =
+                DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             let claim = crate::store::Fact {
                 from_session_id: Some("session-owner".to_string()),
                 schema: crate::FACT_SCHEMA.to_string(),
@@ -4880,13 +4865,13 @@ mod imp {
                 matches!(missing_response, StoreResponse::Err(_)),
                 "a legacy wire request with no caller authority must fail closed: {missing_response:?}"
             );
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
         fn raw_routed_anonymous_identity_cannot_renew_or_append_owner_transitions() {
             let repo_root = unique_repo_root("renewal-anonymous-auth");
-            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut store =
+                DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             let claim = crate::store::Fact {
                 from_session_id: None,
                 schema: crate::FACT_SCHEMA.to_string(),
@@ -4988,13 +4973,13 @@ mod imp {
                     .iter()
                     .any(|active| active.event_id == claim.event_id)
             );
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
         fn raw_routed_modern_caller_can_renew_a_legacy_sessionless_claim() {
             let repo_root = unique_repo_root("renewal-legacy-modern");
-            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let mut store =
+                DirectRoomStore::open_direct_at(repo_root.path().to_path_buf()).unwrap();
             let claim = crate::store::Fact {
                 from_session_id: None,
                 schema: crate::FACT_SCHEMA.to_string(),
@@ -5059,7 +5044,6 @@ mod imp {
                 .expect("routed renewal must append");
             assert_eq!(renewal.tool.as_deref(), Some("tool-a"));
             assert_eq!(renewal.from_session_id.as_deref(), Some("session-modern"));
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
@@ -5067,7 +5051,7 @@ mod imp {
             let repo_root = unique_repo_root("o26-routed-migration-fence");
             let rally_dir = repo_root.join(".rally");
             let mut store = DirectRoomStore::open_direct_at_with_engagement(
-                repo_root.clone(),
+                repo_root.path().to_path_buf(),
                 Some("alpha".to_string()),
             )
             .unwrap();
@@ -5174,7 +5158,6 @@ mod imp {
                     .iter()
                     .any(|fact| fact.event_id == "routed-after-marker-removal")
             );
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         #[test]
@@ -5183,13 +5166,12 @@ mod imp {
             let _deadline =
                 crate::install_watchdog_deadline(Instant::now() + Duration::from_secs(3));
             let err = super::serve_unix(ServeConfig {
-                repo_root: repo_root.clone(),
+                repo_root: repo_root.path().to_path_buf(),
                 idle_exit_secs: Some(1),
                 foreground: true,
             })
             .unwrap_err();
             assert!(err.to_string().contains("watchdog armed"), "{err}");
-            std::fs::remove_dir_all(repo_root).ok();
         }
 
         // Smoke test (Chunk B integration checkpoint): start the daemon on a temp
@@ -5230,8 +5212,6 @@ mod imp {
             let _second = listener.accept().unwrap();
             assert!(!wait_for_listener(&listener, Duration::from_millis(10)).unwrap());
             drop((first, second, listener));
-            std::fs::remove_file(path).unwrap();
-            std::fs::remove_dir_all(root).unwrap();
         }
 
         #[test]
@@ -5240,7 +5220,7 @@ mod imp {
             let repo_root = unique_repo_root("ping-latency");
             let rally_dir = repo_root.join(".rally");
             let cfg = ServeConfig {
-                repo_root: repo_root.clone(),
+                repo_root: repo_root.path().to_path_buf(),
                 idle_exit_secs: Some(10),
                 foreground: true,
             };
@@ -5288,7 +5268,6 @@ mod imp {
             }
             stop.store(true, Ordering::SeqCst);
             daemon.join().unwrap().unwrap();
-            std::fs::remove_dir_all(repo_root).unwrap();
         }
 
         #[test]
@@ -5297,7 +5276,7 @@ mod imp {
             let rally_dir = repo_root.join(".rally");
 
             let cfg = ServeConfig {
-                repo_root: repo_root.clone(),
+                repo_root: repo_root.path().to_path_buf(),
                 // Idle backstop so the daemon self-exits even if the test panics
                 // before requesting shutdown.
                 idle_exit_secs: Some(8),
@@ -5453,8 +5432,6 @@ mod imp {
                 ".addr not unlinked"
             );
             assert!(!rally_dir.join(PID_FILENAME).exists(), "pid not unlinked");
-
-            let _ = std::fs::remove_dir_all(&repo_root);
         }
 
         #[test]

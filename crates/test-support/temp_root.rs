@@ -38,6 +38,8 @@
 //! * A fixture created once per process uses [`TempRoot::process_scoped`]. It
 //!   is not removed at exit; the next test process sweeps it.
 //! * A path that must not exist is a child of a root that you never create.
+//! * A label is a hint for humans. It is sanitised and cut to 48 characters,
+//!   so it cannot fail a test or escape the process area.
 //! * Code that only needs to READ the system temp root keeps calling
 //!   `std::env::temp_dir()` and carries a `// temp-root-read: <reason>` note.
 //!
@@ -57,7 +59,7 @@ use std::sync::{Mutex, Once};
 const AREA_DIR: &str = "rt";
 /// Suffix of the per-process ownership lock, a sibling of the process area.
 const LOCK_SUFFIX: &str = ".lock";
-/// Longest label a caller may pass. Bounded so a fixture cannot spend the
+/// Longest label kept in a folder name. Bounded so a fixture cannot spend the
 /// socket-path budget on its own name.
 const MAX_LABEL_LEN: usize = 48;
 
@@ -178,23 +180,39 @@ fn create_area(base: &Path) -> ProcessArea {
     }
 }
 
-fn validate_label(label: &str) {
-    let ok = !label.is_empty()
-        && label.len() <= MAX_LABEL_LEN
-        && label
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        && !label.starts_with('.');
-    assert!(
-        ok,
-        "test temp root: label {label:?} must be 1 to {MAX_LABEL_LEN} characters of \
-         ASCII letters, digits, '-', '_' or '.', and must not start with '.'"
-    );
+/// Turn any caller-supplied label into a safe, bounded folder-name stem.
+///
+/// A label only makes a leftover folder recognisable; the per-process counter
+/// is what makes a name unique. So a label is never a reason to fail a test:
+/// anything outside ASCII letters, digits, `-`, `_` and `.` becomes `-`, a
+/// leading `.` is dropped, the result is cut to [`MAX_LABEL_LEN`], and an empty
+/// result becomes `root`. No input can escape the process area or spend the
+/// socket-path budget. (An earlier version panicked on a long label. The first
+/// lane merge tripped it with a 49-character label assembled by a helper and
+/// its caller, which neither could see alone.)
+fn safe_label(label: &str) -> String {
+    let mut out: String = label
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') {
+                b as char
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let leading_dots = out.len() - out.trim_start_matches('.').len();
+    out.drain(..leading_dots);
+    out.truncate(MAX_LABEL_LEN);
+    if out.is_empty() {
+        out.push_str("root");
+    }
+    out
 }
 
 /// Create `<area>/<label>-<n>` and count it as live.
 fn allocate(label: &str) -> PathBuf {
-    validate_label(label);
+    let label = safe_label(label);
     let base = base_dir();
     fs::create_dir_all(&base)
         .unwrap_or_else(|err| panic!("test temp root: cannot create {}: {err}", base.display()));

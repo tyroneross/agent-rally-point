@@ -23,15 +23,21 @@
 //!    the same env var — fail-closed on a stuck advisory poll would
 //!    wedge agents.
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+
+use temp_root::TempRoot;
+
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 struct Workspace {
     cwd: PathBuf,
     home: PathBuf,
+    _roots: [TempRoot; 2],
 }
 
 impl Workspace {
@@ -41,7 +47,13 @@ impl Workspace {
         fs::create_dir_all(&cwd).unwrap();
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(cwd.join(".git")).unwrap();
-        Self { cwd, home }
+        let cwd_path = cwd.path().to_path_buf();
+        let home_path = home.path().to_path_buf();
+        Self {
+            cwd: cwd_path,
+            home: home_path,
+            _roots: [cwd, home],
+        }
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -64,20 +76,11 @@ impl Workspace {
         cmd.output().unwrap()
     }
 
-    fn cleanup(self) {
-        fs::remove_dir_all(self.cwd).ok();
-        fs::remove_dir_all(self.home).ok();
-    }
+    fn cleanup(self) {}
 }
 
-fn temp_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "{name}-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
+fn temp_path(name: &str) -> TempRoot {
+    TempRoot::new(name)
 }
 
 // -------------------------------------------------------------------------

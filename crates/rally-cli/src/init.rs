@@ -638,17 +638,11 @@ pub(crate) fn run_init(repo_root: PathBuf, worktree_root: PathBuf) -> Result<Ini
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// Spin up a fake repo root mimicking arp-lead's layout closely enough
     /// that the manifest's pointer-resolution check passes.
-    fn fake_repo(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("rally-init-{label}-{nanos}"));
-        fs::create_dir_all(&root).unwrap();
+    fn fake_repo(label: &str) -> crate::test_temp_root::TempRoot {
+        let root = crate::test_temp_root::TempRoot::new(&format!("rally-init-{label}"));
         for rel in [
             DOC_GUIDE,
             DOC_DOCTRINE,
@@ -671,7 +665,7 @@ mod tests {
     #[test]
     fn init_creates_manifest_and_pointer_blocks() {
         let root = fake_repo("create");
-        let outcome = run_init(root.clone(), root.clone()).unwrap();
+        let outcome = run_init(root.path().to_path_buf(), root.path().to_path_buf()).unwrap();
         assert_eq!(outcome.manifest.action, "created");
         assert_eq!(outcome.pointers.len(), 2);
         for p in &outcome.pointers {
@@ -734,14 +728,12 @@ mod tests {
                 "[docs/HANDOFFS-AND-LAUNCHING-AGENTS.md](docs/HANDOFFS-AND-LAUNCHING-AGENTS.md)"
             ));
         }
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn init_is_idempotent_on_second_run() {
         let root = fake_repo("idempotent");
-        let _ = run_init(root.clone(), root.clone()).unwrap();
+        let _ = run_init(root.path().to_path_buf(), root.path().to_path_buf()).unwrap();
 
         // Capture file states.
         let claude_before = fs::read_to_string(root.join("CLAUDE.md")).unwrap();
@@ -749,7 +741,7 @@ mod tests {
         let manifest_before = fs::read_to_string(root.join(".rally/manifest.json")).unwrap();
 
         // Re-run.
-        let outcome2 = run_init(root.clone(), root.clone()).unwrap();
+        let outcome2 = run_init(root.path().to_path_buf(), root.path().to_path_buf()).unwrap();
         assert_eq!(outcome2.manifest.action, "unchanged");
         for p in &outcome2.pointers {
             // Both docs were just freshly created (no manual edits between
@@ -778,8 +770,6 @@ mod tests {
             assert_eq!(doc.matches(POINTER_START).count(), 1);
             assert_eq!(doc.matches(POINTER_END).count(), 1);
         }
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -789,7 +779,7 @@ mod tests {
         let original = "# CLAUDE.md\n\nLocal project rules:\n- be concise\n- no filler\n";
         fs::write(&claude_path, original).unwrap();
 
-        let outcome = run_init(root.clone(), root.clone()).unwrap();
+        let outcome = run_init(root.path().to_path_buf(), root.path().to_path_buf()).unwrap();
         let after = fs::read_to_string(&claude_path).unwrap();
         // Original body preserved verbatim at the head.
         assert!(after.starts_with(original));
@@ -807,13 +797,11 @@ mod tests {
 
         // Second run on this mixed doc: between-markers replacement keeps body intact,
         // no duplication, marker counts stay at 1.
-        let _ = run_init(root.clone(), root.clone()).unwrap();
+        let _ = run_init(root.path().to_path_buf(), root.path().to_path_buf()).unwrap();
         let after2 = fs::read_to_string(&claude_path).unwrap();
         assert!(after2.starts_with(original));
         assert_eq!(after2.matches(POINTER_START).count(), 1);
         assert_eq!(after2.matches(POINTER_END).count(), 1);
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -826,7 +814,7 @@ mod tests {
         );
         fs::write(&agents_path, &stale).unwrap();
 
-        let outcome = run_init(root.clone(), root.clone()).unwrap();
+        let outcome = run_init(root.path().to_path_buf(), root.path().to_path_buf()).unwrap();
         let after = fs::read_to_string(&agents_path).unwrap();
         // Stale content gone, fresh pointer-block content present.
         assert!(!after.contains("OLD STALE POINTER CONTENT"));
@@ -845,8 +833,6 @@ mod tests {
             .find(|p| p.path == "AGENTS.md")
             .unwrap();
         assert_eq!(agents_outcome.action, "updated");
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -854,12 +840,7 @@ mod tests {
         // A consumer repo missing one of agent-rally-point's own doctrine
         // docs must NOT fail `rally init` — that doc is simply not this
         // repo's concern. Build a fake repo missing the doctrine doc only.
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("rally-init-missing-{nanos}"));
-        fs::create_dir_all(&root).unwrap();
+        let root = crate::test_temp_root::TempRoot::new("rally-init-missing");
         // Create all docs *except* the doctrine one.
         for rel in [
             DOC_GUIDE,
@@ -874,7 +855,7 @@ mod tests {
             }
             fs::write(&path, format!("# stub {rel}\n")).unwrap();
         }
-        let outcome = run_init(root.clone(), root.clone()).unwrap();
+        let outcome = run_init(root.path().to_path_buf(), root.path().to_path_buf()).unwrap();
         assert_eq!(outcome.docs.omitted, vec!["doctrine".to_string()]);
         assert_eq!(outcome.docs.resolved.len(), 5);
         assert!(!outcome.docs.resolved.contains_key("doctrine"));
@@ -899,7 +880,5 @@ mod tests {
         assert!(claude_md.contains(
             "[docs/HANDOFFS-AND-LAUNCHING-AGENTS.md](docs/HANDOFFS-AND-LAUNCHING-AGENTS.md)"
         ));
-
-        fs::remove_dir_all(&root).ok();
     }
 }

@@ -18,6 +18,10 @@
 //! report) rather than weakened to pass — the same posture the plan takes for
 //! T-09(ii)'s confirmed live SEC-001 bypass.
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Write as _;
@@ -25,7 +29,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Once;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_rally");
 
@@ -45,7 +49,7 @@ fn warm_up() {
         let _ = Command::new(BIN)
             .arg("version")
             .arg("--json")
-            .env("HOME", std::env::temp_dir())
+            .env("HOME", std::env::temp_dir()) // temp-root-read: version warm-up only reads HOME
             .env("RALLY_GLOBAL_INDEX", "1")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -98,6 +102,7 @@ const AMBIENT_IDENTITY_ENV: &[&str] = &[
 struct Fixture {
     repo: PathBuf,
     home: PathBuf,
+    _roots: Vec<TempRoot>,
 }
 
 impl Fixture {
@@ -112,21 +117,18 @@ impl Fixture {
 
     /// T-08(b): a directory with no `.rally` anywhere up the chain.
     fn bare(name: &str) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let repo = std::env::temp_dir().join(format!("native-hook-{name}-{nanos}-repo"));
-        let home = std::env::temp_dir().join(format!("native-hook-{name}-{nanos}-home"));
+        let repo = TempRoot::new(&format!("native-hook-{name}-repo"));
+        let home = TempRoot::new(&format!("native-hook-{name}-home"));
         fs::create_dir_all(&repo).unwrap();
         fs::create_dir_all(&home).unwrap();
-        Self { repo, home }
+        Self {
+            repo: repo.to_path_buf(),
+            home: home.to_path_buf(),
+            _roots: vec![repo, home],
+        }
     }
 
-    fn cleanup(self) {
-        let _ = fs::remove_dir_all(&self.repo);
-        let _ = fs::remove_dir_all(&self.home);
-    }
+    fn cleanup(self) {}
 
     fn run_bin(&self, args: &[&str]) -> std::process::Output {
         self.run_bin_stdin(args, "", &[])
@@ -1396,14 +1398,7 @@ fn malformed_no_rally_or_old_binary_fail_open() {
     // verdict, because advising is not gating.
     {
         let fx = Fixture::new("t08e");
-        let outside = std::env::temp_dir().join(format!(
-            "native-hook-t08e-outside-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let outside = TempRoot::new("native-hook-t08e-outside");
         fs::create_dir_all(outside.join("src")).unwrap();
         std::os::unix::fs::symlink(&outside, fx.repo.join("escape")).unwrap();
 
@@ -1445,7 +1440,6 @@ fn malformed_no_rally_or_old_binary_fail_open() {
             before,
             "a refused target must not write the ledger"
         );
-        let _ = fs::remove_dir_all(&outside);
         fx.cleanup();
     }
 }
@@ -1535,8 +1529,7 @@ fn sec001_vectors_refuse_and_fall_back() {
         let canary = fx.repo.join("CANARY-iii");
         let planted = fx.repo.join("target/debug/rally");
         write_executable(&planted, &canary_script(&canary));
-        let outside_dir =
-            std::env::temp_dir().join(format!("t09iii-outside-{}", std::process::id()));
+        let outside_dir = TempRoot::new("t09iii-outside");
         fs::create_dir_all(&outside_dir).unwrap();
         let symlink = outside_dir.join("rally");
         std::os::unix::fs::symlink(&planted, &symlink).unwrap();
@@ -1560,7 +1553,6 @@ fn sec001_vectors_refuse_and_fall_back() {
             "stderr: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let _ = fs::remove_dir_all(&outside_dir);
         fx.cleanup();
     }
 }

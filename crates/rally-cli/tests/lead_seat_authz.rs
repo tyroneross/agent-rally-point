@@ -27,29 +27,36 @@
 //! test asserts the residual rather than describing it, so it cannot rot into a
 //! belief that the seat is defended.
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+
+use temp_root::TempRoot;
+
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 struct Workspace {
     cwd: PathBuf,
     home: PathBuf,
+    _roots: [TempRoot; 2],
 }
 
 impl Workspace {
     fn new(name: &str) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let cwd = std::env::temp_dir().join(format!("lsa-{name}-{nanos}-cwd"));
-        let home = std::env::temp_dir().join(format!("lsa-{name}-{nanos}-home"));
+        let cwd_guard = TempRoot::new(&format!("lsa-{name}-cwd"));
+        let home_guard = TempRoot::new(&format!("lsa-{name}-home"));
+        let cwd = cwd_guard.path().to_path_buf();
+        let home = home_guard.path().to_path_buf();
         fs::create_dir_all(&cwd).unwrap();
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(cwd.join(".git")).unwrap();
-        Self { cwd, home }
+        Self {
+            cwd,
+            home,
+            _roots: [cwd_guard, home_guard],
+        }
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -93,10 +100,7 @@ impl Workspace {
         assert_eq!(v["ok"], Value::Bool(true), "first-join seating: {v}");
     }
 
-    fn cleanup(self) {
-        fs::remove_dir_all(self.cwd).ok();
-        fs::remove_dir_all(self.home).ok();
-    }
+    fn cleanup(self) {}
 }
 
 fn ok(v: &Value) -> bool {

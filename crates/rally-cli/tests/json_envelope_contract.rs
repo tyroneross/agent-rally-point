@@ -11,30 +11,31 @@
 //! will cause this test to fail, not silently skip.
 
 mod support;
+use support::temp_root::TempRoot;
 
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Output;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 struct Workspace {
     cwd: PathBuf,
     home: PathBuf,
+    _roots: Vec<TempRoot>,
 }
 
 impl Workspace {
     fn new(name: &str) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let cwd = std::env::temp_dir().join(format!("envelope-{name}-{nanos}-cwd"));
-        let home = std::env::temp_dir().join(format!("envelope-{name}-{nanos}-home"));
+        let cwd = TempRoot::new(&format!("envelope-{name}-cwd"));
+        let home = TempRoot::new(&format!("envelope-{name}-home"));
         fs::create_dir_all(&cwd).unwrap();
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(cwd.join(".git")).unwrap();
-        Self { cwd, home }
+        Self {
+            cwd: cwd.to_path_buf(),
+            home: home.to_path_buf(),
+            _roots: vec![cwd, home],
+        }
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -67,10 +68,7 @@ impl Workspace {
         })
     }
 
-    fn cleanup(self) {
-        fs::remove_dir_all(&self.cwd).ok();
-        fs::remove_dir_all(&self.home).ok();
-    }
+    fn cleanup(self) {}
 }
 
 /// Assert the envelope contract for one command invocation.

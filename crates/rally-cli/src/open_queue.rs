@@ -1396,19 +1396,17 @@ mod tests {
         assert!(items.is_empty());
     }
 
-    fn temp_root(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rally-open-queue-{label}-{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.canonicalize().unwrap()
+    /// Returns the guard that deletes the folder and its canonical path. Keep
+    /// the guard alive while the path is used.
+    fn temp_root(label: &str) -> (crate::test_temp_root::TempRoot, PathBuf) {
+        let guard = crate::test_temp_root::TempRoot::new(&format!("rally-open-queue-{label}"));
+        let canonical = guard.canonicalize().unwrap();
+        (guard, canonical)
     }
 
     #[test]
     fn fs_probe_flags_changed_scope_and_done_plan_and_stays_in_the_room() {
-        let root = temp_root("probe");
+        let (_root_guard, root) = temp_root("probe");
         std::fs::write(root.join("a.rs"), "fn a() {}").unwrap();
         std::fs::create_dir_all(root.join(".build-loop/coordination")).unwrap();
         std::fs::write(
@@ -1416,7 +1414,7 @@ mod tests {
             "# Plan\n**Status:** P1+P2+P3 landed; P4 deferred\n",
         )
         .unwrap();
-        let outside = temp_root("outside");
+        let (_outside_guard, outside) = temp_root("outside");
         std::fs::write(outside.join("secret.md"), "Status: done\n").unwrap();
 
         let mut item = handoff("q", 1, None, &at(0));
@@ -1454,7 +1452,7 @@ mod tests {
 
     #[test]
     fn room_internals_and_fifos_are_never_read() {
-        let root = temp_root("internals");
+        let (_root_guard, root) = temp_root("internals");
         std::fs::create_dir_all(root.join(".rally")).unwrap();
         std::fs::write(root.join(".rally/facts.db"), "x").unwrap();
         std::fs::create_dir_all(root.join(".git")).unwrap();
@@ -1495,7 +1493,7 @@ mod tests {
 
     #[test]
     fn plan_without_done_status_is_not_flagged() {
-        let root = temp_root("plan");
+        let (_root_guard, root) = temp_root("plan");
         let path = root.join("plan.md");
         std::fs::write(&path, "Status: in progress\nwe are done with lunch\n").unwrap();
         assert!(!plan_marks_done(&path));

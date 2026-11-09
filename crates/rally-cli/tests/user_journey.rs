@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
 // SPDX-License-Identifier: Apache-2.0
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+
+use temp_root::TempRoot;
+
 use chrono::DateTime;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -132,6 +137,7 @@ struct Workspace {
     /// exercise the default-on worktree provisioning use [`real_repo`]
     /// instead.
     suppress_worktree: bool,
+    _roots: Vec<TempRoot>,
 }
 
 impl Workspace {
@@ -143,8 +149,8 @@ impl Workspace {
     }
 
     fn new(name: &str) -> Self {
-        let cwd = temp_path(&format!("{name}-cwd"));
-        let home = temp_path(&format!("{name}-home"));
+        let (cwd, cwd_guard) = temp_path(&format!("{name}-cwd"));
+        let (home, home_guard) = temp_path(&format!("{name}-home"));
         fs::create_dir_all(&cwd).unwrap();
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(cwd.join(".git")).unwrap();
@@ -153,11 +159,12 @@ impl Workspace {
             home,
             global_index: false,
             suppress_worktree: true,
+            _roots: vec![cwd_guard, home_guard],
         }
     }
 
     fn new_with_home(name: &str, home: &Path) -> Self {
-        let cwd = temp_path(&format!("{name}-cwd"));
+        let (cwd, cwd_guard) = temp_path(&format!("{name}-cwd"));
         fs::create_dir_all(&cwd).unwrap();
         fs::create_dir_all(home).unwrap();
         fs::create_dir_all(cwd.join(".git")).unwrap();
@@ -166,6 +173,7 @@ impl Workspace {
             home: home.to_path_buf(),
             global_index: false,
             suppress_worktree: true,
+            _roots: vec![cwd_guard],
         }
     }
 
@@ -309,21 +317,11 @@ impl Workspace {
         }
         cmd.args(args).output().unwrap()
     }
-
-    fn cleanup(self) {
-        fs::remove_dir_all(self.cwd).ok();
-        fs::remove_dir_all(self.home).ok();
-    }
 }
 
-fn temp_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "{name}-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
+fn temp_path(name: &str) -> (PathBuf, TempRoot) {
+    let root = TempRoot::new(name);
+    (root.path().to_path_buf(), root)
 }
 
 fn canonical_fact_rows(cwd: &Path) -> Vec<Value> {
@@ -387,8 +385,8 @@ fn init_real_repo(root: &Path) {
 /// exercises its default-on per-agent worktree provisioning.  This is
 /// the harness for the Phase 1b acceptance tests.
 fn real_repo_workspace(name: &str) -> Workspace {
-    let cwd = temp_path(&format!("{name}-cwd"));
-    let home = temp_path(&format!("{name}-home"));
+    let (cwd, cwd_guard) = temp_path(&format!("{name}-cwd"));
+    let (home, home_guard) = temp_path(&format!("{name}-home"));
     fs::create_dir_all(&cwd).unwrap();
     fs::create_dir_all(&home).unwrap();
     init_real_repo(&cwd);
@@ -397,6 +395,7 @@ fn real_repo_workspace(name: &str) -> Workspace {
         home,
         global_index: false,
         suppress_worktree: false, // default-ON path under test.
+        _roots: vec![cwd_guard, home_guard],
     }
 }
 
@@ -513,7 +512,6 @@ fn published_fact_schema_covers_runtime_fact_kinds() {
          `rally say backlog-item` round-trip) is missing from the published schema enum \
          {published:?} — this is exactly the class of drift this test exists to catch"
     );
-    workspace.cleanup();
 
     // The remaining kinds are either stable (never renamed away from their
     // `#[serde(rename_all = "snake_case")]` default) or `rally`-internal
@@ -601,7 +599,6 @@ fn replies_schema_covers_missing_and_pending_rows() {
         pending["data"]["replies"]["rows"][0]["reply"]["state"],
         "pending"
     );
-    workspace.cleanup();
 }
 
 fn type_matches(type_schema: &Value, value: &Value) -> bool {
@@ -645,8 +642,6 @@ fn rally_uses_factstr_sqlite_as_the_fact_store() {
     assert_eq!(room["ok"], true);
     // Component B: say auto-registers presence (1) + lead (2) + artifact (3).
     assert_eq!(room["data"]["room"]["max_seq"], 3);
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -804,8 +799,6 @@ fn rally_agent_enters_room_checks_work_and_says_artifact() {
     );
     assert!(workspace.cwd.join(".rally/facts.db").exists());
     assert!(workspace.cwd.join(".rally/cursors.json").exists());
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -848,7 +841,6 @@ fn rally_is_not_a_command_fallback() {
             .unwrap()
             .contains("`--tool` requires an argument")
     );
-    workspace.cleanup();
 }
 
 #[test]
@@ -922,8 +914,6 @@ fn rally_before_write_matches_directory_scopes() {
             .len(),
         1
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -1023,8 +1013,6 @@ fn rally_next_finds_useful_work_while_waiting() {
             .any(|item| item["event_id"] == artifact_id),
         "artifact review resolve should consume the reviewed artifact"
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -1077,8 +1065,6 @@ fn rally_next_prioritizes_targeted_ack_artifact_over_stale_handoff() {
                 && item["target_event_id"] == handoff_id),
         "newer handoff should stay visible as an alternative"
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -1277,8 +1263,6 @@ fn rally_artifact_ref_consumes_targeted_handoff_only_from_target_tool() {
             .any(|item| item["event_id"] == handoff_id),
         "closed handoff should not appear in next.waiting_on"
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -1329,8 +1313,6 @@ fn rally_resolve_closes_risks_in_room_projection() {
             .any(|f| f["event_id"] == risk_id),
         "resolved risk should not remain current"
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -1389,8 +1371,6 @@ fn rally_next_waits_only_when_no_useful_work_exists() {
             .unwrap()
             .is_empty()
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -1495,8 +1475,6 @@ fn rally_backlog_plan_status_is_actionable_for_target() {
         after_update["data"]["next"]["action"], "update_plan_status",
         "in_progress status should clear the immediate status-update obligation"
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -1570,8 +1548,6 @@ fn rally_entry_and_handoff_split_response_and_work_buckets() {
             .iter()
             .any(|claim| claim["subject"] == "claude owns other work")
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -1863,8 +1839,6 @@ fn rally_runs_and_injects_managed_tmux_sessions() {
         0
     );
     assert!(!workspace.cwd.join(".rally/sessions.json").exists());
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -1929,8 +1903,6 @@ fn rally_stop_tombstones_session_when_backend_stop_fails() {
             .all(|claim| claim["event_id"] != claim_id),
         "explicit stop must release a normalized managed-session claim: {room:#}"
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -2014,8 +1986,6 @@ esac
         0,
         "--reap must be idempotent"
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -2092,8 +2062,6 @@ esac
         stderr.contains("no longer active"),
         "inject must fail loud for a gone/renumbered managed session (not silent ledger fallback); stderr={stderr}"
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -2205,8 +2173,6 @@ fn rally_inject_require_ack_timeout_returns_ok_with_timeout_ack() {
         1,
         "a late target ACK must close canonically exactly once"
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -2334,8 +2300,6 @@ fn rally_run_assigns_numbered_agent_ids() {
         stderr.contains("already uses") && stderr.contains("codex-01"),
         "error must name the conflicting session-id; got: {stderr}"
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -2448,8 +2412,6 @@ fn rally_run_reserves_numbered_ids_under_parallel_launch() {
     assert!(names.contains(&format!("claude-{n:02}")));
     assert!(tools.contains("claude_code:01"));
     assert!(tools.contains(&format!("claude_code:{n:02}")));
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -2476,8 +2438,6 @@ fn rally_run_removes_session_reservation_when_backend_start_fails() {
             .len(),
         0
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -2587,8 +2547,6 @@ fn rally_next_and_inject_emit_wake_intent_facts() {
         4,
         "timeout must return concrete fallback choices"
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -2620,7 +2578,6 @@ fn rally_next_audit_is_observation_only() {
         before_seq,
         "--audit must not append presence, wake, or read facts"
     );
-    workspace.cleanup();
 }
 
 /// f5 (2026-07-09): the test above only asserted `--audit`'s output against
@@ -2682,9 +2639,6 @@ fn rally_next_audit_matches_default_next_action() {
         audit_next["data"]["next"]["target_event_id"], audit_handoff_id,
         "`next --audit` must resolve to the seeded handoff"
     );
-
-    default_ws.cleanup();
-    audit_ws.cleanup();
 }
 
 /// B17: verify that `locate` and `recent` use only the rooms registry (per-repo
@@ -2693,7 +2647,7 @@ fn rally_next_audit_matches_default_next_action() {
 /// rooms-based discovery still works normally via the global index.
 #[test]
 fn rally_locate_and_recent_discover_rooms_without_legacy() {
-    let home = temp_path("rally-discovery-home");
+    let (home, _home_guard) = temp_path("rally-discovery-home");
     // B17: global index is opt-in; these workspaces use cross-repo locate/recent.
     let repo_a = Workspace::new_with_home("rally-discovery-a", &home).with_global_index();
     let repo_b = Workspace::new_with_home("rally-discovery-b", &home).with_global_index();
@@ -2778,15 +2732,11 @@ fn rally_locate_and_recent_discover_rooms_without_legacy() {
             .any(|row| row["record"]["event"]["id"] == "evt_legacy_wake"),
         "recent must NOT include the legacy-only event after flag retirement"
     );
-
-    repo_a.cleanup();
-    repo_b.cleanup();
-    fs::remove_dir_all(home).ok();
 }
 
 #[test]
 fn rally_refresh_does_not_clobber_corrupt_room_index() {
-    let home = temp_path("rally-corrupt-index-home");
+    let (home, _home_guard) = temp_path("rally-corrupt-index-home");
     // B17: global index is opt-in; this test exercises the corrupt-index recovery path.
     let workspace = Workspace::new_with_home("rally-corrupt-index", &home).with_global_index();
     let index_path = home.join(".agent-rally-point/rooms/v1/index.json");
@@ -2823,9 +2773,6 @@ fn rally_refresh_does_not_clobber_corrupt_room_index() {
             .iter()
             .any(|row| row["fact"]["event_id"].as_str() == Some(artifact_id))
     );
-
-    workspace.cleanup();
-    fs::remove_dir_all(home).ok();
 }
 
 #[test]
@@ -2834,7 +2781,7 @@ fn rally_no_global_index_env_var_skips_home_index() {
     // invocation out of writing to or reading from the home-dir index file.
     // Per-repo facts (in <repo_root>/.rally/) keep working normally; only the
     // cross-repo "what other rooms exist?" surface goes silent.
-    let home = temp_path("rally-no-global-index-home");
+    let (home, _home_guard) = temp_path("rally-no-global-index-home");
     let workspace = Workspace::new_with_home("rally-no-global-index", &home);
     let index_path = home.join(".agent-rally-point/rooms/v1/index.json");
 
@@ -2915,20 +2862,19 @@ fn rally_no_global_index_env_var_skips_home_index() {
             .unwrap_or(true),
         "no room_index_unreadable warning expected in fully-isolated mode"
     );
-
-    workspace.cleanup();
-    fs::remove_dir_all(home).ok();
 }
 
 #[test]
 fn linked_git_worktree_uses_common_room() {
-    let home = temp_path("rally-common-room-home");
+    let (home, _home_guard) = temp_path("rally-common-room-home");
     let primary = Workspace::new_with_home("rally-common-room-main", &home);
+    let (cwd, cwd_guard) = temp_path("rally-common-room-linked");
     let linked = Workspace {
-        cwd: temp_path("rally-common-room-linked"),
+        cwd,
         home: home.clone(),
         global_index: false,
         suppress_worktree: true,
+        _roots: vec![cwd_guard],
     };
     fs::create_dir_all(&linked.cwd).unwrap();
     let linked_git_dir = primary.cwd.join(".git/worktrees/rally-common-room-linked");
@@ -2955,10 +2901,6 @@ fn linked_git_worktree_uses_common_room() {
     let room = primary.json(&["room", "--json"]);
     // Component B: say claim auto-registers presence(1)+lead(2)+claim(3).
     assert_eq!(room["data"]["room"]["max_seq"], 3);
-
-    linked.cleanup();
-    primary.cleanup();
-    fs::remove_dir_all(home).ok();
 }
 
 // Plan F functional core (Chunk 3): the herdr backend is removed; the
@@ -2996,8 +2938,6 @@ fn rally_run_rejects_herdr_backend_with_clear_error() {
         stderr.contains("unsupported backend herdr"),
         "error must name herdr as an unsupported backend; got: {stderr}"
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -3123,8 +3063,6 @@ fn rally_uses_native_cmux_managed_session_commands() {
     // Plan F functional core (Chunk 3): herdr_stop assertion removed
     // (Backend::Herdr is gone; the corresponding rally_run_rejects_*
     // test above covers the negative path).
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -3224,8 +3162,6 @@ fn rally_room_is_queryable_by_tool_role_path_event_thread_and_since() {
             .len(),
         1
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -3243,8 +3179,6 @@ fn rally_json_errors_use_agent_cli_exit_codes() {
     let body: Value = serde_json::from_slice(&invalid.stderr).unwrap();
     assert_eq!(body["exit_code"], 2);
     assert!(body["error"].as_str().unwrap().contains("invalid --since"));
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -3284,8 +3218,6 @@ fn rally_say_persists_summary_round_trip() {
         decision["data"]["say"]["fact"]["summary"], "Adopt the finite pickup protocol.",
         "--summary=value form must round-trip into fact.summary"
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -3309,8 +3241,6 @@ fn rally_rejects_unknown_flags() {
             .unwrap()
             .contains("`--future-flag` is not expected")
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -3362,8 +3292,6 @@ fn rally_check_covers_completion_boundaries() {
             .unwrap()
             .contains("unsupported check phase after-artifact")
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -3510,8 +3438,6 @@ fn rally_supports_all_required_fact_kinds() {
         "agent-rally.fact.v1.json",
         &resolve_fact["data"]["say"]["fact"],
     );
-
-    workspace.cleanup();
 }
 
 /// Component A: presence substrate (B16 acceptance test).
@@ -3621,8 +3547,6 @@ fn presence_substrate_enter_writes_presence_and_lead() {
         rows.iter().any(|r| r["fact"]["kind"] == "presence"),
         "presence facts appear in recent rows"
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -3644,15 +3568,13 @@ fn next_exposes_tool_scoped_lead_context() {
     assert_eq!(lead_context["self_is_lead"], false);
     assert_eq!(lead_context["self_acknowledged"], false);
     assert_eq!(lead_context["current_lead_acknowledged"], true);
-
-    workspace.cleanup();
 }
 
 /// B17 — migrate-legacy: one-shot replay of legacy changes.jsonl into per-repo
 /// ledger; idempotent on second run; legacy file untouched.
 #[test]
 fn rally_migrate_legacy_replays_and_is_idempotent() {
-    let home = temp_path("rally-migrate-legacy-home");
+    let (home, _home_guard) = temp_path("rally-migrate-legacy-home");
     let workspace = Workspace::new_with_home("rally-migrate-legacy", &home);
 
     // Seed a legacy channel whose slug matches the workspace repo basename.
@@ -3787,9 +3709,6 @@ fn rally_migrate_legacy_replays_and_is_idempotent() {
         legacy_file.exists(),
         "migrate-legacy must not delete the legacy file"
     );
-
-    workspace.cleanup();
-    fs::remove_dir_all(home).ok();
 }
 
 // =============================================================================
@@ -3853,8 +3772,6 @@ fn b13_produces_depends_round_trip_on_claim() {
         "evidence must contain depends:src/config.rs; got: {:?}",
         evidence
     );
-
-    workspace.cleanup();
 }
 
 /// B13-2: a receipt fact links to a handoff and closes it from `open_handoffs`.
@@ -3931,8 +3848,6 @@ fn b13_receipt_links_handoff_and_closes_it() {
             .any(|f| f["event_id"].as_str() == Some(handoff_id)),
         "handoff must be closed after receipt"
     );
-
-    workspace.cleanup();
 }
 
 /// B13-3a: `rally check ci --strict` exits 0 when the room is clean.
@@ -3967,8 +3882,6 @@ fn b13_check_ci_strict_exits_zero_clean_room() {
             .len(),
         0
     );
-
-    workspace.cleanup();
 }
 
 /// B13-3b: `rally check ci --strict` exits 4 with an unresolved blocker.
@@ -4003,8 +3916,6 @@ fn b13_check_ci_strict_exits_4_with_unresolved_blocker() {
         "offenders must include the unresolved blocker; got: {:?}",
         offenders
     );
-
-    workspace.cleanup();
 }
 
 /// B13-3c: `rally check ci --strict` exits 4 with a dep-not-met offender.
@@ -4067,8 +3978,6 @@ fn b13_check_ci_strict_exits_4_with_dep_not_met() {
         offenders2,
         output2.status.code().unwrap_or(-1)
     );
-
-    workspace.cleanup();
 }
 
 /// B13-4: `rally check ci --help` exits 0.
@@ -4086,8 +3995,6 @@ fn b13_check_ci_help_exits_zero() {
         stdout.contains("strict") || stdout.contains("CI"),
         "help text must mention --strict; got: {stdout}"
     );
-
-    workspace.cleanup();
 }
 // #6 Source-grounding integration tests
 // =========================================================================
@@ -4169,8 +4076,6 @@ fn advisory_6_source_grounding_unchanged_file_flags_ungrounded_artifact() {
         "warn",
         "risk severity must be warn"
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -4231,8 +4136,6 @@ fn advisory_6_source_grounding_changed_file_does_not_flag() {
         "changed file must NOT produce ungrounded-artifact risk; risks: {:?}",
         ungrounded
     );
-
-    workspace.cleanup();
 }
 
 // =========================================================================
@@ -4345,8 +4248,6 @@ fn advisory_8_ripple_alert_fires_on_pub_sig_change_affecting_peer_claim() {
 
     // Suppress unused variable warning for peer_claim_id.
     let _ = peer_claim_id;
-
-    workspace.cleanup();
 }
 
 // =========================================================================
@@ -4363,7 +4264,6 @@ fn advisory_9_tier_fit_help_exits_zero() {
         "rally check tier-fit --help must exit 0; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    workspace.cleanup();
 }
 
 /// Without a calibration fact, tier-fit returns neutral no_calibration status.
@@ -4390,7 +4290,6 @@ fn advisory_9_tier_fit_no_calibration_returns_neutral() {
         status, "no_calibration",
         "must return no_calibration when no fact present"
     );
-    workspace.cleanup();
 }
 
 /// With a calibration fact, mismatch emits a tier_mismatch finding.
@@ -4441,8 +4340,6 @@ fn advisory_9_tier_fit_mismatch_emits_finding_vs_calibration() {
         finding_severity, "info",
         "tier mismatch is advisory info, not blocking"
     );
-
-    workspace.cleanup();
 }
 
 /// With a matching tier, tier-fit returns ok.
@@ -4478,8 +4375,6 @@ fn advisory_9_tier_fit_ok_when_matching_calibration() {
         .as_str()
         .unwrap_or("");
     assert_eq!(status, "ok");
-
-    workspace.cleanup();
 }
 
 /// B-whoami smoke test: `rally whoami --json` exits 0 and returns repo_root + build_id.
@@ -4515,8 +4410,6 @@ fn rally_whoami_json_exits_zero_and_returns_identity() {
     assert!(!cwd.is_empty(), "cwd must be non-empty");
     let worktree = whoami["worktree"].as_str().unwrap_or("");
     assert!(!worktree.is_empty(), "worktree must be non-empty");
-
-    workspace.cleanup();
 }
 
 /// `repo_id` is the stable repo identity, not the active engagement label.
@@ -4545,8 +4438,6 @@ fn rally_whoami_repo_id_uses_manifest_not_active_engagement() {
         "agent-rally-point"
     );
     assert_eq!(whoami["room_id"].as_str().unwrap_or(""), "sprint-9");
-
-    workspace.cleanup();
 }
 
 /// B-whoami: --tool flag is echoed back in the output.
@@ -4575,8 +4466,6 @@ fn rally_whoami_with_tool_reflects_tool_in_output() {
     assert_eq!(lead_context["self_is_lead"], true);
     assert_eq!(lead_context["self_acknowledged"], true);
     assert_eq!(lead_context["current_lead_acknowledged"], true);
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -4625,8 +4514,6 @@ fn rally_owners_dirty_maps_dirty_path_to_claim_session() {
     assert_eq!(row["owner_status"], "active");
     assert_eq!(row["lease_expired"], false);
     assert_eq!(row["is_owner_live"], true);
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -4677,7 +4564,6 @@ fn same_tool_sibling_session_cannot_claim_owned_path() {
         warning.contains("claim conflict"),
         "failure must identify the existing claim: {body:#}"
     );
-    workspace.cleanup();
 }
 
 #[test]
@@ -4798,8 +4684,6 @@ fn session_ensure_mints_or_reuses_one_parent_lease_with_truthful_capabilities() 
     assert_eq!(history["data"]["session"]["total"], 2);
     assert_eq!(history["data"]["session"]["emitted"], 1);
     assert_eq!(history["data"]["session"]["omitted"], 1);
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -5054,8 +4938,6 @@ fn session_close_releases_only_the_exact_same_tool_session_claims() {
             .unwrap()
             .contains("is closed")
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -5214,8 +5096,6 @@ fn second_fresh_session_activates_rallyd_and_current_view_has_direct_daemon_pari
         .map(|row| row["session_id"].as_str().unwrap().to_string())
         .collect::<BTreeSet<_>>();
     assert_eq!(routed_ids, direct_ids);
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -5231,7 +5111,6 @@ fn session_close_without_a_parent_lease_refuses_to_guess() {
             .unwrap()
             .contains("refusing to guess")
     );
-    workspace.cleanup();
 }
 
 // =============================================================================
@@ -5271,8 +5150,6 @@ fn mission_set_then_get_returns_text_and_set_by() {
         get_result["data"]["mission"]["set_at"].is_string(),
         "set_at must be a string timestamp"
     );
-
-    workspace.cleanup();
 }
 
 /// (b) A second `--set` supersedes the first (latest-by-seq wins).
@@ -5303,8 +5180,6 @@ fn mission_second_set_supersedes_first() {
         get_result["data"]["mission"]["text"], "new mission",
         "second set must supersede first"
     );
-
-    workspace.cleanup();
 }
 
 /// (c) The mission appears in `enter --json` output after being set.
@@ -5329,8 +5204,6 @@ fn mission_appears_in_enter_json_after_set() {
         enter["data"]["enter"]["mission"], "focus on stability",
         "mission must appear in enter output after being set"
     );
-
-    workspace.cleanup();
 }
 
 /// Enter output has no `mission` key when none has been set (skip_serializing_if).
@@ -5345,8 +5218,6 @@ fn mission_absent_from_enter_when_unset() {
         "mission must not appear in enter output when unset; got: {}",
         enter["data"]["enter"]["mission"]
     );
-
-    workspace.cleanup();
 }
 
 /// (d) Envelope set→get round-trips for a named agent.
@@ -5383,8 +5254,6 @@ fn mission_envelope_set_then_get_round_trips() {
     assert_eq!(entry["may"], "refactor within claimed files");
     assert_eq!(entry["must_check"], "before touching shared interfaces");
     assert_eq!(entry["set_by"], "codex:01");
-
-    workspace.cleanup();
 }
 
 /// A second envelope set for the same agent supersedes (latest-by-seq wins).
@@ -5422,8 +5291,6 @@ fn mission_envelope_second_set_supersedes() {
         entry["may"], "new autonomy",
         "second envelope set must supersede first"
     );
-
-    workspace.cleanup();
 }
 
 /// (e) Mission fact survives ledger replay: set, re-open store, confirm mission reads back.
@@ -5454,8 +5321,6 @@ fn mission_fact_survives_ledger_replay() {
         get["data"]["mission"]["text"], "survive the replay",
         "mission must survive ledger replay and appear in mission GET"
     );
-
-    workspace.cleanup();
 }
 
 /// GET when no mission is set returns null mission and empty envelopes.
@@ -5477,8 +5342,6 @@ fn mission_get_with_no_mission_set() {
         0,
         "envelopes must be empty when no envelopes have been set"
     );
-
-    workspace.cleanup();
 }
 
 // ---------------------------------------------------------------------------
@@ -5559,7 +5422,6 @@ fn enter_identity_same_session_has_no_duplicate_warning() {
     let entered = enter_identity(&workspace, ENTER_LAUNCHER_SESSION, None);
     assert_no_enter_collision(&workspace, &entered);
     drop(daemon);
-    workspace.cleanup();
 }
 
 #[test]
@@ -5594,7 +5456,6 @@ fn enter_identity_launcher_then_hook_alias_has_no_duplicate_warning() {
         "the two lease identities must remain separate"
     );
     drop(daemon);
-    workspace.cleanup();
 }
 
 #[test]
@@ -5665,7 +5526,6 @@ fn enter_identity_explicit_hook_session_and_exported_launcher_are_aliases() {
         "sess:parent:other-terminal#live"
     );
     drop(daemon);
-    workspace.cleanup();
 }
 
 #[test]
@@ -5676,7 +5536,6 @@ fn enter_identity_new_alias_uses_caller_observer_evidence() {
     let entered = enter_identity(&workspace, ENTER_HOOK_SESSION, Some("4242"));
     assert_no_enter_collision(&workspace, &entered);
     drop(daemon);
-    workspace.cleanup();
 }
 
 #[test]
@@ -5703,7 +5562,6 @@ fn enter_identity_distinct_sessions_warn_once_with_caller_session() {
         "sess:parent:another-terminal#live"
     );
     drop(daemon);
-    workspace.cleanup();
 }
 
 #[test]
@@ -5723,7 +5581,6 @@ fn enter_identity_unproven_alias_still_warns() {
     );
     assert_eq!(enter_identity_risks(&workspace).len(), 1);
     drop(daemon);
-    workspace.cleanup();
 }
 
 // R12: shared-branch / worktree hazard detector integration tests
@@ -5811,8 +5668,6 @@ fn r12a_shared_branch_hazard_fires_for_second_tool_on_non_main_branch() {
         Some("warn"),
         "shared-branch-hazard risk must have severity=warn"
     );
-
-    workspace.cleanup();
 }
 
 /// R12b: entering the same canonical checkout when HEAD is on `main` must NOT
@@ -5864,8 +5719,6 @@ fn r12b_no_hazard_on_main_branch() {
         !hazard_risk,
         "no shared-branch-hazard risk fact must appear when on main"
     );
-
-    workspace.cleanup();
 }
 
 // C-FLEET / Plan F adoption integration tests.
@@ -5909,8 +5762,6 @@ fn rally_enter_emits_unmanaged_agent_for_presence_only_tool() {
         unmanaged_count, 1,
         "expected exactly one unmanaged-agent risk fact; risks: {risks:?}"
     );
-
-    workspace.cleanup();
 }
 
 /// A daemon-backed enter must not fetch the full durable ledger to decide
@@ -6090,7 +5941,6 @@ fn routed_enter_keeps_managed_identity_over_eight_mib_ledger() {
     }
 
     drop(daemon);
-    workspace.cleanup();
 }
 
 /// C-FLEET: a tool that later runs `rally adopt` flips out of the
@@ -6176,8 +6026,6 @@ fn rally_adopt_flips_stray_to_managed_with_cmux() {
     assert_eq!(row["injectable"], true);
     assert_eq!(row["via"], "cmux");
     assert_eq!(row["target"], "workspace:42");
-
-    workspace.cleanup();
 }
 
 /// C-FLEET: `rally adopt` with neither --tmux nor --cmux is a clear usage
@@ -6196,8 +6044,6 @@ fn rally_adopt_requires_tmux_or_cmux() {
         msg.contains("--tmux") && msg.contains("--cmux"),
         "expected --tmux/--cmux usage error; got: {msg}"
     );
-
-    workspace.cleanup();
 }
 
 /// Duplicate adoption must be rejected by target, even if a later caller uses
@@ -6240,8 +6086,6 @@ fn rally_adopt_rejects_duplicate_target_across_different_tools() {
         stderr.contains("already adopted") || stderr.contains("rally-shared"),
         "expected dedup error mentioning target; got stderr: {stderr}"
     );
-
-    workspace.cleanup();
 }
 
 // ===========================================================================
@@ -6333,8 +6177,6 @@ fn rally_run_default_provisions_per_agent_worktree() {
         joined.contains(worktree_path),
         "backend start command must cd into the worktree; got: {joined}"
     );
-
-    workspace.cleanup();
 }
 
 /// Two agents launched in the same repo get two distinct linked worktrees on
@@ -6417,8 +6259,6 @@ fn two_rally_runs_get_distinct_worktrees_sharing_one_room() {
         2,
         "sessions from one linked worktree must see both agents"
     );
-
-    workspace.cleanup();
 }
 
 /// `rally stop` removes the per-agent worktree and, when safe, its branch.
@@ -6489,8 +6329,6 @@ fn rally_stop_removes_per_agent_worktree() {
         !branch_check.status.success(),
         "empty per-agent branch {branch} must be deleted after stop"
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -6539,7 +6377,6 @@ fn rally_stop_retains_registration_and_worktree_when_death_is_unconfirmed() {
             .iter()
             .any(|entry| entry["session_id"] == session_id)
     );
-    workspace.cleanup();
 }
 
 #[test]
@@ -6586,7 +6423,6 @@ fn rally_stop_closes_failed_binding_without_stopping_or_removing_worktree() {
             ["sessions"],
         json!([])
     );
-    workspace.cleanup();
 }
 
 /// `rally run --shared` and `--no-worktree` opt out of worktree isolation.
@@ -6644,8 +6480,6 @@ fn rally_run_shared_flag_opts_out_of_worktree() {
         run_alt["data"]["run"]["session"]["worktree_path"].is_null(),
         "--no-worktree must also skip worktree provisioning"
     );
-
-    workspace.cleanup();
 }
 
 /// `rally run --dry-run` reports the planned worktree path and branch without
@@ -6687,8 +6521,6 @@ fn rally_run_dry_run_reports_planned_worktree_without_touching_disk() {
         !PathBuf::from(planned_wt).exists(),
         "dry-run must not create the worktree on disk"
     );
-
-    workspace.cleanup();
 }
 
 /// Bounded Codex work is launched through Rally's lifecycle worker, carries
@@ -6772,8 +6604,6 @@ fn rally_run_codex_task_renders_one_shot_command_and_lifecycle() {
         !persistent_start.contains("codex exec"),
         "{persistent_start}"
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -6977,7 +6807,6 @@ printf 'completed: %s\n' "$prompt" > "$result"
         format!("completed: {prompt}\n")
     );
     assert_eq!(fs::read_to_string(&prompt_capture).unwrap(), second_prompt);
-    workspace.cleanup();
 }
 
 #[test]
@@ -7161,7 +6990,6 @@ printf 'completed: %s\n' "$prompt" > "$result"
     );
 
     drop(daemon);
-    workspace.cleanup();
 }
 
 #[test]
@@ -7346,7 +7174,6 @@ printf 'completed after release\n' > "$result"
             .unwrap_or(false),
         "completed task B remained live"
     );
-    workspace.cleanup();
 }
 
 #[test]
@@ -7388,8 +7215,6 @@ fn rally_inject_rejects_task_scoped_session() {
     });
     assert!(body.contains("task-scoped"), "{body}");
     assert!(body.contains("prompt was fixed at launch"), "{body}");
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -7493,8 +7318,6 @@ printf 'completed: %s\n' "$prompt" > "$result"
         artifact_text.contains(worktree.to_string_lossy().as_ref()),
         "{artifact_text}"
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -7578,8 +7401,6 @@ time.sleep(30)
             .iter()
             .all(|session| session["session"]["session_id"] != session_id)
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -7660,8 +7481,6 @@ cat >/dev/null
         !prompt_path.exists(),
         "stale-session reap must remove input"
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -7701,7 +7520,6 @@ fn rally_run_task_rejects_unsupported_agent_before_session_reservation() {
             "unsupported task mode must not reserve a managed session"
         );
     }
-    workspace.cleanup();
 }
 
 // =============================================================================
@@ -7858,8 +7676,6 @@ fn rally_inbox_survives_age_and_cursor_and_clears_only_on_receiver_ack() {
         inbox_ids(&workspace, "codex").is_empty(),
         "a receiver-authored receipt empties the inbox"
     );
-
-    workspace.cleanup();
 }
 
 /// `rally inbox` is READ-ONLY: it writes no fact and advances no cursor. If it
@@ -7892,8 +7708,6 @@ fn rally_inbox_is_read_only() {
         .as_i64()
         .unwrap();
     assert_eq!(before, after, "rally inbox must append no fact");
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -7954,7 +7768,6 @@ fn receiver_can_resolve_an_obligation_after_reaper_expires_the_handoff() {
         &handoff_id,
     ]);
     assert!(inbox_ids(&workspace, "codex").is_empty());
-    workspace.cleanup();
 }
 
 /// `next.inbox` rides along on the `next` result, so the coordination hook can
@@ -7996,8 +7809,6 @@ fn rally_next_embeds_the_inbox_without_a_second_command() {
             .contains("--ref"),
         "each item carries the command that clears it"
     );
-
-    workspace.cleanup();
 }
 
 /// The `Ignore` half of [`next::StaleTargetedPolicy`], end to end.
@@ -8056,8 +7867,6 @@ fn self_exit_check_still_reaches_an_empty_cycle_with_an_ancient_handoff() {
         next["data"]["next"]["target_event_id"].as_str(),
         Some(handoff_id.as_str())
     );
-
-    workspace.cleanup();
 }
 
 #[test]
@@ -8111,7 +7920,6 @@ esac
         0,
         "stop must tombstone a stale session: {after:#}"
     );
-    workspace.cleanup();
 }
 
 /// A successful Git provision followed by a refused record append must never
@@ -8235,14 +8043,13 @@ exit 1
     assert_ne!(retry["data"]["run"]["session"]["session_id"], session);
     assert!(marker.exists(), "only the valid retry reaches the backend");
     assert!(retained.exists());
-    workspace.cleanup();
 }
 
 #[test]
 fn run_worktree_failure_in_commitless_repo_leaves_no_active_session() {
     let _run_guard = serialize_rally_run();
-    let cwd = temp_path("rally-run-no-commits-cwd");
-    let home = temp_path("rally-run-no-commits-home");
+    let (cwd, cwd_guard) = temp_path("rally-run-no-commits-cwd");
+    let (home, home_guard) = temp_path("rally-run-no-commits-home");
     fs::create_dir_all(&cwd).unwrap();
     fs::create_dir_all(&home).unwrap();
     let init = Command::new("git")
@@ -8257,6 +8064,7 @@ fn run_worktree_failure_in_commitless_repo_leaves_no_active_session() {
         home,
         global_index: false,
         suppress_worktree: false,
+        _roots: vec![cwd_guard, home_guard],
     };
     let run = workspace.output(&[
         "run",
@@ -8282,5 +8090,4 @@ fn run_worktree_failure_in_commitless_repo_leaves_no_active_session() {
         0,
         "a run whose worktree provisioning failed must not leave an active session: {sessions:#}"
     );
-    workspace.cleanup();
 }

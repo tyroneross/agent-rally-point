@@ -43,11 +43,14 @@
 //! | volume              | `oversized_field_cannot_bury_later_sections`    |
 //! | negative control    | `benign_ledger_still_renders_a_readable_digest` |
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The canonical trust label, byte-identical to the coordination hook's
 /// `PREAMBLE_MARK` and to the renderer's. Duplicated here ON PURPOSE: a test
@@ -70,20 +73,21 @@ const AUTHORED_SUBSECTIONS: &[&str] = &[
 struct Workspace {
     cwd: PathBuf,
     home: PathBuf,
+    _roots: Vec<TempRoot>,
 }
 
 impl Workspace {
     fn new(name: &str) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let cwd = std::env::temp_dir().join(format!("arp-r04-{name}-{nanos}-cwd"));
-        let home = std::env::temp_dir().join(format!("arp-r04-{name}-{nanos}-home"));
+        let cwd = TempRoot::new(&format!("arp-r04-{name}-cwd"));
+        let home = TempRoot::new(&format!("arp-r04-{name}-home"));
         fs::create_dir_all(&cwd).unwrap();
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(cwd.join(".git")).unwrap();
-        Self { cwd, home }
+        Self {
+            cwd: cwd.to_path_buf(),
+            home: home.to_path_buf(),
+            _roots: vec![cwd, home],
+        }
     }
 
     fn run_with_engagement(&self, engagement: Option<&str>, args: &[&str]) -> Output {
@@ -227,10 +231,7 @@ impl Workspace {
         fs::read_to_string(self.cwd.join(".rally").join("RETROSPECTIVE.md")).unwrap()
     }
 
-    fn cleanup(self) {
-        fs::remove_dir_all(&self.cwd).ok();
-        fs::remove_dir_all(&self.home).ok();
-    }
+    fn cleanup(self) {}
 }
 
 /// Every ATX heading line in the document.

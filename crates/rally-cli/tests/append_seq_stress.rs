@@ -9,24 +9,23 @@
 //! The room is synthetic and lives under the OS temp dir; HOME is pointed at a
 //! scratch dir and session env is scrubbed so no live `.rally/` is touched.
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const PRE_EXISTING: i64 = 1_200;
 const WORKERS: usize = 8;
 const SAYS_PER_WORKER: usize = 5;
 
-fn temp_root() -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!("rally-seq-stress-{nanos}"));
+fn temp_root() -> TempRoot {
+    let root = TempRoot::new("rally-seq-stress");
     fs::create_dir_all(root.join(".git")).unwrap();
     fs::create_dir_all(root.join("home")).unwrap();
     root
@@ -132,7 +131,7 @@ fn concurrent_say_processes_allocate_unique_contiguous_seqs() {
 
     let workers: Vec<_> = (0..WORKERS)
         .map(|worker| {
-            let root = root.clone();
+            let root = root.to_path_buf();
             thread::spawn(move || {
                 for index in 0..SAYS_PER_WORKER {
                     let subject = format!("stress {worker}-{index}");
@@ -197,5 +196,4 @@ fn concurrent_say_processes_allocate_unique_contiguous_seqs() {
     // The derived view agrees with the log.
     let room = run_ok(&root, &["room", "--json"]);
     assert_eq!(room["data"]["room"]["max_seq"], json!(total));
-    fs::remove_dir_all(&root).ok();
 }

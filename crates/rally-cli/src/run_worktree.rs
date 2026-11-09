@@ -558,16 +558,9 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn tmp_dir(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let p = std::env::temp_dir().join(format!("rally-runwt-{label}-{nanos}"));
-        fs::create_dir_all(&p).unwrap();
-        p
+    fn tmp_dir(label: &str) -> crate::test_temp_root::TempRoot {
+        crate::test_temp_root::TempRoot::new(&format!("rally-runwt-{label}"))
     }
 
     fn git_available() -> bool {
@@ -589,7 +582,6 @@ mod tests {
         let repo = tmp_dir("layout");
         let got = worktrees_root(&repo);
         assert_eq!(got, repo.join(".rally").join("worktrees"));
-        fs::remove_dir_all(&repo).ok();
     }
 
     #[test]
@@ -626,8 +618,6 @@ mod tests {
         let head = git_output(&pw.path, "git", &["symbolic-ref", "--short", "HEAD"])
             .expect("symbolic-ref");
         assert_eq!(head.trim(), "rally/claude-reviewer-01");
-
-        fs::remove_dir_all(&repo).ok();
     }
 
     #[test]
@@ -648,8 +638,6 @@ mod tests {
             err.to_string().contains("already exists"),
             "expected refusal message; got: {err}"
         );
-
-        fs::remove_dir_all(&repo).ok();
     }
 
     #[test]
@@ -670,7 +658,7 @@ mod tests {
         // Branch must no longer be present.
         let exists = Command::new("git")
             .arg("-C")
-            .arg(&repo)
+            .arg(repo.path())
             .args(["rev-parse", "--verify", "--quiet", &pw.branch])
             .output()
             .unwrap();
@@ -678,8 +666,6 @@ mod tests {
             !exists.status.success(),
             "branch should be deleted after cleanup of empty branch"
         );
-
-        fs::remove_dir_all(&repo).ok();
     }
 
     #[test]
@@ -713,7 +699,7 @@ mod tests {
         // Branch must still be present.
         let exists = Command::new("git")
             .arg("-C")
-            .arg(&repo)
+            .arg(repo.path())
             .args(["rev-parse", "--verify", "--quiet", &pw.branch])
             .output()
             .unwrap();
@@ -721,8 +707,6 @@ mod tests {
             exists.status.success(),
             "unmerged branch should still be present after cleanup"
         );
-
-        fs::remove_dir_all(&repo).ok();
     }
 
     /// Merged worktree whose ignored content is laid out by `setup`.
@@ -730,7 +714,7 @@ mod tests {
         name: &str,
         tracked_cargo: bool,
         setup: impl FnOnce(&Path),
-    ) -> (PathBuf, CleanupOutcome, PathBuf) {
+    ) -> (crate::test_temp_root::TempRoot, CleanupOutcome, PathBuf) {
         let repo = tmp_dir(name);
         init_test_repo(&repo);
         fs::write(repo.join(".gitignore"), b"target/\nmemory/\n").unwrap();
@@ -752,7 +736,7 @@ mod tests {
         if !git_available() {
             return;
         }
-        let (repo, outcome, path) = cleanup_with_ignored("cleanup-build-out", true, |wt| {
+        let (_repo, outcome, path) = cleanup_with_ignored("cleanup-build-out", true, |wt| {
             fs::create_dir_all(wt.join("target/debug")).unwrap();
             fs::write(wt.join("target/debug/app"), b"binary").unwrap();
         });
@@ -762,7 +746,6 @@ mod tests {
             outcome.warnings
         );
         assert!(!path.exists());
-        fs::remove_dir_all(&repo).ok();
     }
 
     #[test]
@@ -770,14 +753,13 @@ mod tests {
         if !git_available() {
             return;
         }
-        let (repo, outcome, path) = cleanup_with_ignored("cleanup-bare-target", false, |wt| {
+        let (_repo, outcome, path) = cleanup_with_ignored("cleanup-bare-target", false, |wt| {
             fs::create_dir_all(wt.join("target")).unwrap();
             fs::write(wt.join("target/notes.md"), b"not build output").unwrap();
         });
         assert!(!outcome.worktree_removed);
         assert_eq!(outcome.reason, "ignored_files");
         assert!(path.join("target/notes.md").exists());
-        fs::remove_dir_all(&repo).ok();
     }
 
     #[test]
@@ -785,7 +767,7 @@ mod tests {
         if !git_available() {
             return;
         }
-        let (repo, outcome, path) = cleanup_with_ignored("cleanup-mixed", true, |wt| {
+        let (_repo, outcome, path) = cleanup_with_ignored("cleanup-mixed", true, |wt| {
             fs::create_dir_all(wt.join("target")).unwrap();
             fs::write(wt.join("target/out"), b"binary").unwrap();
             fs::create_dir_all(wt.join("memory")).unwrap();
@@ -803,7 +785,6 @@ mod tests {
             warning.contains("memory/") && !warning.contains("target/"),
             "{warning}"
         );
-        fs::remove_dir_all(&repo).ok();
     }
 
     #[test]
@@ -839,8 +820,6 @@ mod tests {
             "warning must list ignored paths for review: {:?}",
             outcome.warnings
         );
-
-        fs::remove_dir_all(&repo).ok();
     }
 
     #[test]
@@ -882,6 +861,5 @@ mod tests {
         fs::remove_file(pw.path.join("untracked.txt")).unwrap();
         let final_cleanup = cleanup(&repo, &pw.path, &pw.branch, "git");
         assert!(final_cleanup.worktree_removed);
-        fs::remove_dir_all(&repo).ok();
     }
 }

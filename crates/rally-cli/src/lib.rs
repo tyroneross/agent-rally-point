@@ -15303,7 +15303,7 @@ mod tests {
 
     #[test]
     fn retract_unknown_target_is_rejected_and_nothing_is_posted() {
-        let root = unique_root("retract-unknown-target");
+        let (root, _guard) = unique_root("retract-unknown-target");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         seed_artifact(&room, "real fact");
@@ -15319,13 +15319,11 @@ mod tests {
             before,
             "a rejected retraction must not mint a dangling fact"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn retract_drops_target_from_room_projections_but_keeps_the_retraction() {
-        let root = unique_root("retract-resolves-room");
+        let (root, _guard) = unique_root("retract-resolves-room");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         let target = seed_artifact(&room, "wrong port number");
@@ -15357,13 +15355,11 @@ mod tests {
                 .any(|f| f.event_id == retraction.event_id),
             "the retraction itself must stay visible"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn only_sender_or_addressee_can_retract_an_open_obligation() {
-        let root = unique_root("retract-obligation-authority");
+        let (root, _guard) = unique_root("retract-obligation-authority");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         let sender_withdrawn = seed_obligation(&room, "sender-withdrawn");
@@ -15405,13 +15401,11 @@ mod tests {
         )
         .unwrap();
         assert!(room.snapshot().unwrap().open_obligations.is_empty());
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn second_retraction_of_same_fact_is_a_reported_noop() {
-        let root = unique_root("retract-noop-second");
+        let (root, _guard) = unique_root("retract-noop-second");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         let target = seed_artifact(&room, "flaky claim");
@@ -15439,13 +15433,11 @@ mod tests {
             "no-op must point at where the correction already lives"
         );
         assert_eq!(room.facts().unwrap().len(), count_after_first);
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn retracting_a_retraction_is_refused() {
-        let root = unique_root("retract-of-retraction");
+        let (root, _guard) = unique_root("retract-of-retraction");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         let target = seed_artifact(&room, "withdrawn claim");
@@ -15457,13 +15449,11 @@ mod tests {
             err.to_string().contains("correction trail"),
             "unexpected error: {err}"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn retract_superseded_by_must_name_an_existing_other_fact() {
-        let root = unique_root("retract-superseded-guardrails");
+        let (root, _guard) = unique_root("retract-superseded-guardrails");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         let target = seed_artifact(&room, "claim");
@@ -15500,8 +15490,6 @@ mod tests {
                 .any(|f| f.event_id == target.event_id),
             "guardrail rejections must not withdraw the target"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     // ---- P1c: session liveness — real pane probe beats presence TTL -------
@@ -16097,14 +16085,11 @@ mod tests {
         }
     }
 
-    fn unique_root(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("rally-lib-{label}-{nanos}"));
-        std::fs::create_dir_all(&root).unwrap();
-        root
+    /// Returns the folder path and the guard that deletes it. Keep the guard
+    /// alive (bind it to `_guard`) for as long as the path is used.
+    fn unique_root(label: &str) -> (PathBuf, crate::test_temp_root::TempRoot) {
+        let guard = crate::test_temp_root::TempRoot::new(&format!("rally-lib-{label}"));
+        (guard.path().to_path_buf(), guard)
     }
 
     fn git_available() -> bool {
@@ -16135,7 +16120,7 @@ mod tests {
     /// `enter` registers the tool in squads and asserts it as lead (first tool).
     #[test]
     fn ensure_presence_auto_enters_tool_and_sets_lead() {
-        let root = unique_root("ensure-presence-auto-enter");
+        let (root, _guard) = unique_root("ensure-presence-auto-enter");
         // Simulate a git repo so RoomStore::open() resolves correctly.
         std::fs::create_dir_all(root.join(".git")).unwrap();
 
@@ -16165,8 +16150,6 @@ mod tests {
             .filter(|f| f.kind == "presence" && f.tool.as_deref() == Some("tool-x"))
             .count();
         assert_eq!(presence_count, 1, "exactly one presence fact for tool-x");
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     fn set_mtime(path: &std::path::Path, offset_secs: i64) {
@@ -16186,7 +16169,7 @@ mod tests {
 
     #[test]
     fn heartbeat_skips_auto_claims_whose_files_were_not_written_in_the_lease() {
-        let root = unique_root("auto-claim-renewal-needs-writes");
+        let (root, _guard) = unique_root("auto-claim-renewal-needs-writes");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         for (name, offset) in [
             ("explicit.txt", -3600),
@@ -16275,12 +16258,11 @@ mod tests {
             1,
             "{second:?}"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn auto_claim_write_check_fails_toward_renewal_when_unanswerable() {
-        let root = unique_root("auto-claim-write-check");
+        let (root, _guard) = unique_root("auto-claim-write-check");
         let mut fact = store::Fact {
             from_session_id: None,
             schema: FACT_SCHEMA.to_string(),
@@ -16325,7 +16307,6 @@ mod tests {
         // No file scope at all: cannot tell, keep renewing.
         fact.scope = vec!["resource:db".to_string()];
         assert!(auto_claim_written_in_current_lease(&fact, &root, 600));
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Oracle for the narrow reads (peer commit 9e7c7f5): the session views
@@ -16333,7 +16314,7 @@ mod tests {
     /// reads or from the whole ledger, the input they used before.
     #[test]
     fn narrow_reads_match_the_whole_ledger_oracle() {
-        let root = unique_root("narrow-read-oracle");
+        let (root, _guard) = unique_root("narrow-read-oracle");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         for tool in ["alpha:1", "beta:1", "gamma:1"] {
@@ -16391,7 +16372,6 @@ mod tests {
             "backlog list drifted"
         );
         assert_eq!(narrow_backlog.as_array().map(Vec::len), Some(2));
-        std::fs::remove_dir_all(root).ok();
     }
 
     fn presence_fact_for_test(tool: &str) -> store::Fact {
@@ -16493,7 +16473,7 @@ mod tests {
 
     #[test]
     fn empty_scope_renew_heartbeat_extends_effective_lease_and_full_reap_preserves() {
-        let root = unique_root("heartbeat-renews-claims");
+        let (root, _guard) = unique_root("heartbeat-renews-claims");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         ensure_presence(&room, "tool-x").unwrap();
@@ -16555,12 +16535,11 @@ mod tests {
                 .iter()
                 .any(|fact| fact.event_id == claim.event_id)
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn heartbeat_renews_every_owned_claim_durably() {
-        let root = unique_root("heartbeat-renews-claims");
+        let (root, _guard) = unique_root("heartbeat-renews-claims");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         ensure_presence(&room, "tool-x").unwrap();
@@ -16601,12 +16580,11 @@ mod tests {
             facts.last().unwrap().ref_id.as_deref(),
             Some("claim-heartbeat-renew")
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn heartbeat_does_not_renew_same_tool_sibling_claim() {
-        let root = unique_root("heartbeat-session-owner");
+        let (root, _guard) = unique_root("heartbeat-session-owner");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         let claim = store::Fact {
@@ -16640,7 +16618,6 @@ mod tests {
                 .all(|fact| fact.kind != store::FactKind::ClaimRenewed),
             "a same-tool sibling heartbeat must not renew the claim"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -16648,7 +16625,7 @@ mod tests {
         let _guard = PROCESS_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let root = unique_root("presence-observer-stamps");
+        let (root, _guard) = unique_root("presence-observer-stamps");
         init_status_git_repo(&root, "main");
         unsafe { env::set_var("RALLY_OBSERVER_PID", "424242") };
         let room = store::RoomStore::open_at(root.clone()).unwrap();
@@ -16685,14 +16662,13 @@ mod tests {
                 .any(|item| item.starts_with("branch_head_sha:"))
         );
         assert!(presence.from_session_id.is_some());
-        std::fs::remove_dir_all(root).ok();
     }
 
     /// Component B acceptance test 2: a second call for the same tool writes no
     /// duplicate presence fact (idempotent per engagement).
     #[test]
     fn ensure_presence_is_idempotent_no_duplicate_facts() {
-        let root = unique_root("ensure-presence-idempotent");
+        let (root, _guard) = unique_root("ensure-presence-idempotent");
         std::fs::create_dir_all(root.join(".git")).unwrap();
 
         let room = store::RoomStore::open_at(root.clone()).unwrap();
@@ -16710,13 +16686,11 @@ mod tests {
             presence_count, 1,
             "second ensure_presence must not write a duplicate presence fact"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn ensure_presence_registers_same_tool_sibling_session() {
-        let root = unique_root("ensure-presence-sibling");
+        let (root, _guard) = unique_root("ensure-presence-sibling");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -16733,7 +16707,6 @@ mod tests {
             .filter_map(|fact| fact.from_session_id)
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(sessions.len(), 2, "each sibling session needs presence");
-        std::fs::remove_dir_all(root).ok();
     }
 
     /// Component B acceptance test 3: a second tool auto-enters but lead stays
@@ -16743,7 +16716,7 @@ mod tests {
         // L-1 (docs/SPEC-lead-agent.md): lead auto-assign is frontier-only.
         // A declared `fast` agent entering an empty room does NOT take the seat;
         // a later `frontier` agent does. Undeclared tier stays lead-eligible.
-        let root = unique_root("lead-frontier-gate");
+        let (root, _guard) = unique_root("lead-frontier-gate");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -16767,7 +16740,7 @@ mod tests {
     #[test]
     fn host_runtime_ambiguity_detection() {
         // SL-1: >1 resolvable ptyd socket => ambiguous (agents must not guess).
-        let base = unique_root("ptyd-sockets");
+        let (base, _guard_base) = unique_root("ptyd-sockets");
         let a = base.join("a");
         let b = base.join("b");
         std::fs::create_dir_all(&a).unwrap();
@@ -16807,7 +16780,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
 
-        let base = unique_root("ptyd-detect");
+        let (base, _guard_base) = unique_root("ptyd-detect");
         let home = base.join("home");
         let et_dir = home.join("Library/Application Support/EasyTerminal");
         let cfg_dir = home.join(".config/ptyd");
@@ -16934,7 +16907,7 @@ mod tests {
     #[test]
     fn coordination_gate_predicate() {
         // C3: presence + ack + claim-covers-every-changed-file.
-        let root = unique_root("coord-merge");
+        let (root, _guard) = unique_root("coord-merge");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root).unwrap();
         ensure_presence_tiered(&room, "opus-1", Some("frontier")).unwrap();
@@ -16987,7 +16960,7 @@ mod tests {
     fn liveness_conflicts_unacked_idle_claim_holder() {
         // C2: an unacknowledged + idle squad still holding an open claim is
         // conflict-out eligible; recording an ack clears it.
-        let root = unique_root("coord-liveness");
+        let (root, _guard) = unique_root("coord-liveness");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root).unwrap();
         let old = "2020-01-01T00:00:00Z";
@@ -17051,7 +17024,7 @@ mod tests {
         let _env = crate::PROCESS_ENV_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let root = unique_root("coord-liveness-2h-gate");
+        let (root, _guard) = unique_root("coord-liveness-2h-gate");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at_with_engagement(root, None).unwrap();
         // 30 minutes ago: idle (>15m) but well under the 2h takeover bar, and
@@ -17104,7 +17077,7 @@ mod tests {
     #[test]
     fn ack_flips_squad_acknowledged() {
         // Coordination-mandate C1: a coordination:ack fact flips the squad to acknowledged.
-        let root = unique_root("coord-ack");
+        let (root, _guard) = unique_root("coord-ack");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root).unwrap();
         ensure_presence_tiered(&room, "opus-1", Some("frontier")).unwrap();
@@ -17150,7 +17123,7 @@ mod tests {
     fn relinquish_reopens_lead_seat() {
         // L-2b: a role:lead:relinquished decision reopens the seat (lead = None);
         // a later assign re-fills it. Projection: latest lead-family fact wins.
-        let root = unique_root("lead-relinquish");
+        let (root, _guard) = unique_root("lead-relinquish");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root).unwrap();
         ensure_presence_tiered(&room, "opus-1", Some("frontier")).unwrap();
@@ -17187,7 +17160,7 @@ mod tests {
     #[test]
     fn undeclared_tier_stays_lead_eligible_for_backcompat() {
         // Back-compat: lazy-auto-enter callers pass no tier; first-enter still leads.
-        let root = unique_root("lead-undeclared-compat");
+        let (root, _guard) = unique_root("lead-undeclared-compat");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         ensure_presence(&room, "legacy-1").unwrap();
@@ -17200,7 +17173,7 @@ mod tests {
 
     #[test]
     fn ensure_presence_second_tool_does_not_steal_lead() {
-        let root = unique_root("ensure-presence-second-tool");
+        let (root, _guard) = unique_root("ensure-presence-second-tool");
         std::fs::create_dir_all(root.join(".git")).unwrap();
 
         let room = store::RoomStore::open_at(root.clone()).unwrap();
@@ -17231,8 +17204,6 @@ mod tests {
             .filter(|f| f.kind == "presence" && f.tool.as_deref() == Some("tool-x"))
             .count();
         assert_eq!(x_count, 1, "exactly one presence fact for tool-x");
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     fn managed_session(name: String, tool: String) -> ManagedSession {
@@ -17396,7 +17367,7 @@ mod tests {
     /// content in subject and summary — verifiable from the ledger alone, no tmux.
     #[test]
     fn inject_content_fact_records_sender_target_and_message() {
-        let root = unique_root("inject-content-fact");
+        let (root, _guard) = unique_root("inject-content-fact");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -17444,13 +17415,11 @@ mod tests {
             recorded.subject
         );
         assert_eq!(recorded.summary.as_deref(), Some(msg));
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn non_controlling_content_never_enters_target_consent_handoffs() {
-        let root = unique_root("inject-non-controlling-no-consent");
+        let (root, _guard) = unique_root("inject-non-controlling-no-consent");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         let message = MessageContext {
@@ -17484,8 +17453,6 @@ mod tests {
             MessageIntent::Directive,
         );
         assert!(refusal.is_some(), "the later directive must remain refused");
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -17527,7 +17494,7 @@ mod tests {
         use rally_protocol::Inbox;
         use rally_protocol::ledger::FileInbox;
 
-        let root = unique_root("inject-ledger-live-parity");
+        let (root, _guard) = unique_root("inject-ledger-live-parity");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::create_dir_all(root.join(".rally")).unwrap();
         let message = MessageContext {
@@ -17559,8 +17526,6 @@ mod tests {
         assert_eq!(directive.message, message);
         assert_eq!(directive.text.as_deref(), Some(live_text.as_str()));
         assert!(live_text.contains("intent=inform | control-attempt=no"));
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     fn ref_fact(kind: FactKind, tool: &str, ref_id: &str, subject: &str) -> Fact {
@@ -17601,7 +17566,7 @@ mod tests {
 
     #[test]
     fn wait_for_resolution_accepts_only_expected_tool() {
-        let root = unique_root("ack-tool-correlation");
+        let (root, _guard) = unique_root("ack-tool-correlation");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         let handoff_id = "handoff-under-test";
@@ -17634,13 +17599,11 @@ mod tests {
                 .contains("right ack"),
             "ack should report the expected tool's resolve, got {ack}",
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn wait_for_resolution_times_out_when_only_wrong_tool_resolves() {
-        let root = unique_root("ack-wrong-tool-timeout");
+        let (root, _guard) = unique_root("ack-wrong-tool-timeout");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         let handoff_id = "handoff-under-test";
@@ -17658,13 +17621,11 @@ mod tests {
         assert_eq!(ack["timed_out"].as_bool(), Some(true));
         assert_eq!(ack["expected_tool"].as_str(), Some(expected_tool));
         assert_eq!(ack["ignored_resolves"].as_u64(), Some(1));
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn wait_for_resolution_accepts_target_artifact_as_ack() {
-        let root = unique_root("ack-target-artifact");
+        let (root, _guard) = unique_root("ack-target-artifact");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         let handoff_id = "handoff-under-test";
@@ -17687,13 +17648,11 @@ mod tests {
         assert_eq!(ack["resolved"].as_bool(), Some(true));
         assert_eq!(ack["handoff_closed"].as_bool(), Some(true));
         assert_eq!(ack["kind"].as_str(), Some("artifact"));
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn wait_for_resolution_accepts_target_blocker_as_received_not_resolved() {
-        let root = unique_root("ack-target-blocker");
+        let (root, _guard) = unique_root("ack-target-blocker");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         let handoff_id = "handoff-under-test";
@@ -17716,8 +17675,6 @@ mod tests {
         assert_eq!(ack["resolved"].as_bool(), Some(false));
         assert_eq!(ack["blocked"].as_bool(), Some(true));
         assert_eq!(ack["kind"].as_str(), Some("blocker"));
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// SEC-015: the inject content fact carries an audit trail — the
@@ -17726,7 +17683,7 @@ mod tests {
     /// trusted blindly.
     #[test]
     fn sec015_inject_content_fact_stamps_sender_and_pid_evidence() {
-        let root = unique_root("sec015-inject-evidence");
+        let (root, _guard) = unique_root("sec015-inject-evidence");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -17752,8 +17709,6 @@ mod tests {
             "evidence must record the writer pid: {:?}",
             fact.evidence
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Fix #1: inject_content_fact uses append_fact_verified — the returned event_id
@@ -17762,7 +17717,7 @@ mod tests {
     /// the coordination record is lost.
     #[test]
     fn inject_content_fact_is_readback_verified_in_canonical_ledger() {
-        let root = unique_root("inject-content-fact-verified");
+        let (root, _guard) = unique_root("inject-content-fact-verified");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -17787,8 +17742,6 @@ mod tests {
              durability guarantee violated",
             fact.event_id
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Long messages are truncated to 120 chars in subject but preserved in full in summary.
@@ -17820,7 +17773,7 @@ mod tests {
     /// inject_content_fact_dry_run returns a fact without touching any store.
     #[test]
     fn inject_content_fact_dry_run_does_not_write_to_ledger() {
-        let root = unique_root("inject-content-fact-dry-run");
+        let (root, _guard) = unique_root("inject-content-fact-dry-run");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -17837,8 +17790,6 @@ mod tests {
             facts.is_empty(),
             "dry_run must not append any fact to the ledger"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Fix 1: squads[] must not contain the reserved system author "rally".
@@ -17848,7 +17799,7 @@ mod tests {
     /// alongside real agents.
     #[test]
     fn squads_excludes_reserved_system_author_rally() {
-        let root = unique_root("squads-excludes-rally");
+        let (root, _guard) = unique_root("squads-excludes-rally");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -17889,8 +17840,6 @@ mod tests {
             snapshot.squads.iter().any(|s| s.tool == "claude_code:01"),
             "real agent claude_code:01 must still appear in squads"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Fix 2a: a single caller tool may hold multiple active managed sessions
@@ -18019,7 +17968,7 @@ mod tests {
     /// B11a: first `enter` for a tool produces no warnings.
     #[test]
     fn b11_first_enter_no_warning() {
-        let root = unique_root("b11-first-enter");
+        let (root, _guard) = unique_root("b11-first-enter");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -18032,15 +17981,13 @@ mod tests {
             .map(|s| s.tool.clone())
             .collect();
         assert!(warnings.is_empty(), "first enter must produce no warnings");
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// B11b: a second enter for the same tool (still active) produces the
     /// `squad-id-active` warning.
     #[test]
     fn b11_second_enter_active_tool_emits_warning() {
-        let root = unique_root("b11-second-enter");
+        let (root, _guard) = unique_root("b11-second-enter");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -18064,15 +18011,13 @@ mod tests {
             active_squad.is_some(),
             "squad-id-active warning must be generated for second enter"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// B11c: entering with a distinct tool id (`tool-b`) never triggers the warning
     /// even when `tool-a` is already active.
     #[test]
     fn b11_distinct_tool_id_no_warning() {
-        let root = unique_root("b11-distinct-tool");
+        let (root, _guard) = unique_root("b11-distinct-tool");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -18084,8 +18029,6 @@ mod tests {
             .iter()
             .any(|s| s.tool == "tool-b" && s.status == "active");
         assert!(!hit, "tool-b must NOT be flagged when tool-a is active");
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// B11d: a second `enter` for an already-active tool writes exactly ONE durable
@@ -18097,7 +18040,7 @@ mod tests {
     /// The first enter produces no risk fact.
     #[test]
     fn b11d_second_enter_writes_durable_risk_fact() {
-        let root = unique_root("b11d-durable-risk");
+        let (root, _guard) = unique_root("b11d-durable-risk");
         std::fs::create_dir_all(root.join(".git")).unwrap();
 
         // --- First enter: no risk fact expected ---
@@ -18191,8 +18134,6 @@ mod tests {
         );
         // enter is still ok — not blocked
         // (enter itself is not called here; the test verifies the durable record)
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// C-FLEET / f4 unit test: `is_managed_style_tool` classifies fleet
@@ -18251,7 +18192,7 @@ mod tests {
     /// pattern (fresh RoomStore) so segment→db reconciliation is verified.
     #[test]
     fn fleet_unmanaged_agent_writes_durable_risk_fact() {
-        let root = unique_root("fleet-unmanaged-risk");
+        let (root, _guard) = unique_root("fleet-unmanaged-risk");
         std::fs::create_dir_all(root.join(".git")).unwrap();
 
         // Simulate the exact `command_enter` block: snapshot → query active
@@ -18321,13 +18262,11 @@ mod tests {
                 .collect();
             assert_eq!(risk_facts.len(), 1, "idempotent — still exactly one");
         }
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn telemetry_idempotency_finds_subject_hidden_by_class_projection() {
-        let root = unique_root("telemetry-durable-subject");
+        let (root, _guard) = unique_root("telemetry-durable-subject");
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         let telemetry = [
             ("worker-01", "unmanaged-agent: worker-01"),
@@ -18372,8 +18311,6 @@ mod tests {
             .snapshot_for_enter("different-tool", BUILD_ID, "", &[], None)
             .unwrap();
         assert!(!wrong_tool_context.unmanaged_agent_recorded);
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// DI-1: system-generated telemetry (subject-prefixed) projects into
@@ -18381,7 +18318,7 @@ mod tests {
     /// remain in `current_risks`. Keeps the risk view trustworthy.
     #[test]
     fn di1_telemetry_splits_from_current_risks_and_dedups() {
-        let root = unique_root("di1-split");
+        let (root, _guard) = unique_root("di1-split");
         let room = store::RoomStore::open_at(root.clone()).unwrap();
         // A human coordination risk — must stay in current_risks.
         room.append_fact(&build_risk_fact(
@@ -18434,7 +18371,6 @@ mod tests {
                 .map(|f| &f.subject)
                 .collect::<Vec<_>>()
         );
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// C-FLEET adopt: an adopted session shows up in `active_session_records`
@@ -18443,7 +18379,7 @@ mod tests {
     /// backend (the herdr `--pane` arm was dropped with `Backend::Herdr`).
     #[test]
     fn fleet_adopt_registers_running_target_and_rejects_duplicate() {
-        let root = unique_root("fleet-adopt-cmux");
+        let (root, _guard) = unique_root("fleet-adopt-cmux");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -18502,15 +18438,13 @@ mod tests {
         // the command_adopt pre-check. Simulate that scan.
         let collision = active.iter().any(|s| s.target == "cmux-target-9");
         assert!(collision, "second adopt must detect prior target");
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// C-FLEET adopt: a tmux-backend adoption stores the tmux target as the
     /// session.target so inject/attach/stop route through the right backend.
     #[test]
     fn fleet_adopt_stores_tmux_target_verbatim() {
-        let root = unique_root("fleet-adopt-tmux");
+        let (root, _guard) = unique_root("fleet-adopt-tmux");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -18550,15 +18484,13 @@ mod tests {
         // target is the caller-provided tmux name, NOT the
         // backend_target(Tmux, session_id) shape (`rally-codex-NN`).
         assert_eq!(adopted.target, "rally-legacy");
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// C-FLEET: `enter` for a tool that DOES have an active managed session
     /// does NOT emit an `unmanaged-agent` risk fact.
     #[test]
     fn fleet_managed_tool_does_not_emit_risk() {
-        let root = unique_root("fleet-managed-no-risk");
+        let (root, _guard) = unique_root("fleet-managed-no-risk");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -18603,8 +18535,6 @@ mod tests {
                 .map(|f| &f.subject)
                 .collect::<Vec<_>>()
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Quirk fix: second `enter` for the same tool with no intervening peer
@@ -18615,7 +18545,7 @@ mod tests {
     /// enters IS still detected as new (the cursor window is not overcorrected).
     #[test]
     fn enter_second_call_does_not_report_own_presence_as_new_peer_content() {
-        let root = unique_root("enter-cursor-own-presence");
+        let (root, _guard) = unique_root("enter-cursor-own-presence");
         std::fs::create_dir_all(root.join(".git")).unwrap();
 
         let room = store::RoomStore::open_at(root.clone()).unwrap();
@@ -18671,7 +18601,7 @@ mod tests {
         // --- Verify: a fact from a DIFFERENT tool between enters IS still detected ---
         // Simulate tool-a's first enter again in a fresh state, then tool-b writes,
         // then tool-a enters again — the inter-enter peer fact must appear as new.
-        let root2 = unique_root("enter-cursor-peer-fact");
+        let (root2, _guard_root2) = unique_root("enter-cursor-peer-fact");
         std::fs::create_dir_all(root2.join(".git")).unwrap();
         let room2 = store::RoomStore::open_at(root2.clone()).unwrap();
 
@@ -18721,9 +18651,6 @@ mod tests {
             advanced_peer,
             "cursor.advanced must be true when a concurrent peer fact exists"
         );
-
-        std::fs::remove_dir_all(&root).ok();
-        std::fs::remove_dir_all(&root2).ok();
     }
 
     // B16 — write→read round-trip gate
@@ -18737,7 +18664,7 @@ mod tests {
     /// than masking it.
     #[test]
     fn b16_write_read_round_trip_all_fact_kinds() {
-        let root = unique_root("b16-round-trip");
+        let (root, _guard) = unique_root("b16-round-trip");
         std::fs::create_dir_all(root.join(".git")).unwrap();
 
         // --- Write phase ---
@@ -18862,8 +18789,6 @@ mod tests {
             snapshot.max_seq, max_written,
             "snapshot.max_seq must equal the highest written seq after reload"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// B10.suffix: exact-match paths must not produce a suffix collision (already
@@ -18891,19 +18816,25 @@ mod tests {
     // ==========================================================================
 
     /// Helper: open a temp dir as a rally room and return the root + rally dir.
-    fn watch_temp_room(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-        let root = unique_root(label);
+    fn watch_temp_room(
+        label: &str,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        crate::test_temp_root::TempRoot,
+    ) {
+        let (root, guard) = unique_root(label);
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let rally_dir = root.join(".rally");
         std::fs::create_dir_all(&rally_dir).unwrap();
-        (root, rally_dir)
+        (root, rally_dir, guard)
     }
 
     /// Test (a): --once first call (after a fact was posted) emits an activity event;
     /// immediate second call with no new fact emits nothing.
     #[test]
     fn watch_once_emits_activity_then_nothing() {
-        let (root, rally_dir) = watch_temp_room("watch-once-activity");
+        let (root, rally_dir, _guard) = watch_temp_room("watch-once-activity");
         let log_dir = rally_dir.join(store::LOG_DIRNAME);
 
         // Post a fact to advance max_seq.
@@ -18963,8 +18894,6 @@ mod tests {
             !activity_second,
             "second --once must not detect activity when no new fact posted"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A hung delivery command must not wedge the watcher. Before the bounded
@@ -18977,7 +18906,7 @@ mod tests {
     /// the property that regressed.
     #[test]
     fn watch_on_activity_reaps_and_returns_for_a_slow_command() {
-        let repo = std::env::temp_dir();
+        let repo = std::env::temp_dir(); // temp-root-read: command cwd only, nothing is created
         let started = Instant::now();
         let (exit_code, duration_ms) =
             watch_run_on_activity("sleep 0.4", "room-1", 1, 2, Some("t"), &repo);
@@ -19000,7 +18929,7 @@ mod tests {
 
     #[test]
     fn watch_on_activity_reports_a_failing_command_without_dying() {
-        let repo = std::env::temp_dir();
+        let repo = std::env::temp_dir(); // temp-root-read: command cwd only, nothing is created
         let (exit_code, _) = watch_run_on_activity("exit 7", "room-1", 1, 2, Some("t"), &repo);
         assert_eq!(
             exit_code,
@@ -19014,7 +18943,7 @@ mod tests {
     /// passes RALLY_TO_SEQ in the child environment.
     #[test]
     fn watch_on_activity_runs_command_with_env_vars() {
-        let (root, rally_dir) = watch_temp_room("watch-on-activity");
+        let (root, rally_dir, _guard) = watch_temp_room("watch-on-activity");
         let log_dir = rally_dir.join(store::LOG_DIRNAME);
 
         // Post a fact.
@@ -19048,7 +18977,7 @@ mod tests {
         assert!(to_seq > 0, "to_seq must be > 0");
 
         // Run a command that writes RALLY_TO_SEQ to a temp file.
-        let out_file = std::env::temp_dir().join(format!("rally-watch-oact-{}.txt", short_id()));
+        let out_file = root.join("rally-watch-oact.txt");
         let cmd = format!("printf '%s' \"$RALLY_TO_SEQ\" > {}", out_file.display());
         let room_id = "test-room";
 
@@ -19065,9 +18994,6 @@ mod tests {
             parsed, to_seq,
             "RALLY_TO_SEQ in child env must equal the detected to_seq"
         );
-
-        std::fs::remove_file(&out_file).ok();
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Test (c): --print-launchd emits a plist containing "watch" and the repo path.
@@ -19078,7 +19004,7 @@ mod tests {
     /// `watch_print_launchd` so the test doesn't rely on a live binary.
     #[test]
     fn watch_print_launchd_contains_watch_and_repo_path() {
-        let (root, _rally_dir) = watch_temp_room("watch-print-launchd");
+        let (root, _rally_dir, _guard) = watch_temp_room("watch-print-launchd");
 
         // Derive the label the same way watch_print_launchd does.
         let label = format!(
@@ -19126,15 +19052,13 @@ mod tests {
             plist.contains(&label),
             "plist must contain the derived launchd label; got:\n{plist}"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Test (d): watch_read_max_seq reads per-repo .rally/log only — no code path
     /// references the legacy global apps directory.
     #[test]
     fn watch_reads_per_repo_log_only_no_legacy_global_index() {
-        let (root, rally_dir) = watch_temp_room("watch-per-repo");
+        let (root, rally_dir, _guard) = watch_temp_room("watch-per-repo");
         let log_dir = rally_dir.join(store::LOG_DIRNAME);
 
         // Empty room: max_seq must be 0.
@@ -19186,8 +19110,6 @@ mod tests {
             !log_dir_str.contains(".agent-rally-point"),
             "watch must NOT reference the legacy global apps dir; got: {log_dir_str}"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Test (e): --ack-file resolving inside the watched `.rally/log/` dir
@@ -19200,7 +19122,7 @@ mod tests {
     /// command, which would be flaky under parallel test execution.
     #[test]
     fn watch_ack_file_inside_log_dir_is_refused_at_startup() {
-        let (root, rally_dir) = watch_temp_room("watch-ack-file-guard");
+        let (root, rally_dir, _guard) = watch_temp_room("watch-ack-file-guard");
         let log_dir = rally_dir.join(store::LOG_DIRNAME);
 
         let inside = PathBuf::from(".rally/log/watch-acks.jsonl");
@@ -19220,8 +19142,6 @@ mod tests {
             !log_watch::ack_file_conflicts_with_log_dir(&root, &log_dir, &outside),
             "the documented convention .rally/watch-acks.jsonl (a sibling of log/) must be allowed"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     // ==========================================================================
@@ -19243,7 +19163,7 @@ mod tests {
     /// exist under a real git tree.
     #[test]
     fn b18b_classify_scope_absolute_under_repo_root_is_repo_local() {
-        let root = unique_root("b18b");
+        let (root, _guard) = unique_root("b18b");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         // We can't change repo_root() without cwd manipulation, so verify the
         // helper directly using a path that starts with the cwd (which is always
@@ -19254,7 +19174,6 @@ mod tests {
             ScopeClass::RepoLocal,
             "relative path under repo must be RepoLocal"
         );
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// B18c: classify_scope returns External for an absolute path that is
@@ -19287,7 +19206,7 @@ mod tests {
     /// current_risks.
     #[test]
     fn b18d_external_path_claim_quarantined_from_active_claims() {
-        let root = unique_root("b18d");
+        let (root, _guard) = unique_root("b18d");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -19365,14 +19284,12 @@ mod tests {
             local_in_active,
             "repo-local claim must appear in active_claims"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// B18e: posting an external-intake handoff excludes it from open_handoffs.
     #[test]
     fn b18e_external_path_handoff_excluded_from_open_handoffs() {
-        let root = unique_root("b18e");
+        let (root, _guard) = unique_root("b18e");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -19411,13 +19328,12 @@ mod tests {
             !ext_in_handoffs,
             "external-intake handoff must be excluded from open_handoffs"
         );
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// B18f: posting an external-intake artifact excludes it from recent_artifacts.
     #[test]
     fn b18f_external_path_artifact_excluded_from_recent_artifacts() {
-        let root = unique_root("b18f");
+        let (root, _guard) = unique_root("b18f");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -19456,14 +19372,13 @@ mod tests {
             !ext_in_artifacts,
             "external-intake artifact must be excluded from recent_artifacts"
         );
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// B18g: the risk fact written for an external-intake claim IS present in
     /// current_risks (the audit trail).
     #[test]
     fn b18g_external_intake_risk_fact_appears_in_current_risks() {
-        let root = unique_root("b18g");
+        let (root, _guard) = unique_root("b18g");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -19540,8 +19455,6 @@ mod tests {
             snapshot.active_claims.is_empty(),
             "active_claims must be empty (external-intake claim quarantined)"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     // ==========================================================================
@@ -19552,7 +19465,7 @@ mod tests {
     /// an empty report (no non-canonical, no collisions).
     #[test]
     fn doctor_canonical_paths_clean_room_reports_empty() {
-        let root = unique_root("doctor-cp-clean");
+        let (root, _guard) = unique_root("doctor-cp-clean");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -19623,15 +19536,13 @@ mod tests {
             !has_collision,
             "single claim must produce no suffix collision"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// doctor_canonical_paths_flags_non_canonical: a claim with a relative dotslash
     /// scope (./src/foo.rs) is detected as non-canonical.
     #[test]
     fn doctor_canonical_paths_flags_non_canonical_scope() {
-        let root = unique_root("doctor-cp-noncanon");
+        let (root, _guard) = unique_root("doctor-cp-noncanon");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -19698,15 +19609,13 @@ mod tests {
             "file:src/foo.rs",
             "normalize_path must strip ./ and add file:"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// doctor_canonical_paths_flags_suffix_collision: two claims from different tools
     /// whose scopes share a 2+ component trailing suffix are detected.
     #[test]
     fn doctor_canonical_paths_flags_suffix_collision_pair() {
-        let root = unique_root("doctor-cp-collision");
+        let (root, _guard) = unique_root("doctor-cp-collision");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -19794,8 +19703,6 @@ mod tests {
             found_collision,
             "crates/a/src/lib.rs and crates/b/src/lib.rs must produce a suffix collision"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     // ==========================================================================
@@ -19808,16 +19715,11 @@ mod tests {
     fn doctor_prune_rooms_dry_run_lists_stale_keeps_index() {
         use std::fs;
 
-        let live_root = unique_root("doctor-prune-live");
+        let (live_root, _guard_live_root) = unique_root("doctor-prune-live");
         fs::create_dir_all(&live_root).unwrap();
 
-        let stale_root_path = std::env::temp_dir().join(format!(
-            "rally-doctor-prune-stale-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let stale_holder = crate::test_temp_root::TempRoot::new("rally-doctor-prune-stale");
+        let stale_root_path = stale_holder.join("stale-root");
         // Do NOT create stale_root_path — it must not exist.
         assert!(
             !stale_root_path.exists(),
@@ -19825,7 +19727,7 @@ mod tests {
         );
 
         // Build a temporary room index with both entries.
-        let index_dir = unique_root("doctor-prune-idx-dir");
+        let (index_dir, _guard_index_dir) = unique_root("doctor-prune-idx-dir");
         let index_path = index_dir.join("index.json");
 
         let index_content = serde_json::json!({
@@ -19895,9 +19797,6 @@ mod tests {
             index_before, index_after,
             "dry-run must not modify the index file"
         );
-
-        fs::remove_dir_all(&live_root).ok();
-        fs::remove_dir_all(&index_dir).ok();
     }
 
     /// doctor_prune_rooms_apply_rewrites_index: after --apply the index only
@@ -19906,19 +19805,14 @@ mod tests {
     fn doctor_prune_rooms_apply_rewrites_index_keeps_live() {
         use std::fs;
 
-        let live_root = unique_root("doctor-prune-apply-live");
+        let (live_root, _guard_live_root) = unique_root("doctor-prune-apply-live");
         fs::create_dir_all(&live_root).unwrap();
 
-        let stale_root_path = std::env::temp_dir().join(format!(
-            "rally-doctor-prune-apply-stale-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let stale_holder = crate::test_temp_root::TempRoot::new("rally-doctor-prune-apply-stale");
+        let stale_root_path = stale_holder.join("stale-root");
         assert!(!stale_root_path.exists());
 
-        let index_dir = unique_root("doctor-prune-apply-idx");
+        let (index_dir, _guard_index_dir) = unique_root("doctor-prune-apply-idx");
         let index_path = index_dir.join("index.json");
 
         let make_index = |rooms_json: serde_json::Value| {
@@ -20004,9 +19898,6 @@ mod tests {
             still_stale.is_empty(),
             "after apply, no stale entries should remain"
         );
-
-        fs::remove_dir_all(&live_root).ok();
-        fs::remove_dir_all(&index_dir).ok();
     }
 
     // R9 stale-binary guard unit tests.
@@ -20043,7 +19934,7 @@ mod tests {
     /// directly into the store — no second binary required.
     #[test]
     fn r9b_different_build_ids_produce_drift_warning_and_risk_fact() {
-        let root = unique_root("r9b-binary-drift");
+        let (root, _guard) = unique_root("r9b-binary-drift");
         std::fs::create_dir_all(root.join(".git")).unwrap();
 
         let fake_old_id = "0.0.0+aabbccd";
@@ -20155,8 +20046,6 @@ mod tests {
         // ok stays true — the enter result would still have ok:true (not tested here
         // since we're not calling command_enter, but the risk fact being non-blocking
         // is the invariant; enter never returns an error for this condition).
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     // ==========================================================================
@@ -20167,7 +20056,7 @@ mod tests {
     /// `wake_after:<iso>` in summary, and round-trips through a fresh RoomStore.
     #[test]
     fn b1a_standby_roundtrip_wake_after_relative() {
-        let root = unique_root("b1a-standby-rt");
+        let (root, _guard) = unique_root("b1a-standby-rt");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -20224,14 +20113,12 @@ mod tests {
         );
         assert!(found.scope.contains(&"run:RUN-B1A".to_string()));
         assert!(found.scope.contains(&"step:S1".to_string()));
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// B1b: `say wake --ref-standby <standby-event-id>` links back to the standby.
     #[test]
     fn b1b_wake_links_to_standby_via_ref() {
-        let root = unique_root("b1b-wake-link");
+        let (root, _guard) = unique_root("b1b-wake-link");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -20298,8 +20185,6 @@ mod tests {
             .iter()
             .any(|d| d.standby_event_id == standby_fact.fact.event_id);
         assert!(!woken_in_due, "woken standby must not appear in wake-due");
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// B1c: lineage fan-out — 1 handoff → 3 child claims via --run/--step/--parent-step.
@@ -20307,7 +20192,7 @@ mod tests {
     /// with parent_step edges connecting them to the handoff step.
     #[test]
     fn b1c_lineage_fanout_dag_three_child_claims() {
-        let root = unique_root("b1c-lineage-fanout");
+        let (root, _guard) = unique_root("b1c-lineage-fanout");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -20387,15 +20272,13 @@ mod tests {
                 node.step_id
             );
         }
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// B1d: stalled detection — a child claim with no artifact past its standby's
     /// wake_after is tagged stalled.
     #[test]
     fn b1d_stalled_child_claim_past_standby() {
-        let root = unique_root("b1d-stalled");
+        let (root, _guard) = unique_root("b1d-stalled");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -20459,15 +20342,13 @@ mod tests {
             dag::NodeStatus::Stalled,
             "S1 with past standby and no artifact must be stalled"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// B4a: wake-due projects past standbys and suggested_command is a string only.
     /// Charter: no execution occurs (no Command/spawn/schedule called).
     #[test]
     fn b4a_wake_due_projects_past_standby_with_suggested_command() {
-        let root = unique_root("b4a-wake-due");
+        let (root, _guard) = unique_root("b4a-wake-due");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -20518,14 +20399,12 @@ mod tests {
             "suggested_command must include owner tool; got: {}",
             entry.suggested_command
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// B4b: not-yet-due standby does not surface in wake-due.
     #[test]
     fn b4b_wake_due_future_standby_not_surfaced() {
-        let root = unique_root("b4b-not-yet-due");
+        let (root, _guard) = unique_root("b4b-not-yet-due");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -20560,8 +20439,6 @@ mod tests {
             due.is_empty(),
             "future standby must not appear in wake-due; got: {due:?}"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Charter assertion test: grep the dag module source for exec/spawn/schedule
@@ -20608,7 +20485,7 @@ mod tests {
     /// R9c: when the same build_id enters twice, NO drift warning is produced.
     #[test]
     fn r9c_same_build_id_produces_no_drift_warning() {
-        let root = unique_root("r9c-no-drift");
+        let (root, _guard) = unique_root("r9c-no-drift");
         std::fs::create_dir_all(root.join(".git")).unwrap();
 
         // Write a presence fact carrying the CURRENT build_id.
@@ -20667,8 +20544,6 @@ mod tests {
             drift_risks.is_empty(),
             "no binary-drift risk fact must appear when build_ids match"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     // ─── C4: path-only release ───────────────────────────────────────────────
@@ -20706,7 +20581,7 @@ mod tests {
 
     #[test]
     fn path_only_release_closes_matching_claim_and_flips_projection() {
-        let root = unique_root("path-only-release-happy");
+        let (root, _guard) = unique_root("path-only-release-happy");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -20762,13 +20637,11 @@ mod tests {
             found,
             "warnings must name the released claim event_id; got {warnings:?}"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn path_only_release_errors_loud_when_no_claim_matches() {
-        let root = unique_root("path-only-release-loud");
+        let (root, _guard) = unique_root("path-only-release-loud");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -20814,8 +20687,6 @@ mod tests {
                 .any(|c| c.event_id == alpha_other),
             "no-match release must NOT incidentally close any other claim"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Append a claim whose `created_at` is backdated, making its owner's
@@ -20859,7 +20730,7 @@ mod tests {
     /// takeover provenance (subject annotation + evidence tag).
     #[test]
     fn stale_owner_claim_is_reclaimable_by_authorized_takeover() {
-        let root = unique_root("stale-claim-takeover");
+        let (root, _guard) = unique_root("stale-claim-takeover");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -20922,8 +20793,6 @@ mod tests {
                 .any(|e| e.as_str().unwrap_or("").contains("dead-owner")),
             "release evidence must name the stale owner reclaimed; got: {evidence:?}"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A still-LIVE peer's claim is NOT reclaimable by takeover — only the
@@ -20931,7 +20800,7 @@ mod tests {
     /// general "anyone can release anyone's live claim" hole.
     #[test]
     fn live_owner_claim_is_not_reclaimable_by_takeover() {
-        let root = unique_root("live-claim-no-takeover");
+        let (root, _guard) = unique_root("live-claim-no-takeover");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -20975,8 +20844,6 @@ mod tests {
             after.active_claims.iter().any(|c| c.event_id == live_id),
             "live owner's claim must survive a rejected takeover"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// independent-auditor HIGH (2026-06-09): a BUSY-BUT-QUIET owner — idle past
@@ -20994,7 +20861,7 @@ mod tests {
         let _env = crate::PROCESS_ENV_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let root = unique_root("busy-quiet-owner");
+        let (root, _guard) = unique_root("busy-quiet-owner");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at_with_engagement(root.clone(), None).unwrap();
 
@@ -21062,8 +20929,6 @@ mod tests {
             after.active_claims.iter().any(|c| c.event_id == live_id),
             "busy-but-quiet owner's claim must survive"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// independent-auditor MED (2026-06-09): a stale DIRECTORY claim (`file:src`)
@@ -21072,7 +20937,7 @@ mod tests {
     /// so the WARN points at a command that actually works.
     #[test]
     fn takeover_release_matches_stale_directory_claim_by_contained_path() {
-        let root = unique_root("takeover-dir-claim");
+        let (root, _guard) = unique_root("takeover-dir-claim");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -21110,13 +20975,11 @@ mod tests {
             "stale directory claim must be released via the contained-path takeover"
         );
         let _ = out;
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn path_only_release_handles_multi_claim_match_atomically() {
-        let root = unique_root("path-only-release-multi");
+        let (root, _guard) = unique_root("path-only-release-multi");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let room = store::RoomStore::open_at(root.clone()).unwrap();
 
@@ -21144,8 +21007,6 @@ mod tests {
         let after = room.snapshot().unwrap();
         assert!(!after.active_claims.iter().any(|c| c.event_id == c1));
         assert!(!after.active_claims.iter().any(|c| c.event_id == c2));
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     // ─── C3: status post + read roundtrip ────────────────────────────────────
@@ -21178,8 +21039,8 @@ mod tests {
         }
     }
 
-    fn o26_db_only_command_root(label: &str) -> PathBuf {
-        let root = unique_root(label);
+    fn o26_db_only_command_root(label: &str) -> (PathBuf, crate::test_temp_root::TempRoot) {
+        let (root, guard) = unique_root(label);
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let store = store::DirectRoomStore::open_direct_at_with_engagement(
             root.clone(),
@@ -21215,7 +21076,7 @@ mod tests {
                 std::fs::remove_file(path).unwrap();
             }
         }
-        root
+        (root, guard)
     }
 
     #[test]
@@ -21245,7 +21106,8 @@ mod tests {
 
     #[test]
     fn o26_doctor_migration_unknown_is_structured_and_resumable() {
-        let root = o26_db_only_command_root("unknown").canonicalize().unwrap();
+        let (root, _guard) = o26_db_only_command_root("unknown");
+        let root = root.canonicalize().unwrap();
         let _cwd = CwdEnvGuard::enter(&root);
         doctor::arm_db_only_migration_fault(
             &root.join(".rally"),
@@ -21297,7 +21159,6 @@ mod tests {
         assert_eq!(retry.exit_code, 0);
         assert_eq!(retry.body["data"]["doctor"]["state"], "committed");
         drop(_cwd);
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -21368,7 +21229,7 @@ mod tests {
 
     #[test]
     fn o26_standalone_say_unknown_renders_queryable_json_and_text() {
-        let root = unique_root("o26-say-unknown");
+        let (root, _guard) = unique_root("o26-say-unknown");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let _cwd = CwdEnvGuard::enter(&root);
         let room = RoomStore::open().unwrap();
@@ -21410,12 +21271,11 @@ mod tests {
                 .count(),
             1
         );
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_say_snapshot_failure_is_committed_success_with_warning() {
-        let root = unique_root("o26-say-snapshot-warning");
+        let (root, _guard) = unique_root("o26-say-snapshot-warning");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let _cwd = CwdEnvGuard::enter(&root);
         let room = RoomStore::open().unwrap();
@@ -21448,12 +21308,11 @@ mod tests {
                 .count(),
             1
         );
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_artifact_ripple_snapshot_failure_degrades_the_primary_outcome() {
-        let root = unique_root("o26-artifact-ripple-snapshot");
+        let (root, _guard) = unique_root("o26-artifact-ripple-snapshot");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/grounded.rs"), "pub fn before() {}\n").unwrap();
@@ -21516,12 +21375,11 @@ mod tests {
                 .count(),
             1
         );
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_status_post_keeps_presence_before_queryable_renewal_unknown() {
-        let root = unique_root("o26-status-renewal-unknown");
+        let (root, _guard) = unique_root("o26-status-renewal-unknown");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let _cwd = CwdEnvGuard::enter(&root);
         let room = RoomStore::open().unwrap();
@@ -21622,12 +21480,11 @@ mod tests {
             presence_seq < renewals[0].seq,
             "outcomes must retain commit order"
         );
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_migrate_legacy_emits_each_canonical_outcome_once() {
-        let root = unique_root("o26-migrate-command-outcomes");
+        let (root, _guard) = unique_root("o26-migrate-command-outcomes");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let _cwd = CwdEnvGuard::enter(&root);
         let home = root.join("test-home");
@@ -21694,12 +21551,11 @@ mod tests {
                 .count(),
             1
         );
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn status_post_then_status_read_roundtrip() {
-        let root = unique_root("status-post-roundtrip");
+        let (root, _guard) = unique_root("status-post-roundtrip");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         // command_status_post calls RoomStore::open() which resolves from cwd,
         // so run in `root`. CwdEnvGuard serializes + restores CWD panic-safely.
@@ -21741,8 +21597,6 @@ mod tests {
         assert_eq!(states[0]["state"], "working");
         assert_eq!(states[0]["file"], "crates/rally-cli");
         assert_eq!(states[0]["intent"], "agent-state");
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -21750,7 +21604,7 @@ mod tests {
         if !git_available() {
             return;
         }
-        let root = unique_root("status-done-autofill");
+        let (root, _guard) = unique_root("status-done-autofill");
         let branch = "feature/status-done-autofill";
         let sha = init_status_git_repo(&root, branch);
 
@@ -21782,13 +21636,11 @@ mod tests {
             assert!(subject.contains(&format!("committed_sha={sha}")));
             assert!(subject.contains(&format!("worktree_branch={branch}")));
         }
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn status_post_done_explicit_metadata_does_not_require_git_autofill() {
-        let root = unique_root("status-done-explicit");
+        let (root, _guard) = unique_root("status-done-explicit");
         std::fs::create_dir_all(root.join(".git")).unwrap();
 
         let _cwd = CwdEnvGuard::enter(&root);
@@ -21815,8 +21667,6 @@ mod tests {
             state["worktree_branch"].as_str().unwrap(),
             "explicit-branch"
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -21824,7 +21674,7 @@ mod tests {
         if !git_available() {
             return;
         }
-        let root = unique_root("status-done-partial-explicit");
+        let (root, _guard) = unique_root("status-done-partial-explicit");
         let branch = "feature/status-done-partial-explicit";
         init_status_git_repo(&root, branch);
 
@@ -21849,8 +21699,6 @@ mod tests {
         assert_eq!(state["state"], "done");
         assert_eq!(state["committed_sha"].as_str().unwrap(), "manual-sha");
         assert_eq!(state["worktree_branch"].as_str().unwrap(), branch);
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

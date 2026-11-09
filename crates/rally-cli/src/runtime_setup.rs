@@ -695,11 +695,11 @@ mod tests {
     }
     #[test]
     fn non_executable_is_not_installed() {
-        let p = std::env::temp_dir().join(format!("rally-noexec-{}", uuid::Uuid::new_v4()));
+        let root = crate::test_temp_root::TempRoot::new("rally-noexec");
+        let p = root.join("tool");
         fs::write(&p, "x").unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(executable(p.to_str().unwrap()).is_none());
-        fs::remove_file(p).unwrap();
     }
     #[test]
     fn hung_subprocess_is_bounded() {

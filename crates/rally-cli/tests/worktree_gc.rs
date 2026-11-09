@@ -15,11 +15,15 @@
 //! * All tests gate on `git_available()` so they skip cleanly in sandboxed
 //!   CI that has no git binary.
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+
+use temp_root::TempRoot;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 mod common;
 use common::test_git_fixture::fixture_git;
@@ -28,16 +32,13 @@ use common::test_git_fixture::fixture_git;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn tmp_dir(label: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("rally-gctest-{label}-{nanos}"));
-    fs::create_dir_all(&p).unwrap();
-    // Canonicalize so macOS /var → /private/var symlink is resolved and paths
-    // match what `git worktree list --porcelain` returns.
-    p.canonicalize().unwrap_or(p)
+fn tmp_dir(label: &str) -> (PathBuf, TempRoot) {
+    let root = TempRoot::new(&format!("rally-gctest-{label}"));
+    // Keep canonical paths consistent with git worktree list.
+    let path = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.path().to_path_buf());
+    (path, root)
 }
 
 fn git_available() -> bool {
@@ -108,7 +109,7 @@ fn merged_worktree_is_reaped_on_apply_listed_on_dry_run() {
         eprintln!("skipping: git not on PATH");
         return;
     }
-    let repo = tmp_dir("merged-reap");
+    let (repo, _repo_guard) = tmp_dir("merged-reap");
     init_repo(&repo);
     let wt = make_rally_worktree(&repo, "claude-protocol-claude-01");
     // Add a commit, then merge it so the branch is fully merged.
@@ -162,8 +163,6 @@ fn merged_worktree_is_reaped_on_apply_listed_on_dry_run() {
         !wt.exists(),
         "worktree directory must be gone after --apply"
     );
-
-    fs::remove_dir_all(&repo).ok();
 }
 
 #[test]
@@ -171,7 +170,7 @@ fn merged_worktree_with_exact_active_owner_is_retained() {
     if !git_available() {
         return;
     }
-    let repo = tmp_dir("merged-live-exact");
+    let (repo, _repo_guard) = tmp_dir("merged-live-exact");
     init_repo(&repo);
     let session_id = "codex-exact-01";
     let wt = make_rally_worktree(&repo, session_id);
@@ -201,7 +200,6 @@ fn merged_worktree_with_exact_active_owner_is_retained() {
             .iter()
             .any(|row| row.worktree_path == wt && row.reason.contains(session_id))
     );
-    fs::remove_dir_all(&repo).ok();
 }
 
 #[test]
@@ -209,7 +207,7 @@ fn unavailable_managed_ledger_retains_merged_tree() {
     if !git_available() {
         return;
     }
-    let repo = tmp_dir("merged-ledger-unavailable");
+    let (repo, _repo_guard) = tmp_dir("merged-ledger-unavailable");
     init_repo(&repo);
     let wt = make_rally_worktree(&repo, "codex-ledger-01");
     let report = rally_cli::worktree_gc::run_gc(rally_cli::worktree_gc::GcConfig {
@@ -231,7 +229,6 @@ fn unavailable_managed_ledger_retains_merged_tree() {
             .iter()
             .any(|row| row.worktree_path == wt && row.reason.contains("unavailable"))
     );
-    fs::remove_dir_all(&repo).ok();
 }
 
 #[test]
@@ -239,7 +236,7 @@ fn incomplete_managed_owner_retains_merged_tree() {
     if !git_available() {
         return;
     }
-    let repo = tmp_dir("merged-incomplete-owner");
+    let (repo, _repo_guard) = tmp_dir("merged-incomplete-owner");
     init_repo(&repo);
     let wt = make_rally_worktree(&repo, "codex-incomplete-01");
     let report = rally_cli::worktree_gc::run_gc(rally_cli::worktree_gc::GcConfig {
@@ -266,7 +263,6 @@ fn incomplete_managed_owner_retains_merged_tree() {
             .iter()
             .any(|row| row.worktree_path == wt && row.reason.contains("incomplete"))
     );
-    fs::remove_dir_all(&repo).ok();
 }
 
 #[test]
@@ -274,7 +270,7 @@ fn worktreeless_and_unrelated_owner_records_do_not_retain_merged_tree() {
     if !git_available() {
         return;
     }
-    let repo = tmp_dir("merged-worktreeless-owners");
+    let (repo, _repo_guard) = tmp_dir("merged-worktreeless-owners");
     init_repo(&repo);
     let session_id = "codex-done-01";
     let wt = make_rally_worktree(&repo, session_id);
@@ -311,7 +307,6 @@ fn worktreeless_and_unrelated_owner_records_do_not_retain_merged_tree() {
         report.skipped
     );
     assert!(!wt.exists());
-    fs::remove_dir_all(&repo).ok();
 }
 
 #[test]
@@ -319,7 +314,7 @@ fn missing_but_registered_tree_is_not_reported_reaped() {
     if !git_available() {
         return;
     }
-    let repo = tmp_dir("missing-registered");
+    let (repo, _repo_guard) = tmp_dir("missing-registered");
     init_repo(&repo);
     let wt = make_rally_worktree(&repo, "codex-missing-01");
     fs::remove_dir_all(&wt).unwrap();
@@ -336,7 +331,6 @@ fn missing_but_registered_tree_is_not_reported_reaped() {
     .unwrap();
     assert!(report.reaped.is_empty());
     assert!(report.skipped.iter().any(|row| row.worktree_path == wt));
-    fs::remove_dir_all(&repo).ok();
 }
 
 /// An unmerged worktree whose owning agent has LIVE presence (fresh heartbeat)
@@ -347,7 +341,7 @@ fn unmerged_with_live_owner_is_never_reaped() {
         eprintln!("skipping: git not on PATH");
         return;
     }
-    let repo = tmp_dir("live-owner");
+    let (repo, _repo_guard) = tmp_dir("live-owner");
     init_repo(&repo);
     let wt = make_rally_worktree(&repo, "claude-review-01");
     add_commit_in_worktree(&wt); // make it unmerged
@@ -392,8 +386,6 @@ fn unmerged_with_live_owner_is_never_reaped() {
         skip_reason.to_lowercase().contains("live"),
         "skip reason must mention live owner; got: {skip_reason}"
     );
-
-    fs::remove_dir_all(&repo).ok();
 }
 
 /// Stale presence cannot authorize deletion of clean unmerged source.
@@ -403,7 +395,7 @@ fn unmerged_with_stale_owner_is_retained() {
         eprintln!("skipping: git not on PATH");
         return;
     }
-    let repo = tmp_dir("stale-owner");
+    let (repo, _repo_guard) = tmp_dir("stale-owner");
     init_repo(&repo);
     let wt = make_rally_worktree(&repo, "codex-claim-authority-01");
     add_commit_in_worktree(&wt); // make it unmerged
@@ -439,8 +431,6 @@ fn unmerged_with_stale_owner_is_retained() {
             .iter()
             .any(|s| s.worktree_path == wt && s.reason.contains("unmerged"))
     );
-
-    fs::remove_dir_all(&repo).ok();
 }
 
 /// The default branch (main) and the current worktree (cwd) must never be
@@ -451,7 +441,7 @@ fn default_branch_and_cwd_worktree_are_never_reaped() {
         eprintln!("skipping: git not on PATH");
         return;
     }
-    let repo = tmp_dir("never-reap");
+    let (repo, _repo_guard) = tmp_dir("never-reap");
     init_repo(&repo);
 
     // No rally-managed worktrees at all.
@@ -472,8 +462,6 @@ fn default_branch_and_cwd_worktree_are_never_reaped() {
         "must not reap the canonical checkout or default branch; reaped={:?}",
         report.reaped
     );
-
-    fs::remove_dir_all(&repo).ok();
 }
 
 /// Dry-run must make absolutely zero filesystem or git changes.
@@ -484,7 +472,7 @@ fn dry_run_makes_no_filesystem_changes() {
         eprintln!("skipping: git not on PATH");
         return;
     }
-    let repo = tmp_dir("dry-run-noop");
+    let (repo, _repo_guard) = tmp_dir("dry-run-noop");
     init_repo(&repo);
     let wt = make_rally_worktree(&repo, "claude-x-01");
     // Merged branch → would be a reap candidate.
@@ -524,8 +512,6 @@ fn dry_run_makes_no_filesystem_changes() {
         branches_before, branches_after,
         "dry-run must not modify any branches"
     );
-
-    fs::remove_dir_all(&repo).ok();
 }
 
 /// `--ttl` boundary: a worktree whose owner's last heartbeat is older than
@@ -539,7 +525,7 @@ fn ttl_boundary_respected() {
         eprintln!("skipping: git not on PATH");
         return;
     }
-    let repo = tmp_dir("ttl-boundary");
+    let (repo, _repo_guard) = tmp_dir("ttl-boundary");
     init_repo(&repo);
     // Session IDs: agent prefix is the first `-`-delimited token.
     // "claude-task-01" → prefix "claude" (stale).
@@ -592,8 +578,6 @@ fn ttl_boundary_respected() {
         report.reaped
     );
     assert!(wt_live.exists(), "live worktree directory must still exist");
-
-    fs::remove_dir_all(&repo).ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -612,7 +596,7 @@ fn live_owner_hyphen_underscore_mismatch_not_reaped() {
         eprintln!("skipping: git not on PATH");
         return;
     }
-    let repo = tmp_dir("f1-hyphen-underscore");
+    let (repo, _repo_guard) = tmp_dir("f1-hyphen-underscore");
     init_repo(&repo);
     // Session id uses the multi-word hyphenated form — derive_owner_prefix
     // returns "claude-code" (hyphenated).
@@ -665,8 +649,6 @@ fn live_owner_hyphen_underscore_mismatch_not_reaped() {
         reason.to_lowercase().contains("live"),
         "f1: skip reason must mention live owner; got: {reason}"
     );
-
-    fs::remove_dir_all(&repo).ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -683,7 +665,7 @@ fn backend_live_stale_by_ttl_not_reaped() {
         eprintln!("skipping: git not on PATH");
         return;
     }
-    let repo = tmp_dir("f2-backend-live");
+    let (repo, _repo_guard) = tmp_dir("f2-backend-live");
     init_repo(&repo);
     let wt = make_rally_worktree(&repo, "codex-long-run-01");
     add_commit_in_worktree(&wt); // unmerged
@@ -736,8 +718,6 @@ fn backend_live_stale_by_ttl_not_reaped() {
         reason.to_lowercase().contains("unmerged"),
         "unmerged source must be retained; got: {reason}"
     );
-
-    fs::remove_dir_all(&repo).ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -754,14 +734,14 @@ fn bundle_failure_skips_unmerged_worktree() {
         eprintln!("skipping: git not on PATH");
         return;
     }
-    let repo = tmp_dir("f3-bundle-fail");
+    let (repo, _repo_guard) = tmp_dir("f3-bundle-fail");
     init_repo(&repo);
     let wt = make_rally_worktree(&repo, "claude-bundle-fail-01");
     add_commit_in_worktree(&wt); // unmerged — would require a bundle
 
     // Write a fake `git` that fails every `bundle create` but succeeds for
     // all other git commands (by delegating to the real git).
-    let fake_git_dir = tmp_dir("fake-git-bin");
+    let (fake_git_dir, _fake_git_dir_guard) = tmp_dir("fake-git-bin");
     let fake_git = fake_git_dir.join("git");
     let real_git = Command::new("which")
         .arg("git")
@@ -822,9 +802,6 @@ fn bundle_failure_skips_unmerged_worktree() {
         report.skipped
     );
     assert!(skipped.unwrap().reason.contains("unmerged"));
-
-    fs::remove_dir_all(&repo).ok();
-    fs::remove_dir_all(&fake_git_dir).ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -845,7 +822,7 @@ fn gc_from_linked_worktree_protects_cwd() {
         eprintln!("skipping: git not on PATH");
         return;
     }
-    let repo = tmp_dir("f4-cwd-protect");
+    let (repo, _repo_guard) = tmp_dir("f4-cwd-protect");
     init_repo(&repo);
     // Create the linked worktree that will be "our" cwd.
     let linked_wt = make_rally_worktree(&repo, "claude-linked-cwd-01");
@@ -899,8 +876,6 @@ fn gc_from_linked_worktree_protects_cwd() {
         reason.to_lowercase().contains("current"),
         "f4: skip reason must mention 'current' worktree; got: {reason}"
     );
-
-    fs::remove_dir_all(&repo).ok();
 }
 
 // ---------------------------------------------------------------------------

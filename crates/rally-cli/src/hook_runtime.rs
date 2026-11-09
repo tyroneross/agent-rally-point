@@ -2836,8 +2836,8 @@ mod tests {
 
     #[test]
     fn dedupe_runs_once_per_logical_event_across_sources() {
-        let dir = std::env::temp_dir().join(format!("rally-dedupe-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let root = crate::test_temp_root::TempRoot::new("rally-dedupe");
+        let dir = root.join("state"); // never created here; dedupe_event creates it
         let material = r#"{"tool_name":"Write"}"#;
         let now = 1_000_000u64;
         assert_eq!(
@@ -2858,14 +2858,12 @@ mod tests {
             DedupeVerdict::Run,
             "an unknown source is never suppressed"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn dedupe_retention_covers_a_configured_window_longer_than_ten_minutes() {
-        let dir =
-            std::env::temp_dir().join(format!("rally-dedupe-retention-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let root = crate::test_temp_root::TempRoot::new("rally-dedupe-retention");
+        let dir = root.join("state"); // never created here; dedupe_event creates it
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2923,13 +2921,12 @@ mod tests {
             DedupeVerdict::Run,
             "retaining a marker must not extend its logical suppression window"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn dedupe_metadata_is_compatible_and_retention_never_shrinks() {
-        let dir = std::env::temp_dir().join(format!("rally-dedupe-compat-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let root = crate::test_temp_root::TempRoot::new("rally-dedupe-compat");
+        let dir = root.join("state"); // never created here; dedupe_event creates it
         dedupe_event(&dir, "plugin", "s", "before-write", "same", 3600, 1000);
         assert_eq!(
             dedupe_event(&dir, "project", "s", "before-write", "same", 5, 1000),
@@ -2954,13 +2951,11 @@ mod tests {
             None,
             "a refresh cannot invent a legacy creator's retention"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn normalize_targets_refuses_paths_outside_the_root() {
-        let root = std::env::temp_dir().join(format!("rally-normalize-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = crate::test_temp_root::TempRoot::new("rally-normalize");
         fs::create_dir_all(root.join("src")).unwrap();
         let root_canonical = fs::canonicalize(&root).unwrap();
         let cwd = root_canonical.to_string_lossy().to_string();
@@ -2983,7 +2978,6 @@ mod tests {
             self_root.err().as_deref(),
             Some("target resolves outside the Rally root")
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

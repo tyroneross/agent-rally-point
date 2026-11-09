@@ -16,21 +16,24 @@
 //! registration → routing → no-keystroke path is exercised against a real
 //! socket, not a stub.
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+
+use temp_root::TempRoot;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
 const RALLY_BIN: &str = env!("CARGO_BIN_EXE_rally");
-static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn assert_command_completed(value: &Value, context: &str) {
     assert_ne!(
@@ -38,18 +41,6 @@ fn assert_command_completed(value: &Value, context: &str) {
         "{context} did not complete; recovery observed after {}ms: {}",
         value["data"]["elapsed_ms"], value["data"]["reason"]
     );
-}
-
-fn unique(prefix: &str) -> String {
-    let counter = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!(
-        "{prefix}-{}-{}-{counter}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    )
 }
 
 /// Behavioral knobs for the test-double daemon so individual tests can drive
@@ -78,15 +69,47 @@ type RequestLog = Arc<Mutex<Vec<Value>>>;
 /// `agent.stop`, `pane.close`, and `pane.list` (the verbs the ptyd
 /// pane-ownership flip drives), and records EVERY request to `log`. Accepts
 /// connections until the listener is dropped.
-fn spawn_double_daemon(socket: PathBuf, cfg: DoubleConfig) -> RequestLog {
+struct DoubleDaemon {
+    socket: PathBuf,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for DoubleDaemon {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // Wake accept so the thread can release its listener before scratch cleanup.
+        let woke = UnixStream::connect(&self.socket).is_ok();
+        if let Some(thread) = self.thread.take() {
+            // Bounded on purpose. A test double must never hang the test that
+            // owns it: if the wake-up did not land, or the thread is still
+            // busy with a client, leave it detached, as it was before this
+            // teardown existed.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while woke && !thread.is_finished() && std::time::Instant::now() < deadline {
+                thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+fn spawn_double_daemon(socket: PathBuf, cfg: DoubleConfig) -> (RequestLog, DoubleDaemon) {
     let log: RequestLog = Arc::new(Mutex::new(Vec::new()));
     let log_thread = Arc::clone(&log);
     // [C]: track created workspaces (label → id) so `workspace.list` reflects
     // them and the CLI's list-then-reuse path can be exercised faithfully.
     let workspaces: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let listener = UnixListener::bind(&socket).expect("bind double daemon socket");
-    thread::spawn(move || {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    let thread = thread::spawn(move || {
         for stream in listener.incoming() {
+            if stop_thread.load(Ordering::Relaxed) {
+                break;
+            }
             let Ok(stream) = stream else { break };
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
@@ -255,7 +278,14 @@ fn spawn_double_daemon(socket: PathBuf, cfg: DoubleConfig) -> RequestLog {
             let _ = w.flush();
         }
     });
-    log
+    (
+        log,
+        DoubleDaemon {
+            socket,
+            stop,
+            thread: Some(thread),
+        },
+    )
 }
 
 /// Minimal `PaneInfo` shape (ptyd `protocol.rs:345`) — only the fields the CLI
@@ -305,6 +335,8 @@ struct Sandbox {
     tmux_spy: PathBuf,
     tmux_log: PathBuf,
     log: RequestLog,
+    _daemon: DoubleDaemon,
+    _root: TempRoot,
 }
 
 impl Sandbox {
@@ -316,17 +348,17 @@ impl Sandbox {
     }
 
     fn with_config(cfg: DoubleConfig) -> Self {
-        let root = std::env::temp_dir().join(unique("daemon-inject"));
+        let root = TempRoot::new("daemon-inject");
         let cwd = root.join("cwd");
         let home = root.join("home");
         fs::create_dir_all(cwd.join(".git")).unwrap();
         fs::create_dir_all(&home).unwrap();
         // Keep the socket path short (unix sun_path limit ~104 bytes).
-        let socket = std::env::temp_dir().join(format!("{}.sock", unique("dtd")));
+        let socket = root.join("dtd.sock");
         let tmux_spy = root.join("tmux-spy.sh");
         let tmux_log = root.join("tmux-invocations.log");
         write_tmux_spy(&tmux_spy, &tmux_log);
-        let log = spawn_double_daemon(socket.clone(), cfg);
+        let (log, daemon) = spawn_double_daemon(socket.clone(), cfg);
         Self {
             cwd,
             home,
@@ -334,6 +366,8 @@ impl Sandbox {
             tmux_spy,
             tmux_log,
             log,
+            _daemon: daemon,
+            _root: root,
         }
     }
 
@@ -542,7 +576,7 @@ fn urgent_addition_skips_daemon_send_and_reports_policy_rejection() {
 #[test]
 fn no_daemon_session_falls_back_to_framed_tmux() {
     // A sandbox whose PTYD_SOCKET_PATH points at a non-existent socket.
-    let root = std::env::temp_dir().join(unique("no-daemon-inject"));
+    let root = TempRoot::new("no-daemon-inject");
     let cwd = root.join("cwd");
     let home = root.join("home");
     fs::create_dir_all(cwd.join(".git")).unwrap();
@@ -1132,7 +1166,7 @@ fn inject_receipt_pane_mismatch_is_hard_failure() {
 /// preserved): the session is launched under tmux, not ptyd.
 #[test]
 fn backend_auto_without_live_socket_uses_tmux() {
-    let root = std::env::temp_dir().join(unique("auto-no-socket"));
+    let root = TempRoot::new("auto-no-socket");
     let cwd = root.join("cwd");
     let home = root.join("home");
     fs::create_dir_all(cwd.join(".git")).unwrap();
@@ -1196,7 +1230,7 @@ fn backend_auto_without_live_socket_uses_tmux() {
 #[test]
 fn daemon_backends_no_socket_no_binary_error_clearly() {
     for backend in ["ptyd", "ptyd-strict"] {
-        let root = std::env::temp_dir().join(unique(&format!("{backend}-no-bin")));
+        let root = TempRoot::new(&format!("{backend}-no-bin"));
         let cwd = root.join("cwd");
         let home = root.join("home");
         let empty_path = root.join("empty-path");
@@ -1307,6 +1341,17 @@ fn kill_socket_holder(socket: &Path) {
     let _ = fs::remove_file(socket);
 }
 
+struct RealPtydScratch {
+    socket: PathBuf,
+    _root: TempRoot,
+}
+
+impl Drop for RealPtydScratch {
+    fn drop(&mut self) {
+        kill_socket_holder(&self.socket);
+    }
+}
+
 #[test]
 fn real_ptyd_inject_actually_submits_and_is_received() {
     let Some(ptyd_bin) = real_ptyd_binary() else {
@@ -1317,7 +1362,7 @@ fn real_ptyd_inject_actually_submits_and_is_received() {
         return;
     };
 
-    let root = std::env::temp_dir().join(unique("real-ptyd"));
+    let root = TempRoot::new("real-ptyd");
     let cwd = root.join("cwd");
     // Autostart is allowed only on rally's canonical socket under HOME, with no
     // RALLY_PTYD_SOCKET override (daemon_client::ensure_rally_owns_socket). A
@@ -1332,6 +1377,10 @@ fn real_ptyd_inject_actually_submits_and_is_received() {
     write_claude_line_reader_shim(&bin_dir.join("claude"));
     // A single rally-owned socket (NOT the ET socket, NOT ~/.local/share/rally).
     let socket = home.join(".local/share/rally/ptyd.sock");
+    let _scratch = RealPtydScratch {
+        socket: socket.clone(),
+        _root: root,
+    };
     // PATH the child shells use must find the fake `claude` plus /bin, /usr/bin
     // (for sh/stty/printf). Put bin_dir FIRST so our shim shadows any real claude.
     let path_env = format!("{}:/usr/bin:/bin", bin_dir.display());

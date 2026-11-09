@@ -950,16 +950,11 @@ mod tests {
         })
     }
 
-    fn temp_sock(name: &str) -> String {
-        let dir = std::env::temp_dir().join(format!(
-            "rally-daemon-{name}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    fn temp_sock(name: &str) -> (String, crate::test_temp_root::TempRoot) {
+        let root = crate::test_temp_root::TempRoot::new(&format!("rally-daemon-{name}"));
         // Unix socket paths are length-limited; keep it short.
-        format!("{}.sock", dir.display())
+        let sock = root.join("d.sock").display().to_string();
+        (sock, root)
     }
 
     #[test]
@@ -1017,8 +1012,8 @@ mod tests {
     fn ptyd_autostart_probe_requires_an_executable_file() {
         use std::os::unix::fs::PermissionsExt;
 
-        let path =
-            std::env::temp_dir().join(format!("rally-ptyd-not-executable-{}", std::process::id()));
+        let root = crate::test_temp_root::TempRoot::new("rally-ptyd-not-exec");
+        let path = root.join("ptyd");
         std::fs::write(&path, "not an executable").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(
@@ -1027,7 +1022,6 @@ mod tests {
         );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(is_executable_file(&path));
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
@@ -1046,7 +1040,7 @@ mod tests {
 
     #[test]
     fn register_agent_against_test_double_returns_registered() {
-        let sock = temp_sock("ok");
+        let (sock, _root) = temp_sock("ok");
         let canned = json!({
             "id": "rally-cli",
             "result": { "pane_id": "pane-7", "identity": "claude_code:01",
@@ -1072,7 +1066,7 @@ mod tests {
 
     #[test]
     fn register_agent_maps_daemon_error_to_unavailable() {
-        let sock = temp_sock("err");
+        let (sock, _root) = temp_sock("err");
         let canned = json!({
             "id": "rally-cli",
             "error": { "code": "pane_not_found", "message": "no such pane" }
@@ -1100,7 +1094,7 @@ mod tests {
     fn register_agent_rejects_identity_echo_mismatch() {
         // security-reviewer LOW/MED: a daemon that bound a DIFFERENT identity
         // than requested must NOT be honored — fall back to the framed path.
-        let sock = temp_sock("idmismatch");
+        let (sock, _root) = temp_sock("idmismatch");
         let canned = json!({
             "id": "rally-cli",
             "result": { "pane_id": "pane-9", "identity": "evil_agent:99",
@@ -1126,7 +1120,7 @@ mod tests {
     fn register_agent_trusts_absent_identity_echo() {
         // Older daemons may omit the identity echo; absent is trusted (pane
         // handle only). Matching echo is the common modern case.
-        let sock = temp_sock("idabsent");
+        let (sock, _root) = temp_sock("idabsent");
         let canned = json!({
             "id": "rally-cli",
             "result": { "pane_id": "pane-3", "transport_resolved": "pty", "rebound": false }
