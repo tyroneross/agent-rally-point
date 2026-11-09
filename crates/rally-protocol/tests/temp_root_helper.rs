@@ -70,16 +70,57 @@ fn roots_stay_under_the_system_temp_directory() {
     );
 }
 
+/// A label can never fail a test or point outside the process area.
 #[test]
-#[should_panic(expected = "label")]
-fn a_label_with_a_path_separator_is_refused() {
-    let _ = TempRoot::new("a/b");
-}
+fn a_hostile_or_overlong_label_is_made_safe() {
+    let area_of = |root: &TempRoot| root.path().parent().expect("process area").to_path_buf();
+    let plain = TempRoot::new("plain");
+    let area = area_of(&plain);
 
-#[test]
-#[should_panic(expected = "label")]
-fn an_empty_label_is_refused() {
-    let _ = TempRoot::new("");
+    for label in [
+        "a/b",
+        "../../escape",
+        "..",
+        "",
+        ".hidden",
+        "sp ace\u{e9}",
+        "/abs",
+    ] {
+        let root = TempRoot::new(label);
+        assert!(root.path().is_dir(), "{label:?} must still yield a folder");
+        assert_eq!(
+            area_of(&root),
+            area,
+            "{label:?} must stay directly inside the process area: {}",
+            root.path().display()
+        );
+        let name = root
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            !name.starts_with('.'),
+            "{label:?} gave a hidden name {name:?}"
+        );
+    }
+
+    let long = "x".repeat(200);
+    let root = TempRoot::new(&long);
+    let name = root
+        .path()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        name.len() <= 48 + 1 + 20,
+        "a 200-character label must be cut down, got {} characters",
+        name.len()
+    );
 }
 
 /// Child entry point. In a normal run it returns at once.
