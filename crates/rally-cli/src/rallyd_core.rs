@@ -1817,6 +1817,18 @@ mod imp {
         use super::*;
         use std::io::{BufRead, BufReader, Write};
 
+        /// A repo root that must outlive the test that made it. The timeout
+        /// tests deliberately leave an owner lock (and, in one, a sleeping
+        /// store-open worker) alive until the process exits; deleting the
+        /// folder at test return would unlink the lock file they still hold.
+        /// The next test process removes it.
+        fn process_lifetime_repo_root(tag: &str) -> &'static std::path::Path {
+            let dir =
+                crate::test_temp_root::TempRoot::process_scoped(&format!("rallyd-core-{tag}"));
+            std::fs::create_dir_all(dir.join(".rally")).unwrap();
+            dir
+        }
+
         fn unique_repo_root(tag: &str) -> crate::test_temp_root::TempRoot {
             let dir = crate::test_temp_root::TempRoot::new(&format!("rallyd-core-{tag}"));
             std::fs::create_dir_all(dir.join(".rally")).unwrap();
@@ -4087,7 +4099,7 @@ mod imp {
 
         #[test]
         fn daemon_store_total_open_timeout_retains_owner_for_late_worker() {
-            let repo_root = unique_repo_root("total-open-timeout-owner-retained");
+            let repo_root = process_lifetime_repo_root("total-open-timeout-owner-retained");
             let rally_dir = repo_root.join(".rally");
             let mut owner = Some(
                 store::acquire_owner_exclusive_bounded(&rally_dir, Duration::from_millis(75))
@@ -4096,10 +4108,9 @@ mod imp {
 
             let bound = Duration::from_millis(50);
             let started = Instant::now();
-            let result =
-                open_direct_store_bounded_with(repo_root.path().to_path_buf(), bound, || {
-                    thread::sleep(BLOCKER_OUTLASTS_CEILING)
-                });
+            let result = open_direct_store_bounded_with(repo_root.to_path_buf(), bound, || {
+                thread::sleep(BLOCKER_OUTLASTS_CEILING)
+            });
             let elapsed = started.elapsed();
             let failure = match result {
                 Ok(_) => panic!("delayed daemon store open unexpectedly completed"),
@@ -4134,7 +4145,7 @@ mod imp {
 
         #[test]
         fn dispatcher_close_timeout_retains_owner_until_process_exit() {
-            let repo_root = unique_repo_root("close-timeout-owner-retained");
+            let repo_root = process_lifetime_repo_root("close-timeout-owner-retained");
             let rally_dir = repo_root.join(".rally");
             let owner =
                 store::acquire_owner_exclusive_bounded(&rally_dir, Duration::from_millis(75))

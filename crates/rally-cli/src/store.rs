@@ -16475,7 +16475,12 @@ mod ledger_tests {
     #[cfg(unix)]
     #[test]
     fn warm_close_spawn_failure_retains_mutation_lock_until_process_exit() {
-        let (root, _guard) = unique_root("warm-close-spawn-failure");
+        // Process-lifetime on purpose: the injected failure forgets the warm
+        // pool and mutation lock, which stay held until the process exits. A
+        // test-scoped root would unlink that lock file at test return. The
+        // next test process removes this folder.
+        let root = crate::test_temp_root::TempRoot::process_scoped("warm-close-spawn-failure")
+            .to_path_buf();
         let rally_dir = root.join(".rally");
         let mut store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         store.install_warm_fact_store().unwrap();
