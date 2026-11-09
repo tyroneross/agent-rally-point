@@ -1522,8 +1522,7 @@ mod tests {
             channel.exists(),
             "migrate_legacy must not delete the legacy file"
         );
-
-                    }
+    }
 
     #[test]
     fn o26_migrate_legacy_preserves_committed_warning_and_queryable_unknown() {
@@ -1583,7 +1582,7 @@ mod tests {
                 );
             }
             drop(room);
-                                }
+        }
     }
 
     /// B17.migrate: non-rally records (build-loop phase events without rally schema)
@@ -1618,8 +1617,7 @@ mod tests {
             "only the rally-schema record is counted as facts_read"
         );
         assert_eq!(result.facts_migrated, 1, "the rally fact is migrated");
-
-                    }
+    }
 
     /// B17.migrate: recent and locate do NOT return legacy-only facts (flag retired).
     /// The repo ledger is the only source; legacy facts are invisible until migrated.
@@ -1698,8 +1696,7 @@ mod tests {
             channel.exists(),
             "legacy file must not be deleted by migrator"
         );
-
-                    }
+    }
 
     /// B17: room_index_path() must default to None (global index off by default).
     ///

@@ -662,19 +662,19 @@ mod tests {
     use std::io::Write;
     use std::time::Instant;
 
-    fn unique_temp_dir(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "rally-log-watch-{label}-{}-{}",
-            std::process::id(),
-            crate::short_id()
-        ))
+    /// A path inside a fresh folder; the path itself is not created. Keep the
+    /// guard alive while the path is used.
+    fn unique_temp_dir(label: &str) -> (crate::test_temp_root::TempRoot, PathBuf) {
+        let root = crate::test_temp_root::TempRoot::new(&format!("rally-log-watch-{label}"));
+        let dir = root.join("watched");
+        (root, dir)
     }
 
     /// Test 1: an armed watcher observes a file creation even when the event
     /// arrives before wait. Registration ordering, not a sleep, defines readiness.
     #[test]
     fn armed_watcher_detects_file_creation() {
-        let dir = unique_temp_dir("create");
+        let (_root, dir) = unique_temp_dir("create");
         std::fs::create_dir_all(&dir).unwrap();
         let index_file = dir.join("index.json");
 
@@ -693,8 +693,6 @@ mod tests {
              on a platform with no backend — if this fired, the CI box's backend needs \
              checking): got {outcome:?}"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Regression for the persistent loop: constructing a new watcher for
@@ -710,7 +708,7 @@ mod tests {
     /// immediately.
     #[test]
     fn a_change_while_not_blocked_is_queued_and_delivered_next_wait() {
-        let dir = unique_temp_dir("queued-while-idle");
+        let (_root, dir) = unique_temp_dir("queued-while-idle");
         std::fs::create_dir_all(&dir).unwrap();
         let index_file = dir.join("index.json");
         std::fs::write(&index_file, b"{}").unwrap();
@@ -748,8 +746,6 @@ mod tests {
              timeout; took {elapsed:?} (a per-call registration would sit the \
              full 3s here)"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The anti-hot-spin invariant: a non-`Changed` return must consume the
@@ -759,7 +755,7 @@ mod tests {
     /// CPU-speed spin that writes heartbeat JSON into an unrotated log.
     #[test]
     fn a_failed_backend_still_consumes_the_full_timeout() {
-        let missing = unique_temp_dir("absent-never-created");
+        let (_root, missing) = unique_temp_dir("absent-never-created");
         let index_file = missing.join("index.json");
         let timeout = Duration::from_millis(400);
 
@@ -787,7 +783,7 @@ mod tests {
     /// it degrades to sleeping, and keeps doing so.
     #[test]
     fn watcher_over_missing_dir_reports_a_non_event_backend() {
-        let missing = unique_temp_dir("absent-2");
+        let (_root, missing) = unique_temp_dir("absent-2");
         let mut watcher = LogWatcher::new(&missing, &missing.join("index.json"));
         assert_eq!(
             watcher.wait(Duration::from_millis(120)),
@@ -801,7 +797,7 @@ mod tests {
     /// nothing happens within a short timeout.
     #[test]
     fn wait_for_change_times_out_when_nothing_happens() {
-        let dir = unique_temp_dir("idle");
+        let (_root, dir) = unique_temp_dir("idle");
         std::fs::create_dir_all(&dir).unwrap();
         let index_file = dir.join("index.json");
 
@@ -818,8 +814,6 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "an idle wait must return close to its own timeout, not hang; took {elapsed:?}"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Test 3: the REAL write shape — `index.json.tmp-*` written then
@@ -829,7 +823,7 @@ mod tests {
     /// in-place write.
     #[test]
     fn armed_watcher_detects_atomic_rename_over_index_file() {
-        let dir = unique_temp_dir("rename");
+        let (_root, dir) = unique_temp_dir("rename");
         std::fs::create_dir_all(&dir).unwrap();
         let index_file = dir.join("index.json");
         std::fs::write(&index_file, b"{}").unwrap();
@@ -854,8 +848,6 @@ mod tests {
             WaitOutcome::Changed,
             "atomic tmp+rename over index.json must be detected as Changed: got {outcome:?}"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Test 4: the `--ack-file` loop-hazard guard refuses a path inside the

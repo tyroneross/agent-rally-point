@@ -422,7 +422,6 @@ mod tests {
         assert_eq!(item.status, "planned");
         assert_eq!(item.target.as_deref(), Some("codex"));
         assert_eq!(item.expected_by.as_deref(), Some("2026-07-02T12:00:00Z"));
-
     }
 
     #[test]
@@ -553,7 +552,6 @@ mod tests {
         // dep-1 is done so only task-2 should be open
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].id, "task-2");
-
     }
 
     #[test]
@@ -596,7 +594,6 @@ mod tests {
         assert_eq!(item.target.as_deref(), Some("codex"));
         assert_eq!(item.status, "in_progress");
         assert_eq!(item.expected_by.as_deref(), Some("next checkpoint"));
-
     }
 
     #[test]
@@ -641,6 +638,5 @@ mod tests {
         let all = list_backlog_items(&room).unwrap();
         let sat = satisfied_ids(&all);
         assert!(sat.contains("finished"));
-
     }
 }

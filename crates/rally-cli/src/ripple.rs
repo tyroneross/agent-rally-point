@@ -182,16 +182,9 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn tmp_dir(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rally-rip-{label}-{nanos}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tmp_dir(label: &str) -> crate::test_temp_root::TempRoot {
+        crate::test_temp_root::TempRoot::new(&format!("rally-rip-{label}"))
     }
 
     #[test]
@@ -211,7 +204,6 @@ pub fn delta_underscore() {}
         assert!(names.contains(&"gamma".to_string()));
         assert!(names.contains(&"delta_underscore".to_string()));
         assert!(!names.contains(&"private".to_string()));
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -219,7 +211,6 @@ pub fn delta_underscore() {}
         let dir = tmp_dir("extract-missing");
         let result = extract_pub_fn_names(&dir.join("nonexistent.rs"));
         assert!(result.is_empty());
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -237,7 +228,6 @@ let x = beta(1, 2);
         assert!(refs.contains(&"alpha".to_string()));
         assert!(refs.contains(&"beta".to_string()));
         assert!(!refs.contains(&"gamma".to_string()));
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -317,8 +307,6 @@ let x = beta(1, 2);
             alert.evidence
         );
         assert_eq!(alert.severity.as_deref(), Some("warn"));
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -368,7 +356,5 @@ let x = beta(1, 2);
             alerts.is_empty(),
             "no alert expected when peer does not reference changed symbol"
         );
-
-        fs::remove_dir_all(&dir).ok();
     }
 }
