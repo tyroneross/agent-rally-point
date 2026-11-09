@@ -61,7 +61,18 @@ pub(crate) enum RallyError {
         #[source]
         source: serde_json::Error,
     },
+    /// The caller's OWN must-keep coordination rows exceed the bound of a
+    /// caller-scoped snapshot (`RoomSnapshot::bound_for_caller`). Distinct so
+    /// callers can branch on it (multi-tool `inbox` reports it per tool) and
+    /// never fall back to an unbounded snapshot. Crosses the daemon wire as a
+    /// `Command` error whose message starts with
+    /// [`CALLER_PROJECTION_TOO_LARGE`] and is rebuilt into this variant.
+    #[error("{CALLER_PROJECTION_TOO_LARGE}: {detail}")]
+    CallerProjectionTooLarge { detail: String },
 }
+
+/// Message prefix of [`RallyError::CallerProjectionTooLarge`].
+pub(crate) const CALLER_PROJECTION_TOO_LARGE: &str = "caller-projection-too-large";
 
 impl RallyError {
     pub(crate) fn exit_code(&self) -> u8 {
@@ -73,6 +84,7 @@ impl RallyError {
             | Self::Message(_)
             | Self::OutcomeUnknown { .. }
             | Self::IncompatibleWire { .. }
+            | Self::CallerProjectionTooLarge { .. }
             | Self::Io { .. }
             | Self::Json { .. } => 1,
         }

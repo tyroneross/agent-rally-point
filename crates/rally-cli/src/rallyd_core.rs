@@ -478,7 +478,8 @@ mod imp {
                     let snapshot = project()
                         .map_err(rally_to_wire)?
                         .snapshot
-                        .for_obligation_target(&tool, row_limit);
+                        .for_obligation_target(&tool, row_limit)
+                        .map_err(rally_to_wire)?;
                     Ok(StoreOk::Snapshot {
                         snapshot: snapshot_to_wire(&snapshot)?,
                         fingerprint: None,
@@ -960,7 +961,9 @@ mod imp {
                 let kind = match other {
                     RallyError::Usage(_) => StoreErrorKind::Usage,
                     RallyError::NotFound(_) => StoreErrorKind::NotFound,
-                    RallyError::Command(_) => StoreErrorKind::Command,
+                    RallyError::Command(_) | RallyError::CallerProjectionTooLarge { .. } => {
+                        StoreErrorKind::Command
+                    }
                     RallyError::Message(_) => StoreErrorKind::Message,
                     RallyError::NotStarted(_) => StoreErrorKind::NotStarted,
                     RallyError::IncompatibleWire { .. } => StoreErrorKind::IncompatibleWire,
@@ -3044,6 +3047,507 @@ mod imp {
             assert_eq!(active.session.unwrap().tool, "worker-01");
             drop(room);
 
+            stop.store(true, Ordering::SeqCst);
+            handle.join().unwrap().unwrap();
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        /// AGEN-ENTER-m6ztgb9h6p7barc8cr79q: a room whose FULL snapshot is
+        /// past the 8 MiB frame because of many rows (stale facts, open
+        /// handoffs, squads), not one giant field. Both caller-scoped ops must
+        /// answer under a fixed bound, routed through a real daemon, and still
+        /// carry what `enter`, `next` and `inbox` read.
+        #[test]
+        fn routed_caller_snapshots_stay_bounded_when_full_snapshot_exceeds_frame() {
+            // Stated bound: 8 fact buckets x MAX_CALLER_BUCKET_BYTES + squads +
+            // internals, well under the frame.
+            const REPLY_BOUND: usize = 6 * 1024 * 1024;
+            const STALE: i64 = 6_000;
+            const ELSEWHERE: i64 = 2_000;
+            const OPEN_QUEUE: i64 = 700;
+            let me = "worker-01";
+            let repo_root = unique_repo_root("caller-snapshot-row-flood");
+            let rally_dir = repo_root.join(".rally");
+            let engagement = "caller-snapshot-row-flood";
+            std::fs::create_dir_all(&rally_dir).unwrap();
+            std::fs::write(
+                rally_dir.join(crate::store::ACTIVE_ENGAGEMENT_FILENAME),
+                format!("{engagement}\n"),
+            )
+            .unwrap();
+            let log_dir = rally_dir.join(crate::store::LOG_DIRNAME);
+            std::fs::create_dir_all(&log_dir).unwrap();
+            let mut segment =
+                std::fs::File::create(log_dir.join(format!("{engagement}.jsonl"))).unwrap();
+            let now = crate::now_string();
+            let padding = "p".repeat(900);
+            let mut seq = 0i64;
+            let mut write = |mut fact: crate::store::Fact| {
+                seq += 1;
+                fact.seq = seq;
+                fact.schema = crate::FACT_SCHEMA.to_string();
+                if fact.event_id.is_empty() {
+                    fact.event_id = format!("flood-{seq}");
+                }
+                fact.thread_id = format!("flood-thread-{seq}");
+                let event_type = serde_json::to_value(&fact.kind).unwrap();
+                writeln!(
+                    segment,
+                    "{}",
+                    serde_json::json!({
+                        "seq": seq,
+                        "occurred_at": fact.created_at,
+                        "event_type": event_type,
+                        "payload": fact,
+                        "engagement": engagement
+                    })
+                )
+                .unwrap();
+            };
+            use crate::store::{Fact, FactKind};
+            // Telemetry guards `enter` must still see.
+            for subject in [
+                format!("unmanaged-agent: {me}"),
+                format!("duplicate-active-squad-id: {me}"),
+                "binary-drift: new-build vs old-build".to_string(),
+            ] {
+                write(Fact {
+                    kind: FactKind::Risk,
+                    tool: Some(me.to_string()),
+                    subject,
+                    created_at: now.clone(),
+                    ..Fact::default()
+                });
+            }
+            write(Fact {
+                kind: FactKind::Presence,
+                tool: Some("peer-presence".to_string()),
+                subject: "peer presence".to_string(),
+                summary: Some("build_id:old-build".to_string()),
+                created_at: now.clone(),
+                ..Fact::default()
+            });
+            // The caller's own claim, a handoff named to it, and its wake.
+            write(Fact {
+                event_id: "my-claim".to_string(),
+                kind: FactKind::Claim,
+                tool: Some(me.to_string()),
+                subject: "my claim".to_string(),
+                scope: vec!["file:src/mine.rs".to_string()],
+                evidence: vec!["lease_expires_at:2099-01-01T00:00:00Z".to_string()],
+                created_at: now.clone(),
+                ..Fact::default()
+            });
+            write(Fact {
+                event_id: "named-to-me".to_string(),
+                kind: FactKind::Handoff,
+                tool: Some("lead-01".to_string()),
+                target: Some(me.to_string()),
+                subject: "work for worker-01".to_string(),
+                created_at: now.clone(),
+                ..Fact::default()
+            });
+            write(Fact {
+                event_id: "my-wake".to_string(),
+                kind: FactKind::Wake,
+                target: Some(me.to_string()),
+                subject: format!("wake intent for {me}: take_handoff"),
+                ref_id: Some("named-to-me".to_string()),
+                status: Some("pending".to_string()),
+                created_at: now.clone(),
+                ..Fact::default()
+            });
+            // Row floods: archived decisions -> stale_facts; peer-to-peer
+            // handoffs from distinct tools -> open_handoffs + squads; and an
+            // untargeted open queue larger than one bucket's row bound.
+            for n in 0..STALE {
+                write(Fact {
+                    kind: FactKind::Decision,
+                    tool: Some("archivist".to_string()),
+                    subject: format!("old decision {n}"),
+                    summary: Some(padding.clone()),
+                    created_at: "2020-01-01T00:00:00Z".to_string(),
+                    ..Fact::default()
+                });
+            }
+            for n in 0..ELSEWHERE {
+                write(Fact {
+                    kind: FactKind::Handoff,
+                    tool: Some(format!("peer-{n}")),
+                    target: Some(format!("peer-{}", n + 1)),
+                    subject: format!("peer handoff {n}"),
+                    summary: Some(padding.clone()),
+                    created_at: now.clone(),
+                    ..Fact::default()
+                });
+            }
+            for n in 0..OPEN_QUEUE {
+                write(Fact {
+                    kind: FactKind::Handoff,
+                    tool: Some("queue-poster".to_string()),
+                    subject: format!("open queue item {n}"),
+                    summary: Some(padding.clone()),
+                    created_at: now.clone(),
+                    ..Fact::default()
+                });
+            }
+            segment.sync_all().unwrap();
+            drop(segment);
+
+            // Precondition: the FULL projection is past the frame, carried by rows.
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let full = store.snapshot().unwrap();
+            let full_bytes = serde_json::to_vec(&full).unwrap().len();
+            assert!(
+                full_bytes > MAX_LINE_BYTES,
+                "fixture full snapshot is {full_bytes} bytes; must exceed {MAX_LINE_BYTES}"
+            );
+            assert_eq!(full.stale_facts.len() as i64, STALE);
+            assert!(full.open_handoffs.len() as i64 >= ELSEWHERE + OPEN_QUEUE);
+            assert!(full.squads.len() as i64 >= ELSEWHERE);
+            let full_squads = full.squads.len();
+            let full_handoffs = full.open_handoffs.len();
+
+            // Daemon dispatch: measured reply size for both ops.
+            let root_str = canonical_repo_root(&repo_root);
+            for (kind, op) in [
+                (
+                    "snapshot_for_obligation_target",
+                    StoreOp::SnapshotForObligationTarget {
+                        tool: me.to_string(),
+                        row_limit: 128,
+                        include_archived: false,
+                    },
+                ),
+                (
+                    "snapshot_for_enter",
+                    StoreOp::SnapshotForEnter {
+                        tool: me.to_string(),
+                        build_id: "new-build".to_string(),
+                        from_session_id: "sess:worker-01#live".to_string(),
+                        presence_evidence: Vec::new(),
+                        session_alias: None,
+                    },
+                ),
+            ] {
+                let response = dispatch_one(
+                    &mut store,
+                    root_str.as_str(),
+                    StoreRequest::new(Some(engagement.to_string()), op),
+                );
+                assert!(
+                    matches!(response, StoreResponse::Ok(_)),
+                    "{kind} failed: {response:?}"
+                );
+                let bytes = serde_json::to_vec(&response).unwrap().len();
+                assert!(
+                    bytes < REPLY_BOUND,
+                    "{kind} reply {bytes} bytes exceeds {REPLY_BOUND}"
+                );
+            }
+            let direct = store
+                .snapshot()
+                .unwrap()
+                .for_obligation_target(me, 128)
+                .unwrap();
+            drop(store);
+
+            let cfg = ServeConfig {
+                repo_root: repo_root.clone(),
+                idle_exit_secs: Some(30),
+                foreground: true,
+            };
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_for_serve = Arc::clone(&stop);
+            let handle = thread::spawn(move || super::serve_unix_with_stop(cfg, stop_for_serve));
+            let socket = wait_for_addr(&rally_dir);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline && !ping_ok(&socket) {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(ping_ok(&socket), "daemon never answered a ping");
+            let room = crate::store::RoomStore::open_at(repo_root.clone()).unwrap();
+            assert!(
+                matches!(room, crate::store::RoomStore::Routed(_)),
+                "fixture must exercise the routed client"
+            );
+
+            // `next` / `inbox` / `self-exit-check` read this op.
+            let snap = room.snapshot_for_obligation_target(me, 128).unwrap();
+            assert_eq!(snap.open_obligations_total, 1);
+            assert_eq!(snap.open_obligations[0].event_id, "named-to-me");
+            assert!(snap.pending_wakes.iter().any(|w| w.event_id == "my-wake"));
+            assert!(snap.active_claims.iter().any(|c| c.event_id == "my-claim"));
+            assert!(
+                snap.open_handoffs
+                    .iter()
+                    .any(|h| h.event_id == "named-to-me")
+            );
+            assert!(snap.squads.iter().any(|s| s.tool == me));
+            assert!(snap.stale_facts.is_empty(), "stale rows have no reader");
+            assert!(snap.squads.len() < full_squads);
+            assert!(snap.open_handoffs.len() < full_handoffs);
+            // Counts stay exact.
+            let summary = crate::store::RoomSummary::from(&snap);
+            assert_eq!(summary.stale_facts as i64, STALE);
+            assert_eq!(summary.open_handoffs, full_handoffs);
+            let inbox = crate::obligations::build_inbox(
+                &snap,
+                me,
+                16,
+                3600,
+                crate::open_queue::open_queue_items(
+                    &snap,
+                    me,
+                    &crate::open_queue::FsSignals::default(),
+                    chrono::Utc::now().timestamp(),
+                ),
+            );
+            assert_eq!(inbox.count, 1);
+            assert_eq!(inbox.open_queue.count as i64, OPEN_QUEUE);
+            let peers = crate::next::peer_targets(&snap, me, 8);
+            assert_eq!(peers.fresh + peers.stale + peers.unknown, full_squads - 1);
+            // Direct and routed agree on the projection.
+            assert_eq!(direct.open_handoffs.len(), snap.open_handoffs.len());
+            assert_eq!(direct.squads.len(), snap.squads.len());
+            assert_eq!(direct.active_claims.len(), snap.active_claims.len());
+            assert_eq!(
+                direct
+                    .composition
+                    .as_ref()
+                    .map(|c| c.buckets.keys().collect::<Vec<_>>()),
+                snap.composition
+                    .as_ref()
+                    .map(|c| c.buckets.keys().collect::<Vec<_>>())
+            );
+
+            // `enter` reads this op.
+            let context = room
+                .snapshot_for_enter(me, "new-build", "sess:worker-01#live", &[], None)
+                .unwrap();
+            assert!(context.duplicate_squad_recorded);
+            assert!(context.unmanaged_agent_recorded);
+            assert!(context.binary_drift_recorded);
+            assert_eq!(context.last_presence_build_id.as_deref(), Some("old-build"));
+            assert!(
+                context
+                    .snapshot
+                    .active_claims
+                    .iter()
+                    .any(|c| c.event_id == "my-claim")
+            );
+            assert!(context.snapshot.squads.iter().any(|s| s.tool == me));
+            drop(room);
+
+            stop.store(true, Ordering::SeqCst);
+            handle.join().unwrap().unwrap();
+            std::fs::remove_dir_all(repo_root).ok();
+        }
+
+        /// R3: one room that hits every caller-reply bound at once (caller
+        /// wakes, caller obligations, must-keep own handoffs, should-keep peer
+        /// claims, optional handoffs/decisions/squads). Both ops must answer
+        /// under `MAX_CALLER_REPLY_BYTES`, measured on the serialized reply,
+        /// and through a real routed daemon.
+        #[test]
+        fn caller_reply_stays_under_one_budget_when_every_bound_is_hit() {
+            use crate::store::{Fact, FactKind, MAX_CALLER_REPLY_BYTES};
+            let me = "worker-01";
+            let repo_root = unique_repo_root("caller-reply-every-bound");
+            let rally_dir = repo_root.join(".rally");
+            let engagement = "caller-reply-every-bound";
+            std::fs::create_dir_all(&rally_dir).unwrap();
+            std::fs::write(
+                rally_dir.join(crate::store::ACTIVE_ENGAGEMENT_FILENAME),
+                format!("{engagement}\n"),
+            )
+            .unwrap();
+            let log_dir = rally_dir.join(crate::store::LOG_DIRNAME);
+            std::fs::create_dir_all(&log_dir).unwrap();
+            let mut segment =
+                std::fs::File::create(log_dir.join(format!("{engagement}.jsonl"))).unwrap();
+            let now = crate::now_string();
+            let mut seq = 0i64;
+            let mut write = |mut fact: Fact| {
+                seq += 1;
+                fact.seq = seq;
+                fact.schema = crate::FACT_SCHEMA.to_string();
+                fact.event_id = format!("bound-{seq}");
+                fact.thread_id = format!("bound-thread-{seq}");
+                if fact.created_at.is_empty() {
+                    fact.created_at = now.clone();
+                }
+                let event_type = serde_json::to_value(&fact.kind).unwrap();
+                writeln!(
+                    segment,
+                    "{}",
+                    serde_json::json!({
+                        "seq": seq,
+                        "occurred_at": fact.created_at,
+                        "event_type": event_type,
+                        "payload": fact,
+                        "engagement": engagement
+                    })
+                )
+                .unwrap();
+            };
+            let pad = |n: usize| Some("p".repeat(n));
+            // Caller wakes past MAX_CALLER_WAKE_BYTES.
+            for n in 0..1_000 {
+                write(Fact {
+                    kind: FactKind::Wake,
+                    target: Some(me.to_string()),
+                    subject: format!("wake intent for {me}: {n}"),
+                    status: Some("pending".to_string()),
+                    summary: pad(200),
+                    ..Fact::default()
+                });
+            }
+            // Caller obligations past MAX_TARGET_OBLIGATION_BYTES (must-keep:
+            // addressed to the caller).
+            for n in 0..400 {
+                write(Fact {
+                    kind: FactKind::Handoff,
+                    tool: Some(format!("asker-{n}")),
+                    target: Some(me.to_string()),
+                    subject: format!("ask {n}"),
+                    summary: pad(800),
+                    ..Fact::default()
+                });
+            }
+            // Must-keep own un-escalated handoffs (~2.4 MB).
+            for n in 0..1_200 {
+                write(Fact {
+                    kind: FactKind::Handoff,
+                    tool: Some(me.to_string()),
+                    target: Some(format!("helper-{n}")),
+                    subject: format!("own {n}"),
+                    summary: pad(1_800),
+                    ..Fact::default()
+                });
+            }
+            // Should-keep peer claims (~1.5 MB).
+            for n in 0..1_500 {
+                write(Fact {
+                    kind: FactKind::Claim,
+                    tool: Some(format!("claimer-{n}")),
+                    subject: format!("claim {n}"),
+                    scope: vec![format!("file:src/c{n}.rs")],
+                    evidence: vec!["lease_expires_at:2099-01-01T00:00:00Z".to_string()],
+                    summary: pad(800),
+                    ..Fact::default()
+                });
+            }
+            // Optional: peer handoffs (and their squads) and decisions.
+            for n in 0..6_000 {
+                write(Fact {
+                    kind: FactKind::Handoff,
+                    tool: Some(format!("p-{n}")),
+                    target: Some(format!("p-{}", n + 1)),
+                    subject: format!("peer {n}"),
+                    summary: pad(1_000),
+                    ..Fact::default()
+                });
+            }
+            for n in 0..1_000 {
+                write(Fact {
+                    kind: FactKind::Decision,
+                    tool: Some("decider".to_string()),
+                    subject: format!("decision {n}"),
+                    summary: pad(1_000),
+                    ..Fact::default()
+                });
+            }
+            // A 3 MiB mission: a scalar no tier budget sees, so only the final
+            // serialized check can keep the reply under budget.
+            write(Fact {
+                kind: FactKind::Mission,
+                tool: Some("lead-01".to_string()),
+                subject: "m".repeat(3 * 1024 * 1024),
+                scope: vec!["mission".to_string()],
+                ..Fact::default()
+            });
+            segment.sync_all().unwrap();
+            drop(segment);
+
+            let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let root_str = canonical_repo_root(&repo_root);
+            for (kind, op) in [
+                (
+                    "snapshot_for_obligation_target",
+                    StoreOp::SnapshotForObligationTarget {
+                        tool: me.to_string(),
+                        row_limit: 1_024,
+                        include_archived: false,
+                    },
+                ),
+                (
+                    "snapshot_for_enter",
+                    StoreOp::SnapshotForEnter {
+                        tool: me.to_string(),
+                        build_id: "build".to_string(),
+                        from_session_id: "sess:worker-01#live".to_string(),
+                        presence_evidence: Vec::new(),
+                        session_alias: None,
+                    },
+                ),
+            ] {
+                let response = dispatch_one(
+                    &mut store,
+                    root_str.as_str(),
+                    StoreRequest::new(Some(engagement.to_string()), op),
+                );
+                assert!(
+                    matches!(response, StoreResponse::Ok(_)),
+                    "{kind} failed: {response:?}"
+                );
+                let bytes = serde_json::to_vec(&response).unwrap().len();
+                eprintln!("{kind} reply bytes: {bytes} (budget {MAX_CALLER_REPLY_BYTES})");
+                assert!(
+                    bytes <= MAX_CALLER_REPLY_BYTES,
+                    "{kind} reply {bytes} bytes exceeds {MAX_CALLER_REPLY_BYTES}"
+                );
+            }
+            drop(store);
+
+            let cfg = ServeConfig {
+                repo_root: repo_root.clone(),
+                idle_exit_secs: Some(60),
+                foreground: true,
+            };
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_for_serve = Arc::clone(&stop);
+            let handle = thread::spawn(move || super::serve_unix_with_stop(cfg, stop_for_serve));
+            let socket = wait_for_addr(&rally_dir);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline && !ping_ok(&socket) {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(ping_ok(&socket), "daemon never answered a ping");
+            let room = crate::store::RoomStore::open_at(repo_root.clone()).unwrap();
+            assert!(
+                matches!(room, crate::store::RoomStore::Routed(_)),
+                "fixture must exercise the routed client"
+            );
+            let snap = room.snapshot_for_obligation_target(me, 1_024).unwrap();
+            assert_eq!(
+                snap.open_handoffs
+                    .iter()
+                    .filter(|f| f.tool.as_deref() == Some(me))
+                    .count(),
+                1_200,
+                "must-keep own handoffs are never evicted"
+            );
+            assert_eq!(snap.totals.active_claims, 1_500);
+            assert_eq!(
+                snap.caller_projection_omitted("active_claims"),
+                1_500 - snap.active_claims.len()
+            );
+            assert_eq!(snap.open_obligations_total, 400);
+            assert!(!snap.pending_wakes.is_empty());
+            room.snapshot_for_enter(me, "build", "sess:worker-01#live", &[], None)
+                .unwrap();
+            drop(room);
             stop.store(true, Ordering::SeqCst);
             handle.join().unwrap().unwrap();
             std::fs::remove_dir_all(repo_root).ok();

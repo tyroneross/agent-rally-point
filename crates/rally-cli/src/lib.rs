@@ -3798,6 +3798,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     let (attention, attention_total, attention_emitted, attention_omitted) = bound_enter_attention(
         &snapshot,
         &tool,
+        cursor_before,
         build_attention(&snapshot, &tool, cursor_before, &paths),
     );
     let entry = build_entry(&snapshot, &tool, role.as_deref(), &paths);
@@ -5436,8 +5437,11 @@ fn command_next(args: NextArgs) -> Result<Output> {
     } else {
         append_next_wake_intent(&room, &snapshot, &tool, &paths, &next)?
     };
+    // Re-read through the same bounded caller projection: a full
+    // `room.snapshot()` here grows with the room and failed every actionable
+    // routed `next` once the room passed the frame (AGEN-ENTER-m6ztgb9h6p7barc8cr79q).
     let snapshot = if wake_intent.is_some() {
-        room.snapshot()?
+        room.snapshot_for_obligation_target(&tool, 128)?
     } else {
         snapshot
     };
@@ -5574,10 +5578,19 @@ fn command_inbox(args: cli::InboxArgs) -> Result<Output> {
         RoomStore::Routed(_) => None,
     };
     let mut inboxes = BTreeMap::new();
+    let mut errors = BTreeMap::new();
     for tool in tools {
         let snapshot = match &base {
             Some(base) => base.clone().for_obligation_target(&tool, row_limit),
-            None => room.snapshot_for_obligation_target(&tool, row_limit)?,
+            None => room.snapshot_for_obligation_target(&tool, row_limit),
+        };
+        // One tool over its own bound must not hide the others' inboxes.
+        let snapshot = match snapshot {
+            Err(error @ RallyError::CallerProjectionTooLarge { .. }) => {
+                errors.insert(tool, error.to_string());
+                continue;
+            }
+            other => other?,
         };
         let inbox = inbox_for(
             &snapshot,
@@ -5591,9 +5604,12 @@ fn command_inbox(args: cli::InboxArgs) -> Result<Output> {
     let text = inboxes
         .iter()
         .map(|(tool, inbox)| inbox_text(tool, inbox))
+        .chain(errors.iter().map(|(tool, error)| {
+            format!("inbox {tool} — error: {}", obligations::single_line(error))
+        }))
         .collect::<Vec<_>>()
         .join("\n");
-    let body = envelope("inbox", SCHEMA_INBOX, InboxManyData { inboxes })?;
+    let body = envelope("inbox", SCHEMA_INBOX, InboxManyData { inboxes, errors })?;
     Ok(Output::new(args.json, text, body))
 }
 
@@ -5623,6 +5639,10 @@ pub(crate) const MAX_INBOX_TOOLS: usize = 128;
 #[derive(JsonSchema, Serialize)]
 struct InboxManyData {
     inboxes: BTreeMap<String, InboxResult>,
+    /// Tools whose own rows exceeded the caller-projection bound
+    /// (`caller-projection-too-large`), keyed by tool; absent when none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    errors: BTreeMap<String, String>,
 }
 
 /// Human render of one tool's inbox. Every peer-authored value goes through
@@ -24204,8 +24224,7 @@ pub(crate) fn ack_by_from_evidence(evidence: &[String]) -> Option<(String, chron
     Some((deadline_raw.to_string(), deadline.with_timezone(&Utc)))
 }
 
-/// Subject prefix of the one risk fact written per overdue handoff.
-const NO_RESPONSE_SUBJECT_PREFIX: &str = "no-response:";
+use crate::store::{NO_RESPONSE_SUBJECT_PREFIX, is_no_response_risk_for};
 const MAX_ACK_WITHIN_SECS: i64 = 7 * 24 * 3600;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24690,12 +24709,6 @@ fn overdue_handoffs_at(
             })
         })
         .collect()
-}
-
-fn is_no_response_risk_for(risk: &Fact, handoff_id: &str) -> bool {
-    risk.kind == FactKind::Risk
-        && risk.ref_id.as_deref() == Some(handoff_id)
-        && risk.subject.starts_with(NO_RESPONSE_SUBJECT_PREFIX)
 }
 
 /// Compute the caller's overdue handoffs and, when `write` is set, record one

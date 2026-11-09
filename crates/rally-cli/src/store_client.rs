@@ -556,10 +556,19 @@ fn store_error_to_rally_error(err: StoreError) -> RallyError {
         StoreErrorKind::IncompatibleWire => RallyError::IncompatibleWire {
             detail: err.message,
         },
-        StoreErrorKind::Command
-        | StoreErrorKind::Message
-        | StoreErrorKind::Internal
-        | StoreErrorKind::Transport => RallyError::Command(err.message),
+        StoreErrorKind::Command => match err
+            .message
+            .strip_prefix(crate::error::CALLER_PROJECTION_TOO_LARGE)
+            .and_then(|rest| rest.strip_prefix(": "))
+        {
+            Some(detail) => RallyError::CallerProjectionTooLarge {
+                detail: detail.to_string(),
+            },
+            None => RallyError::Command(err.message),
+        },
+        StoreErrorKind::Message | StoreErrorKind::Internal | StoreErrorKind::Transport => {
+            RallyError::Command(err.message)
+        }
     }
 }
 

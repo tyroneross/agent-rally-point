@@ -202,7 +202,13 @@ pub(crate) fn peer_targets(snapshot: &RoomSnapshot, tool: &str, limit: usize) ->
         .take(limit)
         .map(|sq| PeerTarget::from_squad(sq))
         .collect();
-    out.truncated = ranked.len().saturating_sub(out.ranked.len());
+    // A caller-scoped reply may bound the squad list; its omitted peers still
+    // count (the caller's own row is never omitted first).
+    out.fresh += snapshot.caller_projection_omitted(crate::store::CALLER_SQUADS_FRESH_BUCKET);
+    out.stale += snapshot.caller_projection_omitted(crate::store::CALLER_SQUADS_STALE_BUCKET);
+    out.unknown += snapshot.caller_projection_omitted(crate::store::CALLER_SQUADS_UNKNOWN_BUCKET);
+    out.truncated = ranked.len().saturating_sub(out.ranked.len())
+        + snapshot.caller_projection_omitted("squads");
     out
 }
 
@@ -1184,6 +1190,7 @@ pub(crate) fn build_attention(
 pub(crate) fn bound_enter_attention(
     snapshot: &RoomSnapshot,
     tool: &str,
+    cursor_before: i64,
     mut items: Vec<AttentionItem>,
 ) -> (Vec<AttentionItem>, usize, usize, usize) {
     let visible_obligation_ids = snapshot
@@ -1216,7 +1223,26 @@ pub(crate) fn bound_enter_attention(
             .max(built_obligations)
     };
     let non_obligation_items = items.len().saturating_sub(built_obligations);
-    let total = non_obligation_items.saturating_add(exact_obligations);
+    // Rows a caller-scoped reply left out of the cursor-gated buckets. Every
+    // ledger seq is > 0, so with no cursor they all count and the total is
+    // exact; above a cursor the omitted rows' seqs are not carried, so the
+    // total is a lower bound (named work and claims are never omitted).
+    let projection_omitted = if cursor_before <= 0 {
+        [
+            crate::store::CALLER_ATTENTION_OPEN_HANDOFFS_BUCKET,
+            "current_decisions",
+            "current_risks",
+            "unconsumed_artifacts",
+        ]
+        .iter()
+        .map(|bucket| snapshot.caller_projection_omitted(bucket))
+        .sum()
+    } else {
+        0
+    };
+    let total = non_obligation_items
+        .saturating_add(exact_obligations)
+        .saturating_add(projection_omitted);
     items.truncate(MAX_ENTER_ROWS);
     let emitted = items.len();
     let omitted = total.saturating_sub(emitted);
@@ -1250,7 +1276,8 @@ mod tests {
             open_obligations: vec![a, b],
             ..Default::default()
         }
-        .for_obligation_target("receiver", 1);
+        .for_obligation_target("receiver", 1)
+        .unwrap();
         let candidates = next_candidates(
             &snapshot,
             "receiver",
@@ -1600,6 +1627,7 @@ mod tests {
         let (attention, total, emitted, omitted) = bound_enter_attention(
             &snapshot,
             "codex",
+            0,
             build_attention(&snapshot, "codex", 0, &[]),
         );
         assert_eq!(total, MAX_ENTER_ROWS + 12);
@@ -1642,6 +1670,7 @@ mod tests {
         let (attention, total, emitted, omitted) = bound_enter_attention(
             &snapshot,
             "codex",
+            i64::MAX,
             build_attention(&snapshot, "codex", i64::MAX, &[]),
         );
         assert_eq!(attention.len(), MAX_ENTER_ROWS);
@@ -2089,5 +2118,69 @@ mod tests {
                 .iter()
                 .any(|item| item.reason == "handoff_assigned" && item.event_id == "pool")
         );
+    }
+
+    /// Peer claims are should-keep: trimmed newest first with an exact omitted
+    /// count, never a failure. The caller's OWN claims are must-keep: when
+    /// they alone exceed the bound the projection fails with the typed
+    /// `CallerProjectionTooLarge` error, naming only the caller's rows.
+    #[test]
+    fn peer_claims_trim_but_own_claims_over_the_bound_fail_loudly() {
+        let claim = |n: usize, owner: &str| Fact {
+            event_id: format!("claim-{n}"),
+            seq: n as i64 + 1,
+            kind: FactKind::Claim,
+            tool: Some(owner.replace("{n}", &n.to_string())),
+            scope: vec![format!("file:src/f{n}.rs")],
+            summary: Some("p".repeat(1_000)),
+            ..Fact::default()
+        };
+        let snapshot = RoomSnapshot {
+            active_claims: (0..4_000).map(|n| claim(n, "peer-{n}")).collect(),
+            ..RoomSnapshot::default()
+        };
+        let kept = snapshot.for_obligation_target("codex", 16).unwrap();
+        assert!(kept.active_claims.len() < 4_000);
+        assert_eq!(
+            kept.caller_projection_omitted("active_claims"),
+            4_000 - kept.active_claims.len()
+        );
+        assert_eq!(kept.active_claims.last().unwrap().event_id, "claim-3999");
+
+        let snapshot = RoomSnapshot {
+            active_claims: (0..4_000).map(|n| claim(n, "codex")).collect(),
+            ..RoomSnapshot::default()
+        };
+        let err = snapshot.for_obligation_target("codex", 16).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::RallyError::CallerProjectionTooLarge { .. }
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains("4000 claims you hold"), "{err}");
+    }
+
+    /// F2: when the reply is over budget after all trimming because of the
+    /// mission text, the error names the mission, not the caller's rows.
+    #[test]
+    fn oversized_mission_error_names_the_mission_not_the_callers_rows() {
+        let snapshot = RoomSnapshot {
+            mission: Some("m".repeat(8 * 1024 * 1024)),
+            ..RoomSnapshot::default()
+        };
+        let err = snapshot.for_obligation_target("codex", 16).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            matches!(
+                err,
+                crate::error::RallyError::CallerProjectionTooLarge { .. }
+            ),
+            "{message}"
+        );
+        assert!(message.contains("mission 8388608 B"), "{message}");
+        assert!(message.contains("set a shorter mission"), "{message}");
+        assert!(!message.contains("handoffs you sent"), "{message}");
     }
 }
