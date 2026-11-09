@@ -57,6 +57,11 @@ pub mod policy;
 // ── cli-dispatch-consent gate ─────────────────────────────────────────────────
 pub mod consent;
 
+/// The one way this crate's tests get scratch space. See the file's header.
+#[cfg(test)]
+#[path = "../../test-support/temp_root.rs"]
+pub(crate) mod test_temp_root;
+
 #[cfg(test)]
 mod smoke {
     #[test]

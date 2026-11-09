@@ -24,6 +24,9 @@
 //!
 //! No network, no real credentials — uses COCKPIT_TOKEN env + mock bins.
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use cockpitd::clock::Clock as _;
@@ -65,8 +68,9 @@ fn ensure_consent_granted() {
             format!("{:x}", Sha256::digest(serde_json::to_vec(&sorted).unwrap()))
         }
 
-        let mut path = std::env::temp_dir();
-        path.push("cockpitd-e2e-consent-granted.json");
+        // Addressed through a process-wide environment variable, so it must
+        // outlive every test here; the next test process removes the folder.
+        let path = temp_root::TempRoot::process_scoped("e2e-consent").join("granted.json");
 
         let mut e0 = json!({
             "seq": 0, "key": "rally-point:claude", "mode": "auto",
@@ -114,7 +118,7 @@ fn mock_claude_path() -> PathBuf {
 /// tests already launch from. Tests that need a *different* allowlist exercise
 /// `policy::resolve_repo_path_within` directly rather than racing on env.
 fn allowed_repo_root() -> PathBuf {
-    std::fs::canonicalize(std::env::temp_dir()).unwrap()
+    std::fs::canonicalize(std::env::temp_dir()).unwrap() // temp-root-read: launch allowlist root
 }
 
 /// Set the process-wide env every e2e daemon depends on.
@@ -337,7 +341,7 @@ async fn e2e_bad_token_rejected() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_launch_open_replay_reconnect() {
     let addr = start_daemon().await;
-    let tmp = std::env::temp_dir();
+    let tmp = std::env::temp_dir(); // temp-root-read: launch cwd under the allowlist root
 
     // ── Step 1: launch a session ──────────────────────────────────────────────
     let mut client = TestClient::connect(addr).await;
@@ -619,7 +623,7 @@ async fn start_daemon_codex() -> SocketAddr {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_codex_approval_wire_roundtrip() {
     let addr = start_daemon_codex().await;
-    let tmp = std::env::temp_dir();
+    let tmp = std::env::temp_dir(); // temp-root-read: launch cwd under the allowlist root
 
     let mut client = TestClient::connect(addr).await;
     client.auth().await;
@@ -917,7 +921,7 @@ async fn start_daemon_multiblock() -> SocketAddr {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_authz_gate_allow() {
     let addr = start_daemon_gated().await;
-    let tmp = std::env::temp_dir();
+    let tmp = std::env::temp_dir(); // temp-root-read: launch cwd under the allowlist root
 
     let mut client = TestClient::connect(addr).await;
     client.auth().await;
@@ -1064,7 +1068,7 @@ async fn e2e_authz_gate_allow() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_authz_gate_deny() {
     let addr = start_daemon_gated().await;
-    let tmp = std::env::temp_dir();
+    let tmp = std::env::temp_dir(); // temp-root-read: launch cwd under the allowlist root
 
     let mut client = TestClient::connect(addr).await;
     client.auth().await;
@@ -1182,7 +1186,7 @@ async fn e2e_authz_gate_deny() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_multiblock_turn_yields_three_events() {
     let addr = start_daemon_multiblock().await;
-    let tmp = std::env::temp_dir();
+    let tmp = std::env::temp_dir(); // temp-root-read: launch cwd under the allowlist root
 
     let mut client = TestClient::connect(addr).await;
     client.auth().await;
@@ -1289,7 +1293,7 @@ async fn e2e_multiblock_turn_yields_three_events() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_audit_log_wire_roundtrip() {
     let addr = start_daemon().await;
-    let tmp = std::env::temp_dir();
+    let tmp = std::env::temp_dir(); // temp-root-read: launch cwd under the allowlist root
 
     let mut client = TestClient::connect(addr).await;
     client.auth().await;
@@ -1404,7 +1408,7 @@ async fn start_daemon_codex_gated() -> SocketAddr {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_codex_native_gate_allow() {
     let addr = start_daemon_codex_gated().await;
-    let tmp = std::env::temp_dir();
+    let tmp = std::env::temp_dir(); // temp-root-read: launch cwd under the allowlist root
 
     let mut client = TestClient::connect(addr).await;
     client.auth().await;
@@ -1524,7 +1528,7 @@ async fn e2e_codex_native_gate_allow() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_codex_native_gate_deny() {
     let addr = start_daemon_codex_gated().await;
-    let tmp = std::env::temp_dir();
+    let tmp = std::env::temp_dir(); // temp-root-read: launch cwd under the allowlist root
 
     let mut client = TestClient::connect(addr).await;
     client.auth().await;

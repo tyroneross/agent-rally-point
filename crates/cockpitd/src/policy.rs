@@ -234,10 +234,10 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     fn unique_dir(tag: &str) -> PathBuf {
-        let p =
-            std::env::temp_dir().join(format!("cockpitd-policy-{tag}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).unwrap();
-        std::fs::canonicalize(&p).unwrap()
+        // Process-scoped: callers keep a plain `PathBuf`, so nothing holds a
+        // guard. The next test process removes these.
+        let p = crate::test_temp_root::TempRoot::process_scoped(tag);
+        std::fs::canonicalize(p).unwrap()
     }
 
     /// `/etc` is itself a symlink on macOS (`/private/etc`), so the expected
