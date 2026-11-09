@@ -28,7 +28,8 @@ class FakeRunner:
 
     def __call__(self, command: list[str]) -> SYNC.CommandResult:
         self.commands.append(list(command))
-        returncode, payload = self.responses.get(tuple(command), (0, {}))
+        default = (0, []) if command == ["claude", "plugin", "marketplace", "list", "--json"] else (0, {"marketplaces": []}) if command == ["codex", "plugin", "marketplace", "list", "--json"] else (0, {})
+        returncode, payload = self.responses.get(tuple(command), default)
         stdout = payload if isinstance(payload, str) else json.dumps(payload)
         return SYNC.CommandResult(list(command), returncode, stdout, "")
 
@@ -241,7 +242,7 @@ class HostSyncTests(unittest.TestCase):
             runner=runner,
         )
         self.assertFalse(report["apply"]["requested"])
-        self.assertEqual(runner.commands, [list(claude_list)])
+        self.assertEqual(runner.commands, [list(claude_list), ["claude", "plugin", "marketplace", "list", "--json"]])
         self.assertTrue(report["apply"]["planned_commands"])
 
     def test_unknown_host_status_never_plans_mutating_commands(self) -> None:
@@ -673,8 +674,10 @@ class InPlaceApplyTests(unittest.TestCase):
             runner.commands,
             [
                 ["claude", "plugin", "list", "--json"],
+                ["claude", "plugin", "marketplace", "list", "--json"],
                 ["claude", "plugin", "update", LOCAL_CLAUDE_ID],
                 ["claude", "plugin", "list", "--json"],
+                ["claude", "plugin", "marketplace", "list", "--json"],
             ],
         )
         record = report["hosts"]["claude_code"]
@@ -708,6 +711,99 @@ class InPlaceApplyTests(unittest.TestCase):
         self.assertEqual(
             exit_code({**identity(), "generated_surface_digest": "sha256:other"}), 2
         )
+
+
+class RegressionTests(unittest.TestCase):
+    def retry_report(self, failures: int, provider: str) -> tuple[dict, FakeRunner]:
+        class RetryRunner(FakeRunner):
+            def __init__(self, home):
+                super().__init__({("codex", "plugin", "list", "--json"): (0, {"installed": [{"name": "agent-rally-point", "pluginId": provider, "marketplaceName": provider.split("@")[1]}]})})
+                self.remaining = failures
+                self.cache = home / ".codex/plugins/cache" / provider.split("@")[1] / "agent-rally-point/local/.codex-plugin"
+
+            def __call__(self, command):
+                if command[:3] == ["codex", "plugin", "add"] and self.remaining:
+                    self.remaining -= 1
+                    self.commands.append(list(command))
+                    return SYNC.CommandResult(list(command), 1, "", "add failed")
+                if command[:3] == ["codex", "plugin", "add"]:
+                    self.cache.mkdir(parents=True, exist_ok=True)
+                    (self.cache / "rally-release.json").write_text(json.dumps(identity()))
+                return super().__call__(command)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = RetryRunner(Path(tmp))
+            report = SYNC.reconcile(ROOT, host="codex", apply=True, runner=runner, home=Path(tmp))
+        return report, runner
+
+    def test_add_retry_succeeds_for_both_provider_paths(self):
+        for provider in (CANONICAL_CLAUDE_ID, LOCAL_CLAUDE_ID):
+            with self.subTest(provider=provider):
+                report, runner = self.retry_report(1, provider)
+                self.assertEqual(runner.commands.count(["codex", "plugin", "add", provider, "--json"]), 2)
+                self.assertEqual(report["apply"]["failed"], 0)
+                self.assertEqual(report["hosts"]["codex"]["status"], "restart_required")
+
+    def test_add_retry_failure_reports_recovery_and_failure_count(self):
+        report, runner = self.retry_report(2, LOCAL_CLAUDE_ID)
+        self.assertEqual(report["apply"]["failed"], 2)
+        self.assertEqual(report["hosts"]["codex"]["status"], "uninstalled")
+        self.assertIn("uninstalled", report["hosts"]["codex"]["reason"])
+        self.assertIn("codex plugin add agent-rally-point@canonical-local --json", report["hosts"]["codex"]["reason"])
+        from unittest import mock
+        import contextlib
+        import io
+        with mock.patch.object(SYNC, "reconcile", return_value=report), contextlib.redirect_stdout(io.StringIO()):
+            self.assertNotEqual(SYNC.main(["--apply", "--json"]), 0)
+
+    def test_failed_marketplace_list_is_unknown_and_other_host_is_planned(self):
+        runner = FakeRunner({("claude", "plugin", "list", "--json"): (0, []), ("claude", "plugin", "marketplace", "list", "--json"): (1, "marketplace corrupted"), ("codex", "plugin", "list", "--json"): (0, {"installed": []})})
+        report = SYNC.reconcile(ROOT, host="all", apply=False, runner=runner)
+        self.assertEqual(report["hosts"]["claude_code"]["status"], "unknown")
+        self.assertIn("marketplace corrupted", report["hosts"]["claude_code"]["reason"])
+        self.assertEqual(report["overall"], "unknown")
+        self.assertTrue(report["apply"]["planned_commands"])
+        self.assertTrue(all(c[0] == "codex" for c in report["apply"]["planned_commands"]))
+        from unittest import mock
+        import contextlib
+        import io
+        with mock.patch.object(SYNC, "default_runner", runner), contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(SYNC, "reconcile", return_value=report):
+                self.assertNotEqual(SYNC.main(["--json"]), 0)
+
+    def test_current_host_stays_current_when_its_marketplace_list_fails(self):
+        """What the plugin list proved is kept; the marketplace error rides along."""
+        with tempfile.TemporaryDirectory() as tmp:
+            install = Path(tmp)
+            (install / "rally-release.json").write_text(json.dumps(identity()))
+            runner = claude_list_with(install)
+            runner.responses[("claude", "plugin", "marketplace", "list", "--json")] = (1, "marketplace corrupted")
+            report = SYNC.reconcile(ROOT, host="claude_code", apply=False, runner=runner, home=install)
+        record = report["hosts"]["claude_code"]
+        self.assertEqual(record["status"], "current")
+        self.assertEqual(record["marketplace_error"], "marketplace corrupted")
+        self.assertEqual(report["apply"]["planned_commands"], [])
+        self.assertEqual(report["overall"], "current")
+
+    def test_host_needing_a_refresh_is_unknown_when_its_marketplace_list_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            install = Path(tmp)
+            (install / "rally-release.json").write_text(json.dumps({**identity(), "version": "0.0.1"}))
+            runner = claude_list_with(install)
+            runner.responses[("claude", "plugin", "marketplace", "list", "--json")] = (1, "marketplace corrupted")
+            report = SYNC.reconcile(ROOT, host="claude_code", apply=False, runner=runner, home=install)
+        record = report["hosts"]["claude_code"]
+        self.assertEqual(record["status"], "unknown")
+        self.assertEqual(record["needed_status"], "stale")
+        self.assertIn("marketplace corrupted", record["reason"])
+        self.assertEqual(report["apply"]["planned_commands"], [])
+
+    def test_unparseable_marketplace_list_is_unknown(self):
+        runner = FakeRunner({("claude", "plugin", "list", "--json"): (0, []), ("claude", "plugin", "marketplace", "list", "--json"): (0, "not json" )})
+        report = SYNC.reconcile(ROOT, host="claude_code", apply=False, runner=runner)
+        self.assertEqual(report["overall"], "unknown")
+        self.assertEqual(report["apply"]["planned_commands"], [])
+        self.assertIn("not json", report["hosts"]["claude_code"]["reason"])
 
 
 if __name__ == "__main__":

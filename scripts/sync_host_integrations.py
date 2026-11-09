@@ -38,6 +38,8 @@ VERSION_PATTERN = re.compile(
 )
 # Rank of a missing/unparseable version: below every parseable one.
 UNPARSEABLE_RANK = (0, ())
+# One retry gives a removed Codex provider one immediate recovery attempt.
+ADD_RETRY_COUNT = 1
 
 
 @dataclass(frozen=True)
@@ -113,7 +115,7 @@ def command_json(command: Sequence[str], runner: Runner) -> tuple[Any, CommandRe
             result.command,
             65,
             result.stdout,
-            "command returned invalid JSON",
+            result.stderr or f"command returned invalid JSON: {result.stdout}",
         )
 
 
@@ -211,7 +213,8 @@ def host_record(
             "status": "unknown",
             "providers": providers,
             "restart_required": False,
-            "reason": command_error.stderr or f"{command_error.command[0]} failed",
+            "reason": (command_error.stderr or command_error.stdout
+                       or f"{shlex.join(command_error.command)} returned unexpected output"),
         }
     if not providers:
         return {
@@ -379,6 +382,58 @@ def codex_status(
     )
 
 
+def claude_marketplaces_ok(data: Any) -> bool:
+    return isinstance(data, list)
+
+
+def codex_marketplaces_ok(data: Any) -> bool:
+    return isinstance(data, dict) and isinstance(data.get("marketplaces"), list)
+
+
+# Per host: the command that lists marketplaces and the shape a healthy reply has.
+MARKETPLACE_PROBES: dict[str, tuple[list[str], Any]] = {
+    "claude_code": (
+        ["claude", "plugin", "marketplace", "list", "--json"],
+        claude_marketplaces_ok,
+    ),
+    "codex": (
+        ["codex", "plugin", "marketplace", "list", "--json"],
+        codex_marketplaces_ok,
+    ),
+}
+
+
+def with_marketplace_health(
+    host: str, record: dict[str, Any], runner: Runner
+) -> dict[str, Any]:
+    """Refuse to plan a refresh through a marketplace command that is broken.
+
+    What the plugin list proved is kept: a host that is already current or ahead
+    stays so, with the marketplace error attached. A host that would need a
+    refresh becomes `unknown`, because every refresh command goes through the
+    marketplace the host CLI cannot read; the status it would have had is kept
+    in `needed_status`.
+    """
+    if record.get("status") == "unknown":
+        return record
+    command, healthy = MARKETPLACE_PROBES[host]
+    data, result = command_json(command, runner)
+    if healthy(data):
+        return record
+    detail = (
+        result.stderr or result.stdout or f"{shlex.join(command)} returned unexpected output"
+    ).strip()
+    record["marketplace_error"] = detail
+    if record["status"] not in NO_ACTION_STATUSES:
+        record["needed_status"] = record["status"]
+        record["status"] = "unknown"
+        record["reason"] = (
+            f"{record['reason']}; not planned because the host cannot list its "
+            f"marketplaces: {detail}"
+        )
+    return record
+
+
 def diagnose(
     root: Path,
     *,
@@ -392,15 +447,18 @@ def diagnose(
     identity = expected_identity(root)
     hosts: dict[str, Any] = {}
     if host in {"all", "claude_code"}:
-        hosts["claude_code"] = claude_status(
-            config["providers"]["claude_code"], identity, runner
+        hosts["claude_code"] = with_marketplace_health(
+            "claude_code",
+            claude_status(config["providers"]["claude_code"], identity, runner),
+            runner,
         )
     if host in {"all", "codex"}:
-        hosts["codex"] = codex_status(
-            config["providers"]["codex"],
-            identity,
+        hosts["codex"] = with_marketplace_health(
+            "codex",
+            codex_status(
+                config["providers"]["codex"], identity, runner, home or Path.home()
+            ),
             runner,
-            home or Path.home(),
         )
     overall = max(
         (record["status"] for record in hosts.values()),
@@ -498,13 +556,51 @@ def reconcile(
             },
         }
     actions: list[CommandResult] = []
+    failures: list[CommandResult] = []
+    recovery_command: list[str] | None = None
     for command in commands:
         action = runner(command)
         actions.append(action)
         if action.returncode != 0:
-            break
-    failures = [action for action in actions if action.returncode != 0]
+            previous = actions[-2] if len(actions) >= 2 else None
+            removed_same = (
+                command[:3] == ["codex", "plugin", "add"]
+                and len(command) > 3 and previous is not None
+                and previous.returncode == 0
+                and previous.command[:3] == ["codex", "plugin", "remove"]
+                and len(previous.command) > 3 and previous.command[3] == command[3]
+            )
+            if removed_same:
+                failures.append(action)
+                for _ in range(ADD_RETRY_COUNT):
+                    action = runner(command)
+                    actions.append(action)
+                    if action.returncode == 0:
+                        failures.clear()
+                        break
+                    failures.append(action)
+                if failures:
+                    recovery_command = command
+            else:
+                failures.append(action)
+            if failures:
+                break
     after = diagnose(root, host=host, runner=runner, home=home)
+    for name, record in before["hosts"].items():
+        if record["status"] == "unknown":
+            after["hosts"][name] = record
+    if recovery_command is not None:
+        record = after["hosts"]["codex"]
+        record["status"] = "uninstalled"
+        record["restart_required"] = False
+        record["reason"] = (
+            f"Codex provider {recovery_command[3]} is now uninstalled; "
+            f"run {shlex.join(recovery_command)} by hand"
+        )
+    after["overall"] = max(
+        (record["status"] for record in after["hosts"].values()),
+        key=lambda status: STATUS_ORDER[status], default="unknown",
+    )
     if not failures:
         for name, record in after["hosts"].items():
             mutated = name in mutated_hosts
