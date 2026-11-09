@@ -798,24 +798,9 @@ mod schema_floor_tests {
     };
     use crate::store::Fact;
     use std::fs;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-
-    fn temp_room(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time is after the Unix epoch")
-            .as_nanos();
-        let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "rally-schema-floor-{name}-{}-{nanos}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_room(name: &str) -> crate::test_temp_root::TempRoot {
+        crate::test_temp_root::TempRoot::new(&format!("schema-floor-{name}"))
     }
 
     fn fact_of(kind: FactKind) -> Fact {
@@ -866,7 +851,6 @@ mod schema_floor_tests {
     fn a_room_with_no_recorded_floor_reads_as_generation_one() {
         let dir = temp_room("absent");
         assert_eq!(read_schema_floor(&dir), 1);
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// Every degraded read resolves DOWNWARD. Falling back to this binary's own
@@ -890,7 +874,6 @@ mod schema_floor_tests {
                 1,
                 "a {label} floor file must degrade to the lowest floor"
             );
-            fs::remove_dir_all(&dir).ok();
         }
     }
 
@@ -899,7 +882,6 @@ mod schema_floor_tests {
         let dir = temp_room("roundtrip");
         write_schema_floor(&dir, 7, "test").unwrap();
         assert_eq!(read_schema_floor(&dir), 7);
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// Lowering cannot make an older reader safe — the higher-generation rows are
@@ -914,7 +896,6 @@ mod schema_floor_tests {
             "unexpected refusal message: {error}"
         );
         assert_eq!(read_schema_floor(&dir), 7, "the refused write still landed");
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg(unix)]
@@ -926,7 +907,7 @@ mod schema_floor_tests {
 
         let dir = temp_room("concurrent-monotonic");
         let held = super::acquire_room_mutation_lock(&dir).unwrap();
-        let writer_dir = dir.clone();
+        let writer_dir = dir.to_path_buf();
         let (started_tx, started_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let writer = thread::spawn(move || {
@@ -954,7 +935,6 @@ mod schema_floor_tests {
         );
         writer.join().unwrap();
         assert_eq!(read_schema_floor(&dir), 3);
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// The gate is inert today (every kind is generation 1, every room floors at
@@ -989,7 +969,6 @@ mod schema_floor_tests {
             message.contains("rally doctor --schema-floor --apply"),
             "refusal does not name the raise command: {message}"
         );
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1002,7 +981,6 @@ mod schema_floor_tests {
             "a room floor ABOVE this binary must not block the kinds it does know — \
              one upgraded peer must not lock every other binary out of the room"
         );
-        fs::remove_dir_all(&dir).ok();
     }
 }
 
@@ -16100,8 +16078,8 @@ mod decoded_tail_tests {
 
     #[test]
     fn decoded_history_reloads_after_same_highwater_rewrite() {
-        let root =
-            std::env::temp_dir().join(format!("rally-decoded-rewrite-{}", uuid::Uuid::new_v4()));
+        let root_guard = crate::test_temp_root::TempRoot::new("decoded-rewrite");
+        let root = root_guard.path().to_path_buf();
         let mut store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         store
             .append_fact(&Fact {
@@ -16146,7 +16124,6 @@ mod decoded_tail_tests {
             serde_json::to_vec(&*changed).unwrap(),
             serde_json::to_vec(&store.facts().unwrap()).unwrap()
         );
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -16189,12 +16166,12 @@ mod ledger_tests {
     use super::*;
     use rusqlite::Connection;
     use std::sync::mpsc;
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::Instant;
 
     #[cfg(unix)]
     #[test]
     fn direct_then_daemon_owner_lock_order_has_no_cycle() {
-        let root = unique_root("direct-daemon-owner-lock-order");
+        let (root, _guard) = unique_root("direct-daemon-owner-lock-order");
         let rally_dir = root.join(".rally");
         let direct_owner = acquire_direct_owner_exclusive_nb(&rally_dir)
             .unwrap()
@@ -16226,13 +16203,12 @@ mod ledger_tests {
             .expect("daemon EX acquisition must succeed");
         drop(daemon_owner);
         drop(direct_owner);
-        fs::remove_dir_all(root).ok();
     }
 
     #[cfg(unix)]
     #[test]
     fn offline_migration_authority_orders_direct_then_daemon_then_mutation() {
-        let root = unique_root("offline-migration-authority-order");
+        let (root, _guard) = unique_root("offline-migration-authority-order");
         let rally_dir = root.join(".rally");
         let authority = acquire_offline_migration_authority(&rally_dir)
             .expect("offline migration must acquire all three guards");
@@ -16273,13 +16249,12 @@ mod ledger_tests {
         })
         .expect("mutation.lock must recover after migration authority drops");
         drop(mutation);
-        fs::remove_dir_all(root).ok();
     }
 
     #[cfg(unix)]
     #[test]
     fn direct_owner_timeout_is_typed_busy_unknown() {
-        let root = unique_root("direct-owner-busy-unknown");
+        let (root, _guard) = unique_root("direct-owner-busy-unknown");
         let rally_dir = root.join(".rally");
         let _held = acquire_direct_owner_exclusive_nb(&rally_dir)
             .unwrap()
@@ -16303,13 +16278,12 @@ mod ledger_tests {
                 && err.to_string().contains("rally daemon stop"),
             "typed contention error must include the safe recovery commands: {err}"
         );
-        fs::remove_dir_all(root).ok();
     }
 
     #[cfg(unix)]
     #[test]
     fn mutation_lock_deadline_returns_not_started_and_never_commits_late() {
-        let root = unique_root("mutation-lock-deadline");
+        let (root, _guard) = unique_root("mutation-lock-deadline");
         let rally_dir = root.join(".rally");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let held = acquire_room_mutation_lock(&rally_dir).unwrap();
@@ -16364,13 +16338,12 @@ mod ledger_tests {
                 .all(|row| row.event_id != "o25-direct-no-late-commit"),
             "a not-started mutation committed after its caller returned"
         );
-        fs::remove_dir_all(root).ok();
     }
 
     #[cfg(unix)]
     #[test]
     fn direct_mutation_rechecks_deadline_after_flock_success() {
-        let root = unique_root("mutation-lock-post-flock-deadline");
+        let (root, _guard) = unique_root("mutation-lock-post-flock-deadline");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let fact = Fact {
             schema: crate::FACT_SCHEMA.to_string(),
@@ -16400,13 +16373,12 @@ mod ledger_tests {
                 .all(|row| row.event_id != fact.event_id),
             "direct mutation committed after its post-flock deadline"
         );
-        fs::remove_dir_all(root).ok();
     }
 
     #[cfg(unix)]
     #[test]
     fn daemon_owner_open_deadline_is_typed_not_started() {
-        let root = unique_root("daemon-owner-open-deadline");
+        let (root, _guard) = unique_root("daemon-owner-open-deadline");
         let rally_dir = root.join(".rally");
         let held = acquire_owner_shared_nb(&rally_dir)
             .unwrap()
@@ -16433,13 +16405,12 @@ mod ledger_tests {
             message.contains("before acquiring"),
             "true pre-acquire owner expiry lost its precise diagnostic"
         );
-        fs::remove_dir_all(root).ok();
     }
 
     #[cfg(unix)]
     #[test]
     fn daemon_owner_rechecks_deadline_after_flock_success() {
-        let root = unique_root("daemon-owner-post-flock-deadline");
+        let (root, _guard) = unique_root("daemon-owner-post-flock-deadline");
         let rally_dir = root.join(".rally");
         force_next_owner_lock_post_flock_pause(Duration::from_millis(60));
 
@@ -16456,13 +16427,12 @@ mod ledger_tests {
         assert!(message.contains("after provisional lock acquisition"));
         assert!(message.contains("lock released before any daemon runtime state"));
         assert!(!message.contains("before acquiring"));
-        fs::remove_dir_all(root).ok();
     }
 
     #[cfg(unix)]
     #[test]
     fn explicit_warm_close_is_bounded_and_drop_is_prompt_nonpanicking() {
-        let root = unique_root("bounded-warm-close");
+        let (root, _guard) = unique_root("bounded-warm-close");
         let rally_dir = root.join(".rally");
         let mut store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         store.install_warm_fact_store().unwrap();
@@ -16500,13 +16470,12 @@ mod ledger_tests {
             "DirectRoomStore::drop blocked on mutation.lock"
         );
         assert!(outcome.is_ok(), "DirectRoomStore::drop panicked");
-        fs::remove_dir_all(root).ok();
     }
 
     #[cfg(unix)]
     #[test]
     fn warm_close_spawn_failure_retains_mutation_lock_until_process_exit() {
-        let root = unique_root("warm-close-spawn-failure");
+        let (root, _guard) = unique_root("warm-close-spawn-failure");
         let rally_dir = root.join(".rally");
         let mut store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         store.install_warm_fact_store().unwrap();
@@ -16590,21 +16559,20 @@ mod ledger_tests {
     /// empty segment rather than propagating an error.
     #[test]
     fn f4_read_segment_entries_treats_missing_file_as_empty_not_error() {
-        let root = unique_root("read-segment-entries-notfound");
+        let (root, _guard) = unique_root("read-segment-entries-notfound");
         let missing = root.join("does-not-exist.jsonl");
         let entries = read_segment_entries(&missing).unwrap();
         assert!(
             entries.is_empty(),
             "a missing segment file must read as empty, not error"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     /// f4 regression guard: widening tolerance for the file's ABSENCE must
     /// NOT widen tolerance for actual corruption of a line that IS present.
     #[test]
     fn f4_read_segment_entries_still_errors_loudly_on_parse_corruption() {
-        let root = unique_root("read-segment-entries-corrupt");
+        let (root, _guard) = unique_root("read-segment-entries-corrupt");
         let path = root.join("corrupt.jsonl");
         fs::write(&path, b"{not json}\n").unwrap();
         let err = read_segment_entries(&path).unwrap_err().to_string();
@@ -16612,23 +16580,13 @@ mod ledger_tests {
             err.contains("corruption"),
             "a completed malformed line must still fail loudly: {err}"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
-    static UNIQUE_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn unique_root(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let counter = UNIQUE_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "rally-{label}-pid{}-{counter}-{nanos}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        root
+    /// Returns the folder path and the guard that deletes it. Keep the guard
+    /// alive (bind it to `_guard`) for as long as the path is used.
+    fn unique_root(label: &str) -> (PathBuf, crate::test_temp_root::TempRoot) {
+        let guard = crate::test_temp_root::TempRoot::new(label);
+        (guard.path().to_path_buf(), guard)
     }
 
     fn make_fact(event_id: &str, kind: FactKind, scope: &str, summary: &str) -> Fact {
@@ -16657,7 +16615,7 @@ mod ledger_tests {
 
     #[test]
     fn new_markerless_referenced_handoff_is_rejected_but_legacy_row_replays() {
-        let root = unique_root("referenced-handoff-legacy-replay");
+        let (root, _guard) = unique_root("referenced-handoff-legacy-replay");
         let store = DirectRoomStore::open_direct_at_with_engagement(
             root.clone(),
             Some("engagement-alpha".to_string()),
@@ -16683,7 +16641,7 @@ mod ledger_tests {
         );
         assert_eq!(store.facts().unwrap().len(), 1);
 
-        let legacy_root = unique_root("legacy-markerless-handoff-replay");
+        let (legacy_root, _guard_legacy_root) = unique_root("legacy-markerless-handoff-replay");
         let legacy_store = DirectRoomStore::open_direct_at_with_engagement(
             legacy_root.clone(),
             Some("engagement-alpha".to_string()),
@@ -16710,13 +16668,11 @@ mod ledger_tests {
         assert_eq!(replayed.len(), 1);
         assert_eq!(replayed[0].event_id, "legacy-markerless-handoff");
         assert!(replayed[0].evidence.is_empty());
-        fs::remove_dir_all(root).ok();
-        fs::remove_dir_all(legacy_root).ok();
     }
 
     #[test]
     fn raw_referenced_handoff_rejects_duplicate_protocol_markers() {
-        let root = unique_root("referenced-handoff-duplicate-marker");
+        let (root, _guard) = unique_root("referenced-handoff-duplicate-marker");
         let store = DirectRoomStore::open_direct_at_with_engagement(
             root.clone(),
             Some("engagement-alpha".to_string()),
@@ -16742,12 +16698,11 @@ mod ledger_tests {
         let error = store.append_fact(&handoff).unwrap_err().to_string();
         assert!(error.contains("handoff_protocol_marker_duplicate"));
         assert_eq!(store.facts().unwrap().len(), 1);
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn raw_unreferenced_handoff_cannot_forge_protocol_namespace() {
-        let root = unique_root("unreferenced-handoff-protocol-forgery");
+        let (root, _guard) = unique_root("unreferenced-handoff-protocol-forgery");
         let store = DirectRoomStore::open_direct_at_with_engagement(
             root.clone(),
             Some("engagement-alpha".to_string()),
@@ -16762,12 +16717,11 @@ mod ledger_tests {
             "{error}"
         );
         assert!(store.facts().unwrap().is_empty());
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn raw_referenced_handoff_cannot_correlate_to_a_foreign_thread() {
-        let root = unique_root("referenced-handoff-foreign-correlation");
+        let (root, _guard) = unique_root("referenced-handoff-foreign-correlation");
         let store = DirectRoomStore::open_direct_at_with_engagement(
             root.clone(),
             Some("engagement-alpha".to_string()),
@@ -16823,7 +16777,6 @@ mod ledger_tests {
             .collect();
         store.append_fact(&bound).unwrap();
         assert_eq!(store.facts().unwrap().len(), 2);
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -16849,7 +16802,7 @@ mod ledger_tests {
 
     #[test]
     fn raw_third_party_append_cannot_bypass_strict_handoff_receiver() {
-        let root = unique_root("referenced-handoff-third-party-bypass");
+        let (root, _guard) = unique_root("referenced-handoff-third-party-bypass");
         let store = DirectRoomStore::open_direct_at_with_engagement(
             root.clone(),
             Some("engagement-alpha".to_string()),
@@ -16901,7 +16854,6 @@ mod ledger_tests {
             "{error}"
         );
         assert_eq!(store.facts().unwrap().len(), 2);
-        fs::remove_dir_all(root).ok();
     }
 
     fn scoped_presence(event_id: &str, tool: &str) -> Fact {
@@ -17226,7 +17178,7 @@ mod ledger_tests {
     /// instead of in an audit.
     #[test]
     fn the_snapshot_cache_capture_path_drops_a_retracted_fact() {
-        let root = unique_root("cache-capture-retraction");
+        let (root, _guard) = unique_root("cache-capture-retraction");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
 
         let mut claim = make_fact("claim-cached", FactKind::Claim, "file:src/a.rs", "owns it");
@@ -17269,14 +17221,13 @@ mod ledger_tests {
                 .any(|f| f.event_id == "retract-cached"),
             "the retraction itself must survive so the correction stays visible"
         );
-        fs::remove_dir_all(root).ok();
     }
 
     /// S9 RED control: an engagement/run read must derive participation from
     /// the selected segment instead of inheriting every repository squad.
     #[test]
     fn scoped_snapshot_suppresses_presence_noise_and_never_reads_other_segment() {
-        let root = unique_root("scoped-snapshot-audited-shape");
+        let (root, _guard) = unique_root("scoped-snapshot-audited-shape");
         let mut store = DirectRoomStore::open_direct_at_with_engagement(
             root.clone(),
             Some("engagement-alpha".to_string()),
@@ -17331,12 +17282,11 @@ mod ledger_tests {
             .snapshot_scoped("engagement-alpha", Some("audit-run"), None, false, true)
             .unwrap();
         assert_eq!(with_presence.squads.len(), 12);
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn scoped_path_joins_external_claim_without_external_contributor_credit() {
-        let root = unique_root("scoped-snapshot-external-claim");
+        let (root, _guard) = unique_root("scoped-snapshot-external-claim");
         let mut store = DirectRoomStore::open_direct_at_with_engagement(
             root.clone(),
             Some("engagement-alpha".to_string()),
@@ -17415,7 +17365,6 @@ mod ledger_tests {
             findings.contains(&("claimed-path", "stop")),
             "path-scoped collision context must still stop a conflicting writer: {findings:?}"
         );
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -17456,7 +17405,7 @@ mod ledger_tests {
 
     #[test]
     fn scoped_path_repairs_corrupt_cold_cache_before_collision_query() {
-        let root = unique_root("scoped-snapshot-cold-cache-repair");
+        let (root, _guard) = unique_root("scoped-snapshot-cold-cache-repair");
         let mut store = DirectRoomStore::open_direct_at_with_engagement(
             root.clone(),
             Some("engagement-alpha".to_string()),
@@ -17505,12 +17454,11 @@ mod ledger_tests {
                 .any(|fact| fact.event_id == "claim-beta"),
             "cold direct mode must rebuild from canonical segments before the collision query"
         );
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn scoped_path_repairs_spoofed_derived_db_sequence_before_collision_query() {
-        let root = unique_root("scoped-snapshot-db-seq-spoof");
+        let (root, _guard) = unique_root("scoped-snapshot-db-seq-spoof");
         let mut store = DirectRoomStore::open_direct_at_with_engagement(
             root.clone(),
             Some("engagement-alpha".to_string()),
@@ -17569,12 +17517,11 @@ mod ledger_tests {
         assert_eq!(projected.seq, 2, "canonical segment seq must win");
         assert_eq!(scoped.max_seq, 2);
         assert_eq!(scoped.content_max_seq, 2);
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn scoped_path_repairs_same_shape_db_content_drift_before_collision_query() {
-        let root = unique_root("scoped-snapshot-db-content-drift");
+        let (root, _guard) = unique_root("scoped-snapshot-db-content-drift");
         let mut store = DirectRoomStore::open_direct_at_with_engagement(
             root.clone(),
             Some("engagement-alpha".to_string()),
@@ -17650,12 +17597,11 @@ mod ledger_tests {
             ["file:src/lib.rs"],
             "the derived cache must be rebuilt, not bypassed for one response"
         );
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn scoped_path_warm_same_shape_content_drift_fails_loud() {
-        let root = unique_root("scoped-snapshot-warm-content-drift");
+        let (root, _guard) = unique_root("scoped-snapshot-warm-content-drift");
         let mut store = DirectRoomStore::open_direct_at_with_engagement(
             root.clone(),
             Some("engagement-alpha".to_string()),
@@ -17704,12 +17650,11 @@ mod ledger_tests {
             err.to_string().contains("facts-db-recovery-required"),
             "a daemon-owned same-shape content mismatch must fail loud: {err}"
         );
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn scoped_collision_cursor_advances_for_renewal_and_zero_claim_closure() {
-        let root = unique_root("scoped-snapshot-lifecycle-cursor");
+        let (root, _guard) = unique_root("scoped-snapshot-lifecycle-cursor");
         let mut store = DirectRoomStore::open_direct_at_with_engagement(
             root.clone(),
             Some("engagement-alpha".to_string()),
@@ -17792,12 +17737,11 @@ mod ledger_tests {
             closed.last_activity_ts.as_deref(),
             Some(release.fact.created_at.as_str())
         );
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn scoped_segment_projection_overwrites_spoofed_nonzero_payload_sequence() {
-        let root = unique_root("scoped-snapshot-spoofed-seq");
+        let (root, _guard) = unique_root("scoped-snapshot-spoofed-seq");
         let store = DirectRoomStore::open_direct_at_with_engagement(
             root.clone(),
             Some("engagement-alpha".to_string()),
@@ -17827,12 +17771,11 @@ mod ledger_tests {
         assert_eq!(scoped.max_seq, 1);
         assert_eq!(scoped.content_max_seq, 1);
         assert_eq!(scoped.recent_artifacts[0].seq, 1);
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn scoped_path_warm_cache_drift_fails_loud_instead_of_returning_empty_success() {
-        let root = unique_root("scoped-snapshot-warm-cache-drift");
+        let (root, _guard) = unique_root("scoped-snapshot-warm-cache-drift");
         let mut store = DirectRoomStore::open_direct_at_with_engagement(
             root.clone(),
             Some("engagement-alpha".to_string()),
@@ -17863,7 +17806,6 @@ mod ledger_tests {
             err.to_string().contains("facts-db-recovery-required"),
             "a daemon-owned derived cache must fail loud on canonical drift: {err}"
         );
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -17974,7 +17916,7 @@ mod ledger_tests {
 
     #[test]
     fn prepared_snapshot_reads_own_inputs_after_scope_change_and_store_removal() {
-        let root = unique_root("prepared-snapshot-owned-inputs");
+        let (root, _guard) = unique_root("prepared-snapshot-owned-inputs");
         let mut store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         store.set_engagement_scope(Some("engagement-alpha".to_string()));
         let first = store
@@ -18048,7 +17990,7 @@ mod ledger_tests {
 
     #[test]
     fn full_capture_releases_lock_and_keeps_original_cache_proof() {
-        let root = unique_root("full-snapshot-short-lock");
+        let (root, _guard) = unique_root("full-snapshot-short-lock");
         let room_dir = root.join(".rally");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let first = make_fact("capture-first", FactKind::Artifact, "src/", "first");
@@ -18097,12 +18039,11 @@ mod ledger_tests {
             try_load_cached_snapshot_at(&room_dir, at).is_none(),
             "an append during projection must invalidate the original proof"
         );
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn scoped_capture_releases_mutation_lock_before_large_projection() {
-        let root = unique_root("scoped-snapshot-short-lock");
+        let (root, _guard) = unique_root("scoped-snapshot-short-lock");
         let store = DirectRoomStore::open_direct_at_with_engagement(
             root.clone(),
             Some("engagement-alpha".to_string()),
@@ -18162,12 +18103,11 @@ mod ledger_tests {
         holder.join().unwrap();
         let snapshot = query.join().unwrap().unwrap();
         assert_eq!(snapshot.max_seq, 1_500);
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn scoped_snapshot_is_location_invariant_and_dedupes_live_archive_overlap() {
-        let root = unique_root("scoped-snapshot-location-invariant");
+        let (root, _guard) = unique_root("scoped-snapshot-location-invariant");
         let store = DirectRoomStore::open_direct_at_with_engagement(
             root.clone(),
             Some("engagement-alpha".to_string()),
@@ -18211,12 +18151,11 @@ mod ledger_tests {
             snapshot_to_wire_value(&after).unwrap(),
             "rotation must not change a non-decayed scoped snapshot"
         );
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn scoped_snapshot_rejects_conflicting_live_archive_payload_at_same_sequence() {
-        let root = unique_root("scoped-snapshot-seq-conflict");
+        let (root, _guard) = unique_root("scoped-snapshot-seq-conflict");
         let store = DirectRoomStore::open_direct_at_with_engagement(
             root.clone(),
             Some("engagement-alpha".to_string()),
@@ -18249,12 +18188,11 @@ mod ledger_tests {
                 && err.to_string().contains("seq 1"),
             "same-seq payload divergence must fail loudly: {err}"
         );
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn scoped_snapshot_rejects_same_payload_with_conflicting_envelope_at_same_sequence() {
-        let root = unique_root("scoped-snapshot-seq-envelope-conflict");
+        let (root, _guard) = unique_root("scoped-snapshot-seq-envelope-conflict");
         let store = DirectRoomStore::open_direct_at_with_engagement(
             root.clone(),
             Some("engagement-alpha".to_string()),
@@ -18289,7 +18227,6 @@ mod ledger_tests {
                 && err.to_string().contains("rows differ"),
             "same payload with divergent envelope metadata must fail loudly: {err}"
         );
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -18391,7 +18328,7 @@ mod ledger_tests {
     /// expires. Removing the append retry loop makes this fail.
     #[test]
     fn warm_append_retries_after_pool_open_when_holder_releases() {
-        let root = unique_root("warm-append-retry");
+        let (root, _guard) = unique_root("warm-append-retry");
         let _deadline = crate::install_watchdog_deadline(Instant::now() + Duration::from_secs(3));
         let mut store = DirectRoomStore::open_direct_at_with_engagement(
             root.clone(),
@@ -18435,7 +18372,6 @@ mod ledger_tests {
 
         holder.join().expect("holder thread joins");
         drop(store);
-        fs::remove_dir_all(root).ok();
     }
 
     fn claim_fact(event_id: &str, tool: &str, scope: &str, lease_expires_at: &str) -> Fact {
@@ -18450,7 +18386,7 @@ mod ledger_tests {
 
     #[test]
     fn claim_authority_rejects_second_exclusive_owner_on_same_scope() {
-        let root = unique_root("claim-authority-conflict");
+        let (root, _guard) = unique_root("claim-authority-conflict");
         let store = RoomStore::open_at(root.clone()).unwrap();
         let first = claim_fact(
             "claim-first",
@@ -18475,7 +18411,6 @@ mod ledger_tests {
         let snapshot = store.snapshot().unwrap();
         assert_eq!(snapshot.active_claims.len(), 1);
         assert_eq!(snapshot.active_claims[0].event_id, "claim-first");
-        fs::remove_dir_all(&root).ok();
     }
 
     /// DI-1 regression: a system-health telemetry fact (split out of
@@ -18484,7 +18419,7 @@ mod ledger_tests {
     /// `current_risks` and hard-failed with "not a live risk".
     #[test]
     fn di1_system_health_fact_is_resolvable_by_ref() {
-        let root = unique_root("di1-resolve");
+        let (root, _guard) = unique_root("di1-resolve");
         let store = RoomStore::open_at(root.clone()).unwrap();
         // make_fact hardcodes subject; set the system-health prefix explicitly.
         let mut risk_fact = make_fact("sys-drift", FactKind::Risk, "tests/", "drift telemetry");
@@ -18515,7 +18450,6 @@ mod ledger_tests {
                 .any(|f| f.event_id == risk.fact.event_id),
             "resolved telemetry must leave system_health"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -18705,7 +18639,7 @@ mod ledger_tests {
 
     #[test]
     fn release_scope_before_later_same_scope_claim_does_not_suppress_later_claim() {
-        let root = unique_root("claim-authority-release-order");
+        let (root, _guard) = unique_root("claim-authority-release-order");
         let store = RoomStore::open_at(root.clone()).unwrap();
         let old_claim = claim_fact(
             "claim-old",
@@ -18745,14 +18679,13 @@ mod ledger_tests {
         assert_eq!(snapshot.active_claims[0].tool.as_deref(), Some("tool-b"));
         assert_eq!(index.claims.len(), 1);
         assert!(index.claims.contains_key("claim-later"));
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn claim_authority_concurrent_exclusive_acquire_allows_one_owner() {
         use std::sync::{Arc, Barrier};
 
-        let root = unique_root("claim-authority-concurrent");
+        let (root, _guard) = unique_root("claim-authority-concurrent");
         let barrier = Arc::new(Barrier::new(8));
         let mut handles = Vec::new();
         for i in 0..8 {
@@ -18789,12 +18722,11 @@ mod ledger_tests {
 
         assert_eq!(successes, 1, "exactly one append should acquire the scope");
         assert_eq!(owners.len(), 1, "projection must show exactly one owner");
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn empty_scope_renew_non_owner_refused_and_latest_lease_monotonic() {
-        let root = unique_root("empty-scope-renew-owner");
+        let (root, _guard) = unique_root("empty-scope-renew-owner");
         let store = RoomStore::open_at(root.clone()).unwrap();
         let mut claim = claim_fact(
             "claim-renew",
@@ -18856,12 +18788,11 @@ mod ledger_tests {
                 .claims
                 .contains_key("claim-renew")
         );
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn empty_scope_renew_scoped_renewal_unchanged() {
-        let root = unique_root("claim-lease-renew");
+        let (root, _guard) = unique_root("claim-lease-renew");
         let store = RoomStore::open_at(root.clone()).unwrap();
         let claim = claim_fact(
             "claim-renew",
@@ -18912,12 +18843,11 @@ mod ledger_tests {
                 .iter()
                 .any(|item| item == "lease_expires_at:2099-01-01T00:30:00Z")
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn sibling_session_renewal_is_refused_at_the_write_boundary() {
-        let root = unique_root("claim-lease-sibling-renew");
+        let (root, _guard) = unique_root("claim-lease-sibling-renew");
         let store = RoomStore::open_at(root.clone()).unwrap();
         let mut claim = claim_fact(
             "claim-session-owner",
@@ -18966,12 +18896,11 @@ mod ledger_tests {
                 .all(|fact| fact.event_id != renewal.event_id),
             "a refused sibling renewal must not reach the ledger"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn direct_renewal_requires_caller_and_expected_owner_session() {
-        let root = unique_root("claim-lease-direct-authority");
+        let (root, _guard) = unique_root("claim-lease-direct-authority");
         let store = RoomStore::open_at(root.clone()).unwrap();
         let mut claim = claim_fact(
             "claim-direct-owner",
@@ -19015,12 +18944,11 @@ mod ledger_tests {
                 .iter()
                 .all(|fact| fact.kind != FactKind::ClaimRenewed)
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn anonymous_identity_cannot_renew_or_close_at_the_write_boundary() {
-        let root = unique_root("claim-anonymous-authority");
+        let (root, _guard) = unique_root("claim-anonymous-authority");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let mut claim = claim_fact(
             "claim-anonymous",
@@ -19092,12 +19020,11 @@ mod ledger_tests {
                 .iter()
                 .any(|active| active.event_id == claim.event_id)
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn modern_identified_caller_can_renew_a_legacy_sessionless_claim() {
-        let root = unique_root("claim-legacy-modern-renewal");
+        let (root, _guard) = unique_root("claim-legacy-modern-renewal");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let claim = claim_fact(
             "claim-legacy-renew",
@@ -19132,12 +19059,11 @@ mod ledger_tests {
             .expect("renewal must be durable");
         assert_eq!(renewal.tool.as_deref(), Some("tool-a"));
         assert_eq!(renewal.from_session_id.as_deref(), Some("session-modern"));
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn claim_lease_renewal_is_monotonic_and_retry_idempotent() {
-        let root = unique_root("claim-lease-renew-idempotent");
+        let (root, _guard) = unique_root("claim-lease-renew-idempotent");
         let store = RoomStore::open_at(root.clone()).unwrap();
         let claim = claim_fact(
             "claim-renew",
@@ -19187,12 +19113,11 @@ mod ledger_tests {
             older.lease_expires_at.as_deref(),
             Some("2099-01-01T00:30:00Z")
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn claim_authority_replays_legacy_claim_without_lease_marker() {
-        let root = unique_root("claim-authority-legacy-replay");
+        let (root, _guard) = unique_root("claim-authority-legacy-replay");
         {
             let store = RoomStore::open_at(root.clone()).unwrap();
             let claim = claim_fact("claim-legacy", "tool-a", "file:src/lib.rs", "");
@@ -19214,7 +19139,6 @@ mod ledger_tests {
             None,
             "legacy claim replay remains tolerant of missing lease metadata"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     fn segments_under(root: &Path) -> Vec<PathBuf> {
@@ -19260,7 +19184,7 @@ mod ledger_tests {
     /// payloads, same snapshot.
     #[test]
     fn round_trip_db_rebuilds_from_segments() {
-        let root = unique_root("segments-roundtrip");
+        let (root, _guard) = unique_root("segments-roundtrip");
         let store = RoomStore::open_at(root.clone()).unwrap();
 
         let a = store
@@ -19324,8 +19248,6 @@ mod ledger_tests {
             assert_eq!(x.seq, y.seq);
             assert_eq!(x.event_id, y.event_id);
         }
-
-        fs::remove_dir_all(&root).ok();
     }
 
     // -------------------------------------------------------------------------
@@ -19383,7 +19305,7 @@ mod ledger_tests {
 
     #[test]
     fn quarantine_corrupt_db_moves_aside_atomically() {
-        let root = unique_root("quarantine-mv");
+        let (root, _guard) = unique_root("quarantine-mv");
         let rally = root.join(".rally");
         fs::create_dir_all(&rally).unwrap();
         let facts_db = rally.join("facts.db");
@@ -19432,8 +19354,6 @@ mod ledger_tests {
             found_main && found_shm && found_wal,
             "all three siblings quarantined"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// RC-044 second-order hazard: an error that merely NAMES a quarantine file
@@ -19478,7 +19398,7 @@ mod ledger_tests {
 
     #[test]
     fn quarantine_corrupt_db_is_idempotent() {
-        let root = unique_root("quarantine-idempotent");
+        let (root, _guard) = unique_root("quarantine-idempotent");
         let rally = root.join(".rally");
         fs::create_dir_all(&rally).unwrap();
         let facts_db = rally.join("facts.db");
@@ -19505,8 +19425,6 @@ mod ledger_tests {
             1,
             "the second, no-op call must not bump the counter again"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// Write a synthetic `{base}.corrupt.<stamp>` quarantine group (main +
@@ -19532,7 +19450,7 @@ mod ledger_tests {
     /// quietly contradict it.
     #[test]
     fn prune_corrupt_quarantine_archives_never_deletes() {
-        let root = unique_root("prune-archives");
+        let (root, _guard) = unique_root("prune-archives");
         let rally = root.join(".rally");
         fs::create_dir_all(&rally).unwrap();
         let base = "facts.db";
@@ -19565,13 +19483,11 @@ mod ledger_tests {
                 "archived group must leave the live set"
             );
         }
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn prune_corrupt_quarantine_keeps_max_groups_newest_first() {
-        let root = unique_root("prune-count-cap");
+        let (root, _guard) = unique_root("prune-count-cap");
         let rally = root.join(".rally");
         fs::create_dir_all(&rally).unwrap();
         let base = "facts.db";
@@ -19598,13 +19514,11 @@ mod ledger_tests {
             remaining, expected_survivors,
             "the 8 NEWEST groups by stamp survive, not the 8 first-scanned"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn prune_corrupt_quarantine_never_orphans_siblings() {
-        let root = unique_root("prune-siblings");
+        let (root, _guard) = unique_root("prune-siblings");
         let rally = root.join(".rally");
         fs::create_dir_all(&rally).unwrap();
         let base = "facts.db";
@@ -19648,13 +19562,11 @@ mod ledger_tests {
                 "file {name} belongs to deleted stamp {stamp} but was not removed"
             );
         }
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn prune_corrupt_quarantine_byte_cap_binds_before_count_cap() {
-        let root = unique_root("prune-byte-cap");
+        let (root, _guard) = unique_root("prune-byte-cap");
         let rally = root.join(".rally");
         fs::create_dir_all(&rally).unwrap();
         let base = "facts.db";
@@ -19675,13 +19587,11 @@ mod ledger_tests {
         );
         assert!(stats.groups_kept < stats.groups_before);
         assert!(stats.bytes_kept <= CORRUPT_QUARANTINE_MAX_BYTES);
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn prune_corrupt_quarantine_always_keeps_newest_regardless_of_size() {
-        let root = unique_root("prune-newest-floor");
+        let (root, _guard) = unique_root("prune-newest-floor");
         let rally = root.join(".rally");
         fs::create_dir_all(&rally).unwrap();
         let base = "facts.db";
@@ -19703,13 +19613,11 @@ mod ledger_tests {
             1,
             "the sole (newest) group survives even though it alone exceeds the byte budget"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn prune_corrupt_quarantine_sorts_by_numeric_stamp_not_lexicographic() {
-        let root = unique_root("prune-numeric-sort");
+        let (root, _guard) = unique_root("prune-numeric-sort");
         let rally = root.join(".rally");
         fs::create_dir_all(&rally).unwrap();
         let base = "facts.db";
@@ -19733,13 +19641,11 @@ mod ledger_tests {
             "numerically newest stamp (10) must survive, not the lexicographically-\
              greatest (9)"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn corruption_counter_increments_and_preserves_first_at() {
-        let root = unique_root("corruption-counter");
+        let (root, _guard) = unique_root("corruption-counter");
         let rally = root.join(".rally");
         fs::create_dir_all(&rally).unwrap();
         let facts_db = rally.join("facts.db");
@@ -19780,8 +19686,6 @@ mod ledger_tests {
             after_second.last_stamp, after_first.last_stamp,
             "last_stamp advances to the new quarantine's nanosecond stamp"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// THE empirical test: corrupt facts.db mid-bytes, reopen the room, and
@@ -19791,7 +19695,7 @@ mod ledger_tests {
     /// orphan facts.db.corrupt.bak left on disk).
     #[test]
     fn malformed_facts_db_is_rebuilt_from_segments_on_open() {
-        let root = unique_root("malformed-recovery");
+        let (root, _guard) = unique_root("malformed-recovery");
         let store = RoomStore::open_at(root.clone()).unwrap();
 
         // Seed enough history that recovery is visibly nontrivial.
@@ -19966,8 +19870,6 @@ mod ledger_tests {
             quarantine_count_pre, quarantine_count_post,
             "idempotent: no new quarantine on second open"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// O26 DB-only cutover: a current-format database without canonical
@@ -19976,7 +19878,7 @@ mod ledger_tests {
     /// room with canonical segments reconstructs after its cache is deleted.
     #[test]
     fn db_only_room_requires_explicit_offline_migration() {
-        let root = unique_root("segments-bootstrap");
+        let (root, _guard) = unique_root("segments-bootstrap");
         let store = RoomStore::open_at(root.clone()).unwrap();
         store
             .append_fact(&make_fact("e1", FactKind::Claim, "src/", "claim a"))
@@ -20009,8 +19911,6 @@ mod ledger_tests {
         assert!(message.contains("rally doctor --migrate-db-only"));
         assert!(segments_under(&root).is_empty());
         assert_eq!(fs::read(&facts_db).unwrap(), db_before);
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// R5 round-trip: seed events under TWO different engagement labels, then
@@ -20018,7 +19918,7 @@ mod ledger_tests {
     /// from per-engagement segments.
     #[test]
     fn round_trip_two_engagements_reconstruct_from_segments() {
-        let root = unique_root("segments-two-engagements");
+        let (root, _guard) = unique_root("segments-two-engagements");
         let mut store = RoomStore::open_at(root.clone()).unwrap();
 
         store.set_active_engagement_for_test("alpha");
@@ -20099,15 +19999,13 @@ mod ledger_tests {
             index_after_noop_open, index_before_noop_open,
             "opening an unchanged room must not dirty the derived segment index"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// R1 → R5 migration: a pre-existing monolith on disk gets partitioned
     /// into segments + the monolith moves to archive. Every event survives.
     #[test]
     fn migrates_r1_monolith_into_segments_preserving_all_events() {
-        let root = unique_root("segments-migrate");
+        let (root, _guard) = unique_root("segments-migrate");
         // Phase 1: seed the room as if R1 had written every event into the
         // monolith (no segments dir).
         let store = RoomStore::open_at(root.clone()).unwrap();
@@ -20180,8 +20078,6 @@ mod ledger_tests {
         );
         let archive2 = archive_under(&root);
         assert_eq!(archive2.len(), 1);
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// Engagement resolution priority: env var > persisted file > UTC date.
@@ -20192,7 +20088,7 @@ mod ledger_tests {
     /// non-deterministic.
     #[test]
     fn engagement_resolution_priority_env_then_file_then_date() {
-        let root = unique_root("engagement-resolve");
+        let (root, _guard) = unique_root("engagement-resolve");
         let dir = root.join(".rally");
         fs::create_dir_all(&dir).unwrap();
 
@@ -20214,8 +20110,6 @@ mod ledger_tests {
         // Sanitise strips path separators.
         let cleaned = sanitise_engagement("../escape/me");
         assert!(!cleaned.contains('/'));
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// A live session whose env OR `.rally/active-engagement` file says `test`
@@ -20225,7 +20119,7 @@ mod ledger_tests {
     /// durable product fix for the test-segment leak.
     #[test]
     fn reserved_fixture_engagement_never_resolves_for_live_session() {
-        let root = unique_root("engagement-reserved");
+        let (root, _guard) = unique_root("engagement-reserved");
         let dir = root.join(".rally");
         fs::create_dir_all(&dir).unwrap();
         let today = utc_date_label();
@@ -20264,8 +20158,6 @@ mod ledger_tests {
         assert!(is_reserved_fixture_engagement("test"));
         assert!(is_reserved_fixture_engagement("Test"));
         assert!(!is_reserved_fixture_engagement("2026-06-09"));
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// independent-auditor LOW (2026-06-09): persisting a reserved label is
@@ -20274,7 +20166,7 @@ mod ledger_tests {
     /// of appearing to work while the resolver silently uses the dated segment.
     #[test]
     fn persist_rejects_reserved_label() {
-        let root = unique_root("engagement-persist-reserved");
+        let (root, _guard) = unique_root("engagement-persist-reserved");
         let dir = root.join(".rally");
         fs::create_dir_all(&dir).unwrap();
 
@@ -20293,8 +20185,6 @@ mod ledger_tests {
         // A normal label still persists fine.
         persist_active_engagement(&dir, "sprint-9").unwrap();
         assert_eq!(resolve_active_engagement_with_env(&dir, None), "sprint-9");
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// Write a raw segment file (lines already JSON) under `.rally/<dir>/`.
@@ -20354,8 +20244,8 @@ mod ledger_tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         invalidate_segment_fold_memo();
-        let root_a = unique_root("segment-memo-room-a");
-        let root_b = unique_root("segment-memo-room-b");
+        let (root_a, _guard_root_a) = unique_root("segment-memo-room-a");
+        let (root_b, _guard_root_b) = unique_root("segment-memo-room-b");
         let a1 = ledger_line(1, "decision", "room-a-1", "alpha");
         let b1 = ledger_line(1, "decision", "room-b-1", "beta");
         write_segment(&root_a, "log", "alpha.jsonl", &[a1.as_str()]);
@@ -20387,8 +20277,6 @@ mod ledger_tests {
             vec!["room-b-1", "room-b-2"]
         );
 
-        fs::remove_dir_all(root_a).ok();
-        fs::remove_dir_all(root_b).ok();
         invalidate_segment_fold_memo();
     }
 
@@ -20400,7 +20288,7 @@ mod ledger_tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         invalidate_segment_fold_memo();
-        let root = unique_root("segment-memo-same-length");
+        let (root, _guard) = unique_root("segment-memo-same-length");
         let old = ledger_line(1, "decision", "event-old", "alpha");
         let new = ledger_line(1, "decision", "event-new", "alpha");
         assert_eq!(old.len(), new.len(), "fixture must preserve file length");
@@ -20444,7 +20332,6 @@ mod ledger_tests {
             "event-new"
         );
 
-        fs::remove_dir_all(root).ok();
         invalidate_segment_fold_memo();
     }
 
@@ -20553,7 +20440,7 @@ mod ledger_tests {
 
     #[test]
     fn last_seq_in_segment_reads_tail_or_none() {
-        let root = unique_root("last-seq-tail");
+        let (root, _guard) = unique_root("last-seq-tail");
         // Absent segment → None.
         let missing = root.join(".rally").join(LOG_DIRNAME).join("missing.jsonl");
         assert_eq!(last_seq_in_segment(&missing).unwrap(), None);
@@ -20576,7 +20463,7 @@ mod ledger_tests {
     /// the last-resort backstop). Regression for the 2026-07-02 corruption.
     #[test]
     fn out_of_band_higher_seq_forces_authoritative_allocation() {
-        let root = unique_root("oob-higher-seq");
+        let (root, _guard) = unique_root("oob-higher-seq");
         let store = RoomStore::open_at(root.clone()).unwrap();
         for i in 1..=3 {
             store
@@ -20644,7 +20531,7 @@ mod ledger_tests {
     /// distinct-seq count to db event count.
     #[test]
     fn healthy_cache_not_rebuilt_when_count_exceeds_max_seq() {
-        let root = unique_root("reconcile-no-false-rebuild");
+        let (root, _guard) = unique_root("reconcile-no-false-rebuild");
 
         // Live segment + an archived monolith copy carrying the SAME seqs.
         // Raw line count across files = 6, but distinct seqs = {1,2,3} → the
@@ -20677,8 +20564,6 @@ mod ledger_tests {
             before,
             "healthy cache was destroyed: count > max_seq false-triggered a rebuild"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// TEST B — The R5 archived monolith `ledger-pre-segment.jsonl` is excluded
@@ -20689,7 +20574,7 @@ mod ledger_tests {
     /// walked wholesale"; GREEN once the constant-named monolith is filtered.
     #[test]
     fn archived_monolith_excluded_from_replay_no_double_count() {
-        let root = unique_root("reconcile-monolith-excluded");
+        let (root, _guard) = unique_root("reconcile-monolith-excluded");
 
         let lines: Vec<String> = (1..=4)
             .map(|s| ledger_line(s, "claim", &format!("e{s}"), "alpha"))
@@ -20717,8 +20602,6 @@ mod ledger_tests {
             before,
             "archived monolith double-counted: triggered a rebuild of a fresh cache"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// TEST D — Replay tolerates a non-contiguous seq set. After rotation +
@@ -20728,7 +20611,7 @@ mod ledger_tests {
     /// `assigned != entry.seq` check; GREEN once that assertion is dropped.
     #[test]
     fn replay_tolerates_non_contiguous_seqs() {
-        let root = unique_root("reconcile-noncontiguous");
+        let (root, _guard) = unique_root("reconcile-noncontiguous");
 
         // Seqs {2, 5, 9} — gaps everywhere, none starting at 1. factstr will
         // reassign 1,2,3 on replay; the old strict check fired here.
@@ -20745,8 +20628,6 @@ mod ledger_tests {
         assert_eq!(facts.len(), 3, "all 3 non-contiguous events replayed");
         let ids: Vec<&str> = facts.iter().map(|f| f.event_id.as_str()).collect();
         assert_eq!(ids, ["e2", "e5", "e9"], "order preserved by stored seq");
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// A sequence number identifies one complete canonical envelope. Any field
@@ -20758,7 +20639,7 @@ mod ledger_tests {
         for source_layout in ["live-live", "live-archive"] {
             for differing_field in ["occurred_at", "engagement", "event_type", "payload"] {
                 let case = format!("{source_layout}-{differing_field}");
-                let root = unique_root(&format!("canonical-conflict-{case}"));
+                let (root, _guard) = unique_root(&format!("canonical-conflict-{case}"));
                 let original = ledger_line(7, "decision", "event-7", "alpha");
                 let mut conflicting: LedgerLine = serde_json::from_str(&original).unwrap();
                 match differing_field {
@@ -20831,15 +20712,13 @@ mod ledger_tests {
                     !root.join(".rally").join("quarantine").exists(),
                     "{case}: conflict detection must not rewrite canonical input into quarantine"
                 );
-
-                fs::remove_dir_all(&root).ok();
             }
         }
     }
 
     #[test]
     fn canonical_fold_conflict_is_input_order_invariant() {
-        let root = unique_root("canonical-conflict-order");
+        let (root, _guard) = unique_root("canonical-conflict-order");
         let original = ledger_line(11, "decision", "event-11", "alpha");
         let mut conflicting: LedgerLine = serde_json::from_str(&original).unwrap();
         conflicting.occurred_at = "2026-05-02T00:00:11Z".to_string();
@@ -20870,13 +20749,11 @@ mod ledger_tests {
         assert_eq!(fs::read(&first_db).unwrap(), b"first sentinel");
         assert_eq!(fs::read(&second_db).unwrap(), b"second sentinel");
         assert!(!rally_dir.join("quarantine").exists());
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn canonical_fold_dedupes_only_exact_ledger_line_copies() {
-        let root = unique_root("canonical-exact-copy");
+        let (root, _guard) = unique_root("canonical-exact-copy");
         let exact = ledger_line(13, "decision", "event-13", "alpha");
         write_segment(&root, "log", "alpha.jsonl", &[exact.as_str()]);
         write_segment(&root, "archive", "alpha.jsonl", &[exact.as_str()]);
@@ -20904,8 +20781,6 @@ mod ledger_tests {
         assert_eq!(rebuilt[0].event_id, "event-13");
         assert_eq!(rebuilt[0].seq, 13);
         assert!(!root.join(".rally").join("quarantine").exists());
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// Sparse canonical ledgers must not be treated as fresh just because the
@@ -20915,7 +20790,7 @@ mod ledger_tests {
     /// append must allocate from the canonical high-water mark.
     #[test]
     fn reconcile_rebuilds_when_sparse_canonical_max_exceeds_db_max() {
-        let root = unique_root("reconcile-sparse-max-drift");
+        let (root, _guard) = unique_root("reconcile-sparse-max-drift");
         let store = RoomStore::open_at(root.clone()).unwrap();
         for seq in 1..=3 {
             store
@@ -20973,8 +20848,6 @@ mod ledger_tests {
             5,
             "canonical ledger high-water mark advances without reusing seq 4"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// TEST C — R7 rotated segments (kept under their original
@@ -20983,7 +20856,7 @@ mod ledger_tests {
     /// (filtering all archive files instead of just the monolith).
     #[test]
     fn rotated_engagement_segment_in_archive_still_replays() {
-        let root = unique_root("reconcile-rotated-replays");
+        let (root, _guard) = unique_root("reconcile-rotated-replays");
 
         // Old engagement rotated to archive under its own name.
         let archived = [
@@ -21010,8 +20883,6 @@ mod ledger_tests {
             vec!["old1", "old2", "new3"],
             "rotated archive segment + live segment both replay"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     // =========================================================================
@@ -21022,7 +20893,7 @@ mod ledger_tests {
     /// passes and the returned fact carries {room, seq}.
     #[test]
     fn r9_case6_successful_mutation_readback_passes_with_room_and_seq() {
-        let root = unique_root("r9-case6-green");
+        let (root, _guard) = unique_root("r9-case6-green");
         let store = RoomStore::open_at(root.clone()).unwrap();
 
         let fact = make_fact("ev-r9-6", FactKind::Claim, "src/", "r9 green baseline");
@@ -21039,8 +20910,6 @@ mod ledger_tests {
         // room_id is available from the store.
         let room = store.room_id();
         assert!(!room.is_empty(), "room_id must be non-empty");
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// R9-case-1 (stale-binary drop): a fact that lands only in `facts.db` but
@@ -21051,7 +20920,7 @@ mod ledger_tests {
     /// directly. This proves the readback reads SEGMENTS, not the db.
     #[test]
     fn r9_case1_segment_drop_readback_fails() {
-        let root = unique_root("r9-case1-drop");
+        let (root, _guard) = unique_root("r9-case1-drop");
         let store = RoomStore::open_at(root.clone()).unwrap();
 
         let fact = make_fact("ev-r9-1", FactKind::Decision, "src/", "segment drop test");
@@ -21085,8 +20954,6 @@ mod ledger_tests {
             in_db,
             "fact must still exist in facts.db (cache) after segment truncation — proving split state"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// Step-2 fast-path correctness: the active-segment tail-first readback
@@ -21095,7 +20962,7 @@ mod ledger_tests {
     /// fallback (active-first miss → full scan miss → error).
     #[test]
     fn r9_active_segment_first_readback_happy_path_and_still_catches_drop() {
-        let root = unique_root("r9-active-first");
+        let (root, _guard) = unique_root("r9-active-first");
         let store = RoomStore::open_at(root.clone()).unwrap();
 
         // Happy path: verified append succeeds, and the tail-first helper finds
@@ -21126,8 +20993,6 @@ mod ledger_tests {
                 .unwrap(),
             "full scan must also miss the dropped event — silent drop is still caught"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     // =========================================================================
@@ -21136,7 +21001,7 @@ mod ledger_tests {
 
     #[test]
     fn step3_reconcile_cache_current_schema_is_stamped_and_required() {
-        let root = unique_root("step3-cache-schema");
+        let (root, _guard) = unique_root("step3-cache-schema");
         let store = RoomStore::open_at(root.clone()).unwrap();
         store
             .append_fact(&make_fact(
@@ -21188,12 +21053,11 @@ mod ledger_tests {
                 && unknown_is_rejected,
             "cache schema contract failed: fresh={fresh_schema:?}, current accepted={current_is_accepted}, absent rejected={absent_is_rejected}, old rejected={old_is_rejected}, unknown rejected={unknown_is_rejected}"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn step3_old_cache_schema_forces_one_scan_then_current_cache_is_fast() {
-        let root = unique_root("step3-cache-schema-upgrade");
+        let (root, _guard) = unique_root("step3-cache-schema-upgrade");
         let store = RoomStore::open_at(root.clone()).unwrap();
         for i in 0..3u32 {
             store
@@ -21239,14 +21103,13 @@ mod ledger_tests {
             after_fast_path, after_upgrade,
             "the current cache written by that scan must permit the next O(1) fast path"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn legacy_reconcile_cache_never_allows_conflicting_append_to_mutate_storage() {
         let mut failures = Vec::new();
         for source_layout in ["live-live", "live-archive"] {
-            let root = unique_root(&format!("legacy-cache-conflict-{source_layout}"));
+            let (root, _guard) = unique_root(&format!("legacy-cache-conflict-{source_layout}"));
             let store = DirectRoomStore::open_direct_at_with_engagement(
                 root.clone(),
                 Some("alpha".to_string()),
@@ -21320,7 +21183,6 @@ mod ledger_tests {
                     cache_after != cache_before,
                 ));
             }
-            fs::remove_dir_all(&root).ok();
         }
         assert!(
             failures.is_empty(),
@@ -21331,7 +21193,7 @@ mod ledger_tests {
 
     #[test]
     fn step3_zero_length_wal_is_absent_but_nonempty_wal_is_fingerprinted() {
-        let root = unique_root("step3-zero-wal");
+        let (root, _guard) = unique_root("step3-zero-wal");
         let rally_dir = root.join(".rally");
         fs::create_dir_all(&rally_dir).unwrap();
         let facts_db = rally_dir.join("facts.db");
@@ -21348,7 +21210,6 @@ mod ledger_tests {
             fingerprint_wal(&facts_db).is_some(),
             "a nonempty WAL must remain part of the cache fingerprint"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     /// Call reconcile directly and report whether it took the authoritative
@@ -21369,7 +21230,7 @@ mod ledger_tests {
     /// the authoritative full scan does NOT run.
     #[test]
     fn step3_reconcile_takes_fast_path_after_append() {
-        let root = unique_root("step3-fast-path");
+        let (root, _guard) = unique_root("step3-fast-path");
         let store = RoomStore::open_at(root.clone()).unwrap();
         for i in 0..5u32 {
             store
@@ -21387,12 +21248,11 @@ mod ledger_tests {
             !reconcile_took_full_scan(&root),
             "second no-change reconcile must also be O(1)"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn step3_wal_state_change_invalidates_an_otherwise_matching_sidecar() {
-        let root = unique_root("step3-wal-fingerprint");
+        let (root, _guard) = unique_root("step3-wal-fingerprint");
         let store = RoomStore::open_at(root.clone()).unwrap();
         store
             .append_fact(&make_fact("e1", FactKind::Claim, "src/", "f"))
@@ -21429,12 +21289,11 @@ mod ledger_tests {
             reconcile_took_full_scan(&root),
             "WAL disappearance must invalidate the reconcile fast path"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn step3_append_remeasures_counts_instead_of_incrementing_a_lie() {
-        let root = unique_root("step3-remeasure-after-append");
+        let (root, _guard) = unique_root("step3-remeasure-after-append");
         let store = RoomStore::open_at(root.clone()).unwrap();
         store
             .append_fact(&make_fact("e1", FactKind::Claim, "src/", "f"))
@@ -21458,7 +21317,6 @@ mod ledger_tests {
         assert_eq!(measured.canonical_max_seq, appended.fact.seq);
         assert_eq!(measured.db_count, 2);
         assert_eq!(measured.db_max_seq, appended.fact.seq);
-        fs::remove_dir_all(&root).ok();
     }
 
     /// (b) Corrupt or delete the sidecar → the next reconcile falls through to
@@ -21466,7 +21324,7 @@ mod ledger_tests {
     /// re-seeds a valid sidecar (subsequent op is fast again).
     #[test]
     fn step3_corrupt_or_missing_sidecar_falls_through_no_loss() {
-        let root = unique_root("step3-sidecar-disposable");
+        let (root, _guard) = unique_root("step3-sidecar-disposable");
         let store = RoomStore::open_at(root.clone()).unwrap();
         for i in 0..4u32 {
             store
@@ -21510,7 +21368,6 @@ mod ledger_tests {
             !reconcile_took_full_scan(&root),
             "sidecar re-seeded after full scan → next reconcile is O(1)"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     /// (c) A malformed facts.db with a STALE-but-structurally-valid sidecar must
@@ -21519,7 +21376,7 @@ mod ledger_tests {
     /// changes), so its fingerprint no longer matches the sidecar → fall through.
     #[test]
     fn step3_malformed_db_with_stale_sidecar_does_not_bypass_corruption_recovery() {
-        let root = unique_root("step3-stale-sidecar-corrupt-db");
+        let (root, _guard) = unique_root("step3-stale-sidecar-corrupt-db");
         let store = RoomStore::open_at(root.clone()).unwrap();
         let mut ids = Vec::new();
         for i in 0..4u32 {
@@ -21631,12 +21488,11 @@ mod ledger_tests {
         for (i, id) in ids.iter().enumerate() {
             assert_eq!(&after[i].event_id, id, "order + identity preserved");
         }
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn facts_query_corruption_with_matching_sidecar_quarantines_and_rebuilds() {
-        let root = unique_root("query-corrupt-sidecar-match");
+        let (root, _guard) = unique_root("query-corrupt-sidecar-match");
         let store = RoomStore::open_at(root.clone()).unwrap();
         let mut ids = Vec::new();
         for i in 0..800u32 {
@@ -21734,8 +21590,6 @@ mod ledger_tests {
             800,
             "rebuilt projection must be queryable and complete"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// Empirical O(1) proof: reconcile wall-time on the no-change happy path
@@ -21747,7 +21601,7 @@ mod ledger_tests {
     fn reconcile_fast_path_is_flat_vs_ledger_size() {
         use std::time::Instant;
         fn time_reconcile_at(n: usize) -> u128 {
-            let root = unique_root(&format!("reconcile-flat-{n}"));
+            let (root, _guard) = unique_root(&format!("reconcile-flat-{n}"));
             let store = RoomStore::open_at(root.clone()).unwrap();
             for i in 0..n {
                 store
@@ -21771,7 +21625,6 @@ mod ledger_tests {
                 !reconcile_took_full_scan(&root),
                 "reconcile at n={n} must be on the O(1) fast path"
             );
-            fs::remove_dir_all(&root).ok();
             best
         }
         let small = time_reconcile_at(200);
@@ -21795,7 +21648,7 @@ mod ledger_tests {
     /// ANY readback path that checked the db would false-pass.
     #[test]
     fn r9_case4_db_false_passes_where_segment_readback_correctly_fails() {
-        let root = unique_root("r9-case4-db-false-pass");
+        let (root, _guard) = unique_root("r9-case4-db-false-pass");
         let store = RoomStore::open_at(root.clone()).unwrap();
 
         let fact = make_fact("ev-r9-4", FactKind::Claim, "src/", "db false-pass guard");
@@ -21825,15 +21678,13 @@ mod ledger_tests {
             db_found,
             "db readback returns true even with the segment gone — this is the false-pass that our segment-only readback avoids"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// R9-case-2 (no-op release): `release` without a valid `--ref` that names
     /// a live active claim → MUST fail loud via `append_state_transition_verified`.
     #[test]
     fn r9_case2_noop_release_fails_loud_without_valid_ref() {
-        let root = unique_root("r9-case2-noop-release");
+        let (root, _guard) = unique_root("r9-case2-noop-release");
         let store = RoomStore::open_at(root.clone()).unwrap();
 
         // Write a claim first.
@@ -21912,8 +21763,6 @@ mod ledger_tests {
                 "failed release fact {bad_id} must NOT appear in canonical segments"
             );
         }
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// R9-case-3 (wrong-room write): a readback expecting the event_id in room A
@@ -21923,8 +21772,8 @@ mod ledger_tests {
     /// store-A's log dir — the event_id is absent from A's segments.
     #[test]
     fn r9_case3_wrong_room_event_absent_in_other_room_segments() {
-        let root_a = unique_root("r9-case3-room-a");
-        let root_b = unique_root("r9-case3-room-b");
+        let (root_a, _guard_root_a) = unique_root("r9-case3-room-a");
+        let (root_b, _guard_root_b) = unique_root("r9-case3-room-b");
         let _store_a = RoomStore::open_at(root_a.clone()).unwrap();
         let store_b = RoomStore::open_at(root_b.clone()).unwrap();
 
@@ -21952,9 +21801,6 @@ mod ledger_tests {
             found_in_b,
             "event written to room B must be found in room B's canonical segments"
         );
-
-        fs::remove_dir_all(&root_a).ok();
-        fs::remove_dir_all(&root_b).ok();
     }
 
     /// R9-case-5 (concurrency): a peer append between write and readback MUST NOT
@@ -21967,7 +21813,7 @@ mod ledger_tests {
     /// for a nonexistent id still returns false.
     #[test]
     fn r9_case5_concurrent_peer_append_does_not_false_pass_exact_event_id() {
-        let root = unique_root("r9-case5-concurrency");
+        let (root, _guard) = unique_root("r9-case5-concurrency");
         // Chunk A router is hard-wired to Direct; this test reaches into the
         // direct store's private fields, so bind the DirectRoomStore directly.
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
@@ -22036,8 +21882,6 @@ mod ledger_tests {
             !found_ghost,
             "a nonexistent event_id must NOT be found even though seq advanced (exact-match, not seq-advance check)"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// TEST E — Parallel reads (concurrent `open_existing_at`) must not destroy
@@ -22046,7 +21890,7 @@ mod ledger_tests {
     /// readers all see the same 5 facts and the db file is never recreated.
     #[test]
     fn parallel_reads_do_not_destroy_cache() {
-        let root = unique_root("reconcile-parallel-read");
+        let (root, _guard) = unique_root("reconcile-parallel-read");
         let store = RoomStore::open_at(root.clone()).unwrap();
         for n in 1..=5 {
             store
@@ -22077,13 +21921,12 @@ mod ledger_tests {
             assert_eq!(h.join().unwrap(), 5, "reader saw a destroyed/racing cache");
         }
         assert_eq!(db_inode(&root), before, "parallel reads rebuilt the cache");
-
-        fs::remove_dir_all(&*root).ok();
     }
 
     #[test]
     fn parallel_opens_and_appends_keep_db_and_segments_in_lockstep() {
-        let root = Arc::new(unique_root("parallel-open-append-lockstep"));
+        let (root_path, _guard) = unique_root("parallel-open-append-lockstep");
+        let root = Arc::new(root_path);
         let store = RoomStore::open_at((*root).clone()).unwrap();
         drop(store);
 
@@ -22127,8 +21970,6 @@ mod ledger_tests {
         assert_eq!(seqs.len(), 8);
         assert!(seqs.contains(&1));
         assert!(seqs.contains(&8));
-
-        fs::remove_dir_all(&*root).ok();
     }
 
     // =========================================================================
@@ -22141,7 +21982,7 @@ mod ledger_tests {
     /// `behind_by`.
     #[test]
     fn r10_a_read_checkpoint_lands_in_ledger_and_projects_correctly() {
-        let root = unique_root("r10-a-read-checkpoint");
+        let (root, _guard) = unique_root("r10-a-read-checkpoint");
         let store = RoomStore::open_at(root.clone()).unwrap();
 
         // Post two substantive facts.
@@ -22205,8 +22046,6 @@ mod ledger_tests {
             tool_a.behind_by <= 1,
             "tool-a is at most 1 behind (checkpoint fact itself)"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// R10-b: BLOAT GUARD — calling `maybe_append_read_checkpoint` twice with
@@ -22214,7 +22053,7 @@ mod ledger_tests {
     /// only ONE checkpoint — the second call is a no-op.
     #[test]
     fn r10_b_no_bloat_repeated_checkpoint_at_same_seq_is_noop() {
-        let root = unique_root("r10-b-no-bloat");
+        let (root, _guard) = unique_root("r10-b-no-bloat");
         let store = RoomStore::open_at(root.clone()).unwrap();
 
         store
@@ -22248,15 +22087,13 @@ mod ledger_tests {
             read_count, 1,
             "BLOAT GUARD: exactly one read-checkpoint fact for tool-a after two no-advance polls"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// R10-b extension: after posting a NEW substantive fact, a further
     /// checkpoint IS written (position genuinely advanced).
     #[test]
     fn r10_b_new_activity_allows_second_checkpoint() {
-        let root = unique_root("r10-b-new-activity");
+        let (root, _guard) = unique_root("r10-b-new-activity");
         let store = RoomStore::open_at(root.clone()).unwrap();
 
         store
@@ -22294,8 +22131,6 @@ mod ledger_tests {
             read_count, 2,
             "two read-checkpoints after two distinct advances"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// R10-c: `FactKind::Read` facts do NOT appear in `active_claims`,
@@ -22303,7 +22138,7 @@ mod ledger_tests {
     /// invisible to claimable-work projection.
     #[test]
     fn r10_c_read_checkpoint_facts_excluded_from_claimable_work() {
-        let root = unique_root("r10-c-excluded-from-work");
+        let (root, _guard) = unique_root("r10-c-excluded-from-work");
         let store = RoomStore::open_at(root.clone()).unwrap();
 
         // Post some substantive facts, then record a checkpoint.
@@ -22339,15 +22174,13 @@ mod ledger_tests {
         let all_facts = store.facts().unwrap();
         let read_count = all_facts.iter().filter(|f| f.kind == "read").count();
         assert_eq!(read_count, 1, "read-checkpoint fact is in the ledger");
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// R10-d: Two distinct tools both record checkpoints; `project_read_receipts`
     /// reports both with correct `behind_by` values.
     #[test]
     fn r10_d_two_tools_both_appear_in_read_receipts() {
-        let root = unique_root("r10-d-two-tools");
+        let (root, _guard) = unique_root("r10-d-two-tools");
         let store = RoomStore::open_at(root.clone()).unwrap();
 
         // Post 3 substantive facts.
@@ -22455,8 +22288,6 @@ mod ledger_tests {
             b2.behind_by > a2.behind_by,
             "tool-b is further behind than tool-a"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// R10-anti-loop: calling `maybe_append_read_checkpoint` repeatedly with
@@ -22464,7 +22295,7 @@ mod ledger_tests {
     /// more than one checkpoint per substantive advancement — no feedback loop.
     #[test]
     fn r10_anti_loop_content_max_seq_prevents_self_inflation() {
-        let root = unique_root("r10-anti-loop");
+        let (root, _guard) = unique_root("r10-anti-loop");
         let store = RoomStore::open_at(root.clone()).unwrap();
 
         // Post one substantive fact.
@@ -22487,13 +22318,11 @@ mod ledger_tests {
             read_count, 1,
             "5 no-advance polls with content_max_seq must produce only 1 read-checkpoint (anti-loop guard)"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn cursor_cache_concurrent_writers_preserve_each_tool_and_clean_staging_files() {
-        let root = unique_root("cursor-cache-concurrent-writers");
+        let (root, _guard) = unique_root("cursor-cache-concurrent-writers");
         let cursor_path = root.join(".rally").join("cursors.json");
         let writers = 12usize;
         let barrier = Arc::new(std::sync::Barrier::new(writers));
@@ -22537,8 +22366,6 @@ mod ledger_tests {
             staging, 0,
             "successful cursor writes must clean staging files"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// R10-cursor-ledger-primary: cursor_for() must return the ledger-derived
@@ -22553,7 +22380,7 @@ mod ledger_tests {
     ///   5. advance checkpoint (second enter) — assert stable, not inflating
     #[test]
     fn r10_cursor_for_is_ledger_derived_survives_cursors_json_deletion() {
-        let root = unique_root("r10-cursor-ledger-primary");
+        let (root, _guard) = unique_root("r10-cursor-ledger-primary");
         let store = RoomStore::open_at(root.clone()).unwrap();
 
         // Step 1: simulate first enter — write both the side-file cache and a ledger checkpoint.
@@ -22634,8 +22461,6 @@ mod ledger_tests {
             idempotent, after_re_enter,
             "cursor_for must be idempotent — no side effects on repeated reads"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     // -------------------------------------------------------------------------
@@ -22648,7 +22473,7 @@ mod ledger_tests {
     /// committed (fsync contract), so it must be tolerated and skipped.
     #[test]
     fn torn_trailing_segment_line_is_skipped_on_rebuild() {
-        let root = unique_root("torn-trailing");
+        let (root, _guard) = unique_root("torn-trailing");
         let store = RoomStore::open_at(root.clone()).unwrap();
 
         // Write 3 valid facts (seq 1-3).
@@ -22714,13 +22539,11 @@ mod ledger_tests {
             !has_quarantine,
             "no quarantine file: torn line is not treated as DB corruption"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_unmarked_db_only_room_fails_loud_and_preserves_db() {
-        let root = unique_root("o26-db-only-refusal");
+        let (root, _guard) = unique_root("o26-db-only-refusal");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         store
             .append_fact(&make_fact(
@@ -22754,12 +22577,11 @@ mod ledger_tests {
             "refusal must preserve the only extant history byte-for-byte"
         );
         assert!(read_segment_files(&log_dir).unwrap().is_empty());
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_invalid_event_id_is_rejected_before_canonical_io() {
-        let root = unique_root("o26-invalid-event-id");
+        let (root, _guard) = unique_root("o26-invalid-event-id");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let segment = store.active_segment_path();
         let db_before = fs::read(&store.facts_db_path).unwrap();
@@ -22799,12 +22621,11 @@ mod ledger_tests {
         assert!(matches!(error, RallyError::Usage(_)));
         assert!(!segment.exists());
         assert_eq!(fs::read(&store.facts_db_path).unwrap(), db_before);
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_canonical_open_fault_is_not_started_and_leaves_db_empty() {
-        let root = unique_root("o26-canonical-open-fault");
+        let (root, _guard) = unique_root("o26-canonical-open-fault");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let rally_dir = root.join(".rally");
         fail_o26_once(&rally_dir, O26FaultPoint::BeforeCanonicalMutation);
@@ -22820,12 +22641,11 @@ mod ledger_tests {
         assert!(!store.active_segment_path().exists());
         let db = open_fact_store_lenient(&store.facts_db_path).unwrap();
         assert!(facts_from_store(&db).unwrap().is_empty());
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_projection_failure_is_committed_and_same_id_retry_repairs_once() {
-        let root = unique_root("o26-projection-degraded");
+        let (root, _guard) = unique_root("o26-projection-degraded");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let candidate = make_fact(
             "o26-projection-failure",
@@ -22864,12 +22684,11 @@ mod ledger_tests {
                 .count(),
             1
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_partial_write_is_unknown_then_same_id_retry_is_singleton() {
-        let root = unique_root("o26-partial-write");
+        let (root, _guard) = unique_root("o26-partial-write");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let candidate = make_fact(
             "o26-partial-event",
@@ -22898,12 +22717,11 @@ mod ledger_tests {
                 .count(),
             1
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_synced_lost_reply_retry_resyncs_and_returns_original_once() {
-        let root = unique_root("o26-full-sync-unknown");
+        let (root, _guard) = unique_root("o26-full-sync-unknown");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let candidate = make_fact(
             "o26-synced-event",
@@ -22929,12 +22747,11 @@ mod ledger_tests {
                 .count(),
             1
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_exact_retry_rejects_unrelated_same_sequence_conflict_before_projection() {
-        let root = unique_root("o26-retry-unrelated-seq-conflict");
+        let (root, _guard) = unique_root("o26-retry-unrelated-seq-conflict");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let candidate = make_fact(
             "o26-retry-before-conflict",
@@ -22968,12 +22785,11 @@ mod ledger_tests {
         assert_eq!(fs::read(&archive_path).unwrap(), archive_before);
         assert_eq!(fs::read(&store.facts_db_path).unwrap(), db_before);
         assert_eq!(fs::read(&reconcile_path).ok(), reconcile_before);
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_exact_live_archive_copy_retry_is_accepted_and_deduped() {
-        let root = unique_root("o26-retry-exact-live-archive-copy");
+        let (root, _guard) = unique_root("o26-retry-exact-live-archive-copy");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let candidate = make_fact(
             "o26-exact-copy-retry",
@@ -23000,12 +22816,11 @@ mod ledger_tests {
         );
         assert_eq!(read_segment_entries(&live_path).unwrap().len(), 1);
         assert_eq!(read_segment_entries(&archive_path).unwrap().len(), 1);
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_deadline_after_scans_stops_new_write_before_any_side_effect() {
-        let root = unique_root("o26-late-start-new");
+        let (root, _guard) = unique_root("o26-late-start-new");
         let seed = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let db_before = fs::read(&seed.facts_db_path).unwrap();
         drop(seed);
@@ -23033,12 +22848,11 @@ mod ledger_tests {
                 .is_empty()
         );
         assert_eq!(fs::read(root.join(".rally/facts.db")).unwrap(), db_before);
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_deadline_after_tail_scan_does_not_start_framing_repair() {
-        let root = unique_root("o26-late-start-tail");
+        let (root, _guard) = unique_root("o26-late-start-tail");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         store
             .append_fact(&make_fact(
@@ -23075,12 +22889,11 @@ mod ledger_tests {
         assert!(matches!(error, RallyError::NotStarted(_)));
         assert_eq!(fs::read(&segment).unwrap(), tail_before);
         assert_eq!(fs::read(root.join(".rally/facts.db")).unwrap(), db_before);
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_exact_retry_past_deadline_is_unknown_not_not_started() {
-        let root = unique_root("o26-retry-resync-deadline");
+        let (root, _guard) = unique_root("o26-retry-resync-deadline");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let candidate = make_fact(
             "o26-retry-resync-event",
@@ -23110,12 +22923,11 @@ mod ledger_tests {
         ));
         assert_eq!(fs::read(&segment).unwrap(), segment_before);
         assert_eq!(fs::read(root.join(".rally/facts.db")).unwrap(), db_before);
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_complete_invalid_unterminated_tail_is_rejected_unchanged() {
-        let root = unique_root("o26-complete-invalid-tail");
+        let (root, _guard) = unique_root("o26-complete-invalid-tail");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         store
             .append_fact(&make_fact(
@@ -23139,12 +22951,11 @@ mod ledger_tests {
             .expect_err("complete invalid tail must fail loud");
         assert!(!matches!(error, RallyError::OutcomeUnknown { .. }));
         assert_eq!(fs::read(&segment).unwrap(), bytes);
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_wrong_schema_unterminated_json_tail_is_rejected_unchanged() {
-        let root = unique_root("o26-wrong-schema-tail");
+        let (root, _guard) = unique_root("o26-wrong-schema-tail");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let segment = store.active_segment_path();
         fs::create_dir_all(segment.parent().unwrap()).unwrap();
@@ -23175,12 +22986,11 @@ mod ledger_tests {
             .expect_err("complete wrong-schema tail must fail loud");
         assert!(error.to_string().contains("unsupported fact schema"));
         assert_eq!(fs::read(&segment).unwrap(), bytes);
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_valid_final_record_without_newline_is_completed_before_append() {
-        let root = unique_root("o26-valid-tail-no-newline");
+        let (root, _guard) = unique_root("o26-valid-tail-no-newline");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let first = store
             .append_fact(&make_fact(
@@ -23214,12 +23024,11 @@ mod ledger_tests {
         );
         assert_eq!(entries[0].payload["event_id"], "o26-valid-tail-first");
         assert_eq!(entries[1].payload["event_id"], "o26-valid-tail-second");
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_incomplete_unterminated_tail_is_truncated_before_append() {
-        let root = unique_root("o26-incomplete-tail");
+        let (root, _guard) = unique_root("o26-incomplete-tail");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         store
             .append_fact(&make_fact(
@@ -23250,12 +23059,11 @@ mod ledger_tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(appended.fact.seq, 2);
         assert_eq!(entries[1].payload["event_id"], "o26-after-torn-tail");
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_tail_repair_sync_failure_is_unknown_then_retry_appends_once() {
-        let root = unique_root("o26-tail-repair-sync");
+        let (root, _guard) = unique_root("o26-tail-repair-sync");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         store
             .append_fact(&make_fact(
@@ -23296,12 +23104,11 @@ mod ledger_tests {
                 .count(),
             1
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_failure_after_repair_before_append_is_unknown_then_retry_singleton() {
-        let root = unique_root("o26-after-tail-repair");
+        let (root, _guard) = unique_root("o26-after-tail-repair");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         store
             .append_fact(&make_fact(
@@ -23342,12 +23149,11 @@ mod ledger_tests {
                 .count(),
             1
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_post_readback_failure_is_committed_warning_not_error() {
-        let root = unique_root("o26-after-readback");
+        let (root, _guard) = unique_root("o26-after-readback");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let candidate = make_fact(
             "o26-after-readback-candidate",
@@ -23374,12 +23180,11 @@ mod ledger_tests {
                 .count(),
             1
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_reconcile_cache_failure_is_committed_warning_and_db_has_row() {
-        let root = unique_root("o26-reconcile-cache-warning");
+        let (root, _guard) = unique_root("o26-reconcile-cache-warning");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let candidate = make_fact(
             "o26-reconcile-cache-candidate",
@@ -23410,12 +23215,11 @@ mod ledger_tests {
                 .count(),
             1
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_real_reconcile_cache_rename_failure_is_committed_warning() {
-        let root = unique_root("o26-reconcile-cache-rename-warning");
+        let (root, _guard) = unique_root("o26-reconcile-cache-rename-warning");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let sidecar = root.join(".rally").join(RECONCILE_CACHE_FILENAME);
         fs::remove_file(&sidecar).ok();
@@ -23446,12 +23250,11 @@ mod ledger_tests {
                 .count(),
             1
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_detached_snapshot_cannot_be_stamped_with_a_new_canonical_fingerprint() {
-        let root = unique_root("o26-snapshot-cache-detached-pair");
+        let (root, _guard) = unique_root("o26-snapshot-cache-detached-pair");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let first = make_fact(
             "o26-cache-first",
@@ -23482,7 +23285,6 @@ mod ledger_tests {
             }),
             "a detached old snapshot must not be published under the intervening commit's fingerprint"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -23494,7 +23296,7 @@ mod ledger_tests {
         let _env_lock = crate::PROCESS_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let root = unique_root("snapshot-cache-obligation-internals");
+        let (root, _guard) = unique_root("snapshot-cache-obligation-internals");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let mut handoff = make_fact(
             "cached-open-obligation",
@@ -23543,12 +23345,11 @@ mod ledger_tests {
             vec!["cached-open-obligation"],
             "serde-skipped internals must round-trip through the cache side channel"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_snapshot_cache_expires_across_no_write_liveness_transition() {
-        let root = unique_root("o26-snapshot-cache-liveness-time");
+        let (root, _guard) = unique_root("o26-snapshot-cache-liveness-time");
         let rally_dir = root.join(".rally");
         fs::create_dir_all(&rally_dir).unwrap();
         let projection_time = 2_000_000_000_i64;
@@ -23642,7 +23443,6 @@ mod ledger_tests {
             try_load_cached_snapshot_at(&rally_dir, later_time).is_none(),
             "a cache captured before a no-write liveness transition must miss afterward"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -23678,7 +23478,7 @@ mod ledger_tests {
             unsafe { std::env::remove_var(name) };
         }
 
-        let root = unique_root("o26-snapshot-cache-policy");
+        let (root, _guard) = unique_root("o26-snapshot-cache-policy");
         let rally_dir = root.join(".rally");
         fs::create_dir_all(&rally_dir).unwrap();
         let projection_time = 2_000_000_000_i64;
@@ -23712,12 +23512,11 @@ mod ledger_tests {
             try_load_cached_snapshot_at(&rally_dir, projection_time).is_none(),
             "a repo policy change must invalidate the cache without a canonical write"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_canonical_only_degraded_commit_invalidates_restored_old_snapshot_cache() {
-        let root = unique_root("o26-snapshot-cache-canonical-generation");
+        let (root, _guard) = unique_root("o26-snapshot-cache-canonical-generation");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let first = make_fact(
             "o26-cache-generation-first",
@@ -23749,12 +23548,11 @@ mod ledger_tests {
             try_load_cached_snapshot(&rally_dir).is_none(),
             "canonical segment generation must reject an old cache even when DB/index signals are unchanged"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_segment_fingerprint_hashes_tail_for_same_length_repair() {
-        let root = unique_root("o26-segment-tail-fingerprint");
+        let (root, _guard) = unique_root("o26-segment-tail-fingerprint");
         let log_dir = root.join(".rally").join(LOG_DIRNAME);
         fs::create_dir_all(&log_dir).unwrap();
         let segment = log_dir.join("alpha.jsonl");
@@ -23782,12 +23580,11 @@ mod ledger_tests {
             first_tail, second_tail,
             "same-length tail repair must invalidate persisted and in-process fingerprints"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_exact_same_event_id_retry_returns_original_sequence_once() {
-        let root = unique_root("o26-same-id-exact");
+        let (root, _guard) = unique_root("o26-same-id-exact");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let candidate = make_fact(
             "o26-same-id",
@@ -23811,12 +23608,11 @@ mod ledger_tests {
             1,
             "same-ID retry must leave exactly one canonical event"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_same_event_id_different_payload_conflicts_without_mutation() {
-        let root = unique_root("o26-same-id-conflict");
+        let (root, _guard) = unique_root("o26-same-id-conflict");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let candidate = make_fact("o26-conflicting-id", FactKind::Decision, "src/", "original");
         store.append_fact(&candidate).unwrap();
@@ -23833,12 +23629,11 @@ mod ledger_tests {
             "identity conflict must precede mutable-state noise: {error}"
         );
         assert_eq!(fs::read(&segment).unwrap(), canonical_before);
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_stateful_exact_retries_precede_mutable_preconditions() {
-        let root = unique_root("o26-stateful-retries");
+        let (root, _guard) = unique_root("o26-stateful-retries");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
 
         let mut claim = make_fact(
@@ -23949,12 +23744,11 @@ mod ledger_tests {
                 "stateful exact retry must be a singleton: {event_id}"
             );
         }
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn o26_renewal_and_checkpoint_requests_keep_stable_identity_and_outcomes() {
-        let root = unique_root("o26-renew-checkpoint-contract");
+        let (root, _guard) = unique_root("o26-renew-checkpoint-contract");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let claim = make_fact(
             "o26-renew-request-claim",
@@ -24042,7 +23836,6 @@ mod ledger_tests {
                 "lost reply and exact retry must be singleton for {event_id}"
             );
         }
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -24051,7 +23844,7 @@ mod ledger_tests {
             ("release", FactKind::Claim, FactKind::Release),
             ("resolve", FactKind::Blocker, FactKind::Resolve),
         ] {
-            let root = unique_root(&format!("o26-{label}-projection"));
+            let (root, _guard) = unique_root(&format!("o26-{label}-projection"));
             let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
             let target = make_fact(
                 &format!("o26-{label}-target"),
@@ -24088,7 +23881,6 @@ mod ledger_tests {
                     .count(),
                 1
             );
-            fs::remove_dir_all(&root).ok();
         }
     }
 
@@ -24098,7 +23890,7 @@ mod ledger_tests {
             ("release", FactKind::Claim, FactKind::Release),
             ("resolve", FactKind::Blocker, FactKind::Resolve),
         ] {
-            let root = unique_root(&format!("o26-{label}-race"));
+            let (root, _guard) = unique_root(&format!("o26-{label}-race"));
             let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
             let target = make_fact(
                 &format!("o26-{label}-race-target"),
@@ -24144,13 +23936,12 @@ mod ledger_tests {
                 })
                 .count();
             assert_eq!(close_count, 1);
-            fs::remove_dir_all(&root).ok();
         }
     }
 
     #[test]
     fn completed_segment_corruption_fails_all_canonical_readers() {
-        let root = unique_root("completed-segment-corruption");
+        let (root, _guard) = unique_root("completed-segment-corruption");
         // Direct-store internals under test; bind the DirectRoomStore directly
         // (Chunk A router always returns Direct).
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
@@ -24199,7 +23990,6 @@ mod ledger_tests {
             db_len_before,
             "failed canonical parse must not replace the derived cache"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -24243,7 +24033,7 @@ mod ledger_tests {
     /// through the fallback when the index is gone.
     #[test]
     fn facts_by_event_id_matches_full_scan_with_and_without_index() {
-        let root = unique_root("facts-by-event-id");
+        let (root, _guard) = unique_root("facts-by-event-id");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         for i in 0..5 {
             let mut f = make_fact(&format!("fact_pt_{i}"), FactKind::Decision, "", "s");
@@ -24280,12 +24070,11 @@ mod ledger_tests {
         for id in ["fact_pt_0", "fact_pt_4", "fact_absent"] {
             assert_eq!(got(id), expect(id), "fallback lookup for {id}");
         }
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn reply_reference_index_migrates_and_preserves_retractions_and_fallback() {
-        let root = unique_root("reply-reference-index");
+        let (root, _guard) = unique_root("reply-reference-index");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let original = make_fact("request", FactKind::Decision, "", "request");
         store.append_fact(&original).unwrap();
@@ -24337,7 +24126,6 @@ mod ledger_tests {
             encode(expected)
         );
         drop(connection);
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -24399,7 +24187,7 @@ mod ledger_tests {
 
     #[test]
     fn batch_reply_facts_matches_single_reads_with_large_quoted_missing_ids_and_retractions() {
-        let root = unique_root("batch-replies");
+        let (root, _guard) = unique_root("batch-replies");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         for id in ["request-one", "request-'日本語"] {
             store
@@ -24460,7 +24248,6 @@ mod ledger_tests {
             encode(expected)
         );
         assert!(store.batch_reply_facts(&[]).unwrap().is_empty());
-        fs::remove_dir_all(root).ok();
     }
 
     /// `recent_facts` returns the same rows through the indexed SQL path and
@@ -24469,7 +24256,7 @@ mod ledger_tests {
     /// timestamp and a retraction.
     #[test]
     fn recent_facts_indexed_matches_fallback_on_edge_cases() {
-        let root = unique_root("recent-facts");
+        let (root, _guard) = unique_root("recent-facts");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let now = chrono::Utc::now().timestamp();
         let at = |ago: i64| {
@@ -24656,7 +24443,6 @@ mod ledger_tests {
         for (q, want) in queries.iter().zip(&indexed) {
             assert_eq!(&ids(store.recent_facts(q).unwrap()), want, "query {q:?}");
         }
-        std::fs::remove_dir_all(root).ok();
     }
 
     /// `project_reply_state` (B3): states, precedence, provenance, and the
@@ -24865,7 +24651,7 @@ mod ledger_tests {
     /// does (`existing.seq >= fact.seq` keeps the earlier fact).
     #[test]
     fn latest_presence_sql_keeps_the_first_fact_on_a_seq_tie() {
-        let root = unique_root("presence-tie");
+        let (root, _guard) = unique_root("presence-tie");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         for id in ["first", "second"] {
             let mut f = make_fact(id, FactKind::Presence, "", "s");
@@ -24909,7 +24695,6 @@ mod ledger_tests {
         .collect();
         assert_eq!(rust, vec!["first".to_string()], "Rust rule agrees");
         drop(connection);
-        std::fs::remove_dir_all(root).ok();
     }
 
     /// P1: a running daemon from an older build of the same wire version
@@ -24920,16 +24705,8 @@ mod ledger_tests {
         use rally_protocol::store_wire::{StoreError, StoreErrorKind, StoreOk, StoreResponse};
         use std::io::{BufRead, BufReader, Write};
 
-        let nonce = unique_root("older-daemon")
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-        let socket = std::env::temp_dir().join(format!(
-            "rod-{}.sock",
-            &nonce[nonce.len().saturating_sub(12)..]
-        ));
-        let _ = std::fs::remove_file(&socket);
+        let socket_root = crate::test_temp_root::TempRoot::new("rod");
+        let socket = socket_root.join("rod.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let session = {
             let mut f = make_fact("s1", FactKind::Session, "", "s");
@@ -24997,7 +24774,7 @@ mod ledger_tests {
             }
         });
 
-        let repo = unique_root("older-daemon-repo");
+        let (repo, _guard_repo) = unique_root("older-daemon-repo");
         let room = RoomStore::Routed(crate::store_client::RoutedRoomStore::for_test(
             socket.clone(),
             repo,
@@ -25030,7 +24807,6 @@ mod ledger_tests {
         assert!(!is_unknown_store_op(&RallyError::Command(
             "malformed request: missing field `op`".to_string()
         )));
-        let _ = std::fs::remove_file(&socket);
     }
 
     /// The routed fallback triggers only on the daemon's typed oversize error.
@@ -25096,7 +24872,7 @@ mod ledger_tests {
     /// (presence not needed), and both backlog kind spellings.
     #[test]
     fn narrow_reads_match_reference_with_and_without_index() {
-        let root = unique_root("d0-narrow-reads");
+        let (root, _guard) = unique_root("d0-narrow-reads");
         let store = DirectRoomStore::open_direct_at(root.clone()).unwrap();
         let mut seq = 0;
         let mut put = |mut f: Fact| {
@@ -25177,7 +24953,6 @@ mod ledger_tests {
             reference_bl,
             "fallback"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     /// Wake expiry (A2): a pending wake leaves `pending_wakes` when the work it
@@ -25906,7 +25681,7 @@ mod ledger_tests {
     /// (offset 4096), and forcing a real b-tree traversal via `store.facts()`.
     #[test]
     fn malformed_facts_db_midpage_corruption_triggers_rebuild() {
-        let root = unique_root("midpage-corrupt");
+        let (root, _guard) = unique_root("midpage-corrupt");
         let store = RoomStore::open_at(root.clone()).unwrap();
 
         // Write ~500 facts to ensure the DB spans multiple pages.
@@ -25992,8 +25767,6 @@ mod ledger_tests {
         // Rebuilt DB is healthy — snapshot is queryable.
         let snap = store2.snapshot().unwrap();
         assert_eq!(snap.max_seq, 500);
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// Regression test: `hash_file_head` must return a FIXED golden value for
@@ -26006,14 +25779,7 @@ mod ledger_tests {
     #[test]
     fn hash_file_head_is_deterministic_golden_value() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join(format!(
-            "rally-golden-hash-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_temp_root::TempRoot::new("golden-hash");
         let path = dir.join("golden.bin");
         let mut f = fs::File::create(&path).unwrap();
         f.write_all(b"hello world").unwrap();
@@ -26029,8 +25795,6 @@ mod ledger_tests {
              A failing assert here means the implementation uses a per-process-seeded hasher \
              (e.g. DefaultHasher) which breaks cross-process sidecar fast-path."
         );
-
-        fs::remove_dir_all(&dir).ok();
     }
 }
 
@@ -26328,16 +26092,12 @@ mod decay_reclaim_tests {
 #[cfg(test)]
 mod sec001_takeover_guard_tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn root(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let r = std::env::temp_dir().join(format!("rally-sec001-{label}-{nanos}"));
-        fs::create_dir_all(&r).unwrap();
-        r
+    /// Returns the folder path and the guard that deletes it. Keep the guard
+    /// alive (bind it to `_guard`) for as long as the path is used.
+    fn root(label: &str) -> (PathBuf, crate::test_temp_root::TempRoot) {
+        let guard = crate::test_temp_root::TempRoot::new(&format!("sec001-{label}"));
+        (guard.path().to_path_buf(), guard)
     }
 
     fn iso_ago(secs: i64) -> String {
@@ -26387,7 +26147,7 @@ mod sec001_takeover_guard_tests {
 
     #[test]
     fn takeover_refused_when_owner_revived_under_lock() {
-        let r = root("revived");
+        let (r, _guard) = root("revived");
         let store = RoomStore::open_at(r.clone()).unwrap();
         // Stale owner "ghost" claimed a single file long ago (>30m => small,
         // reclaim-eligible at snapshot time).
@@ -26427,12 +26187,11 @@ mod sec001_takeover_guard_tests {
         // ghost still owns its claim.
         let snap = store.snapshot().unwrap();
         assert!(snap.active_claims.iter().any(|c| c.event_id == "claim-g"));
-        fs::remove_dir_all(&r).ok();
     }
 
     #[test]
     fn takeover_allowed_when_owner_still_stale() {
-        let r = root("still-stale");
+        let (r, _guard) = root("still-stale");
         let store = RoomStore::open_at(r.clone()).unwrap();
         // ghost claimed a single file 40m ago and has NOT revived -> eligible.
         let claim = fact_at(
@@ -26459,12 +26218,11 @@ mod sec001_takeover_guard_tests {
             !snap.active_claims.iter().any(|c| c.event_id == "claim-g"),
             "stale owner's claim is reclaimed when it is genuinely stale"
         );
-        fs::remove_dir_all(&r).ok();
     }
 
     #[test]
     fn modern_same_tool_caller_can_release_a_legacy_sessionless_claim() {
-        let r = root("self-release");
+        let (r, _guard) = root("self-release");
         let store = RoomStore::open_at(r.clone()).unwrap();
         let claim = fact_at(
             "claim-s",
@@ -26487,7 +26245,6 @@ mod sec001_takeover_guard_tests {
         store.append_fact(&release).unwrap();
         let snap = store.snapshot().unwrap();
         assert!(!snap.active_claims.iter().any(|c| c.event_id == "claim-s"));
-        fs::remove_dir_all(&r).ok();
     }
 
     fn leased_claim(r: &Path, lease: &str) -> (RoomStore, Fact) {
@@ -26526,7 +26283,7 @@ mod sec001_takeover_guard_tests {
     /// room-wide `doctor --reap-stale --apply`.
     #[test]
     fn later_same_tool_session_can_release_a_lease_expired_claim() {
-        let r = root("later-session-expired-release");
+        let (r, _guard) = root("later-session-expired-release");
         let (store, claim) = leased_claim(&r, &iso_ago(60));
         let release = close_by(
             FactKind::Release,
@@ -26538,14 +26295,13 @@ mod sec001_takeover_guard_tests {
             .append_fact(&release)
             .expect("a later same-tool session may release an expired lease");
         assert!(!still_active(&store, &claim));
-        fs::remove_dir_all(&r).ok();
     }
 
     /// ARP-R-02 still holds for an UNEXPIRED claim: a session wearing the same
     /// tool label cannot take it, by release or by any other closing kind.
     #[test]
     fn same_label_session_cannot_take_an_unexpired_claim() {
-        let r = root("same-label-unexpired");
+        let (r, _guard) = root("same-label-unexpired");
         let lease = (chrono::Utc::now() + chrono::Duration::minutes(30))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let (store, claim) = leased_claim(&r, &lease);
@@ -26565,14 +26321,13 @@ mod sec001_takeover_guard_tests {
             );
         }
         assert!(still_active(&store, &claim));
-        fs::remove_dir_all(&r).ok();
     }
 
     /// The successor arm is narrow: lease expiry does not let a DIFFERENT tool,
     /// a sessionless writer, or a non-release kind take the claim.
     #[test]
     fn expired_lease_alone_does_not_open_the_claim_to_others() {
-        let r = root("expired-not-open");
+        let (r, _guard) = root("expired-not-open");
         let (store, claim) = leased_claim(&r, &iso_ago(60));
         let rogue = store
             .append_fact(&close_by(
@@ -26603,12 +26358,11 @@ mod sec001_takeover_guard_tests {
             .to_string();
         assert!(receipt.contains("another shared-tool session"), "{receipt}");
         assert!(still_active(&store, &claim));
-        fs::remove_dir_all(&r).ok();
     }
 
     #[test]
     fn sessionless_caller_cannot_release_a_sessionful_claim() {
-        let r = root("sessionful-claim-sessionless-release");
+        let (r, _guard) = root("sessionful-claim-sessionless-release");
         let store = RoomStore::open_at(r.clone()).unwrap();
         let mut claim = fact_at(
             "claim-sessionful",
@@ -26642,7 +26396,6 @@ mod sec001_takeover_guard_tests {
                 .iter()
                 .any(|active| active.event_id == claim.event_id)
         );
-        fs::remove_dir_all(&r).ok();
     }
 
     /// Build a reaper-style ClaimExpired fact closing `claim_id` for `owner`
@@ -26687,7 +26440,7 @@ mod sec001_takeover_guard_tests {
             (Some("bad"), 20, false),
             (Some("0"), 20, false),
         ] {
-            let r = root("no-lease-policy-stamp");
+            let (r, _guard) = root("no-lease-policy-stamp");
             let store = RoomStore::open_at(r.clone()).unwrap();
             let claim = fact_at(
                 "claim-old",
@@ -26721,7 +26474,6 @@ mod sec001_takeover_guard_tests {
                     .any(|c| c.event_id == "claim-old"),
                 !accepts
             );
-            fs::remove_dir_all(r).unwrap();
         }
         unsafe {
             match previous {
@@ -26736,7 +26488,7 @@ mod sec001_takeover_guard_tests {
         let _guard = crate::PROCESS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let r = root("no-lease-live-race");
+        let (r, _guard) = root("no-lease-live-race");
         crate::test_git_fixture::fixture_git(&r, &["init"]);
         fs::write(r.join("observed.txt"), "observed\n").unwrap();
         crate::test_git_fixture::fixture_git(&r, &["add", "observed.txt"]);
@@ -26810,7 +26562,6 @@ mod sec001_takeover_guard_tests {
                 .iter()
                 .any(|c| c.event_id == "claim-old")
         );
-        fs::remove_dir_all(r).unwrap();
     }
 
     #[test]
@@ -26819,7 +26570,7 @@ mod sec001_takeover_guard_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         for release in [false, true] {
-            let r = root(if release {
+            let (r, _guard) = root(if release {
                 "no-lease-release-race"
             } else {
                 "no-lease-renew-race"
@@ -26873,7 +26624,6 @@ mod sec001_takeover_guard_tests {
                     .any(|fact| fact.event_id == "claim-old"),
                 !release
             );
-            fs::remove_dir_all(r).unwrap();
         }
     }
 
@@ -26883,7 +26633,7 @@ mod sec001_takeover_guard_tests {
         // the reaper's ClaimExpired path: an OWNER-STALE close computed on an
         // unlocked snapshot must be REFUSED if the owner revives before the
         // append acquires the mutation lock.
-        let r = root("reaper-revived");
+        let (r, _guard) = root("reaper-revived");
         let store = RoomStore::open_at(r.clone()).unwrap();
         // ghost claimed a single file 40m ago (small => 30m bar => stale).
         let claim = fact_at(
@@ -26917,14 +26667,13 @@ mod sec001_takeover_guard_tests {
             snap.active_claims.iter().any(|c| c.event_id == "claim-g"),
             "owner-stale ClaimExpired must NOT close a revived owner's claim"
         );
-        fs::remove_dir_all(&r).ok();
     }
 
     #[test]
     fn reaper_lease_expired_close_survives_owner_activity() {
         // A LEASE-EXPIRED close remains valid while the effective lease is still
         // expired, even when the owner is fully active (fresh presence).
-        let r = root("reaper-lease-survives");
+        let (r, _guard) = root("reaper-lease-survives");
         let store = RoomStore::open_at(r.clone()).unwrap();
         // live-owner claims a single file just now AND is fresh (active squad).
         let mut claim = fact_at(
@@ -26968,12 +26717,11 @@ mod sec001_takeover_guard_tests {
             !snap.active_claims.iter().any(|c| c.event_id == "claim-l"),
             "lease-expired ClaimExpired must close the claim despite owner activity"
         );
-        fs::remove_dir_all(&r).ok();
     }
 
     #[test]
     fn reaper_lease_expired_close_is_refused_after_concurrent_renewal() {
-        let r = root("reaper-renewal-race");
+        let (r, _guard) = root("reaper-renewal-race");
         let store = RoomStore::open_at(r.clone()).unwrap();
         let mut claim = fact_at(
             "claim-l",
@@ -27010,12 +26758,11 @@ mod sec001_takeover_guard_tests {
                 .iter()
                 .any(|fact| fact.event_id == "claim-l")
         );
-        fs::remove_dir_all(&r).ok();
     }
 
     #[test]
     fn reaper_owner_session_marker_must_match_the_active_claim() {
-        let r = root("reaper-owner-session-mismatch");
+        let (r, _guard) = root("reaper-owner-session-mismatch");
         let store = RoomStore::open_at(r.clone()).unwrap();
         let mut claim = fact_at(
             "claim-session-owner",
@@ -27051,12 +26798,11 @@ mod sec001_takeover_guard_tests {
                 .iter()
                 .any(|active| active.event_id == claim.event_id)
         );
-        fs::remove_dir_all(&r).ok();
     }
 
     #[test]
     fn observed_stale_close_is_refused_after_live_session_reappears() {
-        let r = root("reaper-observer-race");
+        let (r, _guard) = root("reaper-observer-race");
         crate::test_git_fixture::fixture_git(&r, &["init"]);
         fs::write(r.join("observed.txt"), "observed\n").unwrap();
         crate::test_git_fixture::fixture_git(&r, &["add", "observed.txt"]);
@@ -27119,7 +26865,6 @@ mod sec001_takeover_guard_tests {
                 .iter()
                 .any(|fact| fact.event_id == "claim-observed")
         );
-        fs::remove_dir_all(&r).ok();
     }
 }
 
@@ -28419,12 +28164,7 @@ mod lock_holder_stamp_tests {
     /// contender. Pid 1 is always alive; a pid this test just reaped is not.
     #[test]
     fn a_stamp_round_trips_and_liveness_is_read_from_the_pid() {
-        let dir = std::env::temp_dir().join(format!(
-            "stamp-{}-{}",
-            std::process::id(),
-            unix_millis_now()
-        ));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_temp_root::TempRoot::new("stamp");
         let file = open_named_lock_file(&dir, "probe.lock").unwrap();
         stamp_exclusive_holder(&file, "probe");
 
@@ -28448,8 +28188,6 @@ mod lock_holder_stamp_tests {
 
         fs::write(dir.join("probe.lock"), "this is not a stamp\n").unwrap();
         assert!(read_exclusive_holder(&dir, "probe.lock").is_none());
-
-        fs::remove_dir_all(&dir).ok();
     }
 }
 

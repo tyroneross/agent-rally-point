@@ -181,7 +181,6 @@ pub(crate) fn build_ripple_alerts(
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
 
     fn tmp_dir(label: &str) -> crate::test_temp_root::TempRoot {
         crate::test_temp_root::TempRoot::new(&format!("rally-rip-{label}"))

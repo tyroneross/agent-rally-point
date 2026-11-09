@@ -2784,7 +2784,7 @@ mod tests {
         ActorKind, AuthorityBasis, MessageContext, MessageIntent, RoomSeat, WorkResponsibility,
     };
     use schemars::schema_for;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::process::Command;
 
     #[test]
