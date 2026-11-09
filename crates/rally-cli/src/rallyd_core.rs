@@ -469,16 +469,19 @@ mod imp {
                 tool,
                 row_limit,
                 include_archived,
+                projection,
             } => {
                 let project = store
                     .prepare_snapshot_cache_capture(*include_archived)
                     .map_err(rally_to_wire)?;
                 let (tool, row_limit) = (tool.clone(), *row_limit);
+                let projection = projection.clone();
+                let root = store.repo_root().to_path_buf();
                 Box::new(move || {
                     let snapshot = project()
                         .map_err(rally_to_wire)?
                         .snapshot
-                        .for_obligation_target(&tool, row_limit)
+                        .for_obligation_page_at(&tool, row_limit, projection.as_ref(), Some(&root))
                         .map_err(rally_to_wire)?;
                     Ok(StoreOk::Snapshot {
                         snapshot: snapshot_to_wire(&snapshot)?,
@@ -1419,6 +1422,9 @@ mod imp {
                     .as_ref()
                     .map(to_wire_value)
                     .transpose()?,
+            },
+            StoreOp::ProjectedLead => StoreOk::ProjectedLead {
+                lead: store.projected_lead().map_err(rally_to_wire)?,
             },
             StoreOp::Facts
             | StoreOp::FactsPage { .. }
@@ -2741,13 +2747,22 @@ mod imp {
 
         #[test]
         fn routed_snapshots_survive_more_than_one_thousand_distinct_obligations() {
+            check_addressed_paging_dispatch(1_025);
+        }
+
+        #[test]
+        fn addressed_paging_dispatch_keeps_four_thousand_handoffs_readable() {
+            check_addressed_paging_dispatch(4_000);
+        }
+
+        fn check_addressed_paging_dispatch(count: i64) {
             let repo_root = unique_repo_root("obligation-flood-wire");
             let engagement = "engagement-flood";
             let log_dir = repo_root.join(".rally").join(crate::store::LOG_DIRNAME);
             std::fs::create_dir_all(&log_dir).unwrap();
             let mut segment =
                 std::fs::File::create(log_dir.join(format!("{engagement}.jsonl"))).unwrap();
-            for seq in 1..=1025i64 {
+            for seq in 1..=count {
                 let fact = crate::store::Fact {
                     schema: crate::FACT_SCHEMA.to_string(),
                     event_id: format!("obligation-{seq}"),
@@ -2756,6 +2771,7 @@ mod imp {
                     kind: crate::store::FactKind::Handoff,
                     tool: Some("claude_code:sender".to_string()),
                     subject: format!("obligation {seq}"),
+                    summary: Some("p".repeat(1_000)),
                     target: Some("codex:receiver".to_string()),
                     created_at: crate::now_string(),
                     ..crate::store::Fact::default()
@@ -2776,6 +2792,24 @@ mod imp {
             segment.sync_all().unwrap();
 
             let mut store = DirectRoomStore::open_direct_at(repo_root.clone()).unwrap();
+            let enter = dispatch_one(
+                &mut store,
+                canonical_repo_root(&repo_root).as_str(),
+                StoreRequest::new(
+                    Some(engagement.to_string()),
+                    StoreOp::SnapshotForEnter {
+                        tool: "codex:receiver".into(),
+                        build_id: "test".into(),
+                        from_session_id: "sess:receiver".into(),
+                        presence_evidence: vec![],
+                        session_alias: None,
+                    },
+                ),
+            );
+            assert!(
+                matches!(enter, StoreResponse::Ok(StoreOk::SnapshotForEnter { .. })),
+                "enter dispatch failed: {enter:?}"
+            );
             let normal = dispatch_one(
                 &mut store,
                 canonical_repo_root(&repo_root).as_str(),
@@ -2797,6 +2831,7 @@ mod imp {
                 StoreRequest::new(
                     Some(engagement.to_string()),
                     StoreOp::SnapshotForObligationTarget {
+                        projection: Some(Default::default()),
                         tool: "codex:receiver".to_string(),
                         row_limit: 32,
                         include_archived: false,
@@ -2806,9 +2841,40 @@ mod imp {
             match targeted {
                 StoreResponse::Ok(StoreOk::Snapshot { snapshot, .. }) => {
                     let restored = crate::store::snapshot_from_wire_value(snapshot).unwrap();
-                    assert_eq!(restored.open_obligations_total, 1025);
+                    assert_eq!(restored.open_obligations_total, count as usize);
                     assert_eq!(restored.open_obligations.len(), 32);
-                    assert_eq!(restored.open_obligations_omitted, 993);
+                    assert_eq!(restored.open_obligations_omitted, count as usize - 32);
+                    let cursor = restored
+                        .caller_projection
+                        .as_ref()
+                        .unwrap()
+                        .addressed_page
+                        .next_before
+                        .unwrap();
+                    let older = dispatch_one(
+                        &mut store,
+                        canonical_repo_root(&repo_root).as_str(),
+                        StoreRequest::new(
+                            Some(engagement.to_string()),
+                            StoreOp::SnapshotForObligationTarget {
+                                tool: "codex:receiver".into(),
+                                row_limit: 32,
+                                include_archived: false,
+                                projection: Some(
+                                    rally_protocol::store_wire::CallerProjectionRequest {
+                                        before: Some(cursor),
+                                        ..Default::default()
+                                    },
+                                ),
+                            },
+                        ),
+                    );
+                    let StoreResponse::Ok(StoreOk::Snapshot { snapshot, .. }) = older else {
+                        panic!("page dispatch failed: {older:?}");
+                    };
+                    let older = crate::store::snapshot_from_wire_value(snapshot).unwrap();
+                    assert_eq!(older.open_obligations_total, count as usize);
+                    assert!(older.open_obligations.iter().all(|f| f.seq < cursor));
                 }
                 other => {
                     panic!("targeted routed snapshot failed under obligation flood: {other:?}")
@@ -3214,6 +3280,7 @@ mod imp {
                 (
                     "snapshot_for_obligation_target",
                     StoreOp::SnapshotForObligationTarget {
+                        projection: None,
                         tool: me.to_string(),
                         row_limit: 128,
                         include_archived: false,
@@ -3476,6 +3543,7 @@ mod imp {
                 (
                     "snapshot_for_obligation_target",
                     StoreOp::SnapshotForObligationTarget {
+                        projection: None,
                         tool: me.to_string(),
                         row_limit: 1_024,
                         include_archived: false,
@@ -4626,9 +4694,18 @@ mod imp {
                 other => panic!("unexpected scoped snapshot reply: {other:?}"),
             };
 
+            let collision_context = |snapshot: &crate::store::RoomSnapshot| {
+                let mut wire = crate::store::snapshot_to_wire_value(snapshot).unwrap();
+                // The reads can straddle a wall-clock second. Compare the
+                // durable last-seen timestamp and freshness, not elapsed age.
+                for squad in wire["squads"].as_array_mut().unwrap() {
+                    squad.as_object_mut().unwrap().remove("age_secs");
+                }
+                wire
+            };
             assert_eq!(
-                crate::store::snapshot_to_wire_value(&direct).unwrap(),
-                crate::store::snapshot_to_wire_value(&routed).unwrap(),
+                collision_context(&direct),
+                collision_context(&routed),
                 "direct and routed collision context must match"
             );
             for (mode, snapshot) in [("direct", &direct), ("routed", &routed)] {

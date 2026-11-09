@@ -154,6 +154,20 @@ pub struct RecentQuery {
     pub archive_floor: f64,
 }
 
+/// Optional caller projection controls; old peers ignore this additive field.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct CallerProjectionRequest {
+    /// Exclusive sequence cursor for the addressed page (newest first).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<i64>,
+    /// Enter's read cursor, for an exact attention count before trimming.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_since: Option<i64>,
+    /// Enter's relevance filter for peer claims.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+}
+
 /// The closed set of ROUTED store operations — exactly one variant per
 /// `RoomStore` `pub(crate)` method classified `routed` (touches `facts.db`).
 /// LOCAL methods (pure accessors + `cursors.json` file ops) are intentionally
@@ -252,6 +266,8 @@ pub enum StoreOp {
     /// scan full history internally, but the reply is bounded to zero or one
     /// fact so task finalization remains available in large routed rooms.
     ActiveSessionFact { session_id: String },
+    /// Current lead for implicit presence. Additive v9 operation.
+    ProjectedLead,
     /// `RoomStore::snapshot()` (== `snapshot_with_archived(false)`) and
     /// `RoomStore::snapshot_with_archived(include_archived)` → `RoomSnapshot`.
     SnapshotWithArchived { include_archived: bool },
@@ -271,6 +287,8 @@ pub enum StoreOp {
         tool: String,
         row_limit: usize,
         include_archived: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        projection: Option<CallerProjectionRequest>,
     },
     /// Engagement-selected snapshot. `StoreRequest::engagement` is required;
     /// run/path narrowing happens before projection, while a path separately
@@ -324,6 +342,7 @@ impl StoreOp {
             | Self::RepoWideClaimLifecycleFacts
             | Self::SessionFactsWithContextVersion
             | Self::ActiveSessionFact { .. }
+            | Self::ProjectedLead
             | Self::SnapshotWithArchived { .. }
             | Self::SnapshotForEnter { .. }
             | Self::SnapshotForObligationTarget { .. }
@@ -382,6 +401,8 @@ pub enum StoreOk {
     },
     /// Zero or one exact active managed-session fact.
     ActiveSessionFact { fact: Option<Value> },
+    /// Exact projected lead, without room rows.
+    ProjectedLead { lead: Option<String> },
     /// `RoomSnapshot` plus an optional server-captured snapshot-cache
     /// fingerprint. `None` is compatible but never cacheable by a v5 client.
     Snapshot {
@@ -521,6 +542,39 @@ impl StoreErrorKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caller_paging_request_is_additive_in_both_directions() {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum OldOp {
+            SnapshotForObligationTarget {
+                tool: String,
+                row_limit: usize,
+                include_archived: bool,
+            },
+        }
+        let old = serde_json::json!({"kind":"snapshot_for_obligation_target", "tool":"worker", "row_limit":20, "include_archived":false});
+        let new: StoreOp = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(
+            new,
+            StoreOp::SnapshotForObligationTarget {
+                projection: None,
+                ..
+            }
+        ));
+        let mut current = old;
+        current["projection"] =
+            serde_json::json!({"before":42,"attention_since":5,"paths":["src"]});
+        let OldOp::SnapshotForObligationTarget {
+            tool,
+            row_limit,
+            include_archived,
+        } = serde_json::from_value(current).unwrap();
+        assert_eq!(tool, "worker");
+        assert_eq!(row_limit, 20);
+        assert!(!include_archived);
+    }
 
     #[test]
     fn request_round_trips_through_a_single_line() {

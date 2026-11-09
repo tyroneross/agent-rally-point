@@ -67,6 +67,8 @@ pub(crate) struct InboxItem {
 /// understate how much is owed.
 #[derive(Clone, Debug, Default, JsonSchema, Serialize)]
 pub(crate) struct InboxResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) addressed_page: Option<crate::store::AddressedPage>,
     pub(crate) count: usize,
     pub(crate) handoffs: usize,
     pub(crate) artifacts: usize,
@@ -98,6 +100,9 @@ pub(crate) struct OpenQueueSummary {
     pub(crate) count: usize,
     /// How many carry at least one "revalidate before claiming" reason.
     pub(crate) revalidate: usize,
+    /// Exact before row trimming; absent when an older daemon lacks the count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) revalidate_total: Option<usize>,
     pub(crate) items: Vec<crate::open_queue::OpenQueueItem>,
 }
 
@@ -163,7 +168,8 @@ pub(crate) fn named_work<'a>(
                         .contains(&fact.event_id)
             })
             .map(|fact| {
-                let state = if snapshot.open_obligations_target.as_deref() == Some(tool)
+                let state = if snapshot.caller_projection.is_none()
+                    && snapshot.open_obligations_target.as_deref() == Some(tool)
                     && snapshot.open_obligations_omitted > 0
                 {
                     NamedState::Incomplete
@@ -173,6 +179,19 @@ pub(crate) fn named_work<'a>(
                 (fact, state)
             }),
     );
+    if let Some(c) = &snapshot.caller_projection
+        && let Some(sample) = &c.named_sample
+        && !work.iter().any(|(f, _)| f.event_id == sample.event_id)
+    {
+        work.push((
+            sample,
+            if c.unanswered.contains(&sample.event_id) {
+                NamedState::Unanswered
+            } else {
+                NamedState::AcceptedOpen
+            },
+        ));
+    }
     work.sort_by_key(|(fact, _)| fact.seq);
     work
 }
@@ -218,11 +237,16 @@ pub(crate) fn build_inbox(
             .filter(|fact| fact.kind == FactKind::Artifact)
             .count()
     };
-    let oldest_age_secs = mine
+    let visible_oldest_age_secs = mine
         .iter()
         .map(|fact| fact_age_secs(fact))
         .max()
         .unwrap_or(0);
+
+    let oldest_age_secs = snapshot
+        .caller_projection
+        .as_ref()
+        .map_or(visible_oldest_age_secs, |c| c.oldest_obligation_age_secs);
 
     let items = mine
         .iter()
@@ -257,6 +281,10 @@ pub(crate) fn build_inbox(
         // Exact even when a caller-scoped reply bounded the open queue rows.
         count: open_queue.len()
             + snapshot.caller_projection_omitted(crate::store::CALLER_OPEN_QUEUE_BUCKET),
+        revalidate_total: snapshot
+            .caller_projection
+            .as_ref()
+            .and_then(|c| c.open_queue_revalidate_total),
         revalidate: open_queue
             .iter()
             .filter(|item| item.revalidate_before_claiming)
@@ -284,6 +312,10 @@ pub(crate) fn build_inbox(
     });
 
     InboxResult {
+        addressed_page: snapshot
+            .caller_projection
+            .as_ref()
+            .map(|c| c.addressed_page.clone()),
         accepted_open,
         accepted_open_incomplete,
         count,
@@ -332,6 +364,8 @@ fn obligation_ack_command(tool: &str, fact: &Fact) -> String {
 /// number matches it. The ledger keeps the untruncated text and
 /// `rally locate <id>` fetches it.
 const RENDER_CAP: usize = 600;
+/// Subject sample for an oversized addressed row; the ledger keeps the full text.
+pub(crate) const PAGE_SUBJECT_CHARS: usize = RENDER_CAP;
 
 /// Appended when [`single_line`] clips. ASCII, matching `retrospective`'s
 /// `TRUNCATED` and the coordination hook's `clip()`, so an agent learns one
@@ -502,7 +536,7 @@ mod tests {
                 .clone()
                 .for_obligation_target("receiver", limit)
                 .unwrap();
-            let mut wire = crate::store::snapshot_to_wire_value(&scoped).unwrap();
+            let wire = crate::store::snapshot_to_wire_value(&scoped).unwrap();
             let restored = crate::store::snapshot_from_wire_value(wire.clone()).unwrap();
             let inbox = super::build_inbox(&restored, "receiver", limit, 300, vec![]);
             assert_eq!(inbox.count, 1);
@@ -510,32 +544,28 @@ mod tests {
             assert!(!inbox.accepted_open_incomplete);
             let named = super::named_work(&restored, "receiver");
             assert_eq!(named.len(), 2);
-            if limit == 0 {
-                assert!(
-                    named
-                        .iter()
-                        .all(|(_, state)| *state == super::NamedState::Incomplete)
-                );
-            } else {
-                assert_eq!(
-                    named
-                        .iter()
-                        .filter(|(_, state)| *state == super::NamedState::Unanswered)
-                        .count(),
-                    1
-                );
-                assert_eq!(
-                    named
-                        .iter()
-                        .filter(|(_, state)| *state == super::NamedState::AcceptedOpen)
-                        .count(),
-                    1
-                );
-            }
-            wire[crate::store::WIRE_INTERNALS_KEY]
-                .as_object_mut()
-                .unwrap()
-                .remove("open_obligations_accepted_open");
+            assert_eq!(
+                named
+                    .iter()
+                    .filter(|(_, s)| *s == super::NamedState::Unanswered)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                named
+                    .iter()
+                    .filter(|(_, s)| *s == super::NamedState::AcceptedOpen)
+                    .count(),
+                1
+            );
+            // Model the old projection, which kept all named handoffs but capped obligations.
+            let mut legacy_snapshot = full.clone();
+            legacy_snapshot.open_obligations.truncate(limit);
+            legacy_snapshot.open_obligations_target = Some("receiver".into());
+            legacy_snapshot.open_obligations_total = 1;
+            legacy_snapshot.open_obligations_handoffs = 1;
+            legacy_snapshot.open_obligations_omitted = 1 - limit;
+            let wire = crate::store::snapshot_to_wire_value(&legacy_snapshot).unwrap();
             let legacy = crate::store::snapshot_from_wire_value(wire).unwrap();
             let inbox = super::build_inbox(&legacy, "receiver", limit, 300, vec![]);
             assert_eq!(inbox.accepted_open_incomplete, limit == 0);

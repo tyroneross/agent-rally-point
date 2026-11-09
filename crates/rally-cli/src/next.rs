@@ -1240,9 +1240,14 @@ pub(crate) fn bound_enter_attention(
     } else {
         0
     };
-    let total = non_obligation_items
+    let fallback_total = non_obligation_items
         .saturating_add(exact_obligations)
         .saturating_add(projection_omitted);
+    let total = snapshot
+        .caller_projection
+        .as_ref()
+        .and_then(|c| c.attention_total)
+        .unwrap_or(fallback_total);
     items.truncate(MAX_ENTER_ROWS);
     let emitted = items.len();
     let omitted = total.saturating_sub(emitted);
@@ -1273,13 +1278,41 @@ mod tests {
         };
         let snapshot = RoomSnapshot {
             open_handoffs: vec![a.clone(), b.clone()],
-            open_obligations: vec![a, b],
+            open_obligations: vec![a.clone(), b.clone()],
             ..Default::default()
         }
         .for_obligation_target("receiver", 1)
         .unwrap();
         let candidates = next_candidates(
             &snapshot,
+            "receiver",
+            None,
+            &[],
+            false,
+            &[],
+            &[],
+            300,
+            StaleTargetedPolicy::Surface,
+            &[],
+        );
+        assert_eq!(
+            candidates.len(),
+            1,
+            "new peers rank only their visible page"
+        );
+        assert_eq!(candidates[0].reason, "open_handoff_targeted_to_this_tool");
+        assert_eq!(snapshot.open_obligations_total, 2);
+        // An old daemon can carry both handoffs but only one unanswered row.
+        let legacy = RoomSnapshot {
+            open_handoffs: vec![a.clone(), b],
+            open_obligations: vec![a],
+            open_obligations_target: Some("receiver".into()),
+            open_obligations_total: 2,
+            open_obligations_omitted: 1,
+            ..Default::default()
+        };
+        let candidates = next_candidates(
+            &legacy,
             "receiver",
             None,
             &[],

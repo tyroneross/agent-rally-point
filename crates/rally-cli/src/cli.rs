@@ -306,6 +306,7 @@ pub(crate) struct NextArgs {
 /// process, not N.
 #[derive(Clone, Debug)]
 pub(crate) struct InboxArgs {
+    pub(crate) before: Option<i64>,
     pub(crate) json: bool,
     /// At least one; order as given (duplicates are collapsed by the command).
     pub(crate) tools: Vec<String>,
@@ -1830,8 +1831,23 @@ fn inbox_parser() -> impl Parser<InboxArgs> {
         .help("tool id whose inbox to read; repeat to read several in one call")
         .argument::<String>("TOOL")
         .some("--tool is required");
-    let limit = bounded_i64_arg("limit", "N", 20, 1, 200);
-    construct!(InboxArgs { json, tools, limit })
+    let limit = bounded_i64_arg(
+        "limit",
+        "N",
+        20,
+        1,
+        crate::store::MAX_CALLER_PAGE_ROWS as i64,
+    );
+    let before = long("before")
+        .help("read addressed rows with sequence below this page cursor")
+        .argument::<i64>("SEQ")
+        .optional();
+    construct!(InboxArgs {
+        json,
+        tools,
+        limit,
+        before
+    })
 }
 
 fn retract_parser() -> impl Parser<RetractArgs> {

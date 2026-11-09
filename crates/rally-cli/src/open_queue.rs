@@ -80,7 +80,8 @@ pub(crate) struct OpenQueueSignals {
     /// whenever it has at least one picked-up item.
     #[serde(default)]
     pub(crate) room_pickup_p95_secs: Option<i64>,
-    /// Open-queue item id → later facts that report it done.
+    /// Open-queue item id → later facts that report it done. An empty list
+    /// preserves the revalidation signal when the detail budget was exhausted.
     #[serde(default)]
     pub(crate) later_done: BTreeMap<String, Vec<String>>,
     /// Open NAMED handoffs whose addressee answered with `handoff.rejected`.
@@ -161,11 +162,18 @@ pub(crate) fn open_queue_items(
         .map(|fact| {
             let age_secs = age_secs(fact, now_secs);
             let mut reasons = fs.by_event.get(&fact.event_id).cloned().unwrap_or_default();
-            if let Some(done) = snapshot.open_queue_signals.later_done.get(&fact.event_id) {
+            let done = snapshot.open_queue_signals.later_done.get(&fact.event_id);
+            if let Some(done) = done.filter(|done| !done.is_empty()) {
                 reasons.extend(done.iter().map(|id| RevalidateReason {
                     code: "later_fact_reports_done",
                     detail: id.clone(),
                 }));
+            } else if done.is_some() || snapshot.open_queue_full_later_done.contains(&fact.event_id)
+            {
+                reasons.push(RevalidateReason {
+                    code: "later_fact_reports_done",
+                    detail: "A later fact reports this work done".into(),
+                });
             }
             if let Some(p95) = p95
                 && age_secs.is_some_and(|age| age > p95)
@@ -202,6 +210,33 @@ pub(crate) fn open_queue_items(
     items.into_iter().map(|(_, item)| item).collect()
 }
 
+/// Exact full-set union of ledger, age and the existing bounded filesystem probe.
+pub(crate) fn revalidate_total(
+    snapshot: &RoomSnapshot,
+    tool: &str,
+    fs: &FsSignals,
+    now_secs: i64,
+) -> usize {
+    let p95 = snapshot.open_queue_signals.effective_p95().secs;
+    snapshot
+        .open_handoffs
+        .iter()
+        .filter(|f| is_open_queue_item_for(f, tool))
+        .filter(|f| {
+            snapshot.open_queue_full_later_done.contains(&f.event_id)
+                || snapshot
+                    .open_queue_signals
+                    .later_done
+                    .contains_key(&f.event_id)
+                || fs
+                    .by_event
+                    .get(&f.event_id)
+                    .is_some_and(|reasons| !reasons.is_empty())
+                || p95.is_some_and(|p95| age_secs(f, now_secs).is_some_and(|age| age > p95))
+        })
+        .count()
+}
+
 fn age_secs(fact: &Fact, now_secs: i64) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(&fact.created_at)
         .ok()
@@ -222,7 +257,16 @@ fn epoch(raw: &str) -> Option<i64> {
 ///
 /// Linear: one pass to index closers and done-ish facts, then a lookup per
 /// handoff. Skips the done-ish index entirely when no open-queue item is open.
+#[cfg(test)]
 pub(crate) fn project_signals(facts: &[Fact], open_handoffs: &[Fact]) -> OpenQueueSignals {
+    project_signals_with_full(facts, open_handoffs).0
+}
+
+/// Keep the bounded wire map and full local ids separately, so aggregate counts stay exact.
+pub(crate) fn project_signals_with_full(
+    facts: &[Fact],
+    open_handoffs: &[Fact],
+) -> (OpenQueueSignals, BTreeSet<String>) {
     let (sample, p95) = room_pickup_p95(facts);
     let open_items = open_handoffs
         .iter()
@@ -231,17 +275,20 @@ pub(crate) fn project_signals(facts: &[Fact], open_handoffs: &[Fact]) -> OpenQue
                 && handoff_address(fact, "\0") == HandoffAddress::OpenQueue
         })
         .collect::<Vec<_>>();
-    let later_done = if open_items.is_empty() {
-        BTreeMap::new()
+    let (later_done, full_later_done) = if open_items.is_empty() {
+        (BTreeMap::new(), BTreeSet::new())
     } else {
         later_done_index(facts, &open_items)
     };
-    OpenQueueSignals {
-        pickup_sample: sample,
-        room_pickup_p95_secs: p95,
-        later_done,
-        rejected_named: rejected_named(facts, open_handoffs),
-    }
+    (
+        OpenQueueSignals {
+            pickup_sample: sample,
+            room_pickup_p95_secs: p95,
+            later_done,
+            rejected_named: rejected_named(facts, open_handoffs),
+        },
+        full_later_done,
+    )
 }
 
 /// Open named handoffs whose addressee's LATEST typed response is a rejection.
@@ -579,7 +626,10 @@ fn linkable_scope(scope: &str) -> bool {
     scope != "external-intake" && !scope.is_empty() && scope != "backlog-item"
 }
 
-fn later_done_index(facts: &[Fact], open_items: &[&Fact]) -> BTreeMap<String, Vec<String>> {
+fn later_done_index(
+    facts: &[Fact],
+    open_items: &[&Fact],
+) -> (BTreeMap<String, Vec<String>>, BTreeSet<String>) {
     let wanted_threads = open_items
         .iter()
         .map(|fact| fact.thread_id.as_str())
@@ -638,43 +688,60 @@ fn later_done_index(facts: &[Fact], open_items: &[&Fact]) -> BTreeMap<String, Ve
         }
     }
 
+    for hits in by_thread
+        .values_mut()
+        .chain(by_scope.values_mut())
+        .chain(by_ref.values_mut())
+    {
+        hits.sort_unstable_by(|left, right| {
+            (left.seq, &left.event_id).cmp(&(right.seq, &right.event_id))
+        });
+        hits.dedup_by(|left, right| left.seq == right.seq && left.event_id == right.event_id);
+    }
+
     let mut out = BTreeMap::new();
+    let mut full = BTreeSet::new();
     for item in open_items.iter().rev() {
-        if out.len() >= MAX_LATER_DONE_ITEMS {
-            break;
-        }
-        let mut hits = Vec::<&Fact>::new();
-        if !shared_thread(&item.thread_id)
-            && let Some(list) = by_thread.get(item.thread_id.as_str())
-        {
-            hits.extend(list.iter().copied());
-        }
-        for scope in item.scope.iter().filter(|s| linkable_scope(s)) {
-            if let Some(list) = by_scope.get(scope.as_str()) {
-                hits.extend(list.iter().copied());
-            }
-        }
-        if let Some(list) = by_ref.get(item.event_id.as_str()) {
-            hits.extend(list.iter().copied());
-        }
-        let mut ids = hits
+        let later_lists = (!shared_thread(&item.thread_id))
+            .then(|| by_thread.get(item.thread_id.as_str()))
+            .flatten()
             .into_iter()
-            .filter(|fact| fact.seq > item.seq && fact.event_id != item.event_id)
-            .map(|fact| (fact.seq, fact.event_id.clone()))
-            .collect::<Vec<_>>();
-        ids.sort();
-        ids.dedup();
+            .chain(
+                item.scope
+                    .iter()
+                    .filter_map(|scope| by_scope.get(scope.as_str())),
+            )
+            .chain(by_ref.get(item.event_id.as_str()))
+            .map(|hits| {
+                let first_later = hits.partition_point(|fact| fact.seq <= item.seq);
+                hits[first_later..]
+                    .iter()
+                    .filter(|fact| fact.event_id != item.event_id)
+            });
+        if out.len() == MAX_LATER_DONE_ITEMS {
+            if later_lists.flatten().next().is_some() {
+                full.insert(item.event_id.clone());
+            }
+            continue;
+        }
+
+        // No list can contribute a detail beyond its first MAX_DONE_REFS unique hits.
+        let ids = later_lists
+            .flat_map(|hits| hits.take(MAX_DONE_REFS))
+            .map(|fact| (fact.seq, fact.event_id.as_str()))
+            .collect::<BTreeSet<_>>();
         if !ids.is_empty() {
+            full.insert(item.event_id.clone());
             out.insert(
                 item.event_id.clone(),
                 ids.into_iter()
                     .take(MAX_DONE_REFS)
-                    .map(|(_, id)| id)
+                    .map(|(_, id)| id.to_owned())
                     .collect(),
             );
         }
     }
-    out
+    (out, full)
 }
 
 // ---------------------------------------------------------------------------

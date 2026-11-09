@@ -1238,6 +1238,14 @@ fn every_skipped_snapshot_field_rides_the_wire_side_channel() {
     );
 
     for field in &skipped {
+        // This local index is consumed before paging; the exact scalar is on the wire.
+        // store::paging_regression_revalidate_total_precedes_the_later_done_map_bound
+        // proves its 1,400-item total survives a bounded wire round trip without the index.
+        if field == "open_queue_full_later_done" {
+            assert!(snapshot_body.contains("clients read the exact scalar instead"));
+            assert!(src.contains("pub(crate) open_queue_revalidate_total: Option<usize>"));
+            continue;
+        }
         assert!(
             internals_body.contains(&format!("pub(crate) {field}:")),
             "RoomSnapshot.{field} is #[serde(skip)] but is not carried by \
