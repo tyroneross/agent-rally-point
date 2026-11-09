@@ -23,10 +23,10 @@ mod support;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use support::channel_sandbox::ChannelSandbox;
@@ -67,6 +67,15 @@ fn short_socket(tag: &str) -> PathBuf {
 }
 
 fn spawn_daemon(socket: &Path, panes: Vec<Pane>, reply: EnqueueReply) -> RequestLog {
+    spawn_pane_server(socket, panes, reply, None)
+}
+
+fn spawn_pane_server(
+    socket: &Path,
+    panes: Vec<Pane>,
+    reply: EnqueueReply,
+    mut rendezvous: Option<Arc<Barrier>>,
+) -> RequestLog {
     let _ = std::fs::remove_file(socket);
     if let Some(parent) = socket.parent() {
         std::fs::create_dir_all(parent).unwrap();
@@ -89,6 +98,9 @@ fn spawn_daemon(socket: &Path, panes: Vec<Pane>, reply: EnqueueReply) -> Request
             let id = req["id"].clone();
             let body = match req["method"].as_str() {
                 Some("pane.list") => {
+                    if let Some(rendezvous) = rendezvous.take() {
+                        rendezvous.wait();
+                    }
                     let rows: Vec<Value> = panes
                         .iter()
                         .map(|p| {
@@ -678,7 +690,7 @@ fn targeted_handoff_from_another_room_lands_in_the_recipient_room() {
     let target = "easy-terminal:xroom";
     // Room B: a second repository with an existing room, where the sender
     // holds the lead (as the team lead did in the home room).
-    let room_b = sandbox.root().join("room-b");
+    let room_b = sandbox.cwd().join("nested-room-b");
     std::fs::create_dir_all(room_b.join(".git")).unwrap();
     let log = spawn_daemon(
         &socket,
@@ -885,8 +897,8 @@ fn routed_handoff_records_scope_root_and_no_base_markers() {
 fn routes_report_the_pane_verdict_handoff_delivery_uses() {
     let sandbox = ChannelSandbox::spawn();
     let socket = short_socket("routes");
-    let foreign = std::env::temp_dir().join(unique("hipw-routes-foreign"));
-    std::fs::create_dir_all(&foreign).unwrap();
+    let foreign = sandbox.root().join("empty-room");
+    std::fs::create_dir_all(foreign.join(".rally")).unwrap();
     // A second repository WITH a room: handoffs to its pane are routed there.
     let other_repo = std::env::temp_dir().join(unique("hipw-routes-room"));
     std::fs::create_dir_all(other_repo.join(".git")).unwrap();
@@ -943,7 +955,20 @@ fn routes_report_the_pane_verdict_handoff_delivery_uses() {
             ],
         );
     }
-    let routes = rally(&sandbox, &socket, &["routes", "--json"]);
+    // A route preview must still report the recipient when another process
+    // owns that room. The lock stays held until after the preview returns.
+    let recipient_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(other_repo.join(".rally/direct.owner.lock"))
+        .unwrap();
+    recipient_lock.try_lock().expect("hold recipient room lock");
+    let routes = rally(
+        &sandbox,
+        &socket,
+        &["--timeout-ms", "5000", "routes", "--json"],
+    );
+    drop(recipient_lock);
     let items = routes["data"]["routes"]["items"]
         .as_array()
         .expect("routes items");
@@ -979,4 +1004,113 @@ fn routes_report_the_pane_verdict_handoff_delivery_uses() {
     let _ = std::fs::remove_file(&socket);
     let _ = std::fs::remove_dir_all(&foreign);
     let _ = std::fs::remove_dir_all(&other_repo);
+}
+
+struct RoomDaemon(Child);
+
+impl RoomDaemon {
+    fn start(sandbox: &ChannelSandbox, cwd: &Path, socket: &Path) -> Self {
+        let mut command = base_command(sandbox, &Sockets::Pinned(socket));
+        let daemon = Self(
+            command
+                .current_dir(cwd)
+                .args(["daemon", "serve", "--idle-exit-secs", "180"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start Rally daemon"),
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            let status = rally_in(sandbox, cwd, socket, &["daemon", "status", "--json"]);
+            if status["data"]["daemon"]["live"] == true {
+                return daemon;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("Rally daemon not live in {}", cwd.display());
+    }
+}
+
+impl Drop for RoomDaemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn concurrent_routes_resolve_nested_rooms_in_direct_and_daemon_modes() {
+    let sandbox = ChannelSandbox::spawn();
+    let outer = sandbox.cwd().canonicalize().unwrap();
+    let inner = outer.join("nested");
+    std::fs::create_dir_all(inner.join(".git")).unwrap();
+    for routed in [false, true] {
+        let outer_socket = short_socket("route-a");
+        let inner_socket = short_socket("route-b");
+        let rooms = [
+            (&outer, &outer_socket, "easy-terminal:inner", &inner),
+            (&inner, &inner_socket, "easy-terminal:outer", &outer),
+        ];
+        for (cwd, socket, actor, _) in rooms {
+            rally_in(
+                &sandbox,
+                cwd,
+                socket,
+                &[
+                    "status", "post", "--json", "--tool", actor, "--state", "idle",
+                ],
+            );
+            let status = rally_in(&sandbox, cwd, socket, &["daemon", "status", "--json"]);
+            assert_eq!(status["data"]["daemon"]["live"], false, "{status}");
+        }
+        let _daemons = routed
+            .then(|| rooms.map(|(cwd, socket, _, _)| RoomDaemon::start(&sandbox, cwd, socket)));
+
+        // Both previews reach pane.list only after opening their own room.
+        // In direct mode an opposing foreign-room open would now contend.
+        let rendezvous = Arc::new(Barrier::new(2));
+        for (_, socket, actor, destination) in rooms {
+            spawn_pane_server(
+                socket,
+                vec![Pane {
+                    id: "remote-pane",
+                    identity: actor.to_string(),
+                    cwd: Some(destination.clone()),
+                }],
+                EnqueueReply::Queued,
+                Some(Arc::clone(&rendezvous)),
+            );
+        }
+        thread::scope(|scope| {
+            let lookups = rooms.map(|(cwd, socket, actor, destination)| {
+                let sandbox = &sandbox;
+                scope.spawn(move || {
+                    let response = rally_in(sandbox, cwd, socket, &["routes", "--json"]);
+                    let route = response["data"]["routes"]["items"]
+                        .as_array()
+                        .unwrap_or_else(|| panic!("daemon={routed}: {response}"))
+                        .iter()
+                        .find(|route| route["actor"] == actor)
+                        .unwrap_or_else(|| panic!("daemon={routed}, actor={actor}: {response}"));
+                    assert_eq!(
+                        route["state"], "pane_inbox_recipient_room",
+                        "daemon={routed}: {route}"
+                    );
+                    assert!(
+                        route["reason"]
+                            .as_str()
+                            .unwrap()
+                            .contains(&format!("can route to {} if", destination.display())),
+                        "daemon={routed}: {route}"
+                    );
+                })
+            });
+            for lookup in lookups {
+                lookup.join().unwrap();
+            }
+        });
+        let _ = std::fs::remove_file(outer_socket);
+        let _ = std::fs::remove_file(inner_socket);
+    }
 }

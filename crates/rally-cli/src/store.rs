@@ -5234,16 +5234,7 @@ impl DirectRoomStore {
         let log_dir = dir.join(LOG_DIRNAME);
         let archive_dir = dir.join(ARCHIVE_DIRNAME);
         let legacy_ledger_path = dir.join(LEDGER_FILENAME);
-        // Existence is determined by ANY canonical input: derived db, live
-        // segments, archived segments, or the legacy R1 monolith. A clone
-        // carrying only segments OR only the monolith is still a real room.
-        let has_segments = read_segment_files(&log_dir).is_ok_and(|v| !v.is_empty());
-        let has_archive = read_segment_files(&archive_dir).is_ok_and(|v| !v.is_empty());
-        if !fact_store_path.exists()
-            && !legacy_ledger_path.exists()
-            && !has_segments
-            && !has_archive
-        {
+        if !room_has_storage(&dir) {
             return Ok(None);
         }
         let _guard = acquire_room_mutation_lock(&dir)?;
@@ -12920,6 +12911,16 @@ fn refresh_reconcile_cache_after_full_scan(
         db_max_seq: canonical_stats.max_seq,
     };
     let _ = write_reconcile_cache(facts_db_path, &cache);
+}
+
+/// Check for room storage using filesystem metadata only. A clone carrying
+/// just archived segments or the legacy monolith still has a room.
+pub(crate) fn room_has_storage(rally_dir: &Path) -> bool {
+    rally_dir.join("facts.db").exists()
+        || rally_dir.join(LEDGER_FILENAME).exists()
+        || [LOG_DIRNAME, ARCHIVE_DIRNAME]
+            .into_iter()
+            .any(|dir| read_segment_files(&rally_dir.join(dir)).is_ok_and(|v| !v.is_empty()))
 }
 
 /// Sorted segment file paths in a directory. Empty / missing dir → empty Vec.

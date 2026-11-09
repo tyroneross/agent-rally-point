@@ -22467,7 +22467,11 @@ pub(crate) enum PaneRoute {
         pane: daemon_client::BoundPane,
     },
     /// The only bound pane works in another repository.
-    Elsewhere { pane_id: String, cwd: String },
+    Elsewhere {
+        pane_id: String,
+        cwd: String,
+        recipient_root: PathBuf,
+    },
     /// The only bound pane reports no working directory.
     NoCwd { pane_id: String },
     /// More than one pane is bound; waking one would be a guess.
@@ -22498,7 +22502,7 @@ impl PaneRoute {
                 "bound Easy Terminal pane {}; a handoff queues a wake in its inbox (sender must be lead or invited)",
                 pane.pane_id
             ),
-            PaneRoute::Elsewhere { pane_id, cwd } => format!(
+            PaneRoute::Elsewhere { pane_id, cwd, .. } => format!(
                 "pane {pane_id} works in {cwd}, outside this room's repository; not waking it"
             ),
             PaneRoute::NoCwd { pane_id } => format!(
@@ -22524,16 +22528,21 @@ pub(crate) fn classify_pane_route(
     match binding {
         PaneWakeBinding::None => PaneRoute::Unbound,
         PaneWakeBinding::Ambiguous(n) => PaneRoute::Ambiguous(n),
-        PaneWakeBinding::One { socket, pane } => match pane.cwd.clone() {
-            Some(cwd) if pane_cwd_in_room(&cwd, repo_root) => PaneRoute::Pane { socket, pane },
-            Some(cwd) => PaneRoute::Elsewhere {
-                pane_id: pane.pane_id,
-                cwd,
-            },
-            None => PaneRoute::NoCwd {
-                pane_id: pane.pane_id,
-            },
-        },
+        PaneWakeBinding::One { socket, pane } => {
+            match pane.cwd.clone().filter(|cwd| !cwd.is_empty()) {
+                Some(cwd) => match other_pane_room(repo_root, &cwd) {
+                    None => PaneRoute::Pane { socket, pane },
+                    Some(recipient_root) => PaneRoute::Elsewhere {
+                        pane_id: pane.pane_id,
+                        cwd,
+                        recipient_root,
+                    },
+                },
+                None => PaneRoute::NoCwd {
+                    pane_id: pane.pane_id,
+                },
+            }
+        }
     }
 }
 
@@ -22609,14 +22618,10 @@ fn route_targeted_handoff(
     (route, Some(binding))
 }
 
-/// Pure half of [`route_targeted_handoff`]: map a recipient pane's cwd to its
-/// room, the same way `rally` run in that cwd would ([`repo_root_for`]).
-pub(crate) fn route_for_pane_cwd(sender_root: &Path, target: &str, cwd: &str) -> HandoffRoomRoute {
-    let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let recipient_root = canon(&repo_root_for(&canon(Path::new(cwd))));
-    if recipient_root == canon(sender_root) {
+fn route_for_pane_cwd(sender_root: &Path, target: &str, cwd: &str) -> HandoffRoomRoute {
+    let Some(recipient_root) = other_pane_room(sender_root, cwd) else {
         return HandoffRoomRoute::Sender { pane_bound: true };
-    }
+    };
     // Never create a room in a directory the recipient merely works in: only
     // an existing `.rally/` is a room the recipient can be watching.
     let existing = if recipient_root.join(".rally").is_dir() {
@@ -22642,27 +22647,12 @@ pub(crate) fn route_for_pane_cwd(sender_root: &Path, target: &str, cwd: &str) ->
     }
 }
 
-/// Is the pane's working directory part of this room's repository: inside the
-/// room root, or a checkout sharing its git common directory (a worktree)?
-/// Reads `.git` / `.git/commondir` in process; never spawns `git` on a path
-/// another pane reported.
-fn pane_cwd_in_room(cwd: &str, repo_root: &Path) -> bool {
-    let (Ok(cwd), Ok(root)) = (fs::canonicalize(cwd), fs::canonicalize(repo_root)) else {
-        return false;
-    };
-    if cwd.starts_with(&root) {
-        return true;
-    }
-    let common_dir_above = |start: &Path| {
-        start
-            .ancestors()
-            .find(|dir| dir.join(".git").exists())
-            .and_then(git_common_dir)
-    };
-    match (common_dir_above(&cwd), common_dir_above(&root)) {
-        (Some(a), Some(b)) => a == b,
-        _ => false,
-    }
+/// Resolve the room as Rally would from the pane: the nearest repository
+/// wins, and linked worktrees share their common room.
+fn other_pane_room(sender_root: &Path, cwd: &str) -> Option<PathBuf> {
+    let canonical = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let recipient_root = canonical(&repo_root_for(&canonical(Path::new(cwd))));
+    (recipient_root != canonical(sender_root)).then_some(recipient_root)
 }
 
 /// Detect resolvable ptyd sockets. Lists every on-disk candidate, then probes

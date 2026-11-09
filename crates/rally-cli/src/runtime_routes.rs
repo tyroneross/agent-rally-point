@@ -438,29 +438,26 @@ pub(crate) fn command(args: RoutesArgs) -> Result<Output> {
         }
         let binding = crate::select_pane_wake_binding(&s.tool, bound.clone());
         let pane = crate::classify_pane_route(room.repo_root(), &s.tool, binding, now_ms);
-        // A pane working in another repository is still woken when that
-        // repository has a room: a new targeted handoff is recorded there and
-        // delivered against it (`route_targeted_handoff`). Report that route.
+        // Opening another room here could take its direct-owner lock
+        // while this process still owns the sender's room.
         let (state, reason, queued) = match &pane {
             crate::PaneRoute::Unbound => (
                 pane.state(),
                 "No registered live transport; durable queue only".to_string(),
                 false,
             ),
-            crate::PaneRoute::Elsewhere { cwd, .. } => {
-                match crate::route_for_pane_cwd(room.repo_root(), &s.tool, cwd) {
-                    crate::HandoffRoomRoute::Recipient { room: other, .. } => (
-                        "pane_inbox_recipient_room",
-                        format!(
-                            "bound pane works in {cwd}; a new handoff is recorded in the room at {} and wakes the pane there (sender must be lead or invited in that room)",
-                            other.repo_root().display()
-                        ),
-                        true,
-                    ),
-                    crate::HandoffRoomRoute::Gap(gap) => (pane.state(), gap, false),
-                    crate::HandoffRoomRoute::Sender { .. } => (pane.state(), pane.reason(), false),
-                }
-            }
+            crate::PaneRoute::Elsewhere {
+                cwd,
+                recipient_root,
+                ..
+            } if crate::store::room_has_storage(&recipient_root.join(".rally")) => (
+                "pane_inbox_recipient_room",
+                format!(
+                    "bound pane works in {cwd}; a new handoff can route to {} if that room opens and the sender is lead or invited there",
+                    recipient_root.display()
+                ),
+                true,
+            ),
             other => (
                 other.state(),
                 other.reason(),
