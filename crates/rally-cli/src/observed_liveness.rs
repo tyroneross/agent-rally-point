@@ -562,15 +562,8 @@ pub(crate) fn observe_sessions(room_repo_root: &Path, facts: &[Fact]) -> Observa
 mod tests {
     use super::*;
 
-    fn unique_root(label: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "rally-observed-{label}-{}-{nonce}",
-            std::process::id()
-        ))
+    fn unique_root(label: &str) -> crate::test_temp_root::TempRoot {
+        crate::test_temp_root::TempRoot::new(&format!("rally-observed-{label}"))
     }
 
     fn stamp() -> ObservationStamp {
@@ -927,8 +920,6 @@ mod tests {
             ObservedLiveness::StaleUnobserved,
             "fixture must be stale without the sibling, or this test proves nothing"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -973,14 +964,13 @@ mod tests {
             ObservedLiveness::Live,
             "untracked-file activity newer than the stamp must protect the session"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn current_head_sha_resolves_linked_worktree_common_refs() {
-        let root = unique_root("linked-head");
-        let linked = root.with_extension("linked");
+        let holder = unique_root("linked-head");
+        let root = holder.join("main");
+        let linked = holder.join("linked");
         fs::create_dir_all(&root).unwrap();
         crate::test_git_fixture::fixture_git(&root, &["init"]);
         fs::write(root.join("tracked.txt"), "tracked\n").unwrap();
@@ -999,8 +989,5 @@ mod tests {
         let expected = crate::test_git_fixture::fixture_git(&linked, &["rev-parse", "HEAD"]);
 
         assert_eq!(current_head_sha(&linked).as_deref(), Some(expected.trim()));
-
-        fs::remove_dir_all(&linked).ok();
-        fs::remove_dir_all(&root).ok();
     }
 }
