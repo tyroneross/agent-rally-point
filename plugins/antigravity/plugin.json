@@ -1,0 +1,21 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "agent-rally-point",
+  "version": "0.2.9",
+  "description": "Agent Rally Point coordination skills for Antigravity. Records claims, checks write boundaries, routes handoffs, and exposes room state through the rally CLI.",
+  "author": {
+    "name": "Tyrone Ross",
+    "email": "tyrone@rosslabs.ai"
+  },
+  "homepage": "https://github.com/tyroneross/agent-rally-point",
+  "repository": "https://github.com/tyroneross/agent-rally-point",
+  "license": "Apache-2.0",
+  "keywords": [
+    "agent-coordination",
+    "rally",
+    "dynamic-workflows",
+    "multi-agent",
+    "parallel-agents",
+    "host-neutral"
+  ]
+}

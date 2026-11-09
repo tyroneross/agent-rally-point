@@ -1,0 +1,60 @@
+dynamic-workflows
+Copyright 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com>
+
+This module is licensed under the Apache License, Version 2.0 (the "License");
+you may not use it except in compliance with the License. You may obtain a copy
+of the License at:
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
+---
+
+THIRD-PARTY ATTRIBUTION — MIT-licensed portions
+
+The following files contain portions adapted from pi-dynamic-workflows by Michael Liverant,
+obtained via the fork github.com/tyroneross/pi-dynamic-workflows-fork (source repository:
+github.com/Michaelliv/pi-dynamic-workflows), used under the MIT License:
+
+  core/workstream-lint.mjs
+    (a) DETERMINISM_BLOCKLIST — the regex that rejects Date.now() / Math.random() / new Date()
+        in declared commands, ensuring a shared plan is reproducible across agents.
+    (b) Literal-descriptor validation discipline — the evaluateLiteral/validateMeta pattern that
+        validates every required field as a plain JSON value, never executing it.
+
+  core/limiter.mjs
+    (c) createLimiter — the bounded-concurrency helper that lets a host cap its own fan-out.
+
+  core/route.mjs
+    (d) parallel() / pipeline() control-flow and the budget object — the deterministic-routing
+        primitives, ported host-neutral (decoupled from pi's node:vm executor, WorkflowAgent, and
+        agent() primitive) and extended for the durable model (onError/abort visibility; generic
+        budget units, not pi's token heuristic).
+
+The MIT License for those portions is reproduced here:
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+---
+
+COMPATIBILITY NOTE
+
+The Apache License 2.0 and the MIT License are compatible. The adapted portions listed above
+remain attributed to their original author under the MIT terms reproduced here. The combined
+work as a whole is distributed under the Apache License 2.0, with this NOTICE file preserving
+the required MIT attribution.

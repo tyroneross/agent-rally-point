@@ -17,15 +17,22 @@ from typing import Any
 
 
 CONFIG_PATH = Path("config/host-integrations.json")
-# Separate Muse payload avoids ambiguous root manifests and install-rejected symlinks.
+# Separate payloads avoid ambiguous root manifests and install-rejected symlinks.
 MUSE_ARTIFACT = Path("plugins/muse")
+CURSOR_ARTIFACT = Path("plugins/cursor")
+ANTIGRAVITY_ARTIFACT = Path("plugins/antigravity")
+BUNDLE_ARTIFACTS = {
+    "muse": MUSE_ARTIFACT,
+    "cursor": CURSOR_ARTIFACT,
+    "antigravity": ANTIGRAVITY_ARTIFACT,
+}
 # Cursor overrides Claude's default hooks/hooks.json with its native event schema.
 CURSOR_PLUGIN_HOOKS = Path("hooks/cursor.json")
 IDENTITY_PATHS = (
     Path("rally-release.json"),
     Path("plugins/codex/rally-release.json"),
     Path("plugins/codex/.codex-plugin/rally-release.json"),
-    MUSE_ARTIFACT / "rally-release.json",
+    *(root / "rally-release.json" for root in BUNDLE_ARTIFACTS.values()),
 )
 JSON_SURFACES = (
     Path(".claude-plugin/plugin.json"),
@@ -39,7 +46,7 @@ JSON_SURFACES = (
     Path(".cursor-plugin/plugin.json"),
     CURSOR_PLUGIN_HOOKS,
 )
-GENERATED_DIRS = (Path("plugins/codex/.codex-plugin"), MUSE_ARTIFACT)
+GENERATED_DIRS = (Path("plugins/codex/.codex-plugin"), *BUNDLE_ARTIFACTS.values())
 SKILL_ROOT = Path("skills")
 # Claude Code accepts a path or an array of paths for `skills`; Muse accepts only an array.
 CLAUDE_MANIFEST_SKILL_PATHS = ["./skills"]
@@ -205,13 +212,27 @@ def render_plugin_surfaces(config: dict[str, Any], version: str) -> dict[Path, s
         "description": plugin["descriptions"]["muse"],
         "skills": [f"./skills/{skill}" for skill in sorted(config["skills"])],
     }
+    # Agent Plugins discovers skills/ directly; its portable schema has no hooks.
+    antigravity_manifest = {
+        "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        "name": name,
+        "version": version,
+        "description": plugin["descriptions"]["antigravity"],
+        "author": author,
+        "homepage": homepage,
+        "repository": repository,
+        "license": license_name,
+        "keywords": merged_keywords(config, "antigravity"),
+    }
     return {
         Path(".claude-plugin/plugin.json"): json_text(claude_manifest),
         Path(".claude-plugin/marketplace.json"): json_text(claude_marketplace),
         Path(".codex-plugin/plugin.json"): json_text(codex_manifest),
         Path(".agents/plugins/marketplace.json"): json_text(codex_marketplace),
+        Path(".cursor-plugin/plugin.json"): json_text(cursor_manifest),
         Path(config["providers"]["cursor"]["manifest"]): json_text(cursor_manifest),
         Path(config["providers"]["muse"]["manifest"]): json_text(muse_manifest),
+        Path(config["providers"]["antigravity"]["manifest"]): json_text(antigravity_manifest),
     }
 
 
@@ -418,7 +439,8 @@ def render_hook_surfaces(config: dict[str, Any]) -> dict[Path, str]:
             {"$comment": cursor_comment, "version": 1, "hooks": cursor_hooks}
         ),
         CURSOR_PLUGIN_HOOKS: json_text({"version": 1, "hooks": cursor_plugin_hooks}),
-        MUSE_ARTIFACT / "hooks/hooks.json": json_text({"hooks": muse_hooks}),
+        Path(config["providers"]["cursor"]["hooks"]): json_text({"version": 1, "hooks": cursor_plugin_hooks}),
+        Path(config["providers"]["muse"]["hooks"]): json_text({"hooks": muse_hooks}),
     }
 
 
@@ -604,19 +626,24 @@ def copy_muse_artifact(
     config: dict[str, Any],
     codex_artifact: Path,
     manifest: str,
-    hooks: str,
+    hooks: str | None,
+    *,
+    host: str = "muse",
 ) -> Path:
-    """Reuse the self-contained skill/reference payload without Codex metadata."""
-    dest = dest_root / config["providers"]["muse"]["plugin_root"]
+    """Reuse Muse's self-contained payload path for each standalone host bundle."""
+    provider = config["providers"][host]
+    root = Path(provider["plugin_root"])
+    dest = dest_root / root
     if dest.exists():
         shutil.rmtree(dest)
     for directory in ("skills", "docs", "dynamic-workflows"):
         shutil.copytree(codex_artifact / directory, dest / directory)
     for skill in sorted(config["skills"]):
-        write_text(dest / SKILL_ROOT / skill / "SKILL.md", render_skill(source_root, config, skill, "muse"))
-    write_text(dest / ".claude-plugin/plugin.json", manifest)
-    write_text(dest / "hooks/hooks.json", hooks)
-    shutil.copy2(source_root / "hooks/rally-coordination-hook.sh", dest / "hooks/rally-coordination-hook.sh")
+        write_text(dest / SKILL_ROOT / skill / "SKILL.md", render_skill(source_root, config, skill, host))
+    write_text(dest / Path(provider["manifest"]).relative_to(root), manifest)
+    if hooks is not None:
+        write_text(dest / Path(provider["hooks"]).relative_to(root), hooks)
+        shutil.copy2(source_root / "hooks/rally-coordination-hook.sh", dest / "hooks/rally-coordination-hook.sh")
     return dest
 
 
@@ -694,11 +721,15 @@ def generate(
         surfaces[Path(".codex-plugin/plugin.json")],
         artifact_dest=artifact_dest,
     )
-    muse_artifact = copy_muse_artifact(
-        source_root, dest_root, config, artifact,
-        surfaces[MUSE_ARTIFACT / ".claude-plugin/plugin.json"],
-        surfaces[MUSE_ARTIFACT / "hooks/hooks.json"],
-    )
+    bundles = {}
+    for host, root in BUNDLE_ARTIFACTS.items():
+        provider = config["providers"][host]
+        bundles[root] = copy_muse_artifact(
+            source_root, dest_root, config, artifact,
+            surfaces[Path(provider["manifest"])],
+            surfaces[Path(provider["hooks"])] if "hooks" in provider else None,
+            host=host,
+        )
 
     identity = {
         "schema": "agent-rally.release-identity.v1",
@@ -709,7 +740,7 @@ def generate(
             surfaces,
             skills,
             artifact,
-            bundles={MUSE_ARTIFACT: muse_artifact},
+            bundles=bundles,
         ),
     }
     identity_text = json_text(identity)
@@ -750,6 +781,8 @@ def git_ignored(directory: Path, paths: list[Path]) -> set[Path]:
 
 
 def compare_path(actual: Path, expected: Path) -> list[str]:
+    if actual.is_symlink():
+        return [f"symlink: {actual}"]
     if not actual.exists() and not actual.is_symlink():
         return [f"missing: {actual}"]
     if actual.is_dir() and not actual.is_symlink():
@@ -770,8 +803,7 @@ def compare_path(actual: Path, expected: Path) -> list[str]:
             *(f"missing: {actual / path}" for path in sorted(expected_files - actual_files)),
         ]
         for path in sorted(actual_files & expected_files):
-            if (actual / path).read_bytes() != (expected / path).read_bytes():
-                findings.append(f"drift: {actual / path}")
+            findings.extend(compare_path(actual / path, expected / path))
         return findings
     if actual.read_bytes() != expected.read_bytes():
         return [f"drift: {actual}"]
