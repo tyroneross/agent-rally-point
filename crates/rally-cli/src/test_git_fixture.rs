@@ -87,7 +87,7 @@ pub const GIT_REPOSITORY_SCOPE_ENV_VARS: &[&str] = &[
 /// re-appended, so the guard also works for a root a caller is about to
 /// create.
 pub fn assert_fixture_root(root: &Path) {
-    let expected = canonicalize_best_effort(&std::env::temp_dir());
+    let expected = canonicalize_best_effort(&std::env::temp_dir()); // temp-root-read: containment check
     let actual = canonicalize_best_effort(root);
     assert!(
         actual.starts_with(&expected),

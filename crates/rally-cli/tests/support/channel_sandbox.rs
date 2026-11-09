@@ -46,7 +46,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use rally_protocol::ledger::FileInbox;
 use rally_protocol::{Directive, Inbox, Receipt};
@@ -54,9 +53,6 @@ use serde_json::Value;
 
 /// The built `rally` binary under test (cargo wires this for integration tests).
 const RALLY_BIN: &str = env!("CARGO_BIN_EXE_rally");
-
-/// Monotonic suffix source for unique scratch roots.
-static SANDBOX_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A `rally inject` outcome, parsed from the JSON envelope.
 #[derive(Debug, Clone)]
@@ -75,8 +71,8 @@ pub struct InjectOutcome {
 
 /// A throwaway scratch ledger root, torn down on `Drop`.
 pub struct ChannelSandbox {
-    /// Scratch root; removed on drop.
-    root: PathBuf,
+    /// Scratch root; removed when the sandbox drops.
+    root: super::temp_root::TempRoot,
     /// `cwd` inside the sandbox where rally runs.
     cwd: PathBuf,
     /// Isolated `HOME` so rally subprocesses don't touch `~/.config`.
@@ -86,13 +82,7 @@ pub struct ChannelSandbox {
 impl ChannelSandbox {
     /// Stand up a fresh scratch workspace.
     pub fn spawn() -> Self {
-        let suffix = format!(
-            "{}-{}",
-            std::process::id(),
-            SANDBOX_SEQ.fetch_add(1, Ordering::Relaxed)
-        );
-        let root = std::env::temp_dir().join(format!("rally-channel-sandbox-{suffix}"));
-        fs::create_dir_all(&root).expect("create sandbox root");
+        let root = super::temp_root::TempRoot::new("channel-sandbox");
 
         let cwd = root.join("cwd");
         let home = root.join("home");
@@ -106,7 +96,7 @@ impl ChannelSandbox {
 
     /// Scratch root.
     pub fn root(&self) -> &Path {
-        &self.root
+        self.root.path()
     }
 
     /// The repo "root" rally finds.
@@ -326,11 +316,5 @@ impl ChannelSandbox {
         inbox
             .read_receipts_since(target, after_ref_seq)
             .expect("read receipts")
-    }
-}
-
-impl Drop for ChannelSandbox {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
     }
 }

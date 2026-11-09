@@ -167,6 +167,10 @@ mod store;
 mod store_client;
 #[cfg(test)]
 mod test_git_fixture;
+/// The one way this crate's unit tests get scratch space. See the file's header.
+#[cfg(test)]
+#[path = "../../test-support/temp_root.rs"]
+pub(crate) mod test_temp_root;
 mod text_spacing;
 mod tier_fit;
 pub mod worktree_gc;
