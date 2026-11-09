@@ -479,6 +479,7 @@ fn mutation_query(op: &StoreOp) -> Option<MutationQuery> {
         | StoreOp::RepoWideClaimLifecycleFacts
         | StoreOp::SessionFactsWithContextVersion
         | StoreOp::ActiveSessionFact { .. }
+        | StoreOp::ProjectedLead
         | StoreOp::SnapshotWithArchived { .. }
         | StoreOp::SnapshotForEnter { .. }
         | StoreOp::SnapshotForObligationTarget { .. }
@@ -596,6 +597,20 @@ fn unexpected_reply(op: &str) -> RallyError {
     RallyError::Command(format!(
         "daemon returned an unexpected reply shape for {op}"
     ))
+}
+
+fn decode_caller_snapshot(
+    value: serde_json::Value,
+    request: &rally_protocol::store_wire::CallerProjectionRequest,
+) -> Result<RoomSnapshot> {
+    let snapshot: RoomSnapshot = snapshot_from_value(value)?;
+    if request.before.is_some() && snapshot.caller_projection.is_none() {
+        return Err(RallyError::Usage(
+            "daemon does not support addressed paging; upgrade the daemon before using --before"
+                .into(),
+        ));
+    }
+    Ok(snapshot)
 }
 
 impl RoutedRoomStore {
@@ -864,6 +879,13 @@ impl RoutedRoomStore {
         }
     }
 
+    pub(crate) fn projected_lead(&self) -> Result<Option<String>> {
+        match self.dispatch(StoreOp::ProjectedLead)? {
+            StoreOk::ProjectedLead { lead } => Ok(lead),
+            _ => Err(unexpected_reply("projected_lead")),
+        }
+    }
+
     /// `RoomStore::snapshot()` is `snapshot_with_archived(false)` composed
     /// locally — mirroring `DirectRoomStore::snapshot()`'s own composition;
     /// there is no separate `StoreOp::Snapshot` wire variant.
@@ -916,17 +938,19 @@ impl RoutedRoomStore {
         }
     }
 
-    pub(crate) fn snapshot_for_obligation_target(
+    pub(crate) fn snapshot_for_obligation_page(
         &self,
         tool: &str,
         row_limit: usize,
+        request: &rally_protocol::store_wire::CallerProjectionRequest,
     ) -> Result<RoomSnapshot> {
         match self.dispatch(StoreOp::SnapshotForObligationTarget {
             tool: tool.to_string(),
             row_limit,
             include_archived: false,
+            projection: Some(request.clone()),
         })? {
-            StoreOk::Snapshot { snapshot, .. } => snapshot_from_value(snapshot),
+            StoreOk::Snapshot { snapshot, .. } => decode_caller_snapshot(snapshot, request),
             _ => Err(unexpected_reply("snapshot_for_obligation_target")),
         }
     }
@@ -1068,6 +1092,47 @@ mod tests {
     // The production path no longer keeps its own deadline here (the router
     // owns it and passes what remains), so `Instant` is a test-only import.
     use std::time::Instant;
+
+    #[test]
+    fn caller_paging_mixed_daemon_decode_defaults_and_continuation_refusal() {
+        use rally_protocol::store_wire::CallerProjectionRequest;
+        let snapshot = RoomSnapshot::default();
+        let old_wire = crate::store::snapshot_to_wire_value(&snapshot).unwrap();
+        let decoded = decode_caller_snapshot(old_wire.clone(), &Default::default()).unwrap();
+        assert!(decoded.caller_projection.is_none());
+        let continuation = CallerProjectionRequest {
+            before: Some(42),
+            ..Default::default()
+        };
+        let error = decode_caller_snapshot(old_wire, &continuation).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not support addressed paging")
+        );
+        let current = RoomSnapshot {
+            caller_projection: Some(Default::default()),
+            ..Default::default()
+        };
+        let current_wire = crate::store::snapshot_to_wire_value(&current).unwrap();
+        assert!(decode_caller_snapshot(current_wire.clone(), &continuation).is_ok());
+        // An old peer's type has no paging field; serde ignores it.
+        #[derive(serde::Deserialize)]
+        struct OldSnapshot {
+            open_handoffs: Vec<crate::store::Fact>,
+            #[serde(rename = "__internals")]
+            internals: OldInternals,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldInternals {
+            open_obligations_total: usize,
+            open_obligations_accepted_open: Option<usize>,
+        }
+        let old_view: OldSnapshot = serde_json::from_value(current_wire).unwrap();
+        assert!(old_view.open_handoffs.is_empty());
+        assert_eq!(old_view.internals.open_obligations_total, 0);
+        assert_eq!(old_view.internals.open_obligations_accepted_open, None);
+    }
 
     #[test]
     fn wire_not_started_reconstructs_the_direct_error_class() {

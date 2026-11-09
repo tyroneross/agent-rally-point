@@ -734,6 +734,25 @@ fn over_limit_tool_gets_a_typed_error_naming_only_its_own_rows() {
     assert!(!message.contains("peer-"), "no peer rows named: {message}");
 }
 
+#[test]
+fn caller_over_projection_budget_can_still_post_from_a_new_session() {
+    let room = over_limit_room("presence-lead");
+    let _daemon = Daemon::start(&room);
+    let say = room.json_as(
+        "new-session",
+        &[
+            "say",
+            "artifact",
+            "--tool",
+            FLOODED,
+            "--subject",
+            "status update",
+            "--json",
+        ],
+    );
+    assert_eq!(say["data"]["say"]["committed"], json!(true));
+}
+
 /// R4: multi-tool `inbox` reports the over-limit tool's error in its own
 /// entry and returns the other tools normally.
 #[test]
@@ -820,4 +839,200 @@ fn an_unrelated_risk_does_not_mark_a_handoff_escalated() {
         );
         assert_eq!(no_response_for(&room), 1, "run {run}");
     }
+}
+
+#[test]
+fn addressed_flood_is_pageable_and_accepted_work_count_stays_exact() {
+    exercise_addressed_flood(true);
+}
+
+#[test]
+fn direct_addressed_flood_is_pageable_and_accepted_work_count_stays_exact() {
+    exercise_addressed_flood(false);
+}
+
+fn exercise_addressed_flood(routed: bool) {
+    const ADDRESSED: usize = 4_000;
+    let mut room = Room::new("addressed-pages");
+    room.seal();
+    let accepted = room.json_as(
+        "sender",
+        &[
+            "say",
+            "handoff",
+            "--tool",
+            "sender",
+            "--target",
+            ME,
+            "--subject",
+            "accepted oldest assignment",
+            "--json",
+        ],
+    )["data"]["say"]["fact"]["event_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    room.json_as(
+        "receiver",
+        &[
+            "say",
+            "handoff",
+            "--tool",
+            ME,
+            "--ref",
+            &accepted,
+            "--handoff-state",
+            "accepted",
+            "--subject",
+            "accept",
+            "--json",
+        ],
+    );
+    room.reopen();
+    for n in 0..ADDRESSED {
+        room.fact(json!({
+            "event_id": format!("addressed-{n}"), "kind": "handoff",
+            "tool": "sender", "from_session_id": "sess:parent:sender#live", "target": ME, "subject": format!("assignment {n}"),
+            "summary": padding(1_000),
+        }));
+    }
+    room.seal();
+    let _daemon = routed.then(|| Daemon::start(&room));
+    let enter = room.json(&["enter", "--tool", ME, "--json"]);
+    assert_eq!(
+        enter["data"]["enter"]["addressed_page"]["total"],
+        json!(ADDRESSED + 1)
+    );
+    let next = room.json(&["next", "--audit", "--tool", ME, "--json"]);
+    assert_eq!(next["data"]["next"]["actionable"], json!(true));
+    assert_eq!(next["data"]["next"]["inbox"]["accepted_open"], json!(1));
+    let check = room.json(&["self-exit-check", "--tool", ME, "--persistent", "--json"]);
+    assert_eq!(
+        check["data"]["self_exit_check"]["empty_cycle"],
+        json!(false)
+    );
+    let inbox = room.json(&["inbox", "--tool", ME, "--limit", "20", "--json"]);
+    let inbox = &inbox["data"]["inbox"];
+    assert_eq!(inbox["count"], json!(ADDRESSED));
+    assert_eq!(inbox["accepted_open"], json!(1));
+    assert!(
+        !inbox["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["event_id"] == accepted)
+    );
+    let before = inbox["addressed_page"]["next_before"]
+        .as_i64()
+        .unwrap()
+        .to_string();
+    let older = room.json(&[
+        "inbox", "--tool", ME, "--before", &before, "--limit", "20", "--json",
+    ]);
+    let first_ids = inbox["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["event_id"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        older["data"]["inbox"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| !first_ids.contains(f["event_id"].as_str().unwrap()))
+    );
+    for (n, id) in first_ids.iter().enumerate() {
+        room.json_as(
+            "receiver",
+            &[
+                "say",
+                "handoff",
+                "--tool",
+                ME,
+                "--ref",
+                id,
+                "--handoff-state",
+                if n % 2 == 0 { "accepted" } else { "rejected" },
+                "--subject",
+                "reject",
+                "--json",
+            ],
+        );
+    }
+    let after = room.json(&["inbox", "--tool", ME, "--json"]);
+    assert_eq!(
+        after["data"]["inbox"]["count"],
+        json!(ADDRESSED - first_ids.len())
+    );
+    assert_eq!(
+        after["data"]["inbox"]["accepted_open"],
+        json!(1 + first_ids.len().div_ceil(2))
+    );
+}
+
+#[test]
+fn later_enter_attention_counts_trimmed_rows_above_its_cursor_exactly() {
+    exercise_later_attention(true);
+}
+
+#[test]
+fn direct_later_enter_attention_counts_trimmed_rows_above_its_cursor_exactly() {
+    exercise_later_attention(false);
+}
+
+fn exercise_later_attention(routed: bool) {
+    let mut room = Room::new("attention-cursor");
+    room.seal();
+    let first = room.json(&["enter", "--tool", ME, "--json"]);
+    assert!(first["data"]["enter"]["cursor"]["after"].as_i64().unwrap() > 0);
+    room.reopen();
+    for n in 0..800 {
+        room.fact(json!({"kind": "handoff", "tool": "queue-poster", "subject": format!("available {n}"), "summary": padding(1_000)}));
+    }
+    room.seal();
+    let _daemon = routed.then(|| Daemon::start(&room));
+    let second = room.json(&["enter", "--tool", ME, "--json"]);
+    assert!(
+        second["data"]["enter"]["cursor"]["before"]
+            .as_i64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(second["data"]["enter"]["attention_total"], json!(800));
+}
+
+#[test]
+fn direct_oversized_sender_can_be_acknowledged_by_ref() {
+    let mut room = Room::new("large-sender");
+    room.fact(json!({
+        "event_id": "large-sender", "kind": "handoff", "tool": "sender".repeat(256 * 1_024),
+        "from_session_id": "sess:parent:sender#live", "target": ME, "subject": "assigned work",
+    }));
+    room.seal();
+    let inbox = room.json(&["inbox", "--tool", ME, "--json"]);
+    let items = inbox["data"]["inbox"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert!(
+        items[0]["ack_command"]
+            .as_str()
+            .unwrap()
+            .contains("say receipt")
+    );
+    room.json_as(
+        "receiver",
+        &[
+            "say",
+            "receipt",
+            "--tool",
+            ME,
+            "--ref",
+            "large-sender",
+            "--subject",
+            "acked",
+            "--json",
+        ],
+    );
+    let after = room.json(&["inbox", "--tool", ME, "--json"]);
+    assert_eq!(after["data"]["inbox"]["count"], json!(0));
 }

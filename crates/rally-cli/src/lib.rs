@@ -3793,7 +3793,15 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
     // `ensure_presence_tiered`. Re-snapshot here so the room summary + squads
     // reflect the just-written presence/lead facts AND any warning-block risk
     // facts.
-    let snapshot = room.snapshot_for_obligation_target(&tool, 128)?;
+    let snapshot = room.snapshot_for_obligation_page(
+        &tool,
+        128,
+        &rally_protocol::store_wire::CallerProjectionRequest {
+            attention_since: Some(cursor_before),
+            paths: paths.clone(),
+            ..Default::default()
+        },
+    )?;
 
     let (attention, attention_total, attention_emitted, attention_omitted) = bound_enter_attention(
         &snapshot,
@@ -3850,7 +3858,15 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
         },
         entry,
         attention,
+        addressed_page: snapshot
+            .caller_projection
+            .as_ref()
+            .map(|c| c.addressed_page.clone()),
         attention_total,
+        attention_total_exact: snapshot
+            .caller_projection
+            .as_ref()
+            .is_some_and(|c| c.attention_total.is_some()),
         attention_emitted,
         attention_omitted,
         warnings,
@@ -5493,6 +5509,10 @@ fn command_next(args: NextArgs) -> Result<Output> {
             room: RoomSummary::from(&snapshot),
             lead_context,
             overdue_handoffs,
+            overdue_handoffs_total: snapshot
+                .caller_projection
+                .as_ref()
+                .and_then(|c| c.overdue_handoffs_total),
         },
     )?;
     let text = format!(
@@ -5549,11 +5569,15 @@ fn command_inbox(args: cli::InboxArgs) -> Result<Output> {
     let room = RoomStore::open()?;
     let coord = crate::hooks_config::resolve_coordination(room.repo_root()).unwrap_or_default();
     let row_limit = args.limit.max(1) as usize;
+    let request = rally_protocol::store_wire::CallerProjectionRequest {
+        before: args.before,
+        ..Default::default()
+    };
     let item_limit = args.limit.max(0) as usize;
 
     if args.tools.len() == 1 {
         let tool = args.tools.into_iter().next().unwrap_or_default();
-        let snapshot = room.snapshot_for_obligation_target(&tool, row_limit)?;
+        let snapshot = room.snapshot_for_obligation_page(&tool, row_limit, &request)?;
         let inbox = inbox_for(
             &snapshot,
             &tool,
@@ -5581,8 +5605,13 @@ fn command_inbox(args: cli::InboxArgs) -> Result<Output> {
     let mut errors = BTreeMap::new();
     for tool in tools {
         let snapshot = match &base {
-            Some(base) => base.clone().for_obligation_target(&tool, row_limit),
-            None => room.snapshot_for_obligation_target(&tool, row_limit),
+            Some(base) => base.clone().for_obligation_page_at(
+                &tool,
+                row_limit,
+                Some(&request),
+                Some(room.repo_root()),
+            ),
+            None => room.snapshot_for_obligation_page(&tool, row_limit, &request),
         };
         // One tool over its own bound must not hide the others' inboxes.
         let snapshot = match snapshot {
@@ -5648,7 +5677,7 @@ struct InboxManyData {
 /// Human render of one tool's inbox. Every peer-authored value goes through
 /// `obligations::single_line` (see `command_inbox`).
 fn inbox_text(tool: &str, inbox: &InboxResult) -> String {
-    if inbox.count == 0 {
+    let mut text = if inbox.count == 0 {
         format!("inbox {} — nothing owed", tool)
     } else {
         let mut lines = vec![
@@ -5673,14 +5702,46 @@ fn inbox_text(tool: &str, inbox: &InboxResult) -> String {
                 obligations::single_line(&item.ack_command),
             ));
         }
-        if inbox.count > inbox.items.len() {
+        if inbox.count > inbox.items.len()
+            && inbox
+                .addressed_page
+                .as_ref()
+                .is_none_or(|p| p.next_before.is_none())
+        {
             lines.push(format!(
                 "  ... {} more; raise --limit to see them",
                 inbox.count - inbox.items.len()
             ));
         }
         lines.join("\n")
+    };
+    if let Some(page) = &inbox.addressed_page {
+        if page.total > page.emitted {
+            text.push_str(&format!(
+                "\n  addressed work: {} total, {} on this page",
+                page.total, page.emitted
+            ));
+        }
+        for fact in page
+            .items
+            .iter()
+            .filter(|f| !inbox.items.iter().any(|i| i.event_id == f.event_id))
+        {
+            text.push_str(&format!(
+                "\n  {} [{}] {}",
+                obligations::single_line(&fact.event_id),
+                fact.kind.as_str(),
+                obligations::single_line(&fact.subject)
+            ));
+        }
+        if let Some(command) = &page.next_command {
+            text.push_str(&format!(
+                "\n  next page: {}",
+                obligations::single_line(command)
+            ));
+        }
     }
+    text
 }
 
 #[cfg(test)]
@@ -5696,6 +5757,7 @@ mod inbox_render_fixture_tests {
             artifacts: 1,
             oldest_age_secs: 700,
             stale_window_secs: 600,
+            addressed_page: None,
             accepted_open: 0,
             accepted_open_incomplete: false,
             open_queue: Default::default(),
@@ -21892,7 +21954,10 @@ struct EnterPayload {
     cursor: CursorData,
     entry: EntryData,
     attention: Vec<AttentionItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    addressed_page: Option<store::AddressedPage>,
     attention_total: usize,
+    attention_total_exact: bool,
     attention_emitted: usize,
     attention_omitted: usize,
     /// Non-blocking advisories (omitted from JSON when empty).
@@ -22758,6 +22823,8 @@ struct NextData {
     /// receiver ack. Omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     overdue_handoffs: Vec<OverdueHandoff>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    overdue_handoffs_total: Option<usize>,
 }
 
 fn scopes_from(raw_scopes: Vec<String>, resources: Vec<String>, paths: Vec<String>) -> Vec<String> {

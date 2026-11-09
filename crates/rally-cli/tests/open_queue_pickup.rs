@@ -593,7 +593,21 @@ fn limited_inbox_does_not_invent_accepted_work() {
         assert_eq!(result["accepted_open"], 1, "limit {limit}: {output}");
         assert_eq!(
             result["items"].as_array().unwrap().len(),
-            limit.parse::<usize>().unwrap().min(2)
+            if limit == "1" { 0 } else { 2 }
         );
+        if limit == "1" {
+            let page = &result["addressed_page"];
+            assert_eq!(page["items"][0]["event_id"], id);
+            let before = page["next_before"].as_i64().unwrap().to_string();
+            let older = sandbox.rally_json(&[
+                "inbox", "--json", "--tool", PICKER, "--limit", "1", "--before", &before,
+            ]);
+            assert_eq!(older["data"]["inbox"]["count"], 2);
+            assert_eq!(older["data"]["inbox"]["accepted_open"], 1);
+            assert_eq!(
+                older["data"]["inbox"]["items"][0]["subject"],
+                "unanswered second"
+            );
+        }
     }
 }

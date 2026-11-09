@@ -476,6 +476,27 @@ The reconciler requires exactly one enabled provider per host. It removes stale 
 
 Published releases remain immutable. New versions reconcile the CLI, generated host surfaces, and marketplace artifacts from the same canonical integration configuration.
 
+### Caller projections and paging
+
+`enter`, `next` and `inbox` return bounded addressed pages with exact totals.
+`addressed_page.items` includes handoffs, accepted open work and blockers;
+`next_before` and `next_command` read older rows with `rally inbox --before SEQ`.
+ACK acceptance keeps assigned work open; rejection removes it from addressed pages.
+The full ledger remains available through `rally locate EVENT_ID`.
+
+Wire version 9 is unchanged. The optional `projection` request and
+`caller_projection` response fields are additive. A new CLI with an old daemon
+keeps the old first-page behavior, marks attention counts inexact, omits unavailable
+exact overdue/revalidation totals, and refuses `--before` rather than repeating
+page one. An old CLI with a new daemon ignores the new fields and gets its
+oldest unanswered work first, along with exact inbox and accepted-work counts.
+Older CLIs can answer visible rows and need an upgrade to request older pages.
+Implicit presence reads the lead without requesting room rows. Against an
+older daemon, the CLI derives the lead from bounded ledger pages.
+New peers compute attention and overdue totals before trimming. Inbox
+`open_queue.revalidate` still counts visible rows; `revalidate_total` reports the
+full projection's count using the existing bounded filesystem probe policy.
+
 ## Verification
 
 Rust is the acceptance path, and the pre-push gate runs it:

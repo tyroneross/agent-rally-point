@@ -1925,8 +1925,46 @@ pub(crate) struct RoomComposition {
     pub(crate) over_budget_causes: Vec<String>,
 }
 
+/// One addressed page, over handoffs, blockers and unanswered artifacts.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+pub(crate) struct AddressedPage {
+    pub(crate) total: usize,
+    pub(crate) emitted: usize,
+    /// Exact assigned work already accepted, even when it is off this page.
+    #[serde(default)]
+    pub(crate) accepted_open: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) next_before: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) next_command: Option<String>,
+    /// Visible addressed work, including accepted handoffs and blockers.
+    #[serde(default)]
+    pub(crate) items: Vec<Fact>,
+}
+
+/// Additive caller metadata. Counts are computed before any rows are paged.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+pub(crate) struct CallerProjection {
+    pub(crate) addressed_page: AddressedPage,
+    /// Distinguishes visible unanswered handoffs from accepted open work.
+    pub(crate) unanswered: BTreeSet<String>,
+    #[serde(default)]
+    pub(crate) oldest_obligation_age_secs: i64,
+    /// A fresh named representative protects self-exit when sequence and age disagree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) named_sample: Option<Fact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) attention_total: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) overdue_handoffs_total: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) open_queue_revalidate_total: Option<usize>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 pub(crate) struct RoomSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) caller_projection: Option<CallerProjection>,
     pub(crate) max_seq: i64,
     /// R10: highest seq of a substantive (non-read-checkpoint) fact.
     /// Used internally by `command_next` to record the read position WITHOUT
@@ -2085,6 +2123,11 @@ pub(crate) struct RoomSnapshot {
     /// cache in [`SnapshotInternals`], so routed and direct mode agree.
     #[serde(skip)]
     pub(crate) open_queue_signals: crate::open_queue::OpenQueueSignals,
+    /// Projection-only index, consumed before paging into `open_queue_revalidate_total`.
+    /// Empty after wire decode is correct: clients read the exact scalar instead.
+    /// Transporting this unbounded peer-controlled set would defeat caller bounds.
+    #[serde(skip)]
+    pub(crate) open_queue_full_later_done: BTreeSet<String>,
 }
 
 /// Bounded pre-write state used by `rally enter`.
@@ -2190,6 +2233,8 @@ pub(crate) const MAX_WIRE_PENDING_WAKES: usize = 1_024;
 /// id; truncating here would silently empty an inbox that exists precisely so
 /// nothing can silently empty it. Crossing the bound is a structured error.
 pub(crate) const MAX_WIRE_OPEN_OBLIGATIONS: usize = 1_024;
+/// Match the inbox parser ceiling so every generated continuation command is executable.
+pub(crate) const MAX_CALLER_PAGE_ROWS: usize = 200;
 pub(crate) const MAX_TARGET_OBLIGATION_BYTES: usize = 256 * 1_024;
 pub(crate) const MAX_WIRE_STALE_AUTHORS: usize = 4_096;
 pub(crate) const MAX_WIRE_SNAPSHOT_INTERNALS_BYTES: usize = 512 * 1_024;
@@ -2298,9 +2343,62 @@ impl CallerBudgets {
     }
 }
 
+#[cfg(test)]
+thread_local! { static CALLER_ROW_SERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 fn row_bytes<T: Serialize>(row: &T) -> usize {
+    #[cfg(test)]
+    CALLER_ROW_SERIALIZATIONS.with(|n| n.set(n.get() + 1));
     // `,` separator per row; an unserializable row is treated as huge.
     serde_json::to_vec(row).map_or(usize::MAX / 4, |v| v.len() + 1)
+}
+
+/// Every public fact list plus the two daemon-only fact lists participates in sizing.
+const CALLER_FACT_BUCKETS: usize = 12;
+/// This labeled copy is always discarded; its retained artifact can have a different status.
+const CALLER_RESOLVED_BUCKET: usize = 3;
+
+/// Cache input row sizes once; halving passes only move rows and sum sizes.
+struct CallerRowSizes {
+    facts: BTreeMap<String, usize>,
+    squads: BTreeMap<String, usize>,
+}
+
+impl CallerRowSizes {
+    fn new(snapshot: &RoomSnapshot) -> Self {
+        let mut facts = BTreeMap::new();
+        for (index, rows) in snapshot.caller_fact_buckets().into_iter().enumerate() {
+            if index == CALLER_RESOLVED_BUCKET {
+                continue;
+            }
+            for fact in rows {
+                facts
+                    .entry(fact.event_id.clone())
+                    .or_insert_with(|| row_bytes(fact));
+            }
+        }
+        if let Some(c) = &snapshot.caller_projection {
+            for f in c.addressed_page.items.iter().chain(c.named_sample.iter()) {
+                facts
+                    .entry(f.event_id.clone())
+                    .or_insert_with(|| row_bytes(f));
+            }
+        }
+        Self {
+            facts,
+            squads: snapshot
+                .squads
+                .iter()
+                .map(|s| (s.tool.clone(), row_bytes(s)))
+                .collect(),
+        }
+    }
+    fn fact(&self, fact: &Fact) -> usize {
+        self.facts[&fact.event_id]
+    }
+    fn squad(&self, squad: &Squad) -> usize {
+        self.squads[&squad.tool]
+    }
 }
 
 /// Bound one bucket: rows where `keep` holds are ALWAYS kept; the rest are
@@ -2315,6 +2413,7 @@ fn bound_caller_rows<T: Serialize>(
     keep: impl Fn(&T) -> bool,
     rank: impl Fn(&T) -> u8,
     seq: impl Fn(&T) -> i64,
+    size: impl Fn(&T) -> usize,
 ) -> (Vec<T>, usize, usize) {
     let mut kept_flags = vec![false; rows.len()];
     let mut keep_bytes = 0usize;
@@ -2322,7 +2421,7 @@ fn bound_caller_rows<T: Serialize>(
     for (index, row) in rows.iter().enumerate() {
         if keep(row) {
             kept_flags[index] = true;
-            keep_bytes = keep_bytes.saturating_add(row_bytes(row));
+            keep_bytes = keep_bytes.saturating_add(size(row));
         } else {
             candidates.push(index);
         }
@@ -2337,7 +2436,7 @@ fn bound_caller_rows<T: Serialize>(
         if kept == max_rows {
             break;
         }
-        let size = row_bytes(&rows[index]);
+        let size = size(&rows[index]);
         if bytes.saturating_add(size) > max_bytes {
             break;
         }
@@ -2369,6 +2468,112 @@ fn caller_reply_bytes(snapshot: &RoomSnapshot) -> Option<usize> {
     Some(bytes + MAX_CALLER_ENVELOPE_BYTES)
 }
 
+/// Measure the scalar skeleton plus cached row lengths, without serializing a row.
+fn cached_caller_reply_bytes(snapshot: &mut RoomSnapshot, sizes: &CallerRowSizes) -> Option<usize> {
+    if snapshot.pending_wakes.len() > MAX_WIRE_PENDING_WAKES
+        || snapshot.open_obligations.len() > MAX_WIRE_OPEN_OBLIGATIONS
+        || snapshot.stale_authors.len() > MAX_WIRE_STALE_AUTHORS
+    {
+        return None;
+    }
+    let [
+        claims,
+        blockers,
+        handoffs,
+        resolved,
+        decisions,
+        risks,
+        health,
+        recent,
+        unconsumed,
+        stale,
+        wakes,
+        obligations,
+    ] = snapshot.take_caller_fact_buckets();
+    let rows = [
+        &claims,
+        &blockers,
+        &handoffs,
+        &resolved,
+        &decisions,
+        &risks,
+        &health,
+        &recent,
+        &unconsumed,
+        &stale,
+        &wakes,
+        &obligations,
+    ];
+    let squads = std::mem::take(&mut snapshot.squads);
+    let (page, sample) = snapshot
+        .caller_projection
+        .as_mut()
+        .map(|c| {
+            (
+                std::mem::take(&mut c.addressed_page.items),
+                c.named_sample.take(),
+            )
+        })
+        .unwrap_or_default();
+    let fact_bytes = |rows: &[Fact]| {
+        rows.iter()
+            .map(|f| sizes.fact(f))
+            .sum::<usize>()
+            .saturating_sub(usize::from(!rows.is_empty()))
+    };
+    let public_rows = rows.iter().map(|r| fact_bytes(r)).sum::<usize>()
+        + squads
+            .iter()
+            .map(|s| sizes.squad(s))
+            .sum::<usize>()
+            .saturating_sub(usize::from(!squads.is_empty()))
+        + fact_bytes(&page)
+        + sample.as_ref().map_or(0, |f| sizes.fact(f) - 1);
+    let internal_rows = fact_bytes(&wakes) + fact_bytes(&obligations);
+    let internal_bytes = serde_json::to_vec(&snapshot.internals())
+        .ok()
+        .map(|v| v.len() + internal_rows);
+    // A missing optional sample is absent (rather than null), so account for its key too.
+    let sample_key = if sample.is_some() {
+        ",\"named_sample\":".len()
+    } else {
+        0
+    };
+    let skipped_keys = if resolved.is_empty() {
+        0
+    } else {
+        ",\"resolved_unverified\":[]".len()
+    } + if health.is_empty() {
+        0
+    } else {
+        ",\"system_health\":[]".len()
+    };
+    let measured =
+        caller_reply_bytes(snapshot).map(|n| n + public_rows + sample_key + skipped_keys);
+    snapshot.restore_caller_fact_buckets([
+        claims,
+        blockers,
+        handoffs,
+        resolved,
+        decisions,
+        risks,
+        health,
+        recent,
+        unconsumed,
+        stale,
+        wakes,
+        obligations,
+    ]);
+    snapshot.squads = squads;
+    if let Some(c) = &mut snapshot.caller_projection {
+        c.addressed_page.items = page;
+        c.named_sample = sample;
+    }
+    internal_bytes
+        .filter(|n| *n <= MAX_WIRE_SNAPSHOT_INTERNALS_BYTES)
+        .and(measured)
+}
+
 /// Key the internals ride under in the wire snapshot object.
 ///
 /// Double-underscored so it cannot collide with a `RoomSnapshot` field name, and
@@ -2377,6 +2582,61 @@ fn caller_reply_bytes(snapshot: &RoomSnapshot) -> Option<usize> {
 pub(crate) const WIRE_INTERNALS_KEY: &str = "__internals";
 
 impl RoomSnapshot {
+    fn caller_fact_buckets(&self) -> [&[Fact]; CALLER_FACT_BUCKETS] {
+        [
+            &self.active_claims,
+            &self.active_blockers,
+            &self.open_handoffs,
+            &self.resolved_unverified,
+            &self.current_decisions,
+            &self.current_risks,
+            &self.system_health,
+            &self.recent_artifacts,
+            &self.unconsumed_artifacts,
+            &self.stale_facts,
+            &self.pending_wakes,
+            &self.open_obligations,
+        ]
+    }
+    fn take_caller_fact_buckets(&mut self) -> [Vec<Fact>; CALLER_FACT_BUCKETS] {
+        [
+            &mut self.active_claims,
+            &mut self.active_blockers,
+            &mut self.open_handoffs,
+            &mut self.resolved_unverified,
+            &mut self.current_decisions,
+            &mut self.current_risks,
+            &mut self.system_health,
+            &mut self.recent_artifacts,
+            &mut self.unconsumed_artifacts,
+            &mut self.stale_facts,
+            &mut self.pending_wakes,
+            &mut self.open_obligations,
+        ]
+        .map(std::mem::take)
+    }
+    fn restore_caller_fact_buckets(&mut self, rows: [Vec<Fact>; CALLER_FACT_BUCKETS]) {
+        for (bucket, rows) in [
+            &mut self.active_claims,
+            &mut self.active_blockers,
+            &mut self.open_handoffs,
+            &mut self.resolved_unverified,
+            &mut self.current_decisions,
+            &mut self.current_risks,
+            &mut self.system_health,
+            &mut self.recent_artifacts,
+            &mut self.unconsumed_artifacts,
+            &mut self.stale_facts,
+            &mut self.pending_wakes,
+            &mut self.open_obligations,
+        ]
+        .into_iter()
+        .zip(rows)
+        {
+            *bucket = rows;
+        }
+    }
+
     /// Tools that author or are addressed by open work: active claims,
     /// blockers, open handoffs and unconsumed artifacts. Their presence rows
     /// stay visible however stale, because a reader acting on that work needs
@@ -2554,7 +2814,53 @@ impl RoomSnapshot {
         self
     }
 
-    pub(crate) fn for_obligation_target(mut self, tool: &str, row_limit: usize) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn for_obligation_target(self, tool: &str, row_limit: usize) -> Result<Self> {
+        self.for_obligation_page(tool, row_limit, &Default::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_obligation_page(
+        self,
+        tool: &str,
+        row_limit: usize,
+        request: &rally_protocol::store_wire::CallerProjectionRequest,
+    ) -> Result<Self> {
+        self.for_obligation_page_at(tool, row_limit, Some(request), None)
+    }
+
+    pub(crate) fn for_obligation_page_at(
+        mut self,
+        tool: &str,
+        row_limit: usize,
+        request: Option<&rally_protocol::store_wire::CallerProjectionRequest>,
+        root: Option<&Path>,
+    ) -> Result<Self> {
+        let fs = root
+            .map(|root| crate::open_queue::probe_fs(&self, tool, root))
+            .unwrap_or_default();
+        let revalidate_total =
+            crate::open_queue::revalidate_total(&self, tool, &fs, projection_unix_sec());
+        let mut sizes = CallerRowSizes::new(&self);
+        let attention_total = request.and_then(|request| {
+            request
+                .attention_since
+                .map(|since| crate::next::build_attention(&self, tool, since, &request.paths).len())
+        });
+        let overdue_handoffs_total =
+            crate::overdue_handoffs_at(&self, tool, chrono::Utc::now()).len();
+        let oldest_obligation_age_secs = self
+            .open_obligations
+            .iter()
+            .filter(|f| f.target.as_deref() == Some(tool))
+            .map(|f| fact_age_secs(f, projection_unix_sec()).max(0))
+            .max()
+            .unwrap_or(0);
+        self.compact_addressed_rows(tool, &mut sizes);
+        let named_sample = crate::obligations::named_work(&self, tool)
+            .into_iter()
+            .min_by_key(|(f, _)| fact_age_secs(f, projection_unix_sec()))
+            .map(|(f, _)| f.clone());
         // The only reader of `pending_wakes` is `next`'s coalescing guard, which
         // matches `wake.target == tool`. Keep exactly the caller's wakes so the
         // wire carries one target's set, not the room's (largest measured
@@ -2575,6 +2881,7 @@ impl RoomSnapshot {
             |_| false,
             |_| 0,
             |wake| wake.seq,
+            |wake| sizes.fact(wake),
         );
         let accepted_open = crate::obligations::named_work(&self, tool)
             .iter()
@@ -2585,30 +2892,33 @@ impl RoomSnapshot {
             .into_iter()
             .filter(|fact| fact.target.as_deref() == Some(tool))
             .collect::<Vec<_>>();
-        mine.sort_by_key(|fact| fact.seq);
         let total = mine.len();
-        let handoffs = mine
-            .iter()
-            .filter(|fact| fact.kind == FactKind::Handoff)
-            .count();
-        let artifacts = mine
-            .iter()
-            .filter(|fact| fact.kind == FactKind::Artifact)
-            .count();
-        let mut emitted = Vec::new();
-        let mut emitted_bytes = 0usize;
-        for fact in mine
-            .into_iter()
-            .take(row_limit.min(MAX_WIRE_OPEN_OBLIGATIONS))
-        {
-            let fact_bytes =
-                serde_json::to_vec(&fact).map_or(MAX_TARGET_OBLIGATION_BYTES, |v| v.len());
-            if emitted_bytes.saturating_add(fact_bytes) > MAX_TARGET_OBLIGATION_BYTES {
-                break;
+        let handoffs = mine.iter().filter(|f| f.kind == FactKind::Handoff).count();
+        let artifacts = mine.iter().filter(|f| f.kind == FactKind::Artifact).count();
+        let sample_unanswered = named_sample
+            .as_ref()
+            .is_some_and(|sample| mine.iter().any(|f| f.event_id == sample.event_id));
+        self.open_obligations = std::mem::take(&mut mine);
+        self.page_addressed(tool, row_limit, request, &mut sizes);
+        if let Some(c) = &mut self.caller_projection {
+            c.addressed_page.accepted_open = accepted_open;
+            c.open_queue_revalidate_total = Some(revalidate_total);
+            c.attention_total = attention_total;
+            c.overdue_handoffs_total = Some(overdue_handoffs_total);
+            c.oldest_obligation_age_secs = oldest_obligation_age_secs;
+            c.named_sample = named_sample.filter(|f| {
+                !c.addressed_page
+                    .items
+                    .iter()
+                    .any(|i| i.event_id == f.event_id)
+            });
+            if let Some(sample) = &c.named_sample
+                && sample_unanswered
+            {
+                c.unanswered.insert(sample.event_id.clone());
             }
-            emitted_bytes = emitted_bytes.saturating_add(fact_bytes);
-            emitted.push(fact);
         }
+        let emitted = std::mem::take(&mut self.open_obligations);
         self.open_obligations_omitted = total.saturating_sub(emitted.len());
         self.open_obligations = emitted;
         self.open_obligations_target = Some(tool.to_string());
@@ -2616,14 +2926,228 @@ impl RoomSnapshot {
         self.open_obligations_total = total;
         self.open_obligations_handoffs = handoffs;
         self.open_obligations_artifacts = artifacts;
-        self.bound_for_caller(tool)
+        self.bound_for_caller_sized(tool, sizes)
+    }
+
+    /// A maximal peer payload must still expose an answerable id. Full text remains in locate.
+    fn compact_addressed_rows(&mut self, tool: &str, sizes: &mut CallerRowSizes) {
+        // Half a page leaves room for another row and guarantees forward progress.
+        const MAX_ADDRESSED_ROW_BYTES: usize = MAX_TARGET_OBLIGATION_BYTES / 2;
+        let mut replacements = BTreeMap::new();
+        for (index, rows) in self.caller_fact_buckets().into_iter().enumerate() {
+            if index == CALLER_RESOLVED_BUCKET {
+                continue;
+            }
+            for fact in rows {
+                if fact.target.as_deref() == Some(tool)
+                    && matches!(
+                        fact.kind,
+                        FactKind::Handoff | FactKind::Blocker | FactKind::Artifact
+                    )
+                    && sizes.fact(fact) > MAX_ADDRESSED_ROW_BYTES
+                {
+                    replacements
+                        .entry(fact.event_id.clone())
+                        .or_insert_with(|| {
+                            let mut f = fact.clone();
+                            f.summary = Some(
+                                "[payload omitted from page; use rally locate with this event id]"
+                                    .into(),
+                            );
+                            f.subject = f
+                                .subject
+                                .chars()
+                                .take(crate::obligations::PAGE_SUBJECT_CHARS)
+                                .collect();
+                            // Identity metadata has no text-bound check; keep the row answerable by id.
+                            // A missing oversized sender uses the existing receipt-by-ref ACK path.
+                            const MAX_PAGE_IDENTITY_BYTES: usize =
+                                rally_protocol::ledger::MAX_SUBJECT_LEN;
+                            f.tool = f.tool.filter(|v| v.len() <= MAX_PAGE_IDENTITY_BYTES);
+                            f.from_session_id = f
+                                .from_session_id
+                                .filter(|v| v.len() <= MAX_PAGE_IDENTITY_BYTES);
+                            f.ref_id = f.ref_id.filter(|v| v.len() <= MAX_APPEND_EVENT_ID_BYTES);
+                            f.status = f.status.filter(|v| v.len() <= MAX_PAGE_IDENTITY_BYTES);
+                            f.severity = f.severity.filter(|v| v.len() <= MAX_PAGE_IDENTITY_BYTES);
+                            f.schema = crate::FACT_SCHEMA.into();
+                            f.created_at = chrono::DateTime::parse_from_rfc3339(&f.created_at)
+                                .map(|dt| dt.to_rfc3339())
+                                .unwrap_or_default();
+                            if f.scope.len() > rally_protocol::ledger::MAX_SCOPE_ITEMS
+                                || f.scope
+                                    .iter()
+                                    .any(|v| v.len() > rally_protocol::ledger::MAX_SCOPE_ITEM_LEN)
+                            {
+                                f.scope.clear();
+                            }
+                            // Carry one valid deadline and the ACK marker, not arbitrary peer evidence.
+                            f.evidence = crate::ack_by_from_evidence(&fact.evidence)
+                                .map(|(raw, _)| vec![format!("{}{raw}", crate::ACK_BY_MARKER)])
+                                .unwrap_or_default();
+                            if fact_requires_ack(fact) {
+                                f.evidence.push("requires_ack:true".into());
+                            }
+                            f.uri = None;
+                            f.session = None;
+                            f.role = None;
+                            f.thread_id.clear();
+                            let mut bytes = row_bytes(&f);
+                            if bytes > MAX_ADDRESSED_ROW_BYTES {
+                                // JSON escaping can outgrow raw field caps. Keep only identity and deadline.
+                                f.tool = None;
+                                f.from_session_id = None;
+                                f.ref_id = None;
+                                f.status = None;
+                                f.severity = None;
+                                f.scope.clear();
+                                bytes = row_bytes(&f);
+                            }
+                            (f, bytes)
+                        });
+                }
+            }
+        }
+        if replacements.is_empty() {
+            return;
+        }
+        let mut buckets = self.take_caller_fact_buckets();
+        for rows in &mut buckets {
+            for fact in rows {
+                if let Some((replacement, _)) = replacements.get(&fact.event_id) {
+                    *fact = replacement.clone();
+                }
+            }
+        }
+        self.restore_caller_fact_buckets(buckets);
+        for (id, (_, bytes)) in replacements {
+            sizes.facts.insert(id, bytes);
+        }
+    }
+
+    /// Select a shared page so named-work and inbox decisions see the same ids.
+    fn page_addressed(
+        &mut self,
+        tool: &str,
+        row_limit: usize,
+        request: Option<&rally_protocol::store_wire::CallerProjectionRequest>,
+        sizes: &mut CallerRowSizes,
+    ) {
+        let mut rows = BTreeMap::new();
+        for fact in self
+            .open_handoffs
+            .iter()
+            .chain(&self.active_blockers)
+            .chain(&self.open_obligations)
+        {
+            if fact.target.as_deref() == Some(tool)
+                && !self
+                    .open_queue_signals
+                    .rejected_named
+                    .contains(&fact.event_id)
+            {
+                rows.entry(fact.event_id.clone()).or_insert(fact);
+            }
+        }
+        let total = rows.len();
+        let before = request.and_then(|request| request.before);
+        let mut rows = rows
+            .into_values()
+            .filter(|f| before.is_none_or(|b| f.seq < b))
+            .collect::<Vec<_>>();
+        if request.is_some() {
+            rows.sort_by_key(|f| std::cmp::Reverse(f.seq));
+        } else {
+            // Older CLIs cannot continue. Keep their oldest unanswered work reachable.
+            let unanswered = self
+                .open_obligations
+                .iter()
+                .map(|fact| fact.event_id.as_str())
+                .collect::<BTreeSet<_>>();
+            rows.sort_by_key(|f| (!unanswered.contains(f.event_id.as_str()), f.seq));
+        }
+        let remaining = rows.len();
+        let mut ids = BTreeSet::new();
+        let mut page_items = Vec::new();
+        let mut bytes = 0usize;
+        let mut last = None;
+        for fact in rows
+            .into_iter()
+            .take(row_limit.clamp(1, MAX_CALLER_PAGE_ROWS))
+        {
+            let cost = sizes.fact(fact);
+            if bytes.saturating_add(cost) > MAX_TARGET_OBLIGATION_BYTES {
+                break;
+            }
+            bytes += cost;
+            last = Some(fact.seq);
+            ids.insert(fact.event_id.clone());
+            page_items.push(fact.clone());
+        }
+        let next_before = (request.is_some() && ids.len() < remaining)
+            .then_some(last)
+            .flatten();
+        let mut buckets = BTreeMap::new();
+        for (name, rows) in [
+            ("open_handoffs", &mut self.open_handoffs),
+            ("active_blockers", &mut self.active_blockers),
+            ("open_obligations", &mut self.open_obligations),
+        ] {
+            let total = rows.len();
+            rows.retain(|f| f.target.as_deref() != Some(tool) || ids.contains(&f.event_id));
+            let emitted = rows.len();
+            if total > emitted {
+                buckets.insert(
+                    name.to_string(),
+                    BucketComposition {
+                        total,
+                        emitted,
+                        omitted: total - emitted,
+                        omitted_ids: Vec::new(),
+                        omitted_ids_truncated: false,
+                        reason: CALLER_PROJECTION_REASON.into(),
+                    },
+                );
+            }
+        }
+        if !buckets.is_empty() {
+            self.composition = Some(RoomComposition {
+                buckets,
+                ..Default::default()
+            });
+        }
+        let unanswered = self
+            .open_obligations
+            .iter()
+            .map(|f| f.event_id.clone())
+            .collect();
+        self.caller_projection = Some(CallerProjection {
+            addressed_page: AddressedPage {
+                total,
+                emitted: ids.len(),
+                next_before,
+                next_command: next_before.map(|seq| {
+                    format!(
+                        "rally inbox --tool {} --before {seq} --limit {} --json",
+                        crate::shell_quote(tool),
+                        row_limit.clamp(1, MAX_CALLER_PAGE_ROWS)
+                    )
+                }),
+                items: page_items,
+                accepted_open: 0,
+            },
+            unanswered,
+            ..Default::default()
+        });
     }
 
     /// Bound every list a caller-scoped reply (`SnapshotForEnter`,
     /// `SnapshotForObligationTarget`) carries. Runs on the store side in BOTH
     /// store modes, so direct and routed callers read the same projection.
     ///
-    /// Tiers (a row a decision reads is never evicted):
+    /// Addressed work is paged first under its own byte bound. Decisions read
+    /// the visible page plus one freshness representative; full-set counts ride alongside.
+    /// Remaining tiers:
     /// * MUST-KEEP ([`MAX_CALLER_MUST_BYTES`]; over it, and only then, the
     ///   command fails with [`RallyError::CallerProjectionTooLarge`]):
     ///   caller-authored handoffs not yet escalated; handoffs and blockers
@@ -2642,19 +3166,35 @@ impl RoomSnapshot {
     ///   `claimed_scopes`); the write boundary does not read this projection.
     /// * OPTIONAL: everything else, involving `tool` first, newest first.
     ///
-    /// A final check serializes the reply and, while it exceeds
+    /// A final check adds cached row sizes to the serialized scalar skeleton. While it exceeds
     /// [`MAX_CALLER_REPLY_BYTES`], halves the optional then should-keep
     /// budgets. `totals` stays exact and every cut is recorded in
     /// `composition` (reason [`CALLER_PROJECTION_REASON`]).
     pub(crate) fn bound_for_caller(self, tool: &str) -> Result<Self> {
+        let sizes = CallerRowSizes::new(&self);
+        self.bound_for_caller_sized(tool, sizes)
+    }
+
+    fn bound_for_caller_sized(mut self, tool: &str, mut sizes: CallerRowSizes) -> Result<Self> {
+        if self.caller_projection.is_none() {
+            self.compact_addressed_rows(tool, &mut sizes);
+            self.page_addressed(
+                tool,
+                crate::next::MAX_ENTER_ROWS,
+                Some(&Default::default()),
+                &mut sizes,
+            );
+        }
         let mut budgets = CallerBudgets::DEFAULT;
         loop {
-            let projected = self.clone().project_for_caller(tool, budgets)?;
-            if caller_reply_bytes(&projected).is_some_and(|bytes| bytes <= MAX_CALLER_REPLY_BYTES) {
-                return Ok(projected);
+            self = self.project_for_caller(tool, budgets, &sizes)?;
+            if cached_caller_reply_bytes(&mut self, &sizes)
+                .is_some_and(|bytes| bytes <= MAX_CALLER_REPLY_BYTES)
+            {
+                return Ok(self);
             }
             if !budgets.shrink() {
-                return Err(projected.over_budget_after_trimming(tool));
+                return Err(self.over_budget_after_trimming(tool));
             }
         }
     }
@@ -2694,10 +3234,24 @@ impl RoomSnapshot {
         }
     }
 
-    fn project_for_caller(mut self, tool: &str, budgets: CallerBudgets) -> Result<Self> {
-        let mut buckets = BTreeMap::new();
+    fn project_for_caller(
+        mut self,
+        tool: &str,
+        budgets: CallerBudgets,
+        sizes: &CallerRowSizes,
+    ) -> Result<Self> {
+        let mut buckets = self
+            .composition
+            .take()
+            .map(|c| c.buckets)
+            .unwrap_or_default();
         let mut record = |name: &str, total: usize, omitted: usize| {
             if omitted > 0 {
+                let previous = buckets
+                    .get(name)
+                    .map_or(0, |b: &BucketComposition| b.omitted);
+                let total = total + previous;
+                let omitted = omitted + previous;
                 buckets.insert(
                     name.to_string(),
                     BucketComposition {
@@ -2732,7 +3286,7 @@ impl RoomSnapshot {
         let mut risk_bytes_by_ref = BTreeMap::<String, usize>::new();
         for risk in &self.current_risks {
             if let Some(id) = risk.ref_id.as_deref().filter(|id| own_ids.contains(*id)) {
-                *risk_bytes_by_ref.entry(id.to_string()).or_default() += row_bytes(risk);
+                *risk_bytes_by_ref.entry(id.to_string()).or_default() += sizes.fact(risk);
             }
         }
         // Escalated = has a no-response risk, by the escalation code's own
@@ -2782,7 +3336,7 @@ impl RoomSnapshot {
         let squad_bytes = self
             .squads
             .iter()
-            .map(|squad| (squad.tool.clone(), row_bytes(squad)))
+            .map(|squad| (squad.tool.clone(), sizes.squad(squad)))
             .collect::<BTreeMap<_, _>>();
         let mut must_tools = BTreeSet::from([tool.to_string()]);
         must_tools.extend(self.lead.iter().cloned());
@@ -2797,28 +3351,28 @@ impl RoomSnapshot {
         let own_handoff_bytes = self
             .open_handoffs
             .iter()
-            .filter(|fact| mine(fact) && must_handoff(fact))
+            .filter(|fact| mine(fact) && !to_me(fact) && must_handoff(fact))
             .map(|fact| {
-                row_bytes(fact) + risk_bytes_by_ref.get(&fact.event_id).copied().unwrap_or(0)
+                sizes.fact(fact) + risk_bytes_by_ref.get(&fact.event_id).copied().unwrap_or(0)
             })
             .sum::<usize>();
         let addressed_handoff_bytes = self
             .open_handoffs
             .iter()
             .filter(|fact| to_me(fact) && !mine(fact))
-            .map(row_bytes)
+            .map(|f| sizes.fact(f))
             .sum::<usize>();
         let own_claim_bytes = self
             .active_claims
             .iter()
             .filter(|f| mine(f))
-            .map(row_bytes)
+            .map(|f| sizes.fact(f))
             .sum::<usize>();
         let blocker_bytes = self
             .active_blockers
             .iter()
-            .filter(|f| must_blocker(f))
-            .map(row_bytes)
+            .filter(|f| mine(f) && !to_me(f))
+            .map(|f| sizes.fact(f))
             .sum::<usize>();
         let must_squad_bytes = |tools: &BTreeSet<String>| {
             tools
@@ -2826,11 +3380,9 @@ impl RoomSnapshot {
                 .filter_map(|t| squad_bytes.get(t))
                 .sum::<usize>()
         };
-        let must_bytes = own_handoff_bytes
-            + addressed_handoff_bytes
-            + own_claim_bytes
-            + blocker_bytes
-            + must_squad_bytes(&must_tools);
+        // Addressed rows have their own bounded page; peers cannot exhaust the caller's ownership budget.
+        let must_bytes =
+            own_handoff_bytes + own_claim_bytes + blocker_bytes + must_squad_bytes(&must_tools);
         if must_bytes > MAX_CALLER_MUST_BYTES {
             let count = |rows: &[Fact], pred: &dyn Fn(&Fact) -> bool| {
                 rows.iter().filter(|f| pred(f)).count()
@@ -2864,7 +3416,7 @@ impl RoomSnapshot {
                 .and_then(|t| squad_bytes.get(t))
                 .copied()
                 .unwrap_or(0);
-            let cost = row_bytes(*fact) + risk_bytes_by_ref[&fact.event_id] + target_squad;
+            let cost = sizes.fact(fact) + risk_bytes_by_ref[&fact.event_id] + target_squad;
             if cost > left {
                 break;
             }
@@ -2911,6 +3463,7 @@ impl RoomSnapshot {
                 }
             },
             fact_seq,
+            |f| sizes.fact(f),
         );
         omitted.extend(more);
         record("open_handoffs", total, omitted.len());
@@ -2942,6 +3495,17 @@ impl RoomSnapshot {
         self.open_queue_signals
             .later_done
             .retain(|id, _| kept_handoffs.contains(id));
+        for fact in self
+            .open_handoffs
+            .iter()
+            .filter(|fact| crate::open_queue::is_open_queue_item_for(fact, tool))
+            .filter(|fact| self.open_queue_full_later_done.contains(&fact.event_id))
+        {
+            self.open_queue_signals
+                .later_done
+                .entry(fact.event_id.clone())
+                .or_default();
+        }
         self.open_queue_signals
             .rejected_named
             .retain(|id| kept_handoffs.contains(id));
@@ -2969,6 +3533,7 @@ impl RoomSnapshot {
             },
             fact_rank,
             fact_seq,
+            |f| sizes.fact(f),
         );
         omitted.extend(more);
         record("current_risks", total, omitted.len());
@@ -2983,6 +3548,7 @@ impl RoomSnapshot {
             |fact| mine(fact),
             |_| 0,
             fact_seq,
+            |f| sizes.fact(f),
         );
         should_left = should_left.saturating_sub(used);
         record("active_claims", total, omitted.len());
@@ -2994,6 +3560,7 @@ impl RoomSnapshot {
             |fact| must_blocker(fact),
             |_| 0,
             fact_seq,
+            |f| sizes.fact(f),
         );
         record("active_blockers", total, omitted.len());
 
@@ -3012,6 +3579,7 @@ impl RoomSnapshot {
                 |_| false,
                 fact_rank,
                 fact_seq,
+                |f| sizes.fact(f),
             );
             record(name, total, omitted.len());
         }
@@ -3034,6 +3602,7 @@ impl RoomSnapshot {
                 }
             },
             |squad| squad.last_seen_seq,
+            |squad| sizes.squad(squad),
         );
         record("squads", total, omitted.len());
         for (name, freshness) in [
@@ -3271,6 +3840,7 @@ impl RoomSnapshot {
             return self;
         }
         let mut filtered = Self {
+            caller_projection: self.caller_projection,
             max_seq: self.max_seq,
             content_max_seq: self.content_max_seq,
             last_activity_ts: self.last_activity_ts,
@@ -3319,6 +3889,7 @@ impl RoomSnapshot {
             // Room-level history (pickup p95) and per-item signals keyed by id;
             // a query narrows which items render, not what is known about them.
             open_queue_signals: self.open_queue_signals,
+            open_queue_full_later_done: self.open_queue_full_later_done,
         };
         filtered.totals = RoomTotals {
             active_claims: filtered.active_claims.len(),
@@ -3611,6 +4182,7 @@ impl From<&RoomSnapshot> for RoomSummary {
 ///   rebuild_claim_index                  → RebuildClaimIndex
 ///   renew_claim_lease                    → RenewClaimLease
 ///   session_facts_with_context_version   → SessionFactsWithContextVersion
+///   projected_lead                       → ProjectedLead
 ///   snapshot / snapshot_with_archived    → SnapshotWithArchived
 ///   snapshot_for_enter                   → SnapshotForEnter
 ///   snapshot_scoped                      → SnapshotScoped
@@ -5480,12 +6052,17 @@ impl RoomStore {
         }
     }
 
-    /// The lead seat as the room snapshot reports it (Stage 0: scoped read in
-    /// direct mode; routed stores take the full snapshot as before).
+    /// The lead seat as the room snapshot reports it. Older daemons supply
+    /// bounded ledger pages when they lack the dedicated lead query.
     pub(crate) fn projected_lead(&self) -> Result<Option<String>> {
         match self {
             RoomStore::Direct(d) => d.projected_lead(),
-            RoomStore::Routed(r) => Ok(r.snapshot()?.lead),
+            RoomStore::Routed(r) => match r.projected_lead() {
+                Err(error) if is_unknown_store_op(&error) => {
+                    Ok(claim_authority::projected_lead(&r.facts()?))
+                }
+                result => result,
+            },
         }
     }
 
@@ -5628,9 +6205,23 @@ impl RoomStore {
         tool: &str,
         row_limit: usize,
     ) -> Result<RoomSnapshot> {
+        self.snapshot_for_obligation_page(tool, row_limit, &Default::default())
+    }
+
+    pub(crate) fn snapshot_for_obligation_page(
+        &self,
+        tool: &str,
+        row_limit: usize,
+        request: &rally_protocol::store_wire::CallerProjectionRequest,
+    ) -> Result<RoomSnapshot> {
         match self {
-            RoomStore::Direct(d) => d.snapshot()?.for_obligation_target(tool, row_limit),
-            RoomStore::Routed(r) => r.snapshot_for_obligation_target(tool, row_limit),
+            RoomStore::Direct(d) => d.snapshot()?.for_obligation_page_at(
+                tool,
+                row_limit,
+                Some(request),
+                Some(d.repo_root()),
+            ),
+            RoomStore::Routed(r) => r.snapshot_for_obligation_page(tool, row_limit, request),
         }
     }
 
@@ -11293,7 +11884,8 @@ fn snapshot_from_facts_with_policy_at(
     // the inbox without the hook paying an extra process spawn per fire (the
     // repo's performance agreement counts spawns as an attributed cost).
     let open_obligations = project_open_obligations(facts);
-    let open_queue_signals = crate::open_queue::project_signals(facts, &open_handoffs);
+    let (open_queue_signals, open_queue_full_later_done) =
+        crate::open_queue::project_signals_with_full(facts, &open_handoffs);
     // Tools that have AUTHORED at least one fact here — the room's evidence that
     // an agent by that name has actually been present.
     //
@@ -11775,6 +12367,7 @@ fn snapshot_from_facts_with_policy_at(
     };
 
     RoomSnapshot {
+        caller_projection: None,
         max_seq,
         content_max_seq,
         last_activity_ts,
@@ -11807,6 +12400,7 @@ fn snapshot_from_facts_with_policy_at(
         stale_authors,
         author_last_seen,
         open_queue_signals,
+        open_queue_full_later_done,
     }
 }
 
@@ -24356,7 +24950,11 @@ mod ledger_tests {
         presence.tool = Some("alpha:1".to_string());
         let mut backlog_fact = make_fact("b1", FactKind::BacklogItem, "backlog-item", "s");
         backlog_fact.seq = 3;
-        let all = vec![session, presence, backlog_fact];
+        let mut lead = make_fact("lead", FactKind::Decision, "", "role:lead");
+        lead.seq = 4;
+        lead.tool = Some("alpha:1".to_string());
+        lead.subject = "role:lead".to_string();
+        let all = vec![session, presence, backlog_fact, lead];
         let page: Vec<serde_json::Value> = all
             .iter()
             .map(|f| serde_json::to_value(f).unwrap())
@@ -24375,7 +24973,10 @@ mod ledger_tests {
                 let op_name = raw["op"]["kind"].as_str().unwrap_or_default().to_string();
                 let response = if matches!(
                     op_name.as_str(),
-                    "facts_of_kinds" | "session_view_facts" | "batch_reply_facts"
+                    "facts_of_kinds"
+                        | "session_view_facts"
+                        | "batch_reply_facts"
+                        | "projected_lead"
                 ) {
                     rejected_log.lock().unwrap().push(op_name.clone());
                     // What rallyd_core answers when serde cannot parse the op.
@@ -24417,9 +25018,10 @@ mod ledger_tests {
             ids(room.batch_reply_facts(&requested).unwrap()),
             ids(select_batch_reply_facts(all, &requested))
         );
+        assert_eq!(room.projected_lead().unwrap().as_deref(), Some("alpha:1"));
         assert_eq!(
             rejected.lock().unwrap().len(),
-            3,
+            4,
             "all narrow ops were tried"
         );
         assert!(is_unknown_store_op(&RallyError::Command(
@@ -24838,6 +25440,459 @@ mod ledger_tests {
             unscoped.pending_wakes.is_empty(),
             "unscoped replies carry no wakes"
         );
+    }
+
+    #[test]
+    fn addressed_flood_can_be_projected_without_losing_exact_counts() {
+        let facts = (1..=4_000)
+            .map(|seq| {
+                let mut f = make_fact(
+                    &format!("incoming-{seq}"),
+                    FactKind::Handoff,
+                    "",
+                    "assigned",
+                );
+                f.tool = Some("sender".into());
+                f.target = Some("codex".into());
+                f.seq = seq;
+                f.summary = Some("p".repeat(1_000));
+                f
+            })
+            .collect::<Vec<_>>();
+        let snapshot = RoomSnapshot {
+            open_handoffs: facts.clone(),
+            open_obligations: facts,
+            ..RoomSnapshot::default()
+        };
+        let scoped = snapshot.for_obligation_target("codex", 128).unwrap();
+        assert_eq!(scoped.open_obligations_total, 4_000);
+        assert!(scoped.open_handoffs.len() < 4_000);
+        assert!(caller_reply_bytes(&scoped).unwrap() <= MAX_CALLER_REPLY_BYTES);
+    }
+
+    #[test]
+    fn later_enter_attention_is_exact_before_projection_trims() {
+        let mut snapshot = RoomSnapshot::default();
+        for seq in 1..=800 {
+            let mut f = make_fact(&format!("queue-{seq}"), FactKind::Handoff, "", "available");
+            f.tool = Some("poster".into());
+            f.seq = seq;
+            f.summary = Some("p".repeat(1_000));
+            snapshot.open_handoffs.push(f);
+        }
+        let cursor = 50;
+        let expected = crate::next::build_attention(&snapshot, "codex", cursor, &[]).len();
+        let scoped = snapshot
+            .for_obligation_page(
+                "codex",
+                128,
+                &rally_protocol::store_wire::CallerProjectionRequest {
+                    attention_since: Some(cursor),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let (_, total, _, _) = crate::next::bound_enter_attention(
+            &scoped,
+            "codex",
+            cursor,
+            crate::next::build_attention(&scoped, "codex", cursor, &[]),
+        );
+        assert_eq!(total, expected);
+    }
+
+    #[test]
+    fn caller_sizing_serializes_each_row_once_across_shrinking_passes() {
+        let mut snapshot = RoomSnapshot {
+            // Leave enough scalar text to force optional budgets through several passes.
+            mission: Some("m".repeat(MAX_CALLER_REPLY_BYTES - 32 * 1_024)),
+            ..RoomSnapshot::default()
+        };
+        for seq in 1..=400 {
+            let mut f = make_fact(&format!("risk-{seq}"), FactKind::Risk, "", "risk");
+            f.seq = seq;
+            f.summary = Some("p".repeat(1_000));
+            snapshot.current_risks.push(f);
+        }
+        CALLER_ROW_SERIALIZATIONS.with(|n| n.set(0));
+        let projected = snapshot.bound_for_caller("codex").unwrap();
+        let serializations = CALLER_ROW_SERIALIZATIONS.with(|n| n.get());
+        assert_eq!(
+            serializations, 400,
+            "each input row is sized once despite budget shrinking"
+        );
+        assert!(projected.current_risks.len() < 32);
+        assert!(caller_reply_bytes(&projected).unwrap() <= MAX_CALLER_REPLY_BYTES);
+    }
+
+    #[test]
+    fn paging_regression_rejection_progress_fresh_named_work_and_oldest_age() {
+        let mut accepted = make_fact("accepted", FactKind::Handoff, "", "accepted work");
+        accepted.tool = Some("sender".into());
+        accepted.target = Some("codex".into());
+        accepted.seq = 1;
+        accepted.created_at = chrono::Utc::now().to_rfc3339();
+        let mut snapshot = RoomSnapshot {
+            open_handoffs: vec![accepted],
+            ..Default::default()
+        };
+        for seq in 2..=201 {
+            let mut f = make_fact(
+                &format!("incoming-{seq}"),
+                FactKind::Handoff,
+                "",
+                "assigned",
+            );
+            f.tool = Some("sender".into());
+            f.target = Some("codex".into());
+            f.seq = seq;
+            f.created_at = "2000-01-01T00:00:00Z".into();
+            snapshot.open_handoffs.push(f.clone());
+            snapshot.open_obligations.push(f);
+        }
+        let scoped = snapshot.clone().for_obligation_target("codex", 20).unwrap();
+        let inbox = crate::obligations::build_inbox(
+            &scoped,
+            "codex",
+            20,
+            crate::next::DEFAULT_STALE_WAIT_SECS,
+            vec![],
+        );
+        assert_eq!(inbox.accepted_open, 1);
+        assert!(inbox.oldest_age_secs > 100_000);
+        assert!(
+            !scoped
+                .open_handoffs
+                .iter()
+                .any(|f| f.event_id == "accepted")
+        );
+        let next = crate::next::build_next(
+            &scoped,
+            "codex",
+            None,
+            &[],
+            5,
+            vec![],
+            crate::next::DEFAULT_STALE_WAIT_SECS,
+            crate::next::StaleTargetedPolicy::Ignore,
+            &Default::default(),
+        );
+        assert!(
+            next.actionable,
+            "fresh accepted work on a later page protects self-exit"
+        );
+        let first_ids = scoped
+            .caller_projection
+            .as_ref()
+            .unwrap()
+            .addressed_page
+            .items
+            .iter()
+            .map(|f| f.event_id.clone())
+            .collect::<BTreeSet<_>>();
+        let before = scoped
+            .caller_projection
+            .as_ref()
+            .unwrap()
+            .addressed_page
+            .next_before;
+        let older = snapshot
+            .clone()
+            .for_obligation_page(
+                "codex",
+                20,
+                &rally_protocol::store_wire::CallerProjectionRequest {
+                    before,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            older
+                .caller_projection
+                .as_ref()
+                .unwrap()
+                .addressed_page
+                .items
+                .iter()
+                .all(|f| !first_ids.contains(&f.event_id))
+        );
+        snapshot
+            .open_queue_signals
+            .rejected_named
+            .extend(first_ids.clone());
+        snapshot
+            .open_obligations
+            .retain(|f| !first_ids.contains(&f.event_id));
+        let after = snapshot.for_obligation_target("codex", 20).unwrap();
+        assert_eq!(after.open_obligations_total, 180);
+        let page = &after.caller_projection.as_ref().unwrap().addressed_page;
+        assert_eq!(page.total, 181);
+        assert!(page.items.iter().all(|f| !first_ids.contains(&f.event_id)));
+    }
+
+    #[test]
+    fn paging_regression_oversized_handoff_and_blockers_stay_answerable() {
+        let mut snapshot = RoomSnapshot::default();
+        for seq in 1..=4_000 {
+            let mut f = make_fact(&format!("blocker-{seq}"), FactKind::Blocker, "", "blocker");
+            f.tool = Some("sender".into());
+            f.target = Some("codex".into());
+            f.seq = seq;
+            f.summary = Some("p".repeat(1_000));
+            snapshot.active_blockers.push(f);
+        }
+        let mut f = make_fact("huge", FactKind::Handoff, "", "oversized handoff");
+        f.tool = Some("sender".into());
+        f.target = Some("codex".into());
+        f.seq = 4_001;
+        f.summary = Some("p".repeat(MAX_CALLER_MUST_BYTES + 1));
+        f.evidence.push("ack-by:2000-01-01T00:00:00Z".into());
+        snapshot.open_handoffs.push(f.clone());
+        snapshot.open_obligations.push(f);
+        let scoped = snapshot.for_obligation_target("codex", 20).unwrap();
+        let inbox = crate::obligations::build_inbox(
+            &scoped,
+            "codex",
+            20,
+            crate::next::DEFAULT_STALE_WAIT_SECS,
+            vec![],
+        );
+        assert_eq!(inbox.count, 1);
+        assert_eq!(inbox.items[0].event_id, "huge");
+        assert_eq!(
+            inbox.items[0].ack_by.as_deref(),
+            Some("2000-01-01T00:00:00Z")
+        );
+        assert!(inbox.items[0].ack_command.contains("--ref huge"));
+        let page = inbox.addressed_page.unwrap();
+        assert_eq!(page.total, 4_001);
+        assert!(page.next_before.is_some());
+        assert!(page.items.iter().any(|f| f.kind == FactKind::Blocker));
+        assert!(caller_reply_bytes(&scoped).unwrap() <= MAX_CALLER_REPLY_BYTES);
+    }
+
+    #[test]
+    fn paging_regression_cached_wire_size_matches_encoding_and_totals_survive_shrinking() {
+        let mut snapshot = RoomSnapshot {
+            mission: Some("m".repeat(MAX_CALLER_REPLY_BYTES - 64 * 1_024)),
+            ..Default::default()
+        };
+        for seq in 1..=800 {
+            let mut f = make_fact(&format!("queue-{seq}"), FactKind::Handoff, "", "queue");
+            f.tool = Some("poster".into());
+            f.seq = seq;
+            f.created_at = "2000-01-01T00:00:00Z".into();
+            f.summary = Some("p".repeat(1_000));
+            snapshot.open_handoffs.push(f);
+        }
+        let health = make_fact("health", FactKind::Risk, "", "health");
+        snapshot.system_health.push(health);
+        snapshot.open_queue_signals.room_pickup_p95_secs = Some(60);
+        snapshot.open_queue_signals.pickup_sample = 30;
+        let mut original = make_fact("completion", FactKind::Artifact, "", "completion");
+        original.status = Some("original-status".repeat(100));
+        let mut labeled = original.clone();
+        labeled.status = Some("resolved-unverified".into());
+        snapshot.resolved_unverified.push(labeled);
+        snapshot.recent_artifacts.push(original);
+        let sizes = CallerRowSizes::new(&snapshot);
+        let mut scoped = snapshot.for_obligation_target("codex", 20).unwrap();
+        assert_eq!(
+            scoped
+                .caller_projection
+                .as_ref()
+                .unwrap()
+                .open_queue_revalidate_total,
+            Some(800)
+        );
+        let omitted = scoped.caller_projection_omitted(CALLER_OPEN_QUEUE_BUCKET);
+        assert_eq!(omitted + scoped.open_handoffs.len(), 800);
+
+        assert_eq!(
+            cached_caller_reply_bytes(&mut scoped, &sizes),
+            caller_reply_bytes(&scoped)
+        );
+    }
+
+    #[test]
+    fn paging_regression_overdue_total_includes_evicted_escalated_pairs() {
+        const TOTAL: usize = 1_400;
+        let mut snapshot = RoomSnapshot::default();
+        for seq in 1..=TOTAL {
+            let mut f = make_fact(
+                &format!("outgoing-{seq}"),
+                FactKind::Handoff,
+                "",
+                "outgoing",
+            );
+            f.tool = Some("codex".into());
+            f.target = Some("peer".into());
+            f.seq = seq as i64;
+            f.evidence.push("ack-by:2000-01-01T00:00:00Z".into());
+            f.summary = Some("p".repeat(2_000));
+            let mut risk = make_fact(
+                &format!("risk-{seq}"),
+                FactKind::Risk,
+                "",
+                "no-response: peer",
+            );
+            risk.subject = "no-response: peer".into();
+            risk.ref_id = Some(f.event_id.clone());
+            risk.seq = (TOTAL + seq) as i64;
+            snapshot.open_handoffs.push(f);
+            snapshot.current_risks.push(risk);
+        }
+        let scoped = snapshot.for_obligation_target("codex", 20).unwrap();
+        assert_eq!(
+            scoped
+                .caller_projection
+                .as_ref()
+                .unwrap()
+                .overdue_handoffs_total,
+            Some(TOTAL)
+        );
+        assert!(crate::overdue_handoffs_at(&scoped, "codex", chrono::Utc::now()).len() < TOTAL);
+    }
+
+    #[test]
+    fn legacy_caller_keeps_oldest_unanswered_handoff_visible() {
+        let mut owed = make_fact("owed", FactKind::Handoff, "", "unanswered");
+        owed.target = Some("codex".into());
+        owed.seq = 1;
+        let blockers = (2..=202)
+            .map(|seq| {
+                let mut fact =
+                    make_fact(&format!("blocker-{seq}"), FactKind::Blocker, "", "blocker");
+                fact.target = owed.target.clone();
+                fact.seq = seq;
+                fact
+            })
+            .collect();
+        let snapshot = RoomSnapshot {
+            active_blockers: blockers,
+            open_handoffs: vec![owed.clone()],
+            open_obligations: vec![owed],
+            ..Default::default()
+        };
+        let modern = snapshot
+            .clone()
+            .for_obligation_target("codex", 200)
+            .unwrap();
+        assert!(modern.open_obligations.is_empty());
+
+        let legacy = snapshot
+            .for_obligation_page_at("codex", 200, None, None)
+            .unwrap();
+        let decoded = snapshot_from_wire_value(snapshot_to_wire_value(&legacy).unwrap()).unwrap();
+        assert_eq!(decoded.open_obligations_total, 1);
+        assert_eq!(decoded.open_obligations[0].event_id, "owed");
+    }
+
+    #[test]
+    fn paging_regression_revalidate_total_precedes_the_later_done_map_bound() {
+        const COUNT: usize = 1_400;
+        let mut facts = Vec::new();
+        for n in 1..=COUNT {
+            let mut item = make_fact(
+                &format!("q-{n}"),
+                FactKind::Handoff,
+                &format!("src/f{n}.rs"),
+                "available",
+            );
+            item.seq = n as i64;
+            let mut done = make_fact(
+                &format!("done-{n}"),
+                FactKind::Receipt,
+                &format!("src/f{n}.rs"),
+                "work done",
+            );
+            done.seq = (COUNT + n) as i64;
+            done.subject = "work done".into();
+            facts.push(item);
+            facts.push(done);
+        }
+        facts.sort_by_key(|f| f.seq);
+        let snapshot = snapshot_from_facts_with_policy(&facts, &Default::default(), false);
+        assert_eq!(snapshot.open_handoffs.len(), COUNT);
+        assert_eq!(
+            snapshot.open_queue_signals.later_done.len(),
+            crate::open_queue::MAX_LATER_DONE_ITEMS
+        );
+        let scoped = snapshot.clone().for_obligation_target("codex", 20).unwrap();
+        let wire = snapshot_to_wire_value(&scoped).unwrap();
+        let scoped = snapshot_from_wire_value(wire).unwrap();
+        assert!(
+            scoped.open_queue_full_later_done.is_empty(),
+            "only the exact aggregate crosses the wire"
+        );
+
+        assert_eq!(
+            scoped
+                .caller_projection
+                .as_ref()
+                .unwrap()
+                .open_queue_revalidate_total,
+            Some(COUNT)
+        );
+
+        let mut snapshot = snapshot;
+        for fact in &mut snapshot.open_handoffs {
+            if fact.event_id != "q-1" {
+                fact.scope.push("external-intake".into());
+            }
+        }
+        assert!(!snapshot.open_queue_signals.later_done.contains_key("q-1"));
+        let scoped = snapshot.for_obligation_target("codex", 20).unwrap();
+        let routed = snapshot_from_wire_value(snapshot_to_wire_value(&scoped).unwrap()).unwrap();
+        let visible = crate::open_queue::open_queue_items(
+            &routed,
+            "codex",
+            &Default::default(),
+            projection_unix_sec(),
+        );
+        assert_eq!(visible.len(), 1);
+        assert!(visible[0].revalidate_before_claiming);
+    }
+
+    #[test]
+    fn paging_regression_oldest_age_keeps_the_existing_future_timestamp_clamp() {
+        let mut f = make_fact("future", FactKind::Handoff, "", "future timestamp");
+        f.target = Some("codex".into());
+        f.created_at = "2999-01-01T00:00:00Z".into();
+        let scoped = RoomSnapshot {
+            open_handoffs: vec![f.clone()],
+            open_obligations: vec![f],
+            ..Default::default()
+        }
+        .for_obligation_target("codex", 20)
+        .unwrap();
+        let inbox = crate::obligations::build_inbox(&scoped, "codex", 20, 300, vec![]);
+        assert_eq!(inbox.oldest_age_secs, 0);
+    }
+
+    #[test]
+    fn paging_regression_oversized_sender_still_has_an_answerable_identity() {
+        let mut f = make_fact("large-sender", FactKind::Handoff, "", "assigned");
+        f.tool = Some("sender".repeat(MAX_TARGET_OBLIGATION_BYTES));
+        // Encoded bytes can exceed the raw per-field bounds by six times.
+        f.scope = vec!["\u{1}".repeat(512); 64];
+        f.from_session_id = Some("\u{1}".repeat(4_096));
+        f.status = Some("\u{1}".repeat(4_096));
+        f.severity = Some("\u{1}".repeat(4_096));
+        f.target = Some("codex".into());
+        f.seq = 1;
+        let scoped = RoomSnapshot {
+            open_handoffs: vec![f.clone()],
+            open_obligations: vec![f],
+            ..Default::default()
+        }
+        .for_obligation_target("codex", 20)
+        .unwrap();
+        let inbox = crate::obligations::build_inbox(&scoped, "codex", 20, 300, vec![]);
+        assert_eq!(inbox.items.len(), 1);
+        assert!(inbox.items[0].ack_command.contains("--ref large-sender"));
+        assert!(caller_reply_bytes(&scoped).unwrap() <= MAX_CALLER_REPLY_BYTES);
     }
 
     // -------------------------------------------------------------------------
@@ -26804,10 +27859,9 @@ mod obligation_projection_tests {
         assert_eq!(ids(&restored.open_obligations), vec!["owed"]);
 
         let flooded = RoomSnapshot {
-            open_obligations: vec![
-                aged_handoff("flood", 1, "codex", 60);
-                MAX_WIRE_OPEN_OBLIGATIONS + 1
-            ],
+            open_obligations: (1..=MAX_WIRE_OPEN_OBLIGATIONS + 1)
+                .map(|seq| aged_handoff(&format!("flood-{seq}"), seq as i64, "codex", 60))
+                .collect(),
             ..RoomSnapshot::default()
         };
         let error = snapshot_to_wire_value(&flooded).unwrap_err().to_string();
