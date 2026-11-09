@@ -105,17 +105,9 @@ pub(crate) fn detect_shared_branch_hazard(
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn tmp_dir(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let p = std::env::temp_dir().join(format!("rally-wg-{label}-{nanos}"));
-        fs::create_dir_all(&p).unwrap();
-        p
+    fn tmp_dir(label: &str) -> crate::test_temp_root::TempRoot {
+        crate::test_temp_root::TempRoot::new(&format!("rally-wg-{label}"))
     }
 
     // --- is_linked_worktree ---
@@ -133,7 +125,6 @@ mod tests {
             is_linked_worktree(&root),
             "directory with a .git FILE must be detected as linked worktree"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -145,7 +136,6 @@ mod tests {
             !is_linked_worktree(&root),
             "directory with a .git DIR must NOT be detected as linked worktree"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     // --- current_branch ---
@@ -164,7 +154,6 @@ mod tests {
             Some("feat/my-feature"),
             "branch name must be parsed from ref: refs/heads/<name>"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -180,7 +169,6 @@ mod tests {
             current_branch(&root).is_none(),
             "detached HEAD must return None"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -192,7 +180,6 @@ mod tests {
             current_branch(&root).is_none(),
             "missing HEAD file must return None"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     // --- detect_shared_branch_hazard ---
@@ -224,7 +211,6 @@ mod tests {
             msg.contains("1 active peer"),
             "message must name the peer count; got: {msg}"
         );
-        fs::remove_dir_all(&dummy).ok();
     }
 
     /// Hazard fires: multiple peers escalates the count in the message.
@@ -238,7 +224,6 @@ mod tests {
             msg.contains("3 active peer"),
             "peer count must appear in message; got: {msg}"
         );
-        fs::remove_dir_all(&dummy).ok();
     }
 
     /// No false positive: on `main`, canonical + peers must NOT fire.
@@ -255,7 +240,6 @@ mod tests {
             result.is_none(),
             "hazard must NOT fire when branch is 'main'"
         );
-        fs::remove_dir_all(&dummy).ok();
     }
 
     /// No false positive: on `master`.
@@ -267,7 +251,6 @@ mod tests {
             result.is_none(),
             "hazard must NOT fire when branch is 'master'"
         );
-        fs::remove_dir_all(&dummy).ok();
     }
 
     /// No false positive: linked worktree on non-main branch with peers.
@@ -284,7 +267,6 @@ mod tests {
             result.is_none(),
             "hazard must NOT fire for a linked worktree (that's the correct pattern)"
         );
-        fs::remove_dir_all(&dummy).ok();
     }
 
     /// No false positive: detached HEAD (None branch) must not fire.
@@ -300,7 +282,6 @@ mod tests {
             result.is_none(),
             "hazard must NOT fire on detached HEAD (branch unknown)"
         );
-        fs::remove_dir_all(&dummy).ok();
     }
 
     /// No false positive: solo agent (no peers) on non-main branch.
@@ -317,6 +298,5 @@ mod tests {
             result.is_none(),
             "hazard must NOT fire when there are no active peers (solo agent)"
         );
-        fs::remove_dir_all(&dummy).ok();
     }
 }
