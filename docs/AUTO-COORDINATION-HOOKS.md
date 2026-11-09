@@ -83,9 +83,14 @@ python3 scripts/sync_host_integrations.py --apply --json
 version, and deterministic digest of the generated surfaces. The same identity
 ships inside the Codex `.codex-plugin` payload so the installed cache can be
 attested at its real `local/.codex-plugin` root. The host reconciler compares
-the full identity, not version alone; it reports `current`, `restart_required`,
-`uninstalled`, `stale`, `duplicate_provider`, or `unknown`. Diagnosis is
-read-only and exits non-zero on drift. Apply mode refuses to mutate a host whose
+the full identity, not version alone, and judges the release, not the
+marketplace name: one enabled provider with the canonical identity is `current`
+whatever marketplace installed it. A single provider with a different identity
+is `stale` (older version), `ahead` (newer; exits 0, never removed), or
+`diverged` (same version, different generated surfaces; no automated change).
+It also reports `restart_required`, `uninstalled`, `duplicate_provider` (two or
+more enabled providers), or `unknown`. Diagnosis is read-only and exits
+non-zero on drift. Apply mode refuses to mutate a host whose
 installed state could not be read, reduces each host to
 `agent-rally-point@agent-rally-point`, updates from the canonical marketplace,
 stops on the first failed plugin-manager command, then requires a host restart.

@@ -386,5 +386,93 @@ class HostSyncTests(unittest.TestCase):
         self.assertFalse(claude["restart_required"])
 
 
+LOCAL_CLAUDE_ID = "agent-rally-point@canonical-local"
+
+
+def claude_list_with(install: Path, plugin_id: str = LOCAL_CLAUDE_ID) -> FakeRunner:
+    return FakeRunner(
+        {
+            ("claude", "plugin", "list", "--json"): (
+                0,
+                [{"id": plugin_id, "enabled": True, "installPath": str(install)}],
+            ),
+            ("codex", "plugin", "list", "--json"): (0, {"installed": []}),
+        }
+    )
+
+
+class LocalMarketplaceIdentityTests(unittest.TestCase):
+    """Sync decides on release identity, not on the marketplace name."""
+
+    def plan(self, installed: dict[str, str]) -> tuple[dict, list[list[str]]]:
+        with tempfile.TemporaryDirectory() as tmp:
+            install = Path(tmp)
+            (install / "rally-release.json").write_text(json.dumps(installed))
+            report = SYNC.reconcile(
+                ROOT,
+                host="claude_code",
+                apply=False,
+                runner=claude_list_with(install),
+                home=install,
+            )
+        return report["hosts"]["claude_code"], report["apply"]["planned_commands"]
+
+    def test_equal_identity_from_local_marketplace_is_in_sync(self) -> None:
+        record, planned = self.plan(identity())
+        self.assertEqual(record["status"], "current")
+        self.assertIn("canonical-local", record["reason"])
+        self.assertEqual(planned, [])
+
+    def test_newer_local_release_is_never_removed(self) -> None:
+        record, planned = self.plan({**identity(), "version": "99.0.0"})
+        self.assertEqual(record["status"], "ahead")
+        self.assertEqual(planned, [])
+
+    def test_older_local_release_plans_update(self) -> None:
+        record, planned = self.plan({**identity(), "version": "0.0.1"})
+        self.assertEqual(record["status"], "stale")
+        self.assertIn(
+            ["claude", "plugin", "uninstall", LOCAL_CLAUDE_ID, "--yes"], planned
+        )
+
+    def test_same_version_different_digest_is_not_removed(self) -> None:
+        record, planned = self.plan(
+            {**identity(), "generated_surface_digest": "sha256:other"}
+        )
+        self.assertEqual(record["status"], "diverged")
+        self.assertEqual(planned, [])
+
+    def test_versions_compare_numerically_not_as_strings(self) -> None:
+        self.assertEqual(SYNC.compare_versions("0.10.0", "0.9.0"), 1)
+        self.assertEqual(SYNC.compare_versions("0.2", "0.2.0"), 0)
+        self.assertEqual(SYNC.compare_versions("1.0.0-rc1", "1.0.0"), -1)
+        self.assertIsNone(SYNC.compare_versions("local", "0.2.9"))
+
+    def test_two_enabled_providers_stay_a_duplicate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            install = Path(tmp)
+            (install / "rally-release.json").write_text(json.dumps(identity()))
+            runner = FakeRunner(
+                {
+                    ("claude", "plugin", "list", "--json"): (
+                        0,
+                        [
+                            {"id": LOCAL_CLAUDE_ID, "enabled": True, "installPath": str(install)},
+                            {
+                                "id": "agent-rally-point@agent-rally-point",
+                                "enabled": True,
+                                "installPath": str(install),
+                            },
+                        ],
+                    )
+                }
+            )
+            report = SYNC.reconcile(
+                ROOT, host="claude_code", apply=False, runner=runner, home=install
+            )
+        self.assertEqual(report["hosts"]["claude_code"]["status"], "duplicate_provider")
+        self.assertTrue(report["apply"]["planned_commands"])
+
+
 if __name__ == "__main__":
     unittest.main()

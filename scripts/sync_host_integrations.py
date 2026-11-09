@@ -8,6 +8,7 @@ import json
 import shlex
 import subprocess
 import sys
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -15,14 +16,22 @@ from typing import Any, Callable, Sequence
 
 PLUGIN_NAME = "agent-rally-point"
 IDENTITY_FILE = "rally-release.json"
+# Severity order; the overall status is the worst host status.
 STATUS_ORDER = {
     "current": 0,
-    "restart_required": 1,
-    "uninstalled": 2,
-    "stale": 3,
-    "duplicate_provider": 4,
-    "unknown": 5,
+    "ahead": 1,
+    "restart_required": 2,
+    "uninstalled": 3,
+    "stale": 4,
+    "diverged": 5,
+    "duplicate_provider": 6,
+    "unknown": 7,
 }
+# Statuses that need no host change: apply plans no commands for them.
+NO_ACTION_STATUSES = frozenset({"current", "ahead", "unknown", "diverged"})
+# Statuses that exit 0 from the CLI (nothing to reconcile).
+EXIT_OK_STATUSES = frozenset({"current", "ahead", "restart_required"})
+VERSION_NUMBER = re.compile(r"^v?(\d+(?:\.\d+)*)(.*)$")
 
 
 @dataclass(frozen=True)
@@ -115,6 +124,34 @@ def identity_matches(actual: dict[str, Any], expected: dict[str, Any]) -> bool:
     )
 
 
+def parse_version(value: Any) -> tuple[tuple[int, ...], bool] | None:
+    """Return (numeric components, is_release) or None when unparseable.
+
+    A pre-release suffix (``-rc1``) sorts below the same numeric release.
+    Trailing zero components are ignored so 0.2 equals 0.2.0.
+    """
+    match = VERSION_NUMBER.match(str(value or "").strip())
+    if not match:
+        return None
+    numbers = [int(part) for part in match.group(1).split(".")]
+    while len(numbers) > 1 and numbers[-1] == 0:
+        numbers.pop()
+    suffix = match.group(2).strip()
+    return tuple(numbers), not suffix.startswith("-")
+
+
+def compare_versions(installed: Any, canonical: Any) -> int | None:
+    """-1 / 0 / 1 when installed is older / equal / newer; None if unparseable."""
+    left, right = parse_version(installed), parse_version(canonical)
+    if left is None or right is None:
+        return None
+    return (left > right) - (left < right)
+
+
+def marketplace_of(provider: dict[str, Any]) -> str:
+    return str(provider.get("marketplace") or str(provider["id"]).partition("@")[2])
+
+
 def host_record(
     *,
     host: str,
@@ -139,27 +176,29 @@ def host_record(
             "restart_required": False,
             "reason": "agent-rally-point is not installed",
         }
-    canonical = [provider for provider in providers if provider["id"] == canonical_id]
-    if len(providers) != 1 or len(canonical) != 1:
+    if len(providers) != 1:
         return {
             "host": host,
             "status": "duplicate_provider",
             "providers": providers,
             "restart_required": True,
-            "reason": f"expected only {canonical_id}; found {len(providers)} enabled provider(s)",
+            "reason": f"expected exactly one enabled provider; found {len(providers)}",
         }
-    provider = canonical[0]
+    provider = providers[0]
+    marketplace = marketplace_of(provider)
     installed_identity = provider.get("identity") or {}
     source_identity = provider.get("source_identity") or {}
     if identity_matches(installed_identity, expected):
         status = "current"
-        reason = "installed plugin identity matches canonical generated surfaces"
+        reason = (
+            "installed plugin identity matches canonical generated surfaces "
+            f"(marketplace {marketplace})"
+        )
     elif identity_matches(source_identity, expected):
         status = "restart_required"
         reason = "marketplace source is current but installed cache is stale"
     else:
-        status = "stale"
-        reason = "installed plugin identity does not match canonical generated surfaces"
+        status, reason = classify_mismatch(installed_identity, expected, marketplace)
     return {
         "host": host,
         "status": status,
@@ -167,6 +206,28 @@ def host_record(
         "restart_required": status == "restart_required",
         "reason": reason,
     }
+
+
+def classify_mismatch(
+    installed: dict[str, Any], expected: dict[str, Any], marketplace: str
+) -> tuple[str, str]:
+    """Judge a single provider whose identity differs from the canonical one."""
+    order = compare_versions(installed.get("version"), expected.get("version"))
+    where = f"marketplace {marketplace}"
+    if order is None or order < 0:
+        return "stale", (
+            f"installed release {installed.get('version') or 'unknown'} is older "
+            f"than canonical {expected.get('version')} ({where})"
+        )
+    if order > 0:
+        return "ahead", (
+            f"installed release {installed.get('version')} is newer than canonical "
+            f"{expected.get('version')}; no change planned ({where})"
+        )
+    return "diverged", (
+        f"installed release {installed.get('version')} equals canonical but its "
+        f"generated surfaces differ; no change planned ({where})"
+    )
 
 
 def claude_status(
@@ -304,7 +365,7 @@ def apply_commands(
     commands: list[list[str]] = []
     if host in {"all", "claude_code"}:
         record = report["hosts"].get("claude_code", {})
-        if record.get("status") not in {"current", "unknown"}:
+        if record.get("status") not in NO_ACTION_STATUSES:
             canonical_id = config["providers"]["claude_code"]["canonical_id"]
             for provider in record.get("providers", []):
                 if provider.get("id") != canonical_id:
@@ -320,7 +381,7 @@ def apply_commands(
             commands.append(list(config["providers"]["claude_code"]["update_command"]))
     if host in {"all", "codex"}:
         record = report["hosts"].get("codex", {})
-        if record.get("status") in {"current", "unknown"}:
+        if record.get("status") in NO_ACTION_STATUSES:
             return commands
         canonical_id = config["providers"]["codex"]["canonical_id"]
         for provider in record.get("providers", []):
@@ -356,7 +417,7 @@ def reconcile(
     mutated_hosts = {
         name
         for name, record in before["hosts"].items()
-        if record.get("status") not in {"current", "unknown"}
+        if record.get("status") not in NO_ACTION_STATUSES
     }
     if not apply:
         return {
@@ -442,7 +503,7 @@ def main(argv: list[str] | None = None) -> int:
     failed = report.get("apply", {}).get("failed", 0)
     if failed:
         return 1
-    return 0 if report["overall"] in {"current", "restart_required"} else 2
+    return 0 if report["overall"] in EXIT_OK_STATUSES else 2
 
 
 if __name__ == "__main__":
