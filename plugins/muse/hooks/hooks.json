@@ -1,0 +1,50 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "RALLY_HOOK_SOURCE=plugin RALLY_HOOK_HOST_TIMEOUT_MS=30000 \"${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh\" start muse",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "RALLY_HOOK_SOURCE=plugin RALLY_HOOK_HOST_TIMEOUT_MS=30000 \"${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh\" idle muse",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "RALLY_HOOK_SOURCE=plugin RALLY_HOOK_HOST_TIMEOUT_MS=10000 \"${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh\" before-write muse",
+            "timeout": 10
+          }
+        ],
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit"
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "RALLY_HOOK_SOURCE=plugin RALLY_HOOK_HOST_TIMEOUT_MS=30000 \"${CLAUDE_PLUGIN_ROOT}/hooks/rally-coordination-hook.sh\" after-write muse",
+            "timeout": 30,
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}

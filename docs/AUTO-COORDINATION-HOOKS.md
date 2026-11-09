@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 # Auto-Coordination Hooks
 
 Make Rally presence and mutation deconfliction **automatic** for coding
-agents (Claude Code, Codex, Cursor) without serializing parallel reads. Other agents can
+agents (Claude Code, Codex, Muse, Cursor) without serializing parallel reads. Other agents can
 still participate manually through the same Rally contract; see
 [`ANY-AGENT-ONBOARDING.md`](ANY-AGENT-ONBOARDING.md).
 
@@ -68,7 +68,7 @@ canonical in `crates/rally-cli/Cargo.toml`; the generator reads it rather than
 duplicating it in the contract.
 
 ```bash
-# Rewrite all derived Claude, Codex, Cursor, marketplace, skill, and artifact files.
+# Rewrite all derived Claude, Codex, Muse, Cursor, marketplace, skill, and artifact files.
 python3 scripts/generate_host_surfaces.py
 
 # Read-only drift gate used by release parity.
@@ -82,7 +82,10 @@ python3 scripts/sync_host_integrations.py --apply --json
 `rally-release.json` records the canonical provider, repository, release
 version, and deterministic digest of the generated surfaces. The same identity
 ships inside the Codex `.codex-plugin` payload so the installed cache can be
-attested at its real `local/.codex-plugin` root. The host reconciler compares
+attested at its real `local/.codex-plugin` root, and at `plugins/muse/rally-release.json`.
+The digest includes both complete bundles and the Cursor plugin manifest and hooks.
+Muse and Cursor provider entries describe generation only; the reconciler still
+manages Claude Code and Codex. The host reconciler compares
 the full identity, not version alone, and judges the release, not the
 marketplace name: one enabled provider with the canonical identity is `current`
 whatever marketplace installed it. A single provider with a different identity
@@ -111,8 +114,18 @@ and release jobs.
 > `rally hook` binary subcommand so a one-line committed config calls `rally hook …`
 > with no script path) is tracked as a backlog item.
 >
-> **Cursor:** delivered as the project hook `.cursor/hooks.json` (Cursor has no
-> plugin marketplace, so it is not a plugin install like Claude Code / Codex).
+> **Muse:** `plugins/muse` is a separate, regular-file bundle with one
+> `.claude-plugin/plugin.json`, three skills, and four compatible hooks. It avoids
+> the root's multiple manifests and symlinks. The Muse adapter supplies
+> `CLAUDE_PLUGIN_ROOT`; hook commands pass the `muse` family to Rally and preserve
+> Claude-compatible events, matchers, and async Stop. Validate with
+> `MUSE_NO_AUTO_UPDATE=1 muse plugins validate plugins/muse --json`.
+>
+> **Cursor:** `.cursor-plugin/plugin.json` selects `hooks/cursor.json`, whose
+> commands resolve the shared script through `CURSOR_PLUGIN_ROOT`, independent
+> of the consumer repository. `.cursor/hooks.json` remains the project-only
+> alternative. See [host plugin surfaces](HOST-PLUGIN-SURFACES.md) for validation
+> and the user-level alternative.
 > `sessionStart` returns `{additional_context}` ([Cursor hooks](https://cursor.com/docs/hooks)).
 > `beforeSubmitPrompt` (idle) has no model-inject field — it still posts presence and returns `{}`. `preToolUse`
 > matcher is `Write|Edit|StrReplace|Delete|EditNotebook`; `agent_message` is

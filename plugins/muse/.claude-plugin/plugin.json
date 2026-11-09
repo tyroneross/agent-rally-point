@@ -1,0 +1,10 @@
+{
+  "name": "agent-rally-point",
+  "version": "0.2.9",
+  "description": "Agent Rally Point coordination skills and Muse-compatible hooks. Records claims, checks write boundaries, routes handoffs, and exposes room state through the rally CLI.",
+  "skills": [
+    "./skills/agent-rally-point",
+    "./skills/mini-loop",
+    "./skills/rally-workflows"
+  ]
+}

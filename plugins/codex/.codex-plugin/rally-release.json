@@ -3,5 +3,5 @@
   "version": "0.2.9",
   "canonical_provider": "agent-rally-point@agent-rally-point",
   "source": "https://github.com/tyroneross/agent-rally-point.git",
-  "generated_surface_digest": "sha256:593fc3a7fa120ec1a71db263619cfd230a36bf7bbcb70c21efbe76418d0c75a6"
+  "generated_surface_digest": "sha256:38cf649f13460080223e00b86f6512c11fabf4f9962b8c04c2d7d794a70539fd"
 }

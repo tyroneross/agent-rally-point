@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -44,6 +46,113 @@ def local_markdown_links(markdown: str) -> list[str]:
 
 
 class GenerateHostSurfacesTests(unittest.TestCase):
+    def test_unchanged_surface_requires_no_write_permission(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "surface.json"
+            path.write_text("{}\n")
+            with mock.patch.object(Path, "write_text", side_effect=PermissionError("read-only surface")):
+                GEN.write_text(path, "{}\n")
+
+    def test_new_provider_locations_are_declared_in_contract(self) -> None:
+        config = GEN.load_config(ROOT)
+        self.assertEqual(config["providers"]["muse"]["plugin_root"], "plugins/muse")
+        self.assertEqual(config["providers"]["cursor"]["manifest"], ".cursor-plugin/plugin.json")
+
+    def test_muse_bundle_is_unambiguous_self_contained_and_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            first, second = Path(tmp) / "first", Path(tmp) / "second"
+            GEN.generate(ROOT, first)
+            GEN.generate(ROOT, second)
+            bundle = first / "plugins/muse"
+            self.assertTrue((bundle / ".claude-plugin/plugin.json").is_file())
+            self.assertEqual(snapshot(bundle), snapshot(second / "plugins/muse"))
+            self.assertFalse(any(p.is_symlink() for p in bundle.rglob("*")))
+            self.assertFalse((first / ".muse-plugin").exists())
+            for other in ("plugin.json", ".muse-plugin", ".codex-plugin"):
+                self.assertFalse((bundle / other).exists(), other)
+            manifest = json.loads((bundle / ".claude-plugin/plugin.json").read_text())
+            config = GEN.load_config(ROOT)
+            self.assertEqual(manifest["skills"], [f"./skills/{s}" for s in sorted(config["skills"])])
+            for skill in manifest["skills"]:
+                self.assertTrue((bundle / skill / "SKILL.md").is_file())
+            pending = list((bundle / "skills").glob("*/SKILL.md"))
+            visited = set()
+            while pending:
+                document = pending.pop()
+                if document in visited:
+                    continue
+                visited.add(document)
+                for target in local_markdown_links(document.read_text()):
+                    resolved = (document.parent / target).resolve()
+                    resolved.relative_to(bundle.resolve())
+                    self.assertTrue(resolved.exists(), target)
+                    if resolved.suffix == ".md":
+                        pending.append(resolved)
+            self.assertGreater(len(visited), len(config["skills"]))
+            self.assertEqual((bundle / "rally-release.json").read_bytes(), (first / "rally-release.json").read_bytes())
+
+    def test_muse_compatible_hooks_follow_contract(self) -> None:
+        config = GEN.load_config(ROOT)
+        surfaces = GEN.render_hook_surfaces(config)
+        hooks = json.loads(surfaces[Path("plugins/muse/hooks/hooks.json")])["hooks"]
+        self.assertEqual(set(hooks), {p["events"]["muse"] for p in config["hooks"]["phases"]})
+        for phase in config["hooks"]["phases"]:
+            group = hooks[phase["events"]["muse"]][0]
+            hook = group["hooks"][0]
+            self.assertEqual(hook["timeout"], phase["timeout_ms"] // 1000)
+            self.assertEqual(group.get("matcher"), phase.get("matchers", {}).get("muse"))
+            self.assertEqual(hook.get("async", False), phase.get("async", {}).get("muse", False))
+            self.assertEqual(hook["command"],
+                f'RALLY_HOOK_SOURCE=plugin RALLY_HOOK_HOST_TIMEOUT_MS={phase["timeout_ms"]} '
+                f'"${{CLAUDE_PLUGIN_ROOT}}/hooks/rally-coordination-hook.sh" {phase["phase"]} muse')
+
+    def test_cursor_plugin_commands_resolve_from_consumer_repository(self) -> None:
+        config = GEN.load_config(ROOT)
+        manifests = GEN.render_plugin_surfaces(config, GEN.cargo_version(ROOT))
+        manifest = json.loads(manifests[Path(".cursor-plugin/plugin.json")])
+        hooks = json.loads(GEN.render_hook_surfaces(config)[Path(manifest["hooks"])])["hooks"]
+        self.assertEqual(manifest["skills"], [f"./skills/{s}" for s in sorted(config["skills"])])
+        self.assertEqual(set(hooks), {p["events"]["cursor"] for p in config["hooks"]["phases"]})
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin, consumer = Path(tmp) / "plugin with spaces", Path(tmp) / "consumer"
+            (plugin / "hooks").mkdir(parents=True)
+            consumer.mkdir()
+            (plugin / "hooks/rally-coordination-hook.sh").write_text(
+                'printf "%s|%s|%s|%s" "$1" "$2" "$RALLY_HOOK_SOURCE" "$RALLY_HOOK_HOST_TIMEOUT_MS"\n'
+            )
+            for phase in config["hooks"]["phases"]:
+                hook = hooks[phase["events"]["cursor"]][0]
+                self.assertEqual(hook["timeout"], phase["timeout_ms"] // 1000)
+                self.assertEqual(hook.get("matcher"), phase.get("matchers", {}).get("cursor"))
+                result = subprocess.run(["bash", "-c", hook["command"]], cwd=consumer,
+                    env={**os.environ, "CURSOR_PLUGIN_ROOT": str(plugin)}, capture_output=True, text=True, check=True)
+                self.assertEqual(result.stdout, f"{phase['phase']}|cursor|plugin|{phase['timeout_ms']}")
+
+    def test_release_digest_covers_new_surfaces_and_muse_payload(self) -> None:
+        config = GEN.load_config(ROOT)
+        surfaces = {**GEN.render_plugin_surfaces(config, GEN.cargo_version(ROOT)), **GEN.render_hook_surfaces(config)}
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            GEN.generate(ROOT, dest)
+            bundle = dest / "plugins/muse"
+            self.assertTrue(bundle.is_dir())
+            def digest():
+                return GEN.digest_inputs(surfaces, {}, dest / GEN.CODEX_ARTIFACT,
+                    bundles={Path("plugins/muse"): bundle})
+            before = digest()
+            for relative in (Path(".cursor-plugin/plugin.json"), Path("hooks/cursor.json")):
+                original = surfaces[relative]
+                surfaces[relative] += "\n"
+                self.assertNotEqual(before, digest(), str(relative))
+                surfaces[relative] = original
+            for path in sorted(bundle.rglob("*")):
+                if not path.is_file() or path.name == "rally-release.json":
+                    continue
+                original = path.read_bytes()
+                path.write_bytes(original + b"\n")
+                self.assertNotEqual(before, digest(), str(path))
+                path.write_bytes(original)
+
     def test_cargo_version_ignores_brackets_inside_package_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
