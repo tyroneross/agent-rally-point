@@ -32,6 +32,11 @@
 //! The WAL left behind by an orphaned pool is a FINGERPRINT of the holder, not
 //! the cause of the lock.
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+
+use temp_root::TempRoot;
+
 use rusqlite::Connection;
 use serde_json::Value;
 use std::fs;
@@ -39,7 +44,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 /// Watchdog budget every timed control pins, so assertions are falsifiable
 /// rather than a function of host speed.
@@ -118,15 +123,20 @@ fn assert_within(elapsed: Duration, bound: Duration, what: &str) {
 struct TempRoom {
     cwd: PathBuf,
     home: PathBuf,
+    _roots: [TempRoot; 2],
 }
 
 impl TempRoom {
     fn new(name: &str) -> Self {
-        let cwd = temp_path(&format!("retry-budget-{name}-cwd"));
-        let home = temp_path(&format!("retry-budget-{name}-home"));
+        let (cwd, cwd_guard) = temp_path(&format!("retry-budget-{name}-cwd"));
+        let (home, home_guard) = temp_path(&format!("retry-budget-{name}-home"));
         fs::create_dir_all(cwd.join(".git")).expect("create temp .git");
         fs::create_dir_all(&home).expect("create temp HOME");
-        let room = Self { cwd, home };
+        let room = Self {
+            cwd,
+            home,
+            _roots: [cwd_guard, home_guard],
+        };
         // Seed the room so `facts.db` exists for the holder to lock.
         let out = room.rally(&["enter", "--tool", "claude_code:seed", "--json"]);
         assert!(
@@ -160,21 +170,9 @@ impl TempRoom {
     }
 }
 
-impl Drop for TempRoom {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.cwd).ok();
-        fs::remove_dir_all(&self.home).ok();
-    }
-}
-
-fn temp_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "{name}-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
+fn temp_path(name: &str) -> (PathBuf, TempRoot) {
+    let root = TempRoot::new(name);
+    (root.path().to_path_buf(), root)
 }
 
 /// A thread holding a genuine SQLite `BEGIN EXCLUSIVE` write lock on `db`.
