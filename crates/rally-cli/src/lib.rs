@@ -3549,6 +3549,17 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
                 report.handoffs_expired.len()
             );
         }
+        // A pass that ran out of budget or hit its per-pass cap leaves eligible
+        // work behind. `rally doctor --reap-stale` prints that count; `enter`
+        // used to drop it, so an agent whose cleanup was deferred saw the same
+        // silence as one whose room was already clean.
+        if report.remaining > 0 {
+            eprintln!(
+                "rally: auto-reap deferred {} eligible item(s) to a later pass \
+                 (run `rally doctor --reap-stale` to inspect)",
+                report.remaining
+            );
+        }
         // A lost reap reply is not a successful close and must not be narrated
         // as one. Preserve every stable id/phase/remedy in enter's command-wide
         // append_issues instead of silently dropping an incomplete report.

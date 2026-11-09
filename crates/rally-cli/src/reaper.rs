@@ -446,11 +446,21 @@ const DEFAULT_REAP_APPLY_BUDGET_MS: u64 = 2_000;
 /// Resolve the apply budget. `RALLY_REAP_BUDGET_MS` raises it for a deliberate
 /// bulk drain (pair it with `--timeout-ms`); `0` disables the budget entirely,
 /// which is the old unbounded behaviour and is available on purpose.
+///
+/// In-process unit tests get NO ambient budget unless they set the variable. A
+/// test that reaches this resolver is grading reap policy, not wall-clock
+/// partitioning, and on a loaded host the 2000 ms default is spent before the
+/// first append: the automatic mode then defers action zero, so a test that
+/// expects a reap fails and a test that expects preservation passes without
+/// exercising the rule it names. Budget behaviour is graded by tests that pass
+/// an explicit duration to [`run_reap_stale_in_room_with_budget`].
 fn reap_apply_budget() -> Option<std::time::Duration> {
-    let ms = std::env::var("RALLY_REAP_BUDGET_MS")
+    let configured = std::env::var("RALLY_REAP_BUDGET_MS")
         .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_REAP_APPLY_BUDGET_MS);
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    #[cfg(test)]
+    configured?;
+    let ms = configured.unwrap_or(DEFAULT_REAP_APPLY_BUDGET_MS);
     (ms > 0).then(|| std::time::Duration::from_millis(ms))
 }
 

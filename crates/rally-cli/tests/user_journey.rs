@@ -278,7 +278,13 @@ impl Workspace {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_rally"));
         cmd.current_dir(&self.cwd)
             .env("HOME", &self.home)
-            .env("RALLY_DAEMON_AUTOSTART", "0");
+            .env("RALLY_DAEMON_AUTOSTART", "0")
+            // Journeys grade behaviour, not the reaper's wall-clock budget. A
+            // loaded host must not defer a reap mid-fixture; reaper_scale
+            // grades the budget with its own deterministic steps.
+            // The logical clock exists only in debug builds, so this pin does
+            // nothing under `cargo test --release`.
+            .env("RALLY_TEST_REAP_CLOCK_STEP_MS", "0");
         if self.global_index {
             cmd.env("RALLY_GLOBAL_INDEX", "1");
         }
