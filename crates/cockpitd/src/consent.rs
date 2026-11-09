@@ -499,13 +499,11 @@ mod tests {
     /// path explicitly to `check_with`, so tests never read or write the
     /// operator's real `~/.agent-consent`, and never race on a shared file.
     fn temp_store_path(name: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "cockpitd-consent-test-{name}-{}-{:?}.json",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        p
+        // One folder for the whole test binary; each test's file is removed
+        // by its `TempFile` guard and the folder by the next test process.
+        static DIR: std::sync::OnceLock<&'static std::path::Path> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| crate::test_temp_root::TempRoot::process_scoped("consent"))
+            .join(format!("{name}-{:?}.json", std::thread::current().id()))
     }
 
     struct TempFile(PathBuf);

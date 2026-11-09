@@ -478,9 +478,16 @@ mod tests {
 
     /// A valid two-entry chain granting `rally-point:claude` and
     /// `rally-point:codex` `auto`, written once to a fixed temp path.
+    /// One folder for this test binary's consent stores. The stores are
+    /// addressed through a process-wide environment variable, so they must
+    /// outlive any single test; the next test process removes the folder.
+    fn consent_store_dir() -> &'static std::path::Path {
+        static DIR: std::sync::OnceLock<&'static std::path::Path> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| crate::test_temp_root::TempRoot::process_scoped("supervisor-consent"))
+    }
+
     fn ensure_granted_consent_store() -> std::path::PathBuf {
-        let mut path = std::env::temp_dir();
-        path.push("cockpitd-supervisor-test-consent-granted.json");
+        let path = consent_store_dir().join("granted.json");
 
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
@@ -534,8 +541,7 @@ mod tests {
     /// entries, proving the gate actually refuses by default.
     fn with_no_consent<T>(f: impl FnOnce() -> T) -> T {
         let _guard = CONSENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let mut path = std::env::temp_dir();
-        path.push("cockpitd-supervisor-test-consent-none.json");
+        let path = consent_store_dir().join("none.json");
         let _ = std::fs::remove_file(&path);
         unsafe {
             std::env::set_var("AGENT_CONSENT_SELFTEST", "1");
@@ -762,8 +768,7 @@ mod tests {
         // Session row persists in the store after completion; point the gate
         // at a store with no record and confirm adapter_send re-checks rather
         // than relying on the grant it saw at launch time.
-        let mut no_consent = std::env::temp_dir();
-        no_consent.push("cockpitd-supervisor-test-consent-none-for-send.json");
+        let no_consent = consent_store_dir().join("none-for-send.json");
         let _ = std::fs::remove_file(&no_consent);
         unsafe {
             std::env::set_var("AGENT_CONSENT_STORE_PATH", no_consent.to_str().unwrap());
