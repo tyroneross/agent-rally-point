@@ -8,6 +8,7 @@
 
 mod common;
 mod support;
+use support::temp_root::TempRoot;
 
 use common::test_git_fixture::fixture_git;
 use serde_json::Value;
@@ -17,7 +18,7 @@ use std::io::Read;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use support::rally_cmd::rally_command;
 
 struct Fixture {
@@ -25,18 +26,12 @@ struct Fixture {
     home: PathBuf,
     state: PathBuf,
     bin: PathBuf,
+    _root: TempRoot,
 }
 
 impl Fixture {
     fn new(label: &str) -> Self {
-        let unique = format!(
-            "rally-runtime-setup-{label}-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("wall clock")
-                .as_nanos()
-        );
-        let base = std::env::temp_dir().join(unique);
+        let base = TempRoot::new(&format!("rally-runtime-setup-{label}"));
         let root = base.join("repo");
         let home = base.join("home");
         let state = base.join("setup-state");
@@ -50,6 +45,7 @@ impl Fixture {
             home,
             state,
             bin,
+            _root: base,
         }
     }
 
@@ -136,11 +132,7 @@ impl Fixture {
         path
     }
 
-    fn cleanup(self) {
-        if let Some(base) = self.root.parent() {
-            fs::remove_dir_all(base).ok();
-        }
-    }
+    fn cleanup(self) {}
 }
 
 fn read_capture(capture: &Path) -> (Vec<u8>, Vec<u8>) {

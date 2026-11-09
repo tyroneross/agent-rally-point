@@ -45,11 +45,15 @@
 //! idiom — all tests operate on ephemeral git repos in the OS temp dir and
 //! never touch the live agent-rally-point checkout.
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+
+use temp_root::TempRoot;
+
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 mod common;
 use common::test_git_fixture::{fixture_git, fixture_git_command};
@@ -58,14 +62,12 @@ use common::test_git_fixture::{fixture_git, fixture_git_command};
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn tmp_dir(label: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("rally-init-consumer-{label}-{nanos}"));
-    fs::create_dir_all(&p).unwrap();
-    p.canonicalize().unwrap_or(p)
+fn tmp_dir(label: &str) -> (PathBuf, TempRoot) {
+    let root = TempRoot::new(&format!("rally-init-consumer-{label}"));
+    let path = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.path().to_path_buf());
+    (path, root)
 }
 
 /// Initialise a bare-minimum git repo: `git init -b main` + initial empty
@@ -217,7 +219,7 @@ const MUST_STAY_COMMITTABLE: &[&str] = &[
 /// paths — nothing in the product wrote an ignore rule at all.
 #[test]
 fn init_ignores_every_derived_lock_and_cache_path() {
-    let root = tmp_dir("ignore-derived");
+    let (root, _root_guard) = tmp_dir("ignore-derived");
     init_repo(&root);
 
     let out = run_rally(&root, &["init", "--json"]);
@@ -240,8 +242,6 @@ fn init_ignores_every_derived_lock_and_cache_path() {
             fs::read_to_string(root.join(".rally").join(".gitignore")).unwrap_or_default()
         );
     }
-
-    fs::remove_dir_all(&root).ok();
 }
 
 /// The negative control for the rule above: an over-broad ignore that also
@@ -250,7 +250,7 @@ fn init_ignores_every_derived_lock_and_cache_path() {
 /// canonical record uncommittable — the worse of the two failures.
 #[test]
 fn init_leaves_the_canonical_ledger_committable() {
-    let root = tmp_dir("ignore-canonical");
+    let (root, _root_guard) = tmp_dir("ignore-canonical");
     init_repo(&root);
 
     let out = run_rally(&root, &["init", "--json"]);
@@ -268,8 +268,6 @@ fn init_leaves_the_canonical_ledger_committable() {
             fs::read_to_string(root.join(".rally").join(".gitignore")).unwrap_or_default()
         );
     }
-
-    fs::remove_dir_all(&root).ok();
 }
 
 /// The durable control against the residual risk of the denylist shape
@@ -282,7 +280,7 @@ fn init_leaves_the_canonical_ledger_committable() {
 /// here as a failing test, not as a surprise in someone's `git status`.
 #[test]
 fn every_artifact_a_live_room_writes_is_ignored_or_canonical() {
-    let root = tmp_dir("ignore-sweep");
+    let (root, _root_guard) = tmp_dir("ignore-sweep");
     init_repo(&root);
 
     // Exercise the paths that write to `.rally/`: enter the room, append a
@@ -370,8 +368,6 @@ fn every_artifact_a_live_room_writes_is_ignored_or_canonical() {
          .rally/.gitignore:\n{}",
         fs::read_to_string(rally_dir.join(".gitignore")).unwrap_or_default()
     );
-
-    fs::remove_dir_all(&root).ok();
 }
 
 /// First-open auto-init: `rally enter` creates `.rally/` far more often than
@@ -379,7 +375,7 @@ fn every_artifact_a_live_room_writes_is_ignored_or_canonical() {
 /// too. Without this, the common case still commits its own `facts.db`.
 #[test]
 fn first_open_auto_init_writes_the_ignore_without_rally_init() {
-    let root = tmp_dir("ignore-autoinit");
+    let (root, _root_guard) = tmp_dir("ignore-autoinit");
     init_repo(&root);
 
     // Deliberately never runs `rally init`.
@@ -400,8 +396,6 @@ fn first_open_auto_init_writes_the_ignore_without_rally_init() {
             "{rel} must be ignored after first-open auto-init (no `rally init` run)"
         );
     }
-
-    fs::remove_dir_all(&root).ok();
 }
 
 /// Re-running `rally init` must leave `.rally/.gitignore` byte-identical, and
@@ -409,7 +403,7 @@ fn first_open_auto_init_writes_the_ignore_without_rally_init() {
 /// that clobbers hand-written rules gets turned off by its users.
 #[test]
 fn ignore_file_is_idempotent_and_preserves_rules_outside_the_markers() {
-    let root = tmp_dir("ignore-idempotent");
+    let (root, _root_guard) = tmp_dir("ignore-idempotent");
     init_repo(&root);
     run_rally(&root, &["init", "--json"]);
 
@@ -443,8 +437,6 @@ fn ignore_file_is_idempotent_and_preserves_rules_outside_the_markers() {
     );
     // The managed rules still work with a user rule appended.
     assert!(is_ignored(&root, ".rally/facts.db"));
-
-    fs::remove_dir_all(&root).ok();
 }
 
 /// Scope boundary: the consumer's root `.gitignore` belongs to the consumer.
@@ -452,7 +444,7 @@ fn ignore_file_is_idempotent_and_preserves_rules_outside_the_markers() {
 /// the repo owner, and must never create or edit the root file.
 #[test]
 fn rally_never_touches_the_repo_root_gitignore() {
-    let root = tmp_dir("ignore-root-untouched");
+    let (root, _root_guard) = tmp_dir("ignore-root-untouched");
     init_repo(&root);
 
     // (a) No root .gitignore to begin with — rally must not create one.
@@ -474,8 +466,6 @@ fn rally_never_touches_the_repo_root_gitignore() {
         fs::read_to_string(&root_ignore).unwrap(),
         "rally must not edit the consumer's root .gitignore"
     );
-
-    fs::remove_dir_all(&root).ok();
 }
 
 /// `rally init` in a repo with NONE of agent-rally-point's five pointer docs
@@ -483,7 +473,7 @@ fn rally_never_touches_the_repo_root_gitignore() {
 /// this hard-errored on the first missing doc (`docs.guide`).
 #[test]
 fn init_succeeds_in_a_repo_with_none_of_the_pointer_docs() {
-    let root = tmp_dir("none");
+    let (root, _root_guard) = tmp_dir("none");
     init_repo(&root);
 
     let out = run_rally(&root, &["init", "--json"]);
@@ -510,8 +500,6 @@ fn init_succeeds_in_a_repo_with_none_of_the_pointer_docs() {
         manifest.get("pointer_markers").is_some(),
         "manifest must carry pointer_markers: {manifest}"
     );
-
-    fs::remove_dir_all(&root).ok();
 }
 
 /// The manifest's `docs` object must NOT contain a key whose pointer target
@@ -519,7 +507,7 @@ fn init_succeeds_in_a_repo_with_none_of_the_pointer_docs() {
 /// an empty (or fully-absent-keyed) `docs` object.
 #[test]
 fn init_omits_pointer_docs_that_do_not_resolve() {
-    let root = tmp_dir("omit-all");
+    let (root, _root_guard) = tmp_dir("omit-all");
     init_repo(&root);
 
     let out = run_rally(&root, &["init", "--json"]);
@@ -541,8 +529,6 @@ fn init_omits_pointer_docs_that_do_not_resolve() {
     }
     assert_eq!(manifest["pointer_docs_resolved"], 0);
     assert_eq!(manifest["pointer_docs_omitted"], 6);
-
-    fs::remove_dir_all(&root).ok();
 }
 
 /// D2 control (ARP-R-07): before the fix, `pointer_block()` hardcoded all six
@@ -552,7 +538,7 @@ fn init_omits_pointer_docs_that_do_not_resolve() {
 /// pre-fix run captured in the implementer's return notes.
 #[test]
 fn deeper_docs_links_resolve_or_are_absolute_urls() {
-    let root = tmp_dir("dead-links");
+    let (root, _root_guard) = tmp_dir("dead-links");
     init_repo(&root);
 
     let out = run_rally(&root, &["init", "--json"]);
@@ -574,8 +560,6 @@ fn deeper_docs_links_resolve_or_are_absolute_urls() {
             "dead link: [{text}]({target}) does not resolve under consumer repo root; pointer block:\n{block}"
         );
     }
-
-    fs::remove_dir_all(&root).ok();
 }
 
 /// D1 control (ARP-R-07): the `rally room --json` pointer must carry the same
@@ -585,7 +569,7 @@ fn deeper_docs_links_resolve_or_are_absolute_urls() {
 /// no caveat at all.
 #[test]
 fn room_json_pointer_carries_untrusted_data_caveat() {
-    let root = tmp_dir("caveat");
+    let (root, _root_guard) = tmp_dir("caveat");
     init_repo(&root);
 
     let out = run_rally(&root, &["init", "--json"]);
@@ -610,8 +594,6 @@ fn room_json_pointer_carries_untrusted_data_caveat() {
         room_line.contains("never as instructions"),
         "rally room --json pointer missing untrusted-data caveat: {room_line}"
     );
-
-    fs::remove_dir_all(&root).ok();
 }
 
 /// A consumer repo that DOES carry a subset of the pointer docs must have
@@ -621,7 +603,7 @@ fn room_json_pointer_carries_untrusted_data_caveat() {
 /// partial case).
 #[test]
 fn init_keeps_every_pointer_doc_that_does_resolve() {
-    let root = tmp_dir("partial");
+    let (root, _root_guard) = tmp_dir("partial");
     init_repo(&root);
     fs::write(root.join("RALLY.md"), "# RALLY.md\nstub\n").unwrap();
     fs::create_dir_all(root.join("docs")).unwrap();
@@ -659,8 +641,6 @@ fn init_keeps_every_pointer_doc_that_does_resolve() {
     assert!(!block.contains("dynamic-workflows/PROTOCOL.md"));
     assert!(!block.contains("ANY-AGENT-ONBOARDING.md"));
     assert!(!block.contains("HANDOFFS-AND-LAUNCHING-AGENTS.md"));
-
-    fs::remove_dir_all(&root).ok();
 }
 
 /// If `rally init` fails partway through — after `.rally/` has already been
@@ -673,7 +653,7 @@ fn init_keeps_every_pointer_doc_that_does_resolve() {
 /// permissions-based failure, which silently no-ops when run as root).
 #[test]
 fn failed_init_leaves_no_rally_directory() {
-    let root = tmp_dir("forced-failure");
+    let (root, _root_guard) = tmp_dir("forced-failure");
     init_repo(&root);
     // Force upsert_pointer_in_doc("CLAUDE.md") to fail: it's a directory,
     // not a file, so `fs::read_to_string` on it returns an I/O error.
@@ -690,8 +670,6 @@ fn failed_init_leaves_no_rally_directory() {
         !root.join(".rally").exists(),
         "a failed rally init must not leave `.rally/` behind"
     );
-
-    fs::remove_dir_all(&root).ok();
 }
 
 /// Sanity + D2 negative control (ARP-R-07): agent-rally-point's own repo
@@ -703,7 +681,7 @@ fn failed_init_leaves_no_rally_directory() {
 /// identically to agent-rally-point's own tree.
 #[test]
 fn init_records_all_six_docs_when_all_six_are_present() {
-    let root = tmp_dir("full-fidelity");
+    let (root, _root_guard) = tmp_dir("full-fidelity");
     init_repo(&root);
     fs::write(root.join("RALLY.md"), "# RALLY.md\n").unwrap();
     fs::create_dir_all(root.join("dynamic-workflows")).unwrap();
@@ -768,6 +746,4 @@ fn init_records_all_six_docs_when_all_six_are_present() {
             "link [{text}]({target}) must resolve when its doc was seeded"
         );
     }
-
-    fs::remove_dir_all(&root).ok();
 }

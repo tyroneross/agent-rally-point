@@ -35,6 +35,11 @@
 
 #![cfg(unix)]
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+
+use temp_root::TempRoot;
+
 use serde_json::{Value, json};
 use std::fs;
 use std::path::PathBuf;
@@ -58,6 +63,7 @@ const MAX_PASSES: usize = 60;
 struct Room {
     cwd: PathBuf,
     home: PathBuf,
+    _roots: [TempRoot; 2],
 }
 
 impl Room {
@@ -67,12 +73,10 @@ impl Room {
     /// hours. The segment format is the canonical record, and the first read
     /// reconciles it into `facts.db` — the same path a fresh clone takes.
     fn seeded(name: &str) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let cwd = std::env::temp_dir().join(format!("reaper-scale-{name}-{nanos}-cwd"));
-        let home = std::env::temp_dir().join(format!("reaper-scale-{name}-{nanos}-home"));
+        let cwd_guard = TempRoot::new(&format!("reaper-scale-{name}-cwd"));
+        let home_guard = TempRoot::new(&format!("reaper-scale-{name}-home"));
+        let cwd = cwd_guard.path().to_path_buf();
+        let home = home_guard.path().to_path_buf();
         fs::create_dir_all(cwd.join(".git")).unwrap();
         let log = cwd.join(".rally").join("log");
         fs::create_dir_all(&log).unwrap();
@@ -176,7 +180,11 @@ impl Room {
         }
 
         fs::write(log.join("synthetic.jsonl"), lines.join("\n") + "\n").unwrap();
-        Room { cwd, home }
+        Room {
+            cwd,
+            home,
+            _roots: [cwd_guard, home_guard],
+        }
     }
 
     fn json(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Value {
@@ -209,13 +217,6 @@ impl Room {
             .as_array()
             .map(Vec::len)
             .unwrap_or(0)
-    }
-}
-
-impl Drop for Room {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.cwd).ok();
-        fs::remove_dir_all(&self.home).ok();
     }
 }
 

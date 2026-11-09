@@ -41,12 +41,15 @@
 //! reap that no longer reaps is not a fix, and the two assertions must not be
 //! separable — that is the whole failure mode.
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+
+use temp_root::TempRoot;
+
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const TIMEOUT_MS: &str = "20000";
 
@@ -55,6 +58,7 @@ const TIMEOUT_MS: &str = "20000";
 struct TempRoom {
     cwd: PathBuf,
     home: PathBuf,
+    _roots: [TempRoot; 2],
 }
 
 impl TempRoom {
@@ -63,7 +67,13 @@ impl TempRoom {
         let home = temp_path(&format!("attribution-{name}-home"));
         fs::create_dir_all(cwd.join(".git")).expect("create temp .git");
         fs::create_dir_all(&home).expect("create temp HOME");
-        Self { cwd, home }
+        let cwd_path = cwd.path().to_path_buf();
+        let home_path = home.path().to_path_buf();
+        Self {
+            cwd: cwd_path,
+            home: home_path,
+            _roots: [cwd, home],
+        }
     }
 
     fn rally(&self) -> Command {
@@ -195,24 +205,8 @@ impl TempRoom {
     }
 }
 
-impl Drop for TempRoom {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.cwd).ok();
-        fs::remove_dir_all(&self.home).ok();
-    }
-}
-
-fn temp_path(name: &str) -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    std::env::temp_dir().join(format!(
-        "{name}-{}-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
+fn temp_path(name: &str) -> TempRoot {
+    TempRoot::new(name)
 }
 
 fn stdout_json(output: &Output) -> Value {

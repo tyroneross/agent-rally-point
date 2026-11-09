@@ -13,11 +13,15 @@
 //! predicates into Rust: Rust creates the room/check projections, then the
 //! production shell renderer consumes that room through `RALLY_BIN`.
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+
+use temp_root::TempRoot;
+
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const VIEWER: &str = "codex:hook-viewer";
 const LIVE_OWNER: &str = "live-owner";
@@ -32,22 +36,24 @@ struct Workspace {
     cwd: PathBuf,
     home: PathBuf,
     dedupe: PathBuf,
+    _root: TempRoot,
 }
 
 impl Workspace {
     fn new() -> Self {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let base = std::env::temp_dir().join(format!("hook-projection-parity-{suffix}"));
+        let base = TempRoot::new("hook-projection-parity");
         let cwd = base.join("repo");
         let home = base.join("home");
         let dedupe = base.join("dedupe");
         fs::create_dir_all(cwd.join(".git")).unwrap();
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&dedupe).unwrap();
-        Self { cwd, home, dedupe }
+        Self {
+            cwd,
+            home,
+            dedupe,
+            _root: base,
+        }
     }
 
     fn output(&self, args: &[&str]) -> Output {
@@ -242,14 +248,6 @@ impl Workspace {
             .as_str()
             .unwrap_or_else(|| panic!("hook omitted SessionStart context: {envelope}"))
             .to_string()
-    }
-}
-
-impl Drop for Workspace {
-    fn drop(&mut self) {
-        if let Some(base) = self.cwd.parent() {
-            fs::remove_dir_all(base).ok();
-        }
     }
 }
 

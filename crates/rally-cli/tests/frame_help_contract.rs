@@ -8,11 +8,13 @@
 //! store-free access, exactly eight fields, complete semantics per field, and
 //! a responsibility category that grants neither scope nor authority.
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+
+use temp_root::TempRoot;
+
 use std::collections::BTreeMap;
-use std::fs;
-use std::path::PathBuf;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const FRAME_FIELDS: [&str; 8] = [
     "sender",
@@ -25,17 +27,11 @@ const FRAME_FIELDS: [&str; 8] = [
     "guide",
 ];
 
-fn tmp_dir(label: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock after Unix epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("rally-frame-help-{label}-{nanos}"));
-    fs::create_dir_all(&dir).expect("create isolated help directory");
-    dir
+fn tmp_dir(label: &str) -> TempRoot {
+    TempRoot::new(&format!("rally-frame-help-{label}"))
 }
 
-fn run_help_frame(cwd: &PathBuf, json: bool) -> std::process::Output {
+fn run_help_frame(cwd: &std::path::Path, json: bool) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rally"));
     command.args(["help", "frame"]);
     if json {
@@ -104,7 +100,6 @@ fn help_frame_is_store_free_and_initializes_nothing() {
     );
     assert!(!dir.join(".rally").exists());
     assert!(!dir.join(".git").exists());
-    fs::remove_dir_all(dir).expect("remove isolated help directory");
 }
 
 #[test]
@@ -124,14 +119,12 @@ fn help_frame_json_returns_the_decoder_without_initializing_a_room() {
     );
     assert!(!dir.join(".rally").exists());
     assert!(!dir.join(".git").exists());
-    fs::remove_dir_all(dir).expect("remove isolated help directory");
 }
 
 #[test]
 fn help_frame_defines_exactly_the_runtime_fields_with_complete_semantics() {
     let dir = tmp_dir("glossary");
     let output = run_help_frame(&dir, false);
-    fs::remove_dir_all(dir).expect("remove isolated help directory");
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).expect("UTF-8 help output");
     let rows = glossary(&text);
@@ -155,7 +148,6 @@ fn help_frame_defines_exactly_the_runtime_fields_with_complete_semantics() {
 fn help_frame_keeps_status_duty_intent_and_authority_semantically_separate() {
     let dir = tmp_dir("meaning");
     let output = run_help_frame(&dir, false);
-    fs::remove_dir_all(dir).expect("remove isolated help directory");
     let text = String::from_utf8(output.stdout).expect("UTF-8 help output");
     let rows = glossary(&text);
 

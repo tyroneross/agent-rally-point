@@ -31,6 +31,11 @@
 
 #![cfg(unix)]
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+
+use temp_root::TempRoot;
+
 use serde_json::{Value, json};
 use std::fs;
 use std::path::PathBuf;
@@ -47,6 +52,7 @@ struct Room {
     cwd: PathBuf,
     home: PathBuf,
     session_id: String,
+    _roots: [TempRoot; 2],
 }
 
 impl Room {
@@ -56,17 +62,17 @@ impl Room {
             .expect("system time is after the Unix epoch")
             .as_nanos();
         let nonce = NEXT_ROOM.fetch_add(1, Ordering::Relaxed);
-        let pid = std::process::id();
-        let cwd =
-            std::env::temp_dir().join(format!("rally-fwdcompat-{name}-{pid}-{nanos}-{nonce}"));
-        let home =
-            std::env::temp_dir().join(format!("rally-fwdcompat-{name}-{pid}-{nanos}-{nonce}-home"));
+        let cwd_guard = TempRoot::new(&format!("rally-fwdcompat-{name}"));
+        let home_guard = TempRoot::new(&format!("rally-fwdcompat-{name}-home"));
+        let cwd = cwd_guard.path().to_path_buf();
+        let home = home_guard.path().to_path_buf();
         fs::create_dir_all(cwd.join(".git")).unwrap();
         fs::create_dir_all(&home).unwrap();
         Self {
             cwd,
             home,
             session_id: format!("fwdcompat-{name}-{nanos}-{nonce}"),
+            _roots: [cwd_guard, home_guard],
         }
     }
 
@@ -165,13 +171,6 @@ impl Room {
         });
         self.append_raw(&serde_json::to_string(&line).unwrap());
         seq
-    }
-}
-
-impl Drop for Room {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.cwd).ok();
-        fs::remove_dir_all(&self.home).ok();
     }
 }
 

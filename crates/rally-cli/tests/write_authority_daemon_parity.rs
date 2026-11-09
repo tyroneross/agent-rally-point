@@ -99,6 +99,11 @@
 #![cfg(unix)]
 #![allow(clippy::zombie_processes)]
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+
+use temp_root::TempRoot;
+
 use rally_protocol::store_wire::WIRE_VERSION;
 use serde_json::Value;
 use std::fs;
@@ -250,6 +255,7 @@ struct Room {
     cwd: PathBuf,
     home: PathBuf,
     session_id: String,
+    _roots: [TempRoot; 2],
 }
 
 impl Room {
@@ -258,8 +264,10 @@ impl Room {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let cwd = std::env::temp_dir().join(format!("wadp-{name}-{nanos}-cwd"));
-        let home = std::env::temp_dir().join(format!("wadp-{name}-{nanos}-home"));
+        let cwd_guard = TempRoot::new(&format!("wadp-{name}-cwd"));
+        let home_guard = TempRoot::new(&format!("wadp-{name}-home"));
+        let cwd = cwd_guard.path().to_path_buf();
+        let home = home_guard.path().to_path_buf();
         fs::create_dir_all(cwd.join(".git")).unwrap();
         fs::create_dir_all(cwd.join(".rally")).unwrap();
         fs::create_dir_all(&home).unwrap();
@@ -267,6 +275,7 @@ impl Room {
             cwd,
             home,
             session_id: format!("wadp-{name}-{nanos}"),
+            _roots: [cwd_guard, home_guard],
         }
     }
 
@@ -475,13 +484,6 @@ impl Room {
                  scenario has no seat to aim at",
             )
             .to_string()
-    }
-}
-
-impl Drop for Room {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.cwd).ok();
-        fs::remove_dir_all(&self.home).ok();
     }
 }
 
