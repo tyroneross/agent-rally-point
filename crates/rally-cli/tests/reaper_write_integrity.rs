@@ -22,12 +22,14 @@
 //! failure; no append-failure hook exists in the binary, so the failure is
 //! injected through the filesystem instead.
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Wall-clock budget for every spawned command. Generous enough that a cold
 /// SQLite open on a loaded machine does not trip the mutation watchdog and turn
@@ -37,6 +39,7 @@ const TIMEOUT_MS: &str = "20000";
 struct TempRoom {
     cwd: PathBuf,
     home: PathBuf,
+    _roots: Vec<TempRoot>,
 }
 
 impl TempRoom {
@@ -45,7 +48,11 @@ impl TempRoom {
         let home = temp_path(&format!("reaper-integrity-{name}-home"));
         fs::create_dir_all(cwd.join(".git")).expect("create temp .git");
         fs::create_dir_all(&home).expect("create temp HOME");
-        Self { cwd, home }
+        Self {
+            cwd: cwd.to_path_buf(),
+            home: home.to_path_buf(),
+            _roots: vec![cwd, home],
+        }
     }
 
     fn rally(&self) -> Command {
@@ -257,8 +264,6 @@ impl Drop for TempRoom {
     fn drop(&mut self) {
         // A frozen ledger would defeat remove_dir_all and leak the fixture.
         self.thaw_ledger();
-        fs::remove_dir_all(&self.cwd).ok();
-        fs::remove_dir_all(&self.home).ok();
     }
 }
 
@@ -276,28 +281,9 @@ fn set_mode(_path: &Path, _mode: u32) {
 
 /// A fixture path no other fixture can name.
 ///
-/// The timestamp alone is not enough. macOS reports `SystemTime::now()` at
-/// microsecond granularity (`as_nanos()` always ends in `000`), so two test
-/// PROCESSES that reach the same fixture within the same microsecond compute
-/// the same path — and since `init_observed_worktree` now runs a real
-/// `git init` there, the loser dies on `cannot copy ... /.git/info/exclude:
-/// File exists` rather than on anything it was grading. Two concurrent
-/// `cargo test` invocations against this crate are enough to hit it.
-///
-/// The pid plus a per-process counter closes both directions, matching the
-/// `unique_root` helper the `reaper.rs` unit tests already use. `Drop` removes
-/// these directories, so a collision leaves no evidence behind either.
-fn temp_path(name: &str) -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    std::env::temp_dir().join(format!(
-        "{name}-{}-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
+/// Allocate a root whose guard survives until the ledger has been thawed.
+fn temp_path(name: &str) -> TempRoot {
+    TempRoot::new(name)
 }
 
 fn stdout_json(output: &Output) -> Value {
