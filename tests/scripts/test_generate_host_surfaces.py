@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -56,7 +57,101 @@ class GenerateHostSurfacesTests(unittest.TestCase):
     def test_new_provider_locations_are_declared_in_contract(self) -> None:
         config = GEN.load_config(ROOT)
         self.assertEqual(config["providers"]["muse"]["plugin_root"], "plugins/muse")
-        self.assertEqual(config["providers"]["cursor"]["manifest"], ".cursor-plugin/plugin.json")
+        self.assertEqual(config["providers"]["cursor"]["manifest"], "plugins/cursor/.cursor-plugin/plugin.json")
+        self.assertEqual(config["providers"]["antigravity"]["manifest"], "plugins/antigravity/plugin.json")
+        for host, root in GEN.BUNDLE_ARTIFACTS.items():
+            self.assertEqual(Path(config["providers"][host]["plugin_root"]), root)
+
+    def test_standalone_bundles_are_regular_complete_and_deterministic(self) -> None:
+        config = GEN.load_config(ROOT)
+        with tempfile.TemporaryDirectory() as tmp:
+            first, second = Path(tmp) / "first", Path(tmp) / "second"
+            GEN.generate(ROOT, first)
+            GEN.generate(ROOT, second)
+            for host, relative in GEN.BUNDLE_ARTIFACTS.items():
+                with self.subTest(host=host):
+                    bundle = first / relative
+                    self.assertEqual(snapshot(bundle), snapshot(second / relative))
+                    self.assertFalse(any(p.is_symlink() for p in bundle.rglob("*")))
+                    manifest = json.loads((first / config["providers"][host]["manifest"]).read_text())
+                    # Portable Agent Plugins discovers the fixed skills/ directory.
+                    declared = manifest.get("skills", ["./skills"])
+                    if "hooks" in manifest:
+                        declared.append(manifest["hooks"])
+                    for path in declared:
+                        resolved = (bundle / path).resolve()
+                        resolved.relative_to(bundle.resolve())
+                        self.assertTrue(resolved.exists(), path)
+                    pending = list((bundle / "skills").glob("*/SKILL.md"))
+                    self.assertEqual(len(pending), len(config["skills"]))
+                    visited = set()
+                    while pending:
+                        document = pending.pop()
+                        if document in visited:
+                            continue
+                        visited.add(document)
+                        for target in local_markdown_links(document.read_text()):
+                            resolved = (document.parent / target).resolve()
+                            resolved.relative_to(bundle.resolve())
+                            self.assertTrue(resolved.exists(), target)
+                            if resolved.suffix == ".md":
+                                pending.append(resolved)
+                    self.assertGreater(len(visited), len(config["skills"]))
+                    for filename in GEN.CODEX_WORKFLOW_RUNTIME_FILES:
+                        self.assertTrue((bundle / GEN.CODEX_WORKFLOW_RUNTIME_DEST / filename).is_file())
+                    self.assertEqual((bundle / "rally-release.json").read_bytes(), (first / "rally-release.json").read_bytes())
+
+    def test_cursor_bundle_contains_the_complete_muse_payload_with_native_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            GEN.generate(ROOT, dest)
+            expected = snapshot(dest / GEN.MUSE_ARTIFACT)
+            expected.pop(".claude-plugin/plugin.json")
+            expected.pop("hooks/hooks.json")
+            expected[".cursor-plugin/plugin.json"] = (dest / ".cursor-plugin/plugin.json").read_bytes()
+            expected["hooks/cursor.json"] = (dest / "hooks/cursor.json").read_bytes()
+            self.assertEqual(snapshot(dest / GEN.CURSOR_ARTIFACT), expected)
+
+    def test_antigravity_portable_bundle_contains_skills_without_host_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            GEN.generate(ROOT, dest)
+            bundle = dest / GEN.ANTIGRAVITY_ARTIFACT
+            manifest = json.loads((bundle / "plugin.json").read_text())
+            self.assertEqual(manifest["$schema"], "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json")
+            self.assertNotIn("hooks", manifest)
+            self.assertFalse((bundle / "hooks").exists())
+            self.assertFalse((bundle / "hooks.json").exists())
+            expected = snapshot(dest / GEN.MUSE_ARTIFACT)
+            for path in (".claude-plugin/plugin.json", "hooks/hooks.json", "hooks/rally-coordination-hook.sh"):
+                expected.pop(path)
+            expected["plugin.json"] = (bundle / "plugin.json").read_bytes()
+            self.assertEqual(snapshot(bundle), expected)
+
+    def test_check_cli_rejects_planted_bundle_edits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp).resolve()
+            for relative in (".codex-plugin", "skills", "docs", "dynamic-workflows", "hooks"):
+                shutil.copytree(ROOT / relative, source / relative)
+            for relative in (GEN.CONFIG_PATH, Path("crates/rally-cli/Cargo.toml")):
+                target = source / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / relative, target)
+            GEN.generate(source, source)
+            command = ["python3", str(ROOT / "scripts/generate_host_surfaces.py"), "--root", str(source), "--check"]
+            clean = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(clean.returncode, 0, clean.stderr)
+            for relative in GEN.BUNDLE_ARTIFACTS.values():
+                with self.subTest(bundle=relative):
+                    path = source / relative / "skills/rally-workflows/core/packet.mjs"
+                    original = path.read_bytes()
+                    path.write_bytes(original + b"\n// planted drift\n")
+                    try:
+                        result = subprocess.run(command, capture_output=True, text=True)
+                        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                        self.assertIn(f"drift: {path}", result.stderr)
+                    finally:
+                        path.write_bytes(original)
 
     def test_muse_bundle_is_unambiguous_self_contained_and_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -128,30 +223,39 @@ class GenerateHostSurfacesTests(unittest.TestCase):
                     env={**os.environ, "CURSOR_PLUGIN_ROOT": str(plugin)}, capture_output=True, text=True, check=True)
                 self.assertEqual(result.stdout, f"{phase['phase']}|cursor|plugin|{phase['timeout_ms']}")
 
-    def test_release_digest_covers_new_surfaces_and_muse_payload(self) -> None:
+    def test_release_digest_covers_new_surfaces_and_bundle_payloads(self) -> None:
         config = GEN.load_config(ROOT)
         surfaces = {**GEN.render_plugin_surfaces(config, GEN.cargo_version(ROOT)), **GEN.render_hook_surfaces(config)}
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp)
             GEN.generate(ROOT, dest)
-            bundle = dest / "plugins/muse"
-            self.assertTrue(bundle.is_dir())
+            bundles = {root: dest / root for root in GEN.BUNDLE_ARTIFACTS.values()}
             def digest():
                 return GEN.digest_inputs(surfaces, {}, dest / GEN.CODEX_ARTIFACT,
-                    bundles={Path("plugins/muse"): bundle})
+                    bundles=bundles)
             before = digest()
             for relative in (Path(".cursor-plugin/plugin.json"), Path("hooks/cursor.json")):
                 original = surfaces[relative]
                 surfaces[relative] += "\n"
                 self.assertNotEqual(before, digest(), str(relative))
                 surfaces[relative] = original
-            for path in sorted(bundle.rglob("*")):
+            for path in sorted(p for bundle in bundles.values() for p in bundle.rglob("*")):
                 if not path.is_file() or path.name == "rally-release.json":
                     continue
                 original = path.read_bytes()
                 path.write_bytes(original + b"\n")
                 self.assertNotEqual(before, digest(), str(path))
                 path.write_bytes(original)
+
+    def test_compare_path_rejects_identical_symlink_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            actual, expected = root / "actual", root / "expected"
+            actual.mkdir()
+            expected.mkdir()
+            (expected / "packet.mjs").write_text("// identical bytes\n")
+            (actual / "packet.mjs").symlink_to(expected / "packet.mjs")
+            self.assertEqual(GEN.compare_path(actual, expected), [f"symlink: {actual / 'packet.mjs'}"])
 
     def test_cargo_version_ignores_brackets_inside_package_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

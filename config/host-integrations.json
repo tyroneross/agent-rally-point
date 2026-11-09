@@ -24,7 +24,8 @@
       "claude_code": "Agent Rally Point — repo-local coordination surface for parallel coding agents. Claude Code has a plugin integration; Codex has Rally skills and needs project hook configuration; Cursor uses project hook configuration; Gemini and other hosts use the CLI loop. Records claims, checks write boundaries, routes handoffs, and exposes room state via the rally CLI. Skills: agent-rally-point (per-session loop), rally-workflows (fan-out + dynamic-workflows protocol), mini-loop (per-task quality gate). Hooks auto-fire only in supported, configured projects on SessionStart + PreToolUse to surface room awareness and deconflict before edits; advisory by default (the edit goes through), with opt-in strict and fail-closed switches that block. Backend: rally CLI (cargo install --path crates/rally-cli).",
       "codex": "Agent Rally Point coordination skills (agent-rally-point, rally-workflows, mini-loop) for Codex. Repo-local coordination via the rally CLI: claims, write-boundary checks, handoffs, dynamic-workflow task packets.",
       "muse": "Agent Rally Point coordination skills and Muse-compatible hooks. Records claims, checks write boundaries, routes handoffs, and exposes room state through the rally CLI.",
-      "cursor": "Agent Rally Point coordination skills and Cursor plugin hooks. Records claims, checks write boundaries, routes handoffs, and exposes room state through the rally CLI."
+      "cursor": "Agent Rally Point coordination skills and Cursor plugin hooks. Records claims, checks write boundaries, routes handoffs, and exposes room state through the rally CLI.",
+      "antigravity": "Agent Rally Point coordination skills for Antigravity. Records claims, checks write boundaries, routes handoffs, and exposes room state through the rally CLI."
     },
     "host_keywords": {
       "claude_code": [
@@ -90,10 +91,17 @@
     },
     "muse": {
       "plugin_root": "plugins/muse",
-      "manifest": "plugins/muse/.claude-plugin/plugin.json"
+      "manifest": "plugins/muse/.claude-plugin/plugin.json",
+      "hooks": "plugins/muse/hooks/hooks.json"
     },
     "cursor": {
-      "manifest": ".cursor-plugin/plugin.json"
+      "plugin_root": "plugins/cursor",
+      "manifest": "plugins/cursor/.cursor-plugin/plugin.json",
+      "hooks": "plugins/cursor/hooks/cursor.json"
+    },
+    "antigravity": {
+      "plugin_root": "plugins/antigravity",
+      "manifest": "plugins/antigravity/plugin.json"
     }
   },
   "skills": {
