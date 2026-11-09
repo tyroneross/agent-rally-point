@@ -26,14 +26,17 @@
 
 #![cfg(unix)]
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 use serde_json::Value;
 use std::fs;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::{Child, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 #[path = "support/rally_cmd.rs"]
 mod rally_cmd;
@@ -57,27 +60,24 @@ unsafe extern "C" {
 const LOCK_EX: i32 = 2;
 const LOCK_NB: i32 = 4;
 
-static ROOM_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
 struct Room {
     cwd: PathBuf,
     home: PathBuf,
+    _roots: Vec<TempRoot>,
 }
 
 impl Room {
     fn new() -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let unique = ROOM_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let pid = std::process::id();
-        let cwd = std::env::temp_dir().join(format!("rca-{pid}-{nanos}-{unique}-cwd"));
-        let home = std::env::temp_dir().join(format!("rca-{pid}-{nanos}-{unique}-home"));
+        let cwd = TempRoot::new("rca-cwd");
+        let home = TempRoot::new("rca-home");
         fs::create_dir_all(cwd.join(".git")).unwrap();
         fs::create_dir_all(cwd.join(".rally")).unwrap();
         fs::create_dir_all(&home).unwrap();
-        Self { cwd, home }
+        Self {
+            cwd: cwd.to_path_buf(),
+            home: home.to_path_buf(),
+            _roots: vec![cwd, home],
+        }
     }
 
     fn rally_dir(&self) -> PathBuf {
@@ -143,13 +143,6 @@ impl Room {
             .and_then(Value::as_str)
             .unwrap_or_else(|| panic!("expected a string refusal\nenvelope: {body}"))
             .to_string()
-    }
-}
-
-impl Drop for Room {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.cwd).ok();
-        fs::remove_dir_all(&self.home).ok();
     }
 }
 

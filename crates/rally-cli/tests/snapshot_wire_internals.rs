@@ -55,12 +55,16 @@
 #![cfg(unix)]
 #![allow(clippy::zombie_processes)]
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const SIGTERM: i32 = 15;
 
@@ -93,20 +97,21 @@ const LIVE_RISK_AGE_SECS: i64 = 5_400;
 struct Room {
     cwd: PathBuf,
     home: PathBuf,
+    _roots: Vec<TempRoot>,
 }
 
 impl Room {
     fn new(name: &str) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let cwd = std::env::temp_dir().join(format!("swi-{name}-{nanos}-cwd"));
-        let home = std::env::temp_dir().join(format!("swi-{name}-{nanos}-home"));
+        let cwd = TempRoot::new(&format!("swi-{name}-cwd"));
+        let home = TempRoot::new(&format!("swi-{name}-home"));
         fs::create_dir_all(cwd.join(".git")).unwrap();
         fs::create_dir_all(cwd.join(".rally")).unwrap();
         fs::create_dir_all(&home).unwrap();
-        Self { cwd, home }
+        Self {
+            cwd: cwd.to_path_buf(),
+            home: home.to_path_buf(),
+            _roots: vec![cwd, home],
+        }
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -251,13 +256,6 @@ impl Room {
         ] {
             fs::remove_file(rally.join(name)).ok();
         }
-    }
-}
-
-impl Drop for Room {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.cwd).ok();
-        fs::remove_dir_all(&self.home).ok();
     }
 }
 

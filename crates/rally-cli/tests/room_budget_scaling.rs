@@ -50,11 +50,15 @@
 //!   nothing, so the test reports and skips the ratio rather than asserting on
 //!   noise. A skipped assertion that says so beats a coin-flip that does not.
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+use temp_root::TempRoot;
+
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 /// Facts in the small ledger.
 const BASE_FACTS: usize = 800;
@@ -101,6 +105,7 @@ const MAX_BYTE_GROWTH: f64 = 6.0;
 struct Workspace {
     cwd: PathBuf,
     home: PathBuf,
+    _roots: Vec<TempRoot>,
 }
 
 impl Workspace {
@@ -111,7 +116,11 @@ impl Workspace {
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(cwd.join(".git")).unwrap();
         fs::create_dir_all(cwd.join(".rally/log")).unwrap();
-        Self { cwd, home }
+        Self {
+            cwd: cwd.to_path_buf(),
+            home: home.to_path_buf(),
+            _roots: vec![cwd, home],
+        }
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -126,20 +135,11 @@ impl Workspace {
             .unwrap()
     }
 
-    fn cleanup(self) {
-        fs::remove_dir_all(self.cwd).ok();
-        fs::remove_dir_all(self.home).ok();
-    }
+    fn cleanup(self) {}
 }
 
-fn temp_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "{name}-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
+fn temp_path(name: &str) -> TempRoot {
+    TempRoot::new(name)
 }
 
 /// Seed a ledger made almost entirely of facts in the buckets the budget
