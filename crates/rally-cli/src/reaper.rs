@@ -459,9 +459,7 @@ fn reap_apply_budget() -> Option<std::time::Duration> {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok());
     #[cfg(test)]
-    if configured.is_none() {
-        return None;
-    }
+    configured?;
     let ms = configured.unwrap_or(DEFAULT_REAP_APPLY_BUDGET_MS);
     (ms > 0).then(|| std::time::Duration::from_millis(ms))
 }

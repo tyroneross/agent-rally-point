@@ -3556,7 +3556,7 @@ fn command_enter(args: EnterArgs) -> Result<Output> {
         if report.remaining > 0 {
             eprintln!(
                 "rally: auto-reap deferred {} eligible item(s) to a later pass \
-                 (run `rally doctor --reap-stale --apply` to drain now)",
+                 (run `rally doctor --reap-stale` to inspect)",
                 report.remaining
             );
         }

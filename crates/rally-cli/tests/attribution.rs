@@ -76,6 +76,8 @@ impl TempRoom {
             // append and the automatic pass defers silently, which read as a
             // missing `claim.expired` fact. reaper_scale grades the budget with
             // its own deterministic steps.
+            // The logical clock exists only in debug builds, so this pin does
+            // nothing under `cargo test --release`.
             .env("RALLY_TEST_REAP_CLOCK_STEP_MS", "0")
             .env_remove("GITHUB_ACTIONS")
             .env_remove("GITHUB_RUN_ID");
