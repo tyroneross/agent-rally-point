@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -637,6 +638,38 @@ def generate(
         write_text(dest_root / path, identity_text)
 
 
+# Upper bound for one `git check-ignore` call during a surface check.
+GIT_CHECK_IGNORE_TIMEOUT_SECONDS = 10
+
+
+def git_ignored(directory: Path, paths: list[Path]) -> set[Path]:
+    """Return the members of ``paths`` that git ignores.
+
+    A host can write its own files into a generated directory (Codex writes
+    ``migrated-command-skills/`` beside the plugin manifest). An ignored file
+    cannot be committed or released, so it is not generator drift. Tracked files
+    are never ignored. Without git, or outside a repository, nothing is treated
+    as ignored and every extra file is still reported.
+    """
+    if not paths:
+        return set()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(directory), "check-ignore", "-z", "--stdin"],
+            input="\0".join(str(path) for path in paths),
+            capture_output=True,
+            text=True,
+            timeout=GIT_CHECK_IGNORE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    # 0 = some ignored, 1 = none ignored; anything else is a git failure.
+    if result.returncode not in (0, 1):
+        return set()
+    return {Path(item) for item in result.stdout.split("\0") if item}
+
+
 def compare_path(actual: Path, expected: Path) -> list[str]:
     if not actual.exists() and not actual.is_symlink():
         return [f"missing: {actual}"]
@@ -651,8 +684,10 @@ def compare_path(actual: Path, expected: Path) -> list[str]:
             for p in expected.rglob("*")
             if p.is_file() or p.is_symlink()
         }
+        extra = [actual / path for path in sorted(actual_files - expected_files)]
+        ignored = git_ignored(actual, extra)
         findings = [
-            *(f"extra: {actual / path}" for path in sorted(actual_files - expected_files)),
+            *(f"extra: {path}" for path in extra if path not in ignored),
             *(f"missing: {actual / path}" for path in sorted(expected_files - actual_files)),
         ]
         for path in sorted(actual_files & expected_files):

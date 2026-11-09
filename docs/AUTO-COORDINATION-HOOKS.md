@@ -87,7 +87,7 @@ the full identity, not version alone, and judges the release, not the
 marketplace name: one enabled provider with the canonical identity is `current`
 whatever marketplace installed it. A single provider with a different identity
 is `stale` (older version), `ahead` (newer; exits 0, never removed), or
-`diverged` (same version, different generated surfaces; no automated change).
+`diverged` (same version, different generated surfaces; refreshed from the marketplace it was installed from).
 It also reports `restart_required`, `uninstalled`, `duplicate_provider` (two or
 more enabled providers), or `unknown`. Diagnosis is read-only and exits
 non-zero on drift. Apply mode refuses to mutate a host whose

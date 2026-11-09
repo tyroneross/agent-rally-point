@@ -490,6 +490,26 @@ class GenerateHostSurfacesTests(unittest.TestCase):
             expected.write_text('{"version":"new"}\n')
             self.assertEqual(GEN.compare_path(actual, expected), [f"drift: {actual}"])
 
+    def test_compare_path_skips_git_ignored_extra_files(self) -> None:
+        """A host-written file that git ignores is not generator drift; an
+        unignored extra file still is."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            actual = repo / "generated"
+            expected = Path(tmp) / "expected"
+            (actual / "host-written").mkdir(parents=True)
+            expected.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            (repo / ".git" / "info" / "exclude").write_text("**/host-written/\n")
+            for root in (actual, expected):
+                (root / "manifest.json").write_text("{}\n")
+            ignored = actual / "host-written" / "SKILL.md"
+            ignored.write_text("local only\n")
+            self.assertEqual(GEN.compare_path(actual, expected), [])
+            stray = actual / "stray.md"
+            stray.write_text("not ignored\n")
+            self.assertEqual(GEN.compare_path(actual, expected), [f"extra: {stray}"])
+
     def test_artifact_destination_rejects_broad_or_misnamed_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -428,19 +428,47 @@ class LocalMarketplaceIdentityTests(unittest.TestCase):
         self.assertEqual(record["status"], "ahead")
         self.assertEqual(planned, [])
 
-    def test_older_local_release_plans_update(self) -> None:
+    # A provider from another marketplace is refreshed where it came from. It is
+    # never uninstalled in favor of the canonical marketplace.
+    IN_PLACE_CLAUDE = [["claude", "plugin", "update", LOCAL_CLAUDE_ID]]
+
+    def test_older_local_release_is_refreshed_in_place(self) -> None:
         record, planned = self.plan({**identity(), "version": "0.0.1"})
         self.assertEqual(record["status"], "stale")
-        self.assertIn(
-            ["claude", "plugin", "uninstall", LOCAL_CLAUDE_ID, "--yes"], planned
-        )
+        self.assertEqual(planned, self.IN_PLACE_CLAUDE)
 
-    def test_same_version_different_digest_is_not_removed(self) -> None:
+    def test_same_version_different_digest_is_refreshed_in_place(self) -> None:
         record, planned = self.plan(
             {**identity(), "generated_surface_digest": "sha256:other"}
         )
         self.assertEqual(record["status"], "diverged")
-        self.assertEqual(planned, [])
+        self.assertEqual(planned, self.IN_PLACE_CLAUDE)
+
+    def test_codex_local_provider_is_refreshed_from_its_own_marketplace(self) -> None:
+        local = {"id": LOCAL_CLAUDE_ID, "marketplace": "canonical-local"}
+        report = {"hosts": {"codex": {"status": "diverged", "providers": [local]}}}
+        config = json.loads((ROOT / "config/host-integrations.json").read_text())
+        self.assertEqual(
+            SYNC.apply_commands(report, config, "codex"),
+            [
+                ["codex", "plugin", "marketplace", "upgrade", "canonical-local", "--json"],
+                ["codex", "plugin", "remove", LOCAL_CLAUDE_ID, "--json"],
+                ["codex", "plugin", "add", LOCAL_CLAUDE_ID, "--json"],
+            ],
+        )
+
+    def test_canonical_provider_keeps_the_canonical_update_path(self) -> None:
+        config = json.loads((ROOT / "config/host-integrations.json").read_text())
+        canonical_id = config["providers"]["claude_code"]["canonical_id"]
+        report = {
+            "hosts": {
+                "claude_code": {"status": "stale", "providers": [{"id": canonical_id}]}
+            }
+        }
+        self.assertEqual(
+            SYNC.apply_commands(report, config, "claude_code"),
+            [list(config["providers"]["claude_code"]["update_command"])],
+        )
 
     def test_versions_compare_numerically_not_as_strings(self) -> None:
         self.assertEqual(SYNC.compare_versions("0.10.0", "0.9.0"), 1)

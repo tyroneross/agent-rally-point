@@ -28,7 +28,7 @@ STATUS_ORDER = {
     "unknown": 7,
 }
 # Statuses that need no host change: apply plans no commands for them.
-NO_ACTION_STATUSES = frozenset({"current", "ahead", "unknown", "diverged"})
+NO_ACTION_STATUSES = frozenset({"current", "ahead", "unknown"})
 # Statuses that exit 0 from the CLI (nothing to reconcile).
 EXIT_OK_STATUSES = frozenset({"current", "ahead", "restart_required"})
 VERSION_NUMBER = re.compile(r"^v?(\d+(?:\.\d+)*)(.*)$")
@@ -217,7 +217,8 @@ def classify_mismatch(
     if order is None or order < 0:
         return "stale", (
             f"installed release {installed.get('version') or 'unknown'} is older "
-            f"than canonical {expected.get('version')} ({where})"
+            f"than canonical {expected.get('version')}; refresh it from its own "
+            f"marketplace ({where})"
         )
     if order > 0:
         return "ahead", (
@@ -226,7 +227,7 @@ def classify_mismatch(
         )
     return "diverged", (
         f"installed release {installed.get('version')} equals canonical but its "
-        f"generated surfaces differ; no change planned ({where})"
+        f"generated surfaces differ; refresh it from its own marketplace ({where})"
     )
 
 
@@ -359,14 +360,34 @@ def diagnose(
     }
 
 
+def sole_other_marketplace_provider(
+    record: dict[str, Any], canonical_id: str
+) -> dict[str, Any] | None:
+    """The single installed provider when it came from another marketplace.
+
+    Such a provider is refreshed from the marketplace it was installed from. It
+    is never uninstalled in favor of the canonical marketplace: a local
+    directory marketplace is a legitimate source and is often the newer one.
+    """
+    providers = record.get("providers", [])
+    if len(providers) == 1 and providers[0].get("id") != canonical_id:
+        return providers[0]
+    return None
+
+
 def apply_commands(
     report: dict[str, Any], config: dict[str, Any], host: str
 ) -> list[list[str]]:
     commands: list[list[str]] = []
     if host in {"all", "claude_code"}:
         record = report["hosts"].get("claude_code", {})
-        if record.get("status") not in NO_ACTION_STATUSES:
-            canonical_id = config["providers"]["claude_code"]["canonical_id"]
+        canonical_id = config["providers"]["claude_code"]["canonical_id"]
+        in_place = sole_other_marketplace_provider(record, canonical_id)
+        if record.get("status") in NO_ACTION_STATUSES:
+            pass
+        elif in_place is not None:
+            commands.append(["claude", "plugin", "update", str(in_place["id"])])
+        else:
             for provider in record.get("providers", []):
                 if provider.get("id") != canonical_id:
                     commands.append(
@@ -384,6 +405,19 @@ def apply_commands(
         if record.get("status") in NO_ACTION_STATUSES:
             return commands
         canonical_id = config["providers"]["codex"]["canonical_id"]
+        in_place = sole_other_marketplace_provider(record, canonical_id)
+        if in_place is not None:
+            provider_id = str(in_place["id"])
+            # Same order as the canonical path: refresh the marketplace
+            # snapshot first, then replace the installed copy from it.
+            commands.extend(
+                [
+                    ["codex", "plugin", "marketplace", "upgrade", marketplace_of(in_place), "--json"],
+                    ["codex", "plugin", "remove", provider_id, "--json"],
+                    ["codex", "plugin", "add", provider_id, "--json"],
+                ]
+            )
+            return commands
         for provider in record.get("providers", []):
             if provider.get("id") != canonical_id:
                 commands.append(
