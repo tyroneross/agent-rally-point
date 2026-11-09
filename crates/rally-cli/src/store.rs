@@ -2243,6 +2243,18 @@ pub(crate) const CALLER_SQUADS_FRESH_BUCKET: &str = "squads_fresh";
 pub(crate) const CALLER_SQUADS_STALE_BUCKET: &str = "squads_stale";
 pub(crate) const CALLER_SQUADS_UNKNOWN_BUCKET: &str = "squads_unknown";
 
+/// Subject prefix of the one risk fact written per overdue handoff.
+pub(crate) const NO_RESPONSE_SUBJECT_PREFIX: &str = "no-response:";
+
+/// THE definition of "handoff `handoff_id` is already escalated": `next`'s
+/// overdue escalation (`overdue_handoffs_at`) and the caller projection's
+/// escalated-pair tier both use it, so they cannot disagree.
+pub(crate) fn is_no_response_risk_for(risk: &Fact, handoff_id: &str) -> bool {
+    risk.kind == FactKind::Risk
+        && risk.ref_id.as_deref() == Some(handoff_id)
+        && risk.subject.starts_with(NO_RESPONSE_SUBJECT_PREFIX)
+}
+
 /// Tier budgets for one projection pass; the final check shrinks them.
 #[derive(Clone, Copy, Debug)]
 struct CallerBudgets {
@@ -2642,15 +2654,43 @@ impl RoomSnapshot {
                 return Ok(projected);
             }
             if !budgets.shrink() {
-                return Err(RallyError::CallerProjectionTooLarge {
-                    detail: format!(
-                        "{tool}'s reply still exceeds {MAX_CALLER_REPLY_BYTES} bytes with only \
-                         its own coordination rows left; resolve or retract handoffs you sent, \
-                         answer handoffs sent to you, release claims you hold, or resolve your \
-                         blockers"
-                    ),
-                });
+                return Err(projected.over_budget_after_trimming(tool));
             }
+        }
+    }
+
+    /// The error when nothing optional or should-keep is left to trim: name
+    /// the part that does not fit, from measured bytes, and point the caller
+    /// at its own rows only when those are the cause.
+    fn over_budget_after_trimming(&self, tool: &str) -> RallyError {
+        let mission = self.mission.as_ref().map_or(0, String::len);
+        let internals = serde_json::to_vec(&self.internals()).map_or(0, |v| v.len());
+        let public = serde_json::to_vec(self).map_or(0, |v| v.len());
+        let rows = public.saturating_sub(mission);
+        let total = public + internals + MAX_CALLER_ENVELOPE_BYTES;
+        let wire = snapshot_to_wire_value(self)
+            .err()
+            .map(|e| format!("; the wire encoding also refused it: {e}"))
+            .unwrap_or_default();
+        let cause = if mission >= internals && mission >= rows {
+            "the room mission text is the largest part; set a shorter mission".to_string()
+        } else if internals >= rows {
+            format!(
+                "snapshot internals (your pending wakes, your open obligations, per-tool \
+                 liveness maps) are the largest part{wire}"
+            )
+        } else {
+            "your own coordination rows are the largest part; resolve or retract handoffs \
+             you sent, answer handoffs sent to you, release claims you hold, or resolve your \
+             blockers"
+                .to_string()
+        };
+        RallyError::CallerProjectionTooLarge {
+            detail: format!(
+                "{tool}'s reply needs {total} bytes, over the {MAX_CALLER_REPLY_BYTES}-byte \
+                 bound, with every optional and should-keep row already trimmed: mission \
+                 {mission} B, internals {internals} B, rows and other fields {rows} B. {cause}"
+            ),
         }
     }
 
@@ -2695,13 +2735,31 @@ impl RoomSnapshot {
                 *risk_bytes_by_ref.entry(id.to_string()).or_default() += row_bytes(risk);
             }
         }
+        // Escalated = has a no-response risk, by the escalation code's own
+        // predicate. A handoff with only unrelated risks stays un-escalated
+        // (must-keep), and its risks stay with it.
+        let no_response = self
+            .current_risks
+            .iter()
+            .filter_map(|risk| risk.ref_id.as_deref())
+            .filter(|id| own_ids.contains(*id))
+            .filter(|id| {
+                self.current_risks
+                    .iter()
+                    .any(|risk| is_no_response_risk_for(risk, id))
+            })
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
         let dead = self.takeover_eligible_owners();
+        let now_secs = projection_unix_sec();
         let mut escalated = self
             .open_handoffs
             .iter()
-            .filter(|fact| mine(fact) && risk_bytes_by_ref.contains_key(&fact.event_id))
+            .filter(|fact| mine(fact) && no_response.contains(&fact.event_id))
             .collect::<Vec<_>>();
-        escalated.sort_by_key(|fact| std::cmp::Reverse(fact.seq));
+        // Newest by `created_at` (the clock `waiting_on_facts`' age filter
+        // reads; `seq` is append order and can disagree), then by seq.
+        escalated.sort_by_key(|fact| (fact_age_secs(fact, now_secs), std::cmp::Reverse(fact.seq)));
         // The newest escalated handoff to a live peer: if any escalated
         // handoff passes `waiting_on_facts`' age filter, this one does, so
         // keeping it keeps `next`'s waiting verdict exact.
@@ -2713,7 +2771,7 @@ impl RoomSnapshot {
                 })
             })
             .map(|fact| fact.event_id.clone());
-        let is_escalated = |fact: &Fact| risk_bytes_by_ref.contains_key(&fact.event_id);
+        let is_escalated = |fact: &Fact| no_response.contains(&fact.event_id);
         let must_handoff = |fact: &Fact| {
             to_me(fact)
                 || (mine(fact)
@@ -2820,7 +2878,7 @@ impl RoomSnapshot {
             .map(|f| f.event_id.clone())
             .collect::<BTreeSet<_>>();
         drop(escalated);
-        let escalated_total = risk_bytes_by_ref.len();
+        let escalated_total = no_response.len();
         record(
             CALLER_ESCALATED_PAIRS_BUCKET,
             escalated_total,

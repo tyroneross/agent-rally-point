@@ -751,3 +751,73 @@ fn multi_tool_inbox_returns_the_others_when_one_tool_is_over_the_limit() {
     );
     assert!(data["inboxes"].get(FLOODED).is_none());
 }
+
+/// F1: "escalated" means a no-response risk exists, by the escalation code's
+/// own predicate. An overdue handoff carrying only an UNRELATED risk is not
+/// escalated, so it stays must-keep under budget pressure and `next`
+/// escalates it exactly once.
+#[test]
+fn an_unrelated_risk_does_not_mark_a_handoff_escalated() {
+    const ESCALATED: usize = 1_400;
+    let mut room = Room::new("f1");
+    room.fact(json!({
+        "event_id": "has-unrelated-risk",
+        "kind": "handoff",
+        "tool": ME,
+        "target": "slow-peer",
+        "subject": "oldest overdue handoff",
+        "evidence": [format!("ack-by:{}", ago(3_600))],
+        "created_at": ago(7_200),
+    }));
+    room.fact(json!({
+        "kind": "risk",
+        "tool": ME,
+        "subject": "flaky CI on this branch",
+        "severity": "warn",
+        "ref": "has-unrelated-risk",
+        "created_at": ago(7_100),
+    }));
+    for n in 0..ESCALATED {
+        room.fact(json!({
+            "event_id": format!("escalated-{n}"),
+            "kind": "handoff",
+            "tool": ME,
+            "target": format!("peer-{n}"),
+            "subject": format!("escalated handoff {n}"),
+            "summary": padding(2_000),
+            "evidence": [format!("ack-by:{}", ago(3_600))],
+            "created_at": ago(7_000),
+        }));
+        room.fact(json!({
+            "kind": "risk",
+            "tool": ME,
+            "target": ME,
+            "subject": format!("no-response: peer-{n} did not ack handoff escalated-{n}"),
+            "severity": "warn",
+            "ref": format!("escalated-{n}"),
+        }));
+    }
+    room.seal();
+    let _daemon = Daemon::start(&room);
+    let no_response_for = |room: &Room| {
+        room.ledger()
+            .iter()
+            .filter(|f| f["kind"] == "risk" && f["ref"] == "has-unrelated-risk")
+            .filter(|f| {
+                f["subject"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("no-response:"))
+            })
+            .count()
+    };
+    for run in 1..=2 {
+        let next = room.json(&["next", "--tool", ME, "--json"]);
+        assert!(
+            next["data"]["room"]["omitted"]["escalated_handoffs"]
+                .as_u64()
+                .is_some_and(|n| n > 0),
+            "fixture must push escalated pairs past the budget"
+        );
+        assert_eq!(no_response_for(&room), 1, "run {run}");
+    }
+}

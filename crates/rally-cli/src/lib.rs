@@ -24224,8 +24224,7 @@ pub(crate) fn ack_by_from_evidence(evidence: &[String]) -> Option<(String, chron
     Some((deadline_raw.to_string(), deadline.with_timezone(&Utc)))
 }
 
-/// Subject prefix of the one risk fact written per overdue handoff.
-const NO_RESPONSE_SUBJECT_PREFIX: &str = "no-response:";
+use crate::store::{NO_RESPONSE_SUBJECT_PREFIX, is_no_response_risk_for};
 const MAX_ACK_WITHIN_SECS: i64 = 7 * 24 * 3600;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24710,12 +24709,6 @@ fn overdue_handoffs_at(
             })
         })
         .collect()
-}
-
-fn is_no_response_risk_for(risk: &Fact, handoff_id: &str) -> bool {
-    risk.kind == FactKind::Risk
-        && risk.ref_id.as_deref() == Some(handoff_id)
-        && risk.subject.starts_with(NO_RESPONSE_SUBJECT_PREFIX)
 }
 
 /// Compute the caller's overdue handoffs and, when `write` is set, record one

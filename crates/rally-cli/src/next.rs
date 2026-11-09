@@ -2161,4 +2161,26 @@ mod tests {
         );
         assert!(err.to_string().contains("4000 claims you hold"), "{err}");
     }
+
+    /// F2: when the reply is over budget after all trimming because of the
+    /// mission text, the error names the mission, not the caller's rows.
+    #[test]
+    fn oversized_mission_error_names_the_mission_not_the_callers_rows() {
+        let snapshot = RoomSnapshot {
+            mission: Some("m".repeat(8 * 1024 * 1024)),
+            ..RoomSnapshot::default()
+        };
+        let err = snapshot.for_obligation_target("codex", 16).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            matches!(
+                err,
+                crate::error::RallyError::CallerProjectionTooLarge { .. }
+            ),
+            "{message}"
+        );
+        assert!(message.contains("mission 8388608 B"), "{message}");
+        assert!(message.contains("set a shorter mission"), "{message}");
+        assert!(!message.contains("handoffs you sent"), "{message}");
+    }
 }
