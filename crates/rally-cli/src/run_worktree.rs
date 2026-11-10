@@ -241,13 +241,13 @@ pub(crate) fn cleanup_against(
             Ok(out)
                 if out.status.success()
                     && ignored_only(&out.stdout)
-                    && all_regenerable_build_output(worktree_path, &out.stdout) => {}
+                    && all_disposable_ignored(worktree_path, &out.stdout) => {}
             Ok(out) if out.status.success() && ignored_only(&out.stdout) => {
                 let text = String::from_utf8_lossy(&out.stdout);
                 let ignored: Vec<&str> = text
                     .lines()
                     .filter_map(|line| line.strip_prefix("!! "))
-                    .filter(|path| !is_regenerable_build_output(worktree_path, path))
+                    .filter(|path| !is_disposable_ignored(worktree_path, path))
                     .collect();
                 let sample = ignored
                     .iter()
@@ -338,7 +338,11 @@ pub(crate) fn cleanup_against(
     match branch_has_unmerged(repo_root, branch, base, git_bin) {
         Some(false) => {}
         Some(true) => {
-            warnings.push(format!("rally stop: retained unmerged worktree for review at {} (branch {branch}, target {base})", worktree_path.display()));
+            warnings.push(format!(
+                "rally stop: retained unmerged worktree for review at {} (branch {branch}, target {base}); \
+after merging or deleting {branch}, `rally worktree gc --apply` removes it",
+                worktree_path.display()
+            ));
             return CleanupOutcome {
                 worktree_removed: false,
                 branch_deleted: false,
@@ -544,13 +548,35 @@ fn is_regenerable_build_output(worktree: &Path, rel: &str) -> bool {
     false
 }
 
-/// True when every ignored path in porcelain `stdout` is regenerable build
-/// output, so removing the worktree loses nothing a build cannot recreate.
-fn all_regenerable_build_output(worktree: &Path, stdout: &[u8]) -> bool {
+/// True when `rel` is per-session bookkeeping a hook writes into every
+/// worktree an agent runs in, and that holds nothing once the session ends:
+/// Rally's own once-per-session notice markers (`.rally/.hook-seen/<file>`)
+/// and the Bookmark plugin's per-session counter file
+/// (`.bookmark/sessions/<id>/state.json`). Every other path under `.rally/`
+/// or `.bookmark/` (snapshots, notes) still retains the worktree.
+fn is_session_bookkeeping(rel: &str) -> bool {
+    let parts: Vec<&str> = rel.split('/').collect();
+    let named = |part: &str| !part.is_empty() && part != "." && part != "..";
+    match parts.as_slice() {
+        [".rally", ".hook-seen", file] => named(file),
+        [".bookmark", "sessions", id, "state.json"] => named(id),
+        _ => false,
+    }
+}
+
+/// True when removing `rel` loses nothing: regenerable build output or
+/// finished-session bookkeeping.
+fn is_disposable_ignored(worktree: &Path, rel: &str) -> bool {
+    is_regenerable_build_output(worktree, rel) || is_session_bookkeeping(rel)
+}
+
+/// True when every ignored path in porcelain `stdout` is disposable, so
+/// removing the worktree loses nothing a build or a new session cannot recreate.
+fn all_disposable_ignored(worktree: &Path, stdout: &[u8]) -> bool {
     String::from_utf8_lossy(stdout)
         .lines()
         .filter_map(|line| line.strip_prefix("!! "))
-        .all(|path| is_regenerable_build_output(worktree, path))
+        .all(|path| is_disposable_ignored(worktree, path))
 }
 
 #[cfg(test)]
@@ -784,6 +810,113 @@ mod tests {
         assert!(
             warning.contains("memory/") && !warning.contains("target/"),
             "{warning}"
+        );
+    }
+
+    /// AGEN-RUN-m71b1z15atdm1w4xdvkzq: every finished task session left its
+    /// worktree because hooks write these per-session markers into it. Real
+    /// evidence from the 2026-11-09 room: four such paths retained each tree.
+    fn plant_session_bookkeeping(wt: &Path) {
+        fs::create_dir_all(wt.join(".rally/.hook-seen")).unwrap();
+        for marker in ["s1.after-write.seen", "s1.idle.seen", "native-probe.x.seen"] {
+            fs::write(wt.join(".rally/.hook-seen").join(marker), b"").unwrap();
+        }
+        fs::create_dir_all(wt.join(".bookmark/sessions/s1")).unwrap();
+        fs::write(
+            wt.join(".bookmark/sessions/s1/state.json"),
+            br#"{"compaction_count":1}"#,
+        )
+        .unwrap();
+    }
+
+    fn cleanup_with_bookkeeping_ignore(
+        name: &str,
+        setup: impl FnOnce(&Path),
+    ) -> (
+        crate::test_temp_root::TempRoot,
+        CleanupOutcome,
+        ProvisionedWorktree,
+    ) {
+        let repo = tmp_dir(name);
+        init_test_repo(&repo);
+        fs::write(repo.join(".gitignore"), b".rally/\n.bookmark/\n").unwrap();
+        crate::test_git_fixture::fixture_git(&repo, &["add", ".gitignore"]);
+        crate::test_git_fixture::fixture_git(&repo, &["commit", "-m", "ignore"]);
+        let pw = provision(&repo, &format!("{name}-01"), "git").expect("provision");
+        setup(&pw.path);
+        let outcome = cleanup(&repo, &pw.path, &pw.branch, "git");
+        (repo, outcome, pw)
+    }
+
+    #[test]
+    fn cleanup_removes_merged_worktree_holding_only_session_bookkeeping() {
+        if !git_available() {
+            return;
+        }
+        let (_repo, outcome, pw) =
+            cleanup_with_bookkeeping_ignore("cleanup-bookkeeping", plant_session_bookkeeping);
+        assert!(
+            outcome.worktree_removed,
+            "finished-session bookkeeping alone must not retain: {:?}",
+            outcome.warnings
+        );
+        assert!(outcome.branch_deleted);
+        assert!(!pw.path.exists());
+    }
+
+    #[test]
+    fn cleanup_retains_unmerged_worktree_even_with_only_session_bookkeeping() {
+        if !git_available() {
+            return;
+        }
+        let (repo, outcome, pw) =
+            cleanup_with_bookkeeping_ignore("cleanup-bookkeeping-unmerged", |wt| {
+                plant_session_bookkeeping(wt);
+                fs::write(wt.join("work.txt"), b"agent work").unwrap();
+                crate::test_git_fixture::fixture_git(wt, &["add", "work.txt"]);
+                crate::test_git_fixture::fixture_git(wt, &["commit", "-m", "work"]);
+            });
+        assert!(!outcome.worktree_removed);
+        assert_eq!(outcome.reason, "unmerged");
+        assert!(pw.path.join("work.txt").exists());
+        let warning = outcome.warnings.join("\n");
+        assert!(
+            warning.contains(&pw.branch) && warning.contains("rally worktree gc --apply"),
+            "retention notice must name the branch and the removal command: {warning}"
+        );
+        let exists = Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["rev-parse", "--verify", "--quiet", &pw.branch])
+            .output()
+            .unwrap();
+        assert!(exists.status.success(), "unmerged branch must survive");
+    }
+
+    #[test]
+    fn cleanup_retains_other_rally_and_bookmark_state_beside_bookkeeping() {
+        if !git_available() {
+            return;
+        }
+        let (_repo, outcome, pw) =
+            cleanup_with_bookkeeping_ignore("cleanup-bookkeeping-other", |wt| {
+                plant_session_bookkeeping(wt);
+                fs::create_dir_all(wt.join(".bookmark/snapshots")).unwrap();
+                fs::write(wt.join(".bookmark/snapshots/s1.md"), b"context").unwrap();
+                fs::create_dir_all(wt.join(".rally/.hook-seen/nested")).unwrap();
+                fs::write(wt.join(".rally/.hook-seen/nested/x"), b"").unwrap();
+                fs::write(wt.join(".rally/notes.md"), b"notes").unwrap();
+            });
+        assert!(!outcome.worktree_removed);
+        assert_eq!(outcome.reason, "ignored_files");
+        assert!(pw.path.join(".bookmark/snapshots/s1.md").exists());
+        let warning = outcome.warnings.join("\n");
+        assert!(
+            warning.contains("3 gitignored path(s)")
+                && warning.contains(".bookmark/snapshots/s1.md")
+                && !warning.contains("state.json")
+                && !warning.contains("idle.seen"),
+            "only the non-disposable paths are listed for review: {warning}"
         );
     }
 
