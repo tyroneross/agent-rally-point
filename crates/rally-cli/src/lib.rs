@@ -9442,6 +9442,15 @@ fn command_run(args: RunArgs) -> Result<Output> {
     // and the `RALLY_NO_WORKTREE=1` escape hatch (for hosts that already
     // operate inside a per-agent worktree) opt out.
     let isolate_worktree = !shared && env::var("RALLY_NO_WORKTREE").as_deref() != Ok("1");
+    // A shared session runs in the checkout the caller stands in. The room and
+    // ledger still resolve to the common repo root (`repo`), so a caller inside
+    // a linked worktree shares the room while the agent works on that
+    // worktree's branch, never silently on the main checkout's branch.
+    let launch_cwd = if isolate_worktree {
+        repo.clone()
+    } else {
+        caller_checkout_root()?
+    };
     let room = RoomStore::open()?;
     let reservation = if dry_run {
         let active_sessions = active_session_records(&room)?;
@@ -9459,7 +9468,7 @@ fn command_run(args: RunArgs) -> Result<Output> {
                 task_id: task_scoped.then(|| format!("task-dry-run-{}", identity.session_id)),
                 admission_resources: resources.clone(),
                 admission_claim_id: None,
-                cwd: repo.clone(),
+                cwd: launch_cwd.clone(),
                 target: backend_target(backend, &identity.session_id),
                 worktree_path: None,
                 branch: None,
@@ -9482,6 +9491,7 @@ fn command_run(args: RunArgs) -> Result<Output> {
                 backend,
                 backend_name: &backend_name,
                 repo: &repo,
+                cwd: &launch_cwd,
             },
         )?
     };
@@ -9797,8 +9807,11 @@ fn command_run(args: RunArgs) -> Result<Output> {
         },
     )?;
     let text = format!(
-        "run agent={} backend={} session={}",
-        session.agent, session.backend, session.session_id
+        "run agent={} backend={} session={} cwd={}",
+        session.agent,
+        session.backend,
+        session.session_id,
+        session.cwd.display()
     );
     if let Some(rollback) = &mut admission_rollback {
         rollback.disarm();
@@ -10408,6 +10421,9 @@ struct SessionReservationInput<'a> {
     backend: Backend,
     backend_name: &'a str,
     repo: &'a Path,
+    /// Directory the agent starts in: the provisioning root for isolated
+    /// sessions, the caller's own checkout for `--shared`.
+    cwd: &'a Path,
 }
 
 fn reserve_numbered_session(
@@ -10438,7 +10454,7 @@ fn reserve_numbered_session(
             backend: input.backend_name.to_string(),
             task_scoped: input.task_scoped,
             task_id: input.task_scoped.then(|| new_id("task")),
-            cwd: input.repo.to_path_buf(),
+            cwd: input.cwd.to_path_buf(),
             target: backend_target(input.backend, &identity.session_id),
             worktree_path: None,
             branch: None,
@@ -23000,6 +23016,14 @@ pub(crate) fn worktree_root() -> Result<PathBuf> {
             return env::current_dir().map_err(RallyError::io("current dir"));
         }
     }
+}
+
+/// The top level of the checkout the caller stands in, canonicalized so the
+/// main checkout compares equal to [`repo_root`]. Inside a linked worktree this
+/// is that worktree, not the common repo root.
+fn caller_checkout_root() -> Result<PathBuf> {
+    let root = worktree_root()?;
+    Ok(root.canonicalize().unwrap_or(root))
 }
 
 fn git_common_repo_root(worktree_root: &Path) -> Option<PathBuf> {

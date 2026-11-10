@@ -2903,6 +2903,88 @@ fn linked_git_worktree_uses_common_room() {
     assert_eq!(room["data"]["room"]["max_seq"], 3);
 }
 
+/// GAP AGEN-RUN-m718t1ht7kgbrgpghfz41: `rally run --shared` from inside a
+/// linked worktree started the agent in the MAIN checkout, because the session
+/// cwd was the common repo root that also locates the room. The session must
+/// start in the caller's own worktree while the room stays shared.
+#[test]
+fn shared_run_from_linked_worktree_starts_in_callers_worktree() {
+    let (home, _home_guard) = temp_path("rally-shared-cwd-home");
+    let primary = Workspace::new_with_home("rally-shared-cwd-main", &home);
+    let (cwd, cwd_guard) = temp_path("rally-shared-cwd-linked");
+    let linked = Workspace {
+        cwd,
+        home: home.clone(),
+        global_index: false,
+        suppress_worktree: false,
+        _roots: vec![cwd_guard],
+    };
+    fs::create_dir_all(linked.cwd.join("nested")).unwrap();
+    let linked_git_dir = primary.cwd.join(".git/worktrees/rally-shared-cwd-linked");
+    fs::create_dir_all(&linked_git_dir).unwrap();
+    fs::write(linked_git_dir.join("commondir"), "../..\n").unwrap();
+    fs::write(
+        linked.cwd.join(".git"),
+        format!("gitdir: {}\n", linked_git_dir.display()),
+    )
+    .unwrap();
+    let linked_root = linked.cwd.canonicalize().unwrap();
+    let primary_root = primary.cwd.canonicalize().unwrap();
+    // Start from a subdirectory: the session cwd is the worktree top level.
+    let caller = Workspace {
+        cwd: linked.cwd.join("nested"),
+        home: home.clone(),
+        global_index: false,
+        suppress_worktree: false,
+        _roots: Vec::new(),
+    };
+
+    let run = caller.json(&[
+        "run",
+        "codex",
+        "--name",
+        "probe",
+        "--shared",
+        "--task",
+        "hello",
+        "--dry-run",
+        "--json",
+    ]);
+    let session = &run["data"]["run"]["session"];
+    assert_eq!(
+        session["cwd"].as_str().map(PathBuf::from),
+        Some(linked_root.clone()),
+        "shared session must start in the caller's worktree, not {}; session={session}",
+        primary_root.display()
+    );
+    let start = run["data"]["run"]["commands"]["start"].to_string();
+    assert!(
+        start.contains(&format!("cd {}", linked_root.display())),
+        "start command must cd into the caller's worktree; start={start}"
+    );
+    assert!(
+        !start.contains(&format!("cd {} ", primary_root.display())),
+        "start command must not cd into the main checkout; start={start}"
+    );
+
+    let text = caller.output(&[
+        "run",
+        "codex",
+        "--name",
+        "probe",
+        "--shared",
+        "--task",
+        "hello",
+        "--dry-run",
+    ]);
+    assert!(text.status.success());
+    assert!(
+        String::from_utf8_lossy(&text.stdout).contains(&format!("cwd={}", linked_root.display())),
+        "human output must name the chosen directory; stdout={}",
+        String::from_utf8_lossy(&text.stdout)
+    );
+}
+
 // Plan F functional core (Chunk 3): the herdr backend is removed; the
 // `rally_uses_native_herdr_and_cmux_managed_session_commands` test split
 // into two: (1) `rally_run_rejects_herdr_backend_with_clear_error` and
