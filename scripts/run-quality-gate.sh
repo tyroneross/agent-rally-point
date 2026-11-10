@@ -57,7 +57,10 @@ $CARGO fmt --all --check
 # temp_dir() call in a test fails the gate, so a new test cannot bring the
 # scratch-folder leak back.
 echo "quality-gate: test scratch-folder lint…" >&2
-python3 "$(dirname "$0")/lint_test_temp_dir.py"
+# Addressed from the repository under test, not from "$0": the pre-push hook
+# runs a pinned COPY of this script from its own folder, where the lint does
+# not exist.
+python3 "$repo_root/scripts/lint_test_temp_dir.py"
 
 echo "quality-gate: clippy (-D warnings)…" >&2
 # shellcheck disable=SC2086
