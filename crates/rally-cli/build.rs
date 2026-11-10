@@ -54,6 +54,18 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
     let hash = git_short_hash().unwrap_or_else(|| "nogit".to_string());
+    if hash == "nogit" {
+        // Without git, none of the watch paths above resolved, so the only
+        // trigger left was `build.rs` itself and a `+nogit` stamp was cached
+        // for good: every later build, with git available again, reused it
+        // (an installed binary reported `0.2.9+nogit` on 2026-11-09). Watching
+        // a path that never exists makes Cargo run this script again on the
+        // next build, so the stamp recovers as soon as git does.
+        if let Some(out_dir) = std::env::var_os("OUT_DIR") {
+            let never = PathBuf::from(out_dir).join("rally-build-id-retry-until-git-resolves");
+            println!("cargo:rerun-if-changed={}", never.display());
+        }
+    }
     let dirty_suffix = if hash != "nogit" && has_relevant_dirty_state() {
         "-dirty"
     } else {
