@@ -23682,7 +23682,11 @@ fn command_lead(args: LeadArgs) -> Result<Output> {
         LeadSubcommand::Show => {
             let snap = room.snapshot()?;
             let current = snap.lead.clone();
-            let facts = room.facts().unwrap_or_default();
+            // Only decisions can carry `role:lead`; loading every fact here
+            // paged the whole ledger to answer a few hundred bytes.
+            let facts = room
+                .facts_of_kinds(&["decision".to_string()])
+                .unwrap_or_default();
             let latest = facts
                 .iter()
                 .filter(|f| f.kind == "decision" && f.subject == "role:lead")
