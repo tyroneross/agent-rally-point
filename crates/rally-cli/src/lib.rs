@@ -19210,7 +19210,7 @@ mod tests {
                 assert_eq!(
                     classify_scope(outside),
                     ScopeClass::External,
-                    "/tmp/some-other-repo/x.rs must be External when repo root is {root_str}"
+                    "/tmp/some-other-repo/x.rs must be External when repo root is {root_str}" // temp-root-read: assertion message, not a path
                 );
             }
         }

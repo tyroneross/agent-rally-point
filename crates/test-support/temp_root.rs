@@ -41,6 +41,9 @@
 //! * A fixture whose path becomes a Unix socket address uses
 //!   [`TempRoot::short`], which lives under `/tmp`. Never build a `/tmp` path
 //!   by hand: it is not swept and not removed when a test is killed.
+//! * A fixture that deliberately leaves a folder behind (failure evidence, a
+//!   daemon it could not stop) calls [`TempRoot::keep`]. `mem::forget` on a
+//!   root is a bug: the next test process would sweep the folder.
 //! * A label is a hint for humans. It is sanitised and cut to 48 characters,
 //!   so it cannot fail a test or escape the process area.
 //! * Code that only needs to READ the system temp root keeps calling
@@ -62,6 +65,8 @@ use std::sync::{Mutex, Once};
 const AREA_DIR: &str = "rt";
 /// Suffix of the per-process ownership lock, a sibling of the process area.
 const LOCK_SUFFIX: &str = ".lock";
+/// Suffix of the marker that tells a sweeper to leave an area's folder alone.
+const KEEP_SUFFIX: &str = ".keep";
 /// Longest label kept in a folder name. Bounded so a fixture cannot spend the
 /// socket-path budget on its own name.
 const MAX_LABEL_LEN: usize = 48;
@@ -162,6 +167,20 @@ fn sweep_abandoned(base: &Path) {
         if !same_file(&lock, &lock_path) {
             continue;
         }
+        // A test asked for this area to stay (see `TempRoot::keep`). Leave
+        // the folder for a person to inspect and remove, and leave the lock
+        // file and marker where they are: together they reserve the area's
+        // name, so a later process that is handed the same process id cannot
+        // create an area on top of the kept folder. Once someone has removed
+        // the folder, the reservation has nothing left to protect.
+        let keep_marker = base.join(format!("{area_name}{KEEP_SUFFIX}"));
+        if keep_marker.exists() {
+            if !base.join(area_name).exists() {
+                let _ = fs::remove_file(&keep_marker);
+                let _ = fs::remove_file(&lock_path);
+            }
+            continue;
+        }
         let _ = fs::remove_dir_all(base.join(area_name));
         let _ = fs::remove_file(&lock_path);
     }
@@ -209,9 +228,24 @@ fn create_area(base: &Path) -> ProcessArea {
         if lock.try_lock().is_err() {
             continue;
         }
+        // A sweeper can take a brand-new, not-yet-locked file for an abandoned
+        // one and unlink it. We would then hold a lock on a file nobody can
+        // find, and a later sweep could never clean up after us. Make sure the
+        // file we locked is still the one at this path; if not, try the next
+        // name.
+        if !same_file(&lock, &lock_path) {
+            continue;
+        }
         let dir = base.join(&name);
-        if let Err(err) = fs::create_dir(&dir) {
-            panic!("test temp root: cannot create {}: {err}", dir.display());
+        match fs::create_dir(&dir) {
+            Ok(()) => {}
+            // A folder with this name and no owner: a kept area from an older
+            // run, or one left by hand. Leave it alone and take another name.
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&lock_path);
+                continue;
+            }
+            Err(err) => panic!("test temp root: cannot create {}: {err}", dir.display()),
         }
         return ProcessArea {
             dir,
@@ -229,9 +263,7 @@ fn create_area(base: &Path) -> ProcessArea {
 /// anything outside ASCII letters, digits, `-`, `_` and `.` becomes `-`, a
 /// leading `.` is dropped, the result is cut to [`MAX_LABEL_LEN`], and an empty
 /// result becomes `root`. No input can escape the process area or spend the
-/// socket-path budget. (An earlier version panicked on a long label. The first
-/// lane merge tripped it with a 49-character label assembled by a helper and
-/// its caller, which neither could see alone.)
+/// socket-path budget.
 fn safe_label(label: &str) -> String {
     let mut out: String = label
         .bytes()
@@ -303,8 +335,45 @@ impl TempRoot {
         Box::leak(allocate(&STANDARD, label).into_boxed_path())
     }
 
+    /// [`TempRoot::process_scoped`] under `/tmp`: for a socket-bound fixture
+    /// whose helper hands back only a path string, so there is nowhere to hold
+    /// a guard. Nothing is deleted while this process lives, so no daemon or
+    /// child can lose its folder early; the next test process removes it.
+    pub fn short_process_scoped(label: &str) -> &'static Path {
+        Box::leak(allocate(&SHORT, label).into_boxed_path())
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Leave this folder on disk, in place, for a person to inspect: use it
+    /// where a fixture keeps failure evidence, or cannot prove that a daemon
+    /// it started has stopped using the folder. Nothing is moved, so a process
+    /// still running in there is not disturbed. The folder is not deleted on
+    /// drop and not swept by later test processes; the path is printed so it
+    /// can be found and removed by hand. Sibling roots in the same process
+    /// stay on disk with it. The area's lock file and `.keep` marker stay too,
+    /// reserving its name; the first sweep after the folder has been removed
+    /// clears them.
+    pub fn keep(self) -> PathBuf {
+        let path = self.path.clone();
+        let area = path.parent();
+        if let (Some(base), Some(name)) =
+            (area.and_then(Path::parent), area.and_then(Path::file_name))
+        {
+            let mut marker = name.to_os_string();
+            marker.push(KEEP_SUFFIX);
+            let _ = File::create(base.join(marker));
+        }
+        eprintln!(
+            "test temp root: kept {} (not swept; remove it by hand when done)",
+            path.display()
+        );
+        // Skip `Drop`: the folder must stay, and the live count must not reach
+        // zero, or this process would remove the whole area on its way out.
+        std::mem::forget(self);
+        path
     }
 }
 
