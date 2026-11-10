@@ -1344,6 +1344,9 @@ fn kill_socket_holder(socket: &Path) {
 struct RealPtydScratch {
     socket: PathBuf,
     _root: TempRoot,
+    /// Short HOME holding the socket. Last, so it goes after the holder is
+    /// killed (this struct's `Drop`) and after `_root`.
+    _home: TempRoot,
 }
 
 impl Drop for RealPtydScratch {
@@ -1367,8 +1370,8 @@ fn real_ptyd_inject_actually_submits_and_is_received() {
     // Autostart is allowed only on rally's canonical socket under HOME, with no
     // RALLY_PTYD_SOCKET override (daemon_client::ensure_rally_owns_socket). A
     // short HOME keeps that socket path under the 104-byte sun_path limit.
-    let home = PathBuf::from(format!("/tmp/rp{}", std::process::id()));
-    let _ = fs::remove_dir_all(&home);
+    let home_root = TempRoot::short("rp");
+    let home = home_root.path().to_path_buf();
     let bin_dir = root.join("bin");
     fs::create_dir_all(cwd.join(".git")).unwrap();
     fs::create_dir_all(&home).unwrap();
@@ -1380,6 +1383,7 @@ fn real_ptyd_inject_actually_submits_and_is_received() {
     let _scratch = RealPtydScratch {
         socket: socket.clone(),
         _root: root,
+        _home: home_root,
     };
     // PATH the child shells use must find the fake `claude` plus /bin, /usr/bin
     // (for sh/stty/printf). Put bin_dir FIRST so our shim shadows any real claude.

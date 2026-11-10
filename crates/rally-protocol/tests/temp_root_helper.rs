@@ -70,6 +70,27 @@ fn roots_stay_under_the_system_temp_directory() {
     );
 }
 
+/// The short variant exists for socket addresses, so its whole point is the
+/// length of the path it returns.
+#[test]
+#[cfg(unix)]
+fn a_short_root_is_short_and_is_removed_on_drop() {
+    let root = TempRoot::short("sock");
+    let path = root.path().to_path_buf();
+    assert!(path.is_dir());
+    let canonical = std::fs::canonicalize(&path).expect("canonical short root");
+    // A macOS socket address holds 103 bytes. Leave room for the longest
+    // suffix this repo hangs off a HOME: `/h/.local/share/rally/ptyd.sock`.
+    let longest_suffix = "/h/.local/share/rally/ptyd.sock".len();
+    assert!(
+        canonical.as_os_str().len() + longest_suffix <= 103,
+        "{} leaves no room for a socket path",
+        canonical.display()
+    );
+    drop(root);
+    assert!(!path.exists(), "drop must remove a short root too");
+}
+
 /// A label can never fail a test or point outside the process area.
 #[test]
 fn a_hostile_or_overlong_label_is_made_safe() {
@@ -140,6 +161,16 @@ fn child_entry() {
             report_area(root.path());
             let mut sink = Vec::new();
             let _ = std::io::stdin().read_to_end(&mut sink);
+        }
+        "hold-short" => {
+            let root = TempRoot::short("hold");
+            report_area(root.path());
+            let mut sink = Vec::new();
+            let _ = std::io::stdin().read_to_end(&mut sink);
+        }
+        "sweep-short" => {
+            let root = TempRoot::short("sweep");
+            report_area(root.path());
         }
         "scoped" => {
             let path = TempRoot::process_scoped("scoped");
@@ -268,6 +299,36 @@ fn a_killed_process_is_swept_and_a_live_one_is_left_alone() {
             held.area.display()
         );
     }
+}
+
+/// The short area gets the same guarantee as the standard one: a killed
+/// owner's folder is removed by the next process that uses a short root.
+#[test]
+#[cfg(unix)]
+fn a_killed_process_short_area_is_swept_too() {
+    let mut doomed = spawn_child("hold-short");
+    let mut living = spawn_child("hold-short");
+    doomed.child.kill().expect("kill child");
+    doomed.child.wait().expect("reap killed child");
+    assert!(doomed.area.is_dir(), "killed short area should still exist");
+
+    let mut sweeper = spawn_child("sweep-short");
+    drop(sweeper.child.stdin.take());
+    assert!(sweeper.child.wait().expect("reap sweeper").success());
+
+    assert!(
+        !doomed.area.exists(),
+        "the next short-root user must remove a killed process's short area: {}",
+        doomed.area.display()
+    );
+    assert!(
+        living.area.is_dir(),
+        "and must leave a live one alone: {}",
+        living.area.display()
+    );
+    drop(living.child.stdin.take());
+    assert!(living.child.wait().expect("reap child").success());
+    assert!(!living.area.exists(), "normal exit removes the short area");
 }
 
 /// A once-per-process fixture outlives every test, so it cannot be removed at

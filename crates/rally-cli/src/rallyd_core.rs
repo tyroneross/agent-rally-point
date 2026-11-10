@@ -5442,7 +5442,7 @@ mod imp {
             assert!(p.ends_with(SOCK_FILENAME));
 
             // A pathologically deep repo forces the $TMPDIR hash fallback.
-            let deep = PathBuf::from(format!("/tmp/{}", "d".repeat(SUN_PATH_MAX)));
+            let deep = PathBuf::from(format!("/tmp/{}", "d".repeat(SUN_PATH_MAX))); // temp-root-read: over-long path value, never created
             let fb = resolve_socket_path(&deep, &deep.join(".rally"));
             let name = fb.file_name().unwrap().to_string_lossy();
             assert!(name.starts_with("rallyd-") && name.ends_with(".sock"));
