@@ -9,7 +9,8 @@
 //! Plan F inverts the herdr-era direction: rally no longer calls into the
 //! daemon. Instead, rally appends typed [`Directive`] records to an
 //! append-only per-agent inbox file in the `.rally` ledger; the daemon
-//! ([`rally-termd`](https://github.com/tyroneross/ptyd)) subscribes via
+//! (`rally-termd`, a separate daemon that is optional and not publicly
+//! available) subscribes via
 //! kernel file-events, executes terminal-touching directives by logical
 //! agent-id, and posts [`Receipt`]s back to the same ledger.
 //!
