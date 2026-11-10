@@ -60,7 +60,7 @@ echo "quality-gate: test scratch-folder lint…" >&2
 # Addressed from the repository under test, not from "$0": the pre-push hook
 # runs a pinned COPY of this script from its own folder, where the lint does
 # not exist.
-python3 "$repo_root/scripts/lint_test_temp_dir.py"
+python3 "$repo_root/scripts/lint_test_temp_dir.py" --root "$repo_root"
 
 echo "quality-gate: clippy (-D warnings)…" >&2
 # shellcheck disable=SC2086

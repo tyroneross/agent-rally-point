@@ -172,7 +172,8 @@ if ! python3 -m unittest \
   tests/scripts/test_sync_host_integrations.py \
   tests/scripts/test_check_command_conformance.py \
   tests/scripts/test_lint_sibling_asymmetry.py \
-  tests/scripts/test_lint_test_temp_dir.py >&2; then
+  tests/scripts/test_lint_test_temp_dir.py \
+  tests/scripts/test_gate_script_runs_from_a_copy.py >&2; then
   echo "check-release-parity: HOST GENERATOR/RECONCILER TESTS FAILED" >&2
   fail=1
 fi
