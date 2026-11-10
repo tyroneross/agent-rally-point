@@ -170,9 +170,13 @@ def strip_line_comment(line: str) -> str:
 
 def scan_file(root: Path, rel: Path, declared_test: bool = False) -> list[dict]:
     try:
-        lines = (root / rel).read_text(encoding="utf-8", errors="replace").splitlines()
+        text = (root / rel).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return []
+    # Most files mention neither; skip the line-by-line pass for them.
+    if "temp_dir" not in text and "/tmp" not in text:
+        return []
+    lines = text.splitlines()
     whole_file = declared_test or is_test_file(rel)
     test_lines = set() if whole_file else inline_test_lines(lines)
     if not whole_file and not test_lines:
