@@ -178,6 +178,16 @@ fn child_entry() {
             report_area(root.path());
             let _ = root.keep();
         }
+        "heal" => {
+            let first = TempRoot::new("first");
+            let area = first.path().parent().expect("process area").to_path_buf();
+            report_area(first.path());
+            // Something outside the test removes the whole area.
+            std::fs::remove_dir_all(&area).expect("remove area from outside");
+            let again = TempRoot::new("again");
+            assert!(again.path().is_dir(), "the helper must put its area back");
+            println!("HEALED");
+        }
         "scoped" => {
             let path = TempRoot::process_scoped("scoped");
             report_area(path);
@@ -375,6 +385,27 @@ fn a_kept_root_survives_later_sweeps() {
     assert!(
         !lock_of(&keeper.area).exists(),
         "once the kept folder is gone, the next sweep releases its name"
+    );
+}
+
+/// A cleanup script or a person can remove the helper's folders while tests
+/// run. One removal must not fail every later test in that process.
+#[test]
+fn an_area_removed_from_outside_is_put_back() {
+    let mut child = spawn_child("heal");
+    drop(child.child.stdin.take());
+    let mut rest = String::new();
+    child
+        .stdout
+        .read_to_string(&mut rest)
+        .expect("read child output");
+    assert!(
+        child.child.wait().expect("reap child").success(),
+        "allocating after the area was removed must work: {rest}"
+    );
+    assert!(
+        rest.contains("HEALED"),
+        "child did not reach the second allocation: {rest}"
     );
 }
 

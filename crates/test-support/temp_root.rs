@@ -55,7 +55,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::ErrorKind;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -71,6 +71,10 @@ const KEEP_SUFFIX: &str = ".keep";
 /// Longest label kept in a folder name. Bounded so a fixture cannot spend the
 /// socket-path budget on its own name.
 const MAX_LABEL_LEN: usize = 48;
+/// Names tried for a process area before giving up. Each failed attempt means
+/// another process took that exact name in the same instant, so two or three
+/// is already unusual.
+const MAX_AREA_ATTEMPTS: u32 = 64;
 
 /// One process's area: a folder plus the lock that proves the owner is alive.
 struct ProcessArea {
@@ -218,7 +222,11 @@ fn same_file(_open: &File, path: &Path) -> bool {
 /// next name is tried.
 fn create_area(base: &Path) -> ProcessArea {
     let pid = std::process::id();
-    loop {
+    // Every `continue` below means "this name is taken, try the next". None of
+    // them can repeat without end on a healthy filesystem, but a loop that can
+    // only stop by succeeding has no business in a test fixture: give up with
+    // a message instead of spinning while holding the area mutex.
+    for _ in 0..MAX_AREA_ATTEMPTS {
         let attempt = NEXT_AREA.fetch_add(1, Ordering::Relaxed);
         let name = format!("{pid}-{attempt}");
         let lock_path = base.join(format!("{name}{LOCK_SUFFIX}"));
@@ -235,8 +243,21 @@ fn create_area(base: &Path) -> ProcessArea {
                 lock_path.display()
             ),
         };
-        if lock.try_lock().is_err() {
-            continue;
+        match lock.try_lock() {
+            Ok(()) => {}
+            // A sweeper got to this brand-new file first. Take another name.
+            Err(TryLockError::WouldBlock) => continue,
+            // The filesystem cannot lock at all. Without a lock nothing could
+            // tell this process's folders from abandoned ones, so say so
+            // rather than try name after name.
+            Err(TryLockError::Error(err)) => {
+                let _ = fs::remove_file(&lock_path);
+                panic!(
+                    "test temp root: cannot lock {} ({err}); the scratch area needs a \
+                     filesystem with file locks",
+                    lock_path.display()
+                );
+            }
         }
         // A sweeper can take a brand-new, not-yet-locked file for an abandoned
         // one and unlink it. We would then hold a lock on a file nobody can
@@ -264,6 +285,10 @@ fn create_area(base: &Path) -> ProcessArea {
             live: 0,
         };
     }
+    panic!(
+        "test temp root: no free area name under {} after {MAX_AREA_ATTEMPTS} attempts",
+        base.display()
+    );
 }
 
 /// Turn any caller-supplied label into a safe, bounded folder-name stem.
@@ -306,8 +331,16 @@ fn allocate(space: &'static Space, label: &str) -> PathBuf {
     let area = area.get_or_insert_with(|| create_area(&base));
     let n = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
     let path = area.dir.join(format!("{label}-{n}"));
-    fs::create_dir(&path)
-        .unwrap_or_else(|err| panic!("test temp root: cannot create {}: {err}", path.display()));
+    let created = match fs::create_dir(&path) {
+        // The area folder was removed from outside (a cleanup script, a
+        // person). The lock is still ours, so put the folder back; otherwise
+        // every later test in this process would fail for an unrelated reason.
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            fs::create_dir_all(&area.dir).and_then(|()| fs::create_dir(&path))
+        }
+        other => other,
+    };
+    created.unwrap_or_else(|err| panic!("test temp root: cannot create {}: {err}", path.display()));
     area.live += 1;
     path
 }
@@ -369,17 +402,28 @@ impl TempRoot {
     pub fn keep(self) -> PathBuf {
         let path = self.path.clone();
         let area = path.parent();
+        let mut marked = false;
         if let (Some(base), Some(name)) =
             (area.and_then(Path::parent), area.and_then(Path::file_name))
         {
             let mut marker = name.to_os_string();
             marker.push(KEEP_SUFFIX);
-            let _ = File::create(base.join(marker));
+            marked = File::create(base.join(marker)).is_ok();
         }
-        eprintln!(
-            "test temp root: kept {} (not swept; remove it by hand when done)",
-            path.display()
-        );
+        if marked {
+            eprintln!(
+                "test temp root: kept {} (not swept; remove it by hand when done)",
+                path.display()
+            );
+        } else {
+            // Not fatal here: `keep` runs in teardown, often while a test is
+            // already failing. But do not claim what did not happen.
+            eprintln!(
+                "test temp root: could NOT mark {} as kept; it stays for now and the \
+                 next test process will remove it. Copy it elsewhere to preserve it.",
+                path.display()
+            );
+        }
         // Skip `Drop`: the folder must stay, and the live count must not reach
         // zero, or this process would remove the whole area on its way out.
         std::mem::forget(self);

@@ -77,7 +77,7 @@ class GateScriptRunsFromACopy(unittest.TestCase):
         # The exact line that broke every push. If this stops failing, the
         # test above no longer proves anything.
         broken = GATE.read_text(encoding="utf-8").replace(
-            'python3 "$repo_root/scripts/lint_test_temp_dir.py"',
+            'python3 "$repo_root/scripts/lint_test_temp_dir.py" --root "$repo_root"',
             'python3 "$(dirname "$0")/lint_test_temp_dir.py"',
         )
         self.assertNotEqual(broken, GATE.read_text(encoding="utf-8"), "fixture line not found")
