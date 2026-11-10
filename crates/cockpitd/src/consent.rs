@@ -526,7 +526,7 @@ mod tests {
     ///       "seq": 0, "key": "rally-point:codex", "mode": "auto",
     ///       "decided_at": "2026-08-21T18:04:11Z", "decided_by": "user",
     ///       "decided_via": "claude_code_ask",
-    ///       "decided_in_repo": "/Users/tyroneross/dev/git-folder/agent-rally-point",
+    ///       "decided_in_repo": "/Users/example/dev/git-folder/agent-rally-point",
     ///       "prev_sha256": None,
     ///   }
     ///   print(entry_hash(entry))
@@ -546,12 +546,12 @@ mod tests {
             "decided_at": "2026-08-21T18:04:11Z",
             "decided_by": "user",
             "decided_via": "claude_code_ask",
-            "decided_in_repo": "/Users/tyroneross/dev/git-folder/agent-rally-point",
+            "decided_in_repo": "/Users/example/dev/git-folder/agent-rally-point",
             "prev_sha256": null
         });
         assert_eq!(
             entry_hash(&entry),
-            "ce3528c3a11578ff75845ba7989db63e839a1fca199037bdc61b57c5005a0a92",
+            "1011f30ef86a44d2fc8fb212f95824c6bba622c3075cc35e3078d673d5ba201f",
             "Rust digest must match the Python reference's entry_hash() for the same entry"
         );
 
@@ -570,12 +570,12 @@ mod tests {
             "decided_at": "2026-08-21T18:04:11Z",
             "decided_by": "user",
             "decided_via": "claude_code_ask",
-            "decided_in_repo": "/Users/tyroneross/dev/café-app",
+            "decided_in_repo": "/Users/example/dev/café-app",
             "prev_sha256": null
         });
         assert_eq!(
             entry_hash(&non_ascii),
-            "ed7b39bc53fe45fbcf73b2a01f09b157c55a0c67a76e0c1605cdff5b44f23eba",
+            "f0f4d87e92ae68c575244f00df15dcdebf711935bf66b113e098eeb5e0a06a18",
             "non-ASCII must hash raw, not \\uXXXX-escaped — see contract 'Wire format / Hashing'"
         );
 
@@ -592,12 +592,12 @@ mod tests {
             "decided_at": "2026-08-21T18:10:00Z",
             "decided_by": "user",
             "decided_via": "claude_code_ask",
-            "decided_in_repo": "/Users/tyroneross/dev/git-folder/agent-rally-point",
+            "decided_in_repo": "/Users/example/dev/git-folder/agent-rally-point",
             "prev_sha256": entry_hash(&entry)
         });
         assert_eq!(
             entry_hash(&entry2),
-            "60961374d3560a00157d671fa88a86408014bf8c33349cc92563393eb445d3d0"
+            "26cb5ad96c19c9d6363bb29eb024112551286d67394c4e2cfa1f32722342f53c"
         );
     }
 

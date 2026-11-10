@@ -61,7 +61,7 @@ target/
 #     lead seat. A cloner does not inherit history — they inherit the
 #     maintainer's LIVE ROOM, complete with work assigned to machines they do
 #     not have.
-#   * 956 matches for `tyrones-macbook-pro-2.local` and `/Users/tyroneross/…`
+#   * 956 matches for `tyrones-macbook-pro-2.local` and `/Users/<maintainer>/…`
 #     across 25 tracked files, 544 of them in `.rally/`. Active claim scopes
 #     name personal files (`Movies/rally-hero-video/…`,
 #     `.claude/projects/…/memory/MEMORY.md`) and private sibling repos.
@@ -122,7 +122,7 @@ cockpitd.db.audit.db-wal
 # in docs/security/TRUST-MODEL.md for what de-tracking does and does not remove.
 # ARP-R-06: the whole of archive/ is de-tracked, not just bundles/. It also held
 # `stashes-2026-06-11/` — six recovery patches plus a bundle, carrying 30
-# `/Users/tyroneross/…` paths and the maintainer's hostname. Same class as the
+# `/Users/<maintainer>/…` paths and the maintainer's hostname. Same class as the
 # bundles: internal recovery artifacts that a cloner has no use for and that
 # leak the machine they were cut on. Files stay on disk; history still has them.
 archive/
