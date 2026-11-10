@@ -106,6 +106,13 @@ class LintTestTempDir(unittest.TestCase):
         )
         self.assertEqual(self.flagged(), [("crates/a/tests/t.rs", 3)])
 
+    def test_flags_a_slash_tmp_base_joined_on_the_next_line(self):
+        self.tree.write(
+            "crates/a/tests/t.rs",
+            'fn f() {\n    let base = PathBuf::from("/tmp")\n        .join(format!("x-{}", 1));\n}\n',
+        )
+        self.assertEqual(self.flagged(), [("crates/a/tests/t.rs", 2)])
+
     def test_leaves_a_fixed_slash_tmp_value_alone(self):
         self.tree.write(
             "crates/a/tests/t.rs",

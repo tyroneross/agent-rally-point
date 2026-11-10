@@ -65,6 +65,7 @@ RENAMED_IMPORT = re.compile(r"\btemp_dir\s+as\s+([A-Za-z_][A-Za-z0-9_]*)")
 # The literal is matched on its own, without `format!(` in front, because the
 # macro call and its string are often on different lines.
 DYNAMIC_SLASH_TMP = re.compile(r'"/tmp/[^"]*\{[^"]*"|"/tmp/?"\s*\)\s*\.join\(')
+SLASH_TMP_AT_LINE_END = re.compile(r'"/tmp/?"\s*\)\s*$')
 
 
 MOD_DECL = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;")
@@ -150,6 +151,15 @@ def inline_test_lines(lines: list[str]) -> set[int]:
     return inside
 
 
+def next_code_starts_with_join(lines: list[str], index: int) -> bool:
+    """`PathBuf::from("/tmp")` with its `.join(..)` on the following line."""
+    for later in lines[index + 1 :]:
+        code = strip_line_comment(later).strip()
+        if code:
+            return code.startswith(".join(")
+    return False
+
+
 def is_test_file(rel: Path) -> bool:
     name = rel.name
     return (
@@ -197,6 +207,7 @@ def scan_file(root: Path, rel: Path, declared_test: bool = False) -> list[dict]:
             CALL.search(code)
             or any(pattern.search(code) for pattern in alias_calls)
             or DYNAMIC_SLASH_TMP.search(code)
+            or (SLASH_TMP_AT_LINE_END.search(code) and next_code_starts_with_join(lines, index))
         )
         if not hit or ANNOTATION.search(line):
             continue
