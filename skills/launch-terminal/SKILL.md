@@ -21,7 +21,7 @@ and cleanly stoppable. A bare `tmux new-session claude` gives none of that.
 
 ```bash
 rally run claude --name <name> --backend auto --json     # worktree-isolated (default)
-rally run claude --name <name> --backend auto --shared   # share the live checkout (no worktree)
+rally run claude --name <name> --backend auto --shared   # run in the checkout you launch from (no new worktree)
 ```
 
 `--backend auto` uses rally's ptyd remote-delivery daemon when available and
@@ -31,7 +31,9 @@ pane a human will attach to by name.
 - `<name>` is what the user sees everywhere — their phone, `rally sessions`,
   the tmux target (`rally-claude-<name>`). Pick a human-meaningful name.
 - Default provisions a per-agent git worktree; use `--shared` for a
-  general-purpose terminal that should sit in the real checkout.
+  general-purpose terminal that should sit in your current checkout: the
+  linked worktree you launch from, or the main checkout. The run output's
+  `cwd` names the directory chosen; the room stays the repo's shared room.
 - `codex` / `opencode` / `gemini` work as the agent argument too.
 - This skill creates a deliberately persistent, steerable terminal. For one
   bounded Codex assignment, use `rally run codex --task "<prompt>"` instead;
@@ -73,7 +75,7 @@ the session runs in a worktree or the shared checkout.
 rally inject <name> --text "..." --json   # inspect delivery_reason and target ACK
 rally capture <name> --json               # read session output via the backend
 rally attach <name> --json                # attach to the runtime surface where supported
-rally stop <name> --json                  # stop cleanly (releases claims, cleans worktree)
+rally stop <name> --json                  # stop cleanly (releases claims, removes a clean merged worktree)
 ```
 
 For an ALREADY-open terminal, `rally adopt` registers it as managed — but only
@@ -82,7 +84,10 @@ delivers keystrokes into the wrong window.
 
 ## Teardown
 
-Prefer `rally stop <name>` per persistent session. `rally sessions --reap --apply` sweeps
-dead sessions in bulk; a worktree-isolated session's worktree is cleaned at
-stop. Never `kill -9` the pane while it holds unreleased claims — stop it
+Prefer `rally stop <name>` per persistent session. `rally sessions --reap` sweeps
+dead sessions in bulk. A worktree-isolated session's worktree and branch are
+removed at stop, or when a `--task` session exits, only when the tree is clean
+and the branch is merged; otherwise they are retained and the stop or
+task-result warning names the path. After merging the branch,
+`rally worktree gc --apply` removes the leftover worktree and branch. Never `kill -9` the pane while it holds unreleased claims — stop it
 properly so claims release.
