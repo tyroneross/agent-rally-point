@@ -38,6 +38,9 @@
 //! * A fixture created once per process uses [`TempRoot::process_scoped`]. It
 //!   is not removed at exit; the next test process sweeps it.
 //! * A path that must not exist is a child of a root that you never create.
+//! * A fixture whose path becomes a Unix socket address uses
+//!   [`TempRoot::short`], which lives under `/tmp`. Never build a `/tmp` path
+//!   by hand: it is not swept and not removed when a test is killed.
 //! * A label is a hint for humans. It is sanitised and cut to 48 characters,
 //!   so it cannot fail a test or escape the process area.
 //! * Code that only needs to READ the system temp root keeps calling
@@ -73,22 +76,61 @@ struct ProcessArea {
     live: usize,
 }
 
-static AREA: Mutex<Option<ProcessArea>> = Mutex::new(None);
-static SWEEP: Once = Once::new();
+/// One place areas live, with this process's area in it. There are two:
+/// the system temp directory, and a short one for fixtures whose paths must
+/// fit a Unix socket address.
+struct Space {
+    short: bool,
+    area: Mutex<Option<ProcessArea>>,
+    sweep: Once,
+}
+
+impl Space {
+    const fn new(short: bool) -> Self {
+        Self {
+            short,
+            area: Mutex::new(None),
+            sweep: Once::new(),
+        }
+    }
+
+    fn base_dir(&self) -> PathBuf {
+        if self.short {
+            short_base_dir()
+        } else {
+            std::env::temp_dir().join(AREA_DIR)
+        }
+    }
+
+    fn lock_area(&self) -> std::sync::MutexGuard<'_, Option<ProcessArea>> {
+        // A test that panics while holding this guard must not take every
+        // later test in the binary down with a poison error.
+        self.area
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+static STANDARD: Space = Space::new(false);
+static SHORT: Space = Space::new(true);
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 /// Area names are never reused inside one process. A sweeper in another
 /// process may still hold a handle to an area this process already removed;
 /// reusing the name would let that sweeper delete the replacement.
 static NEXT_AREA: AtomicU64 = AtomicU64::new(0);
 
-fn base_dir() -> PathBuf {
-    std::env::temp_dir().join(AREA_DIR)
+/// Base for [`TempRoot::short`]. On macOS the system temp directory is about
+/// 49 characters (57 once `/var` is resolved to `/private/var`), which leaves
+/// too little of a 104-byte socket address for `HOME/.local/share/...`. `/tmp`
+/// is the shortest directory every Unix has.
+#[cfg(unix)]
+fn short_base_dir() -> PathBuf {
+    PathBuf::from("/tmp").join(AREA_DIR)
 }
 
-fn lock_area() -> std::sync::MutexGuard<'static, Option<ProcessArea>> {
-    // A test that panics while holding this guard must not take every later
-    // test in the binary down with a poison error.
-    AREA.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+#[cfg(not(unix))]
+fn short_base_dir() -> PathBuf {
+    std::env::temp_dir().join(AREA_DIR)
 }
 
 /// Remove the areas of processes that no longer exist.
@@ -211,14 +253,14 @@ fn safe_label(label: &str) -> String {
 }
 
 /// Create `<area>/<label>-<n>` and count it as live.
-fn allocate(label: &str) -> PathBuf {
+fn allocate(space: &'static Space, label: &str) -> PathBuf {
     let label = safe_label(label);
-    let base = base_dir();
+    let base = space.base_dir();
     fs::create_dir_all(&base)
         .unwrap_or_else(|err| panic!("test temp root: cannot create {}: {err}", base.display()));
-    SWEEP.call_once(|| sweep_abandoned(&base));
+    space.sweep.call_once(|| sweep_abandoned(&base));
 
-    let mut area = lock_area();
+    let mut area = space.lock_area();
     let area = area.get_or_insert_with(|| create_area(&base));
     let n = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
     let path = area.dir.join(format!("{label}-{n}"));
@@ -231,6 +273,7 @@ fn allocate(label: &str) -> PathBuf {
 /// A scratch folder that is deleted when this value drops.
 pub struct TempRoot {
     path: PathBuf,
+    space: &'static Space,
 }
 
 impl TempRoot {
@@ -238,14 +281,26 @@ impl TempRoot {
     /// followed by a per-process counter, so two roots never collide.
     pub fn new(label: &str) -> Self {
         Self {
-            path: allocate(label),
+            path: allocate(&STANDARD, label),
+            space: &STANDARD,
+        }
+    }
+
+    /// Like [`TempRoot::new`], but under `/tmp` so the path is short. Use it
+    /// only when a path derived from this folder becomes a Unix socket
+    /// address; everything else belongs in the system temp directory. Same
+    /// cleanup, same ownership lock, same sweep.
+    pub fn short(label: &str) -> Self {
+        Self {
+            path: allocate(&SHORT, label),
+            space: &SHORT,
         }
     }
 
     /// A folder that lives until the process exits, for fixtures built once
     /// per test binary. The next test process removes it.
     pub fn process_scoped(label: &str) -> &'static Path {
-        Box::leak(allocate(label).into_boxed_path())
+        Box::leak(allocate(&STANDARD, label).into_boxed_path())
     }
 
     pub fn path(&self) -> &Path {
@@ -285,7 +340,7 @@ impl std::fmt::Debug for TempRoot {
 impl Drop for TempRoot {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
-        let mut area = lock_area();
+        let mut area = self.space.lock_area();
         let Some(current) = area.as_mut() else {
             return;
         };

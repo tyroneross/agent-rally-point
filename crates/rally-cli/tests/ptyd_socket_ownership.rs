@@ -10,14 +10,15 @@
 //! live workspace. Each case points `RALLY_PTYD_BIN` at a fake daemon that only
 //! touches a marker file, so "was a daemon spawned" is observed directly.
 
+#[path = "../../test-support/temp_root.rs"]
+mod temp_root;
+
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 const RALLY_BIN: &str = env!("CARGO_BIN_EXE_rally");
-static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct Sandbox {
     root: PathBuf,
@@ -25,14 +26,15 @@ struct Sandbox {
     cwd: PathBuf,
     fake_ptyd: PathBuf,
     marker: PathBuf,
+    /// Last field: removed after everything above stops using it.
+    _guard: temp_root::TempRoot,
 }
 
 impl Sandbox {
     fn new() -> Self {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         // Short root: the canonical socket path must fit in sun_path (104 bytes).
-        let root = PathBuf::from(format!("/tmp/rso{}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let guard = temp_root::TempRoot::short("rso");
+        let root = guard.path().to_path_buf();
         let home = root.join("h");
         let cwd = root.join("cwd");
         fs::create_dir_all(cwd.join(".git")).unwrap();
@@ -51,6 +53,7 @@ impl Sandbox {
             cwd,
             fake_ptyd,
             marker,
+            _guard: guard,
         }
     }
 
@@ -85,12 +88,6 @@ impl Sandbox {
 
     fn spawned(&self) -> bool {
         self.marker.exists()
-    }
-}
-
-impl Drop for Sandbox {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
     }
 }
 

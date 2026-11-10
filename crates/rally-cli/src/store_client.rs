@@ -1147,7 +1147,7 @@ mod tests {
     #[test]
     fn daemon_timeout_reply_does_not_authorize_blind_mutation_retry() {
         for kind in [StoreErrorKind::Transport, StoreErrorKind::NotStarted] {
-            let socket = unique_socket("error-reply");
+            let (socket, _socket_root) = unique_socket("error-reply");
             let listener = UnixListener::bind(&socket).unwrap();
             let server = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -1201,18 +1201,17 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::thread;
 
-    fn unique_socket(tag: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+    /// A socket path short enough for a Unix socket address, plus the guard
+    /// that removes it. Bind the guard for as long as the socket is in use.
+    fn unique_socket(tag: &str) -> (PathBuf, crate::test_temp_root::TempRoot) {
         let tag = &tag[..tag.len().min(8)];
-        PathBuf::from("/tmp").join(format!("rsc-{tag}-{nonce:x}.sock"))
+        let guard = crate::test_temp_root::TempRoot::short(&format!("rsc-{tag}"));
+        (guard.join("s.sock"), guard)
     }
 
     #[test]
     fn partial_mutation_reply_is_unknown_and_queryable_by_event_id() {
-        let socket = unique_socket("partial-mutation");
+        let (socket, _socket_root) = unique_socket("partial-mutation");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
@@ -1420,7 +1419,7 @@ mod tests {
 
     #[test]
     fn routed_snapshot_without_server_fingerprint_is_usable_but_not_cacheable() {
-        let socket = unique_socket("snapshot-no-fingerprint");
+        let (socket, _socket_root) = unique_socket("snapshot-no-fingerprint");
         let listener = UnixListener::bind(&socket).unwrap();
         let expected = RoomSnapshot::default();
         let wire_snapshot = store::snapshot_to_wire_value(&expected).unwrap();

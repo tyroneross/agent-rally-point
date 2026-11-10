@@ -17,6 +17,12 @@ A call to `temp_dir()` in test code. That covers `std::env::temp_dir()`,
 `env::temp_dir()`, a bare `temp_dir()` after `use std::env::temp_dir`, and a
 renamed import (`use std::env::temp_dir as scratch` then `scratch()`).
 
+It also flags a path under `/tmp` that is assembled at run time
+(`format!("/tmp/x{}", ..)`, `PathBuf::from("/tmp").join(..)`). Three tests built
+socket-bound fixtures that way and never removed them; `TempRoot::short` is the
+supported way to get a short path. A fixed literal such as `"/tmp/worktree"` is
+a value, not a fixture, and is not flagged.
+
 Test code is: any `.rs` file under a `tests/` directory, any `*_tests.rs` or
 `test_*.rs` file, and everything after the first `#[cfg(test)]` in another
 `.rs` file. Production code is not this lint's business.
@@ -52,6 +58,10 @@ ANNOTATION = re.compile(r"//\s*temp-root-read:\s*\S")
 CFG_TEST = re.compile(r"^\s*#\[cfg\(test\)\]")
 CALL = re.compile(r"\btemp_dir\s*\(\s*\)")
 RENAMED_IMPORT = re.compile(r"\btemp_dir\s+as\s+([A-Za-z_][A-Za-z0-9_]*)")
+# A path under /tmp that is assembled at run time: `format!("/tmp/x{}", ..)` or
+# `PathBuf::from("/tmp").join(..)`. A fixed literal such as "/tmp/worktree" is a
+# plain value and is left alone.
+DYNAMIC_SLASH_TMP = re.compile(r'format!\(\s*"/tmp[^"]*\{|"/tmp/?"\s*\)\s*\.join\(')
 
 
 def is_test_file(rel: Path) -> bool:
@@ -93,7 +103,11 @@ def scan_file(root: Path, rel: Path) -> list[dict]:
         code = strip_line_comment(line)
         if not code.strip():
             continue
-        hit = CALL.search(code) or any(pattern.search(code) for pattern in alias_calls)
+        hit = (
+            CALL.search(code)
+            or any(pattern.search(code) for pattern in alias_calls)
+            or DYNAMIC_SLASH_TMP.search(code)
+        )
         if not hit or ANNOTATION.search(line):
             continue
         findings.append({"file": rel.as_posix(), "line": index + 1, "text": line.strip()})
@@ -130,9 +144,10 @@ def main(argv: list[str] | None = None) -> int:
         files = len({finding["file"] for finding in findings})
         if findings:
             print(
-                f"test-temp-dir lint: {len(findings)} direct temp_dir() call(s) in test code "
-                f"across {files} file(s). Use TempRoot from {HELPER.as_posix()}, or add "
-                f"'// temp-root-read: <reason>' when the test needs the temp root itself.",
+                f"test-temp-dir lint: {len(findings)} hand-built scratch path(s) in test code "
+                f"across {files} file(s). Use TempRoot (or TempRoot::short for a socket "
+                f"path) from {HELPER.as_posix()}, or add '// temp-root-read: <reason>' when "
+                f"the test needs the temp root itself or only a path value.",
                 file=sys.stderr,
             )
         else:

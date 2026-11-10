@@ -85,6 +85,27 @@ class LintTestTempDir(unittest.TestCase):
         self.tree.write("crates/a/src/x_tests.rs", "fn f() { let d = std::env::temp_dir(); }\n")
         self.assertEqual(self.flagged(), [("crates/a/src/x_tests.rs", 1)])
 
+    def test_flags_a_formatted_path_under_slash_tmp(self):
+        self.tree.write(
+            "crates/a/tests/t.rs",
+            'fn f() { let d = PathBuf::from(format!("/tmp/x{}", std::process::id())); }\n',
+        )
+        self.assertEqual(self.flagged(), [("crates/a/tests/t.rs", 1)])
+
+    def test_flags_a_joined_path_under_slash_tmp(self):
+        self.tree.write(
+            "crates/a/tests/t.rs",
+            'fn f() { let d = PathBuf::from("/tmp").join(format!("s-{n}.sock")); }\n',
+        )
+        self.assertEqual(self.flagged(), [("crates/a/tests/t.rs", 1)])
+
+    def test_leaves_a_fixed_slash_tmp_value_alone(self):
+        self.tree.write(
+            "crates/a/tests/t.rs",
+            'fn f() { let a = Path::new("/tmp/foo"); let b = PathBuf::from("/tmp"); }\n',
+        )
+        self.assertEqual(self.flagged(), [])
+
     def test_ignores_production_code(self):
         self.tree.write("crates/a/src/lib.rs", "pub fn prod() { let d = std::env::temp_dir(); }\n")
         self.assertEqual(self.flagged(), [])
