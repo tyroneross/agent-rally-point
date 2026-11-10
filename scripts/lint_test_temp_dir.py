@@ -24,8 +24,9 @@ supported way to get a short path. A fixed literal such as `"/tmp/worktree"` is
 a value, not a fixture, and is not flagged.
 
 Test code is: any `.rs` file under a `tests/` directory, any `*_tests.rs` or
-`test_*.rs` file, and everything after the first `#[cfg(test)]` in another
-`.rs` file. Production code is not this lint's business.
+`test_*.rs` file, any file declared as `#[cfg(test)] mod name;` (and the modules
+that file declares), and the body of every `#[cfg(test)] mod name { .. }` block
+in another `.rs` file. Production code is not this lint's business.
 
 WHAT IT ALLOWS
 --------------
@@ -61,7 +62,92 @@ RENAMED_IMPORT = re.compile(r"\btemp_dir\s+as\s+([A-Za-z_][A-Za-z0-9_]*)")
 # A path under /tmp that is assembled at run time: `format!("/tmp/x{}", ..)` or
 # `PathBuf::from("/tmp").join(..)`. A fixed literal such as "/tmp/worktree" is a
 # plain value and is left alone.
-DYNAMIC_SLASH_TMP = re.compile(r'format!\(\s*"/tmp[^"]*\{|"/tmp/?"\s*\)\s*\.join\(')
+# The literal is matched on its own, without `format!(` in front, because the
+# macro call and its string are often on different lines.
+DYNAMIC_SLASH_TMP = re.compile(r'"/tmp/[^"]*\{[^"]*"|"/tmp/?"\s*\)\s*\.join\(')
+
+
+MOD_DECL = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;")
+
+
+def child_module_files(root: Path, rel: Path, name: str) -> list[Path]:
+    """Where `mod name;` declared in `rel` can live."""
+    parent = rel.parent
+    if rel.name not in ("mod.rs", "main.rs", "lib.rs"):
+        parent = parent / rel.stem
+    candidates = [parent / f"{name}.rs", parent / name / "mod.rs"]
+    return [c for c in candidates if (root / c).is_file()]
+
+
+def test_only_module_files(root: Path, files: list[Path]) -> set[Path]:
+    """Files that are test code because of how they are declared, not named:
+    `#[cfg(test)] mod concurrency_tests;` puts `concurrency_tests.rs` in the
+    test build even though nothing in that file says so. Everything such a file
+    declares in turn is test code too."""
+    found: set[Path] = set()
+    queue: list[Path] = []
+    for rel in files:
+        try:
+            lines = (root / rel).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for index, line in enumerate(lines):
+            match = MOD_DECL.match(line)
+            if not match:
+                continue
+            attrs = lines[max(0, index - 3) : index]
+            if any(CFG_TEST.match(attr) for attr in attrs):
+                queue.extend(child_module_files(root, rel, match.group(1)))
+    while queue:
+        rel = queue.pop()
+        if rel in found:
+            continue
+        found.add(rel)
+        try:
+            lines = (root / rel).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            match = MOD_DECL.match(line)
+            if match:
+                queue.extend(child_module_files(root, rel, match.group(1)))
+    return found
+
+
+INLINE_MOD = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*\{")
+STRING = re.compile(r'"(?:\\.|[^"\\])*"')
+
+
+def inline_test_lines(lines: list[str]) -> set[int]:
+    """Indexes of lines inside a `#[cfg(test)] mod name { .. }` block.
+
+    A file can mix production code and test modules in any order, and a lone
+    `#[cfg(test)]` can sit on a single item near the top. Treating everything
+    after the first `#[cfg(test)]` as test code flagged a production function
+    in such a file, so the block is followed by its braces instead."""
+    inside: set[int] = set()
+    index = 0
+    while index < len(lines):
+        if not CFG_TEST.match(lines[index]):
+            index += 1
+            continue
+        start = index + 1
+        while start < len(lines) and lines[start].lstrip().startswith("#["):
+            start += 1
+        if start >= len(lines) or not INLINE_MOD.match(lines[start]):
+            index += 1
+            continue
+        depth = 0
+        cursor = start
+        while cursor < len(lines):
+            code = STRING.sub('""', strip_line_comment(lines[cursor]))
+            depth += code.count("{") - code.count("}")
+            inside.add(cursor)
+            cursor += 1
+            if depth <= 0:
+                break
+        index = cursor
+    return inside
 
 
 def is_test_file(rel: Path) -> bool:
@@ -82,14 +168,14 @@ def strip_line_comment(line: str) -> str:
     return line if cut < 0 else line[:cut]
 
 
-def scan_file(root: Path, rel: Path) -> list[dict]:
+def scan_file(root: Path, rel: Path, declared_test: bool = False) -> list[dict]:
     try:
         lines = (root / rel).read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return []
-    whole_file = is_test_file(rel)
-    first_cfg_test = next((i for i, line in enumerate(lines) if CFG_TEST.match(line)), None)
-    if not whole_file and first_cfg_test is None:
+    whole_file = declared_test or is_test_file(rel)
+    test_lines = set() if whole_file else inline_test_lines(lines)
+    if not whole_file and not test_lines:
         return []
     aliases = set()
     for line in lines:
@@ -98,7 +184,7 @@ def scan_file(root: Path, rel: Path) -> list[dict]:
 
     findings = []
     for index, line in enumerate(lines):
-        if not whole_file and index <= first_cfg_test:
+        if not whole_file and index not in test_lines:
             continue
         code = strip_line_comment(line)
         if not code.strip():
@@ -115,7 +201,7 @@ def scan_file(root: Path, rel: Path) -> list[dict]:
 
 
 def scan(root: Path) -> list[dict]:
-    findings: list[dict] = []
+    files: list[Path] = []
     for scan_dir in SCAN_DIRS:
         base = root / scan_dir
         if not base.is_dir():
@@ -124,7 +210,11 @@ def scan(root: Path) -> list[dict]:
             rel = path.relative_to(root)
             if SKIP_DIR_NAMES.intersection(rel.parts) or rel == HELPER:
                 continue
-            findings.extend(scan_file(root, rel))
+            files.append(rel)
+    declared = test_only_module_files(root, files)
+    findings: list[dict] = []
+    for rel in files:
+        findings.extend(scan_file(root, rel, rel in declared))
     return findings
 
 

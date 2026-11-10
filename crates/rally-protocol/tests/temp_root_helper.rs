@@ -172,6 +172,12 @@ fn child_entry() {
             let root = TempRoot::short("sweep");
             report_area(root.path());
         }
+        "keep" => {
+            let root = TempRoot::new("evidence");
+            std::fs::write(root.join("log.txt"), b"evidence").expect("write evidence");
+            report_area(root.path());
+            let _ = root.keep();
+        }
         "scoped" => {
             let path = TempRoot::process_scoped("scoped");
             report_area(path);
@@ -329,6 +335,47 @@ fn a_killed_process_short_area_is_swept_too() {
     drop(living.child.stdin.take());
     assert!(living.child.wait().expect("reap child").success());
     assert!(!living.area.exists(), "normal exit removes the short area");
+}
+
+/// A fixture that keeps failure evidence must still find it after later test
+/// runs. `keep` leaves the folder in place and out of reach of every sweep.
+#[test]
+fn a_kept_root_survives_later_sweeps() {
+    let mut keeper = spawn_child("keep");
+    drop(keeper.child.stdin.take());
+    assert!(keeper.child.wait().expect("reap keeper").success());
+    let evidence = std::fs::read_dir(&keeper.area)
+        .expect("kept area must still exist")
+        .flatten()
+        .map(|entry| entry.path().join("log.txt"))
+        .find(|path| path.is_file())
+        .expect("kept evidence file");
+
+    for _ in 0..2 {
+        let mut sweeper = spawn_child("sweep");
+        drop(sweeper.child.stdin.take());
+        assert!(sweeper.child.wait().expect("reap sweeper").success());
+    }
+    assert!(
+        evidence.is_file(),
+        "a kept folder must survive later test processes: {}",
+        evidence.display()
+    );
+    assert!(
+        lock_of(&keeper.area).exists(),
+        "the lock file stays, reserving the kept area's name against process-id reuse"
+    );
+
+    // Someone inspects the evidence and removes the folder. The next sweep
+    // then clears the reservation, so nothing is left behind for good.
+    std::fs::remove_dir_all(&keeper.area).expect("remove kept area");
+    let mut sweeper = spawn_child("sweep");
+    drop(sweeper.child.stdin.take());
+    assert!(sweeper.child.wait().expect("reap sweeper").success());
+    assert!(
+        !lock_of(&keeper.area).exists(),
+        "once the kept folder is gone, the next sweep releases its name"
+    );
 }
 
 /// A once-per-process fixture outlives every test, so it cannot be removed at

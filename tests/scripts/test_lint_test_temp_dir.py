@@ -99,12 +99,54 @@ class LintTestTempDir(unittest.TestCase):
         )
         self.assertEqual(self.flagged(), [("crates/a/tests/t.rs", 1)])
 
+    def test_flags_a_formatted_slash_tmp_path_split_across_lines(self):
+        self.tree.write(
+            "crates/a/tests/t.rs",
+            'fn f() {\n    let s = format!(\n        "/tmp/x-{}-{}.sock",\n        1, 2\n    );\n}\n',
+        )
+        self.assertEqual(self.flagged(), [("crates/a/tests/t.rs", 3)])
+
     def test_leaves_a_fixed_slash_tmp_value_alone(self):
         self.tree.write(
             "crates/a/tests/t.rs",
             'fn f() { let a = Path::new("/tmp/foo"); let b = PathBuf::from("/tmp"); }\n',
         )
         self.assertEqual(self.flagged(), [])
+
+    def test_flags_a_sibling_file_declared_under_cfg_test(self):
+        self.tree.write(
+            "crates/a/src/store.rs",
+            "pub fn prod() {}\n#[cfg(test)]\nmod concurrency;\n",
+        )
+        self.tree.write(
+            "crates/a/src/store/concurrency.rs",
+            "mod deeper;\nfn f() { let d = std::env::temp_dir(); }\n",
+        )
+        self.tree.write(
+            "crates/a/src/store/concurrency/deeper.rs",
+            "fn g() { let d = std::env::temp_dir(); }\n",
+        )
+        self.assertEqual(
+            sorted(self.flagged()),
+            [("crates/a/src/store/concurrency.rs", 2), ("crates/a/src/store/concurrency/deeper.rs", 1)],
+        )
+
+    def test_a_sibling_file_declared_without_cfg_test_is_production(self):
+        self.tree.write("crates/a/src/lib.rs", "mod store;\n")
+        self.tree.write("crates/a/src/store.rs", "pub fn p() { let d = std::env::temp_dir(); }\n")
+        self.assertEqual(self.flagged(), [])
+
+    def test_production_code_after_a_cfg_test_item_is_not_flagged(self):
+        self.tree.write(
+            "crates/a/src/lib.rs",
+            "#[cfg(test)]\nuse std::sync::Mutex;\n"
+            "pub fn prod() { let d = std::env::temp_dir(); }\n"
+            "#[cfg(test)]\nmod tests {\n"
+            "    fn f() { let s = \"{\"; let d = std::env::temp_dir(); }\n"
+            "}\n"
+            "pub fn later() { let d = std::env::temp_dir(); }\n",
+        )
+        self.assertEqual(self.flagged(), [("crates/a/src/lib.rs", 6)])
 
     def test_ignores_production_code(self):
         self.tree.write("crates/a/src/lib.rs", "pub fn prod() { let d = std::env::temp_dir(); }\n")
