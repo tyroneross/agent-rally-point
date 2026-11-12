@@ -549,6 +549,58 @@ fn next_after_a_wake_stays_bounded_when_the_room_is_over_the_frame() {
     );
 }
 
+/// `say` reads the room after its append. In a room whose full snapshot is
+/// over the frame that read must be the bounded caller projection, or every
+/// `say` reports an incomplete projection.
+#[test]
+fn say_after_its_append_stays_bounded_when_the_room_is_over_the_frame() {
+    const ELSEWHERE: usize = 8_000;
+    let mut room = Room::new("say-bounded");
+    for n in 0..ELSEWHERE {
+        room.fact(json!({
+            "kind": "handoff",
+            "tool": format!("p-{n}"),
+            "target": format!("p-{}", n + 1),
+            "subject": format!("peer handoff {n}"),
+            "summary": padding(1_000),
+        }));
+    }
+    room.seal();
+    let segment = room
+        .cwd
+        .join(".rally/log")
+        .join(format!("{ENGAGEMENT}.jsonl"));
+    assert!(fs::metadata(&segment).unwrap().len() > 8 * 1024 * 1024);
+    let _daemon = Daemon::start(&room);
+    room.json(&["enter", "--tool", ME, "--json"]);
+
+    let say = room.json(&[
+        "say",
+        "handoff",
+        "--tool",
+        ME,
+        "--to",
+        "p-7",
+        "--subject",
+        "bounded say",
+        "--summary",
+        "post-append read must stay under the frame",
+        "--json",
+    ]);
+    assert_eq!(say["data"]["say"]["committed"], json!(true), "{say}");
+    assert_eq!(
+        say["data"]["say"]["projection_complete"],
+        json!(true),
+        "say's post-append room read failed: {}",
+        say["data"]["warnings"]
+    );
+    assert_eq!(
+        say["data"]["room"]["open_handoffs"].as_u64().unwrap() as usize,
+        ELSEWHERE + 1,
+        "room totals stay exact under the bounded projection"
+    );
+}
+
 /// D6: `--path` relevance. Every claim is guaranteed, so a peer claim on the
 /// caller's path is visible however many peer claims (600 x ~1 KB) exist.
 #[test]
