@@ -2610,6 +2610,13 @@ fn command_worktree_closeout(args: WorktreeCloseoutArgs) -> Result<Output> {
     });
     let rally_available = room_evidence.is_ok();
     let (sessions, claims) = room_evidence.unwrap_or_default();
+    // A session record stays active until a stopped record is written, so a
+    // session whose process died without one would own its worktree forever.
+    // Closeout is read-only and cannot write that record; it sets such
+    // sessions aside instead and names them on the row they last held.
+    let (gone_sessions, sessions): (Vec<SessionView>, Vec<SessionView>) = sessions
+        .into_iter()
+        .partition(closeout_session_process_gone);
     let canonical =
         |path: &std::path::Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let mut paths = std::collections::BTreeSet::new();
@@ -2668,7 +2675,10 @@ fn command_worktree_closeout(args: WorktreeCloseoutArgs) -> Result<Output> {
                     .find(|other| other.branch.as_deref() == Some(branch))
                     .map(|other| canonical(std::path::Path::new(&other.path)))
             });
-            (wt.and_then(|w| w.branch.as_deref()) == session_branch.as_deref()
+            // A detached worktree and a session with no branch share no
+            // branch: `None == None` is not a match.
+            (session_branch.is_some()
+                && wt.and_then(|w| w.branch.as_deref()) == session_branch.as_deref()
                 && session_path.as_ref() != Some(&path))
                 || (session_path.as_ref() == Some(&path)
                     && git_path_for_session_branch.as_ref() != Some(&path))
@@ -2682,6 +2692,16 @@ fn command_worktree_closeout(args: WorktreeCloseoutArgs) -> Result<Output> {
             })
         });
         let liveness = sole.map(|view| format!("{:?}", view.liveness).to_lowercase());
+        let process_gone_session_ids: Vec<&str> = gone_sessions
+            .iter()
+            .filter(|view| {
+                view.session
+                    .worktree_path
+                    .as_ref()
+                    .is_some_and(|p| canonical(p) == path)
+            })
+            .map(|view| view.session.session_id.as_str())
+            .collect();
         let availability = if !rally_available {
             "unavailable"
         } else if matches.len() > 1
@@ -2773,7 +2793,7 @@ fn command_worktree_closeout(args: WorktreeCloseoutArgs) -> Result<Output> {
             "path": path, "head": wt.map(|w| w.head.as_str()), "branch": wt.and_then(|w| w.branch.as_deref()),
             "git_status": git_status, "branch_state": branch_state,
             "merge_target": { "ref": target_ref, "commit": target_commit, "status": merge_status },
-            "ownership": { "status": ownership_status, "source": "rally_managed_session", "session_id": sole.map(|v| v.session.session_id.as_str()), "tool": sole.map(|v| v.session.tool.as_str()), "liveness": liveness, "claims_status": if !rally_available { "unavailable" } else if claim_count > 0 { "active" } else { "none_observed" }, "claim_count": claim_count, "availability": availability },
+            "ownership": { "status": ownership_status, "source": "rally_managed_session", "session_id": sole.map(|v| v.session.session_id.as_str()), "tool": sole.map(|v| v.session.tool.as_str()), "liveness": liveness, "liveness_source": sole.map(|v| v.liveness_source), "process_gone_session_ids": process_gone_session_ids, "claims_status": if !rally_available { "unavailable" } else if claim_count > 0 { "active" } else { "none_observed" }, "claim_count": claim_count, "availability": availability },
             "disposition": { "action": action, "reasons": reasons },
         }));
     }
@@ -2796,6 +2816,13 @@ fn command_worktree_closeout(args: WorktreeCloseoutArgs) -> Result<Output> {
         format!("rally worktree closeout: {count} worktrees (read-only)"),
         body,
     ))
+}
+
+/// True when the session's backend answered and no longer has its pane: the
+/// process is gone. A lapsed heartbeat alone is not proof (a busy agent can be
+/// quiet), and an unreachable backend proves nothing, so both keep the session.
+fn closeout_session_process_gone(view: &SessionView) -> bool {
+    view.liveness == SessionLiveness::Stale && view.liveness_source == "backend_probe"
 }
 
 fn command_worktree_plan(args: WorktreePlanArgs) -> Result<Output> {
@@ -4524,7 +4551,12 @@ fn command_say(args: SayArgs) -> Result<Output> {
         }
     }
 
-    let snapshot = match room.snapshot() {
+    // The bounded caller projection, not a full `room.snapshot()`: the full
+    // one grows with the room and stops crossing the daemon frame. Its readers
+    // below need the room totals, the sender's peers and the target's squad;
+    // the projection keeps the squad of every target the sender is waiting on,
+    // which includes a handoff just written.
+    let snapshot = match room.snapshot_for_obligation_target(&args.tool, 128) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             let warning = store::ProjectionWarning {
