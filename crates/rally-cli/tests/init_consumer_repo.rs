@@ -156,8 +156,17 @@ fn markdown_links(block: &str) -> Vec<(String, String)> {
 /// exist. That is what lets these tests name artifacts (`rallyd.sock`, a
 /// crash-scratch tempfile) that only a running daemon or a crash produces.
 fn is_ignored(root: &Path, rel: &str) -> bool {
+    // Only the repository's own rules are under test. A machine-wide ignore
+    // file (for example one that ignores `.rally/` everywhere) must not decide
+    // whether `rally init` left the ledger committable.
     let out = fixture_git_command(root)
-        .args(["check-ignore", "-q", rel])
+        .args([
+            "-c",
+            "core.excludesFile=/dev/null",
+            "check-ignore",
+            "-q",
+            rel,
+        ])
         .output()
         .expect("git check-ignore invocation");
     match out.status.code() {
