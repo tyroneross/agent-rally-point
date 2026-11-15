@@ -28,16 +28,14 @@ new one only for a genuinely new agent session:
 eval "$(rally session ensure \
   --tool <stable-tool-id> \
   --adapter <host-family> \
-  --resource task:<stable-work-context-id> \
   --json | jq -r '.data.session.shell_export')"
 ```
 
-The outer host adapter must run this command **before** it opens or resumes the
-work context. `--resource` is repeatable and accepts exclusive typed scopes.
-When another live session owns the same scope, Rally refuses admission before
-the new harness starts. The adapter may wait, show the current owner, or offer a
-redirect, but it must not invoke the harness's native retry path. Omit
-`--resource` only when the session has no exclusive work context to protect.
+Normal room participation uses the shared lease above. When opening or resuming
+a context that requires an exclusive effect, add `--resource
+task:<stable-work-context-id>` before starting the new harness. Rally refuses
+admission while another live session owns that scope. The host handles the
+conflict. Use the narrowest exclusive resource the operation needs.
 
 An adapter adds `--native-hook`, `--strict`, `--lifecycle-close`, or
 `--live-delivery` only after it has wired that behavior. The response reports

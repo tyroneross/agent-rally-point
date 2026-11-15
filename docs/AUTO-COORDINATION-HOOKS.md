@@ -12,8 +12,8 @@ still participate manually through the same Rally contract; see
 
 ## Install — portable, ships in the repo (no global config)
 
-The wiring **ships with this repo** so it works on **any user machine** without
-touching `~/.claude` or `~/.codex`:
+This checkout supplies project-local wiring for supported hosts. It can load
+without editing `~/.claude` or `~/.codex`:
 
 - `.claude/settings.json` — Claude Code hooks via `${CLAUDE_PROJECT_DIR}` (resolves
   to the repo root on any machine).
@@ -25,8 +25,8 @@ touching `~/.claude` or `~/.codex`:
   into `permission: deny`.
 
 Just open the repo in Claude Code / Codex / Cursor and **trust it on first prompt**. The
-hook self-gates on `.rally/` presence (no-op elsewhere) and fail-opens (never
-blocks an edit). This is the default and recommended path — nothing to run.
+hooks self-gate on `.rally/` presence and use advisory edit checks by default.
+Install the CLI first, then confirm the host loaded the project configuration.
 `SessionStart` shows a concise Rally-active prompt with the current off switch
 so users know the repo is coordinated before work starts.
 
@@ -280,8 +280,9 @@ agent/session, so bare host ids are expanded to `<host-family>:<agent-id>`.
 Set `RALLY_AGENT_ID` to a unique string or number for this terminal/session or
 worker; otherwise the hook derives a stable id from host session metadata.
 Every concurrently working agent that posts Rally facts needs its own id.
-`--session-id` is recorded as metadata only and does not route
-handoffs/claims/presence.
+`--tool` identifies the actor peers can address. The session lease identifies
+which running instance holds a claim or wrote a receipt. CLI calls from a
+long-lived parent should reuse its `RALLY_SESSION_ID`.
 
 **Status model.** The hook uses Rally's typed agent-state surface rather than a
 host-specific side channel. Each working agent posts `rally status post` as it

@@ -40,8 +40,9 @@ blocking switches.
 
 ## Identify Yourself
 
-Pick a stable `tool` id and use it across sessions. Peers address you by this
-id.
+Give each concurrent agent its own stable `--tool` ID. Peers address work by
+that ID. Keep the same `RALLY_SESSION_ID` in the parent environment throughout
+the session so its CLI commands use the same lease.
 
 For managed sessions, `rally run` appends readable ids from the active room.
 The first default Claude session is `claude-01` with tool `claude_code:01`; a
@@ -205,15 +206,13 @@ them before relying on it:
 [`docs/security/TRUST-MODEL.md`](docs/security/TRUST-MODEL.md) and
 [`docs/AUTO-COORDINATION-HOOKS.md`](docs/AUTO-COORDINATION-HOOKS.md).
 
-The hooks are advisory by default, and three opt-in switches make them block.
-Default posture: PreToolUse returns `permissionDecision: "allow"` with a warning,
-so the edit goes through, and every hook exits 0 even when Rally is broken. The
-switches, each off unless you set it:
+Edit checks are advisory by default. The hook renders findings in the host’s
+response format. Strict checks are available through these controls:
 
-- `RALLY_HOOK_STRICT=1` — the hook emits `permissionDecision: "deny"` on a
-  high-severity PreToolUse signal. Stop remains advisory because it marks a
-  turn boundary, not run completion. The hook still exits 0; the refusal
-  travels in the JSON, not the exit code.
+- `RALLY_HOOK_STRICT=1` lets a supported hook emit a host-specific denial for
+  a high-severity PreToolUse finding. The host applies the denial from the
+  response JSON. Stop remains advisory. See the
+  [host-specific limits](docs/AUTO-COORDINATION-HOOKS.md#strict-mode).
 - `rally check before-write --strict` — exits 4 when a stop finding is present. The
   Load-Bearing Commands block above passes `--strict`; drop it for warn-only.
 - `RALLY_BEFORE_WRITE_FAILCLOSED=1` (or `--fail-closed`) — makes `check before-write`
