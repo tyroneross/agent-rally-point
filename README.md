@@ -69,7 +69,7 @@ RALLY_SESSION_ID="pilot-reviewer-$(date +%s)-$$" \
   rally check before-write --tool pilot:reviewer --path README.md --strict --json
 ```
 
-The claim command returns the exclusive claim’s `data.say.event_id`. The strict check exits **4** and reports `data.check.allow: false`. Keep that writer session ID to release the claim via `rally say release --tool pilot:writer --ref <claim-event-id>`. A host hook needs its own activation and edit check. [Manual coordination guide](RALLY.md) · [Hook verification](docs/AUTO-COORDINATION-HOOKS.md)
+The claim command returns the exclusive claim’s `data.say.fact.event_id`. The strict check exits **4** and reports `data.check.allow: false`. Keep that writer session ID to release the claim via `rally say release --tool pilot:writer --ref <claim-event-id>`. A host hook needs its own activation and edit check. [Manual coordination guide](RALLY.md) · [Hook verification](docs/AUTO-COORDINATION-HOOKS.md)
 
 ## Host integrations
 
