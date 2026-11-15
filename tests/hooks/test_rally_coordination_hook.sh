@@ -2371,6 +2371,21 @@ if [ "$?" = "0" ]; then ok "$T"; else bad "$T" "a displaced notification must su
 # Test 11b: installed-plugin + project hook registration must execute one
 # logical event once, including Rally side effects (not only message output).
 # ----------------------------------------------------------------------
+wait_for_idle_calls() {
+  local call_log="$1" expected="$2" count attempt
+  # The shell fallback publishes its heartbeat in a detached child. Wait for
+  # each expected heartbeat before sampling the log for deduplication checks.
+  for ((attempt = 0; attempt < 30; attempt++)); do
+    count=$(grep -c '^status post .*--state idle' "$call_log" 2>/dev/null || true)
+    if [ "${count:-0}" -ge "$expected" ]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  printf 'expected %s idle heartbeat(s) in %s\n' "$expected" "$call_log" >&2
+  return 1
+}
+
 T="duplicate registration: identical event envelope runs Rally side effects once"
 registration_bin="$tmpdir/rally_registration"
 registration_calls="$tmpdir/rally_registration.calls"
@@ -2396,6 +2411,7 @@ install_stub "$registration_bin"
   envelope='{"session_id":"duplicate-registration-session","hook_event_name":"SessionStart"}'
   CALLS="$registration_calls" RALLY_HOOK_SOURCE=plugin RALLY_HOOK_DEDUPE_SECS=120 RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
     "$HOOK" start claude_code <<<"$envelope" >/dev/null 2>&1
+  wait_for_idle_calls "$registration_calls" 1 || exit 1
   first_count="$(wc -l < "$registration_calls" | tr -d ' ')"
   CALLS="$registration_calls" RALLY_HOOK_SOURCE=project RALLY_HOOK_DEDUPE_SECS=120 RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
     "$HOOK" start claude_code <<<"$envelope" >/dev/null 2>&1
@@ -2450,9 +2466,11 @@ T="dedupe source counts handle grouped registration arrival order"
   envelope='{"session_id":"grouped-source-session","hook_event_name":"SessionStart"}'
   CALLS="$calls" RALLY_HOOK_SOURCE=plugin RALLY_HOOK_DEDUPE_SECS=120 RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
     "$HOOK" start claude_code <<<"$envelope" >/dev/null 2>&1
+  wait_for_idle_calls "$calls" 1 || exit 1
   one="$(wc -l < "$calls" | tr -d ' ')"
   CALLS="$calls" RALLY_HOOK_SOURCE=plugin RALLY_HOOK_DEDUPE_SECS=120 RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
     "$HOOK" start claude_code <<<"$envelope" >/dev/null 2>&1
+  wait_for_idle_calls "$calls" 2 || exit 1
   two="$(wc -l < "$calls" | tr -d ' ')"
   CALLS="$calls" RALLY_HOOK_SOURCE=project RALLY_HOOK_DEDUPE_SECS=120 RALLY_HOOK_DEDUPE_DIR="$repo/dedupe" RALLY_BIN="$registration_bin" \
     "$HOOK" start claude_code <<<"$envelope" >/dev/null 2>&1

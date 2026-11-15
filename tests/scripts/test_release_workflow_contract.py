@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -455,6 +456,7 @@ exit 97
 
     def test_release_serial_mode_ignores_an_ambient_nextest(self) -> None:
         cargo_log = self.root / "cargo.log"
+        (self.bin / "python3").symlink_to(sys.executable)
         make_executable(
             self.bin / "git",
             f"""#!/bin/sh
