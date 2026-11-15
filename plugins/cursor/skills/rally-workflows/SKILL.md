@@ -11,8 +11,8 @@ SPDX-License-Identifier: Apache-2.0
 
 # Rally Flow — host-neutral skill
 
-Rally facilitates; the host executes. Rally records claims, checks write boundaries, routes
-handoffs, and exposes room state — it never spawns, schedules, or retries agents. This skill turns a
+The host chooses what to dispatch, and agent harnesses execute the work. Rally records claims,
+checks write boundaries, routes handoffs, and can start managed sessions on request. This skill turns a
 goal into a *workstream descriptor*, lints its structure and write boundaries, then fans out agents that
 coordinate through `rally`. The same protocol runs on any coding host; the host supplies the few
 runtime values below. Canonical wire spec: [`../../dynamic-workflows/PROTOCOL.md`](../../dynamic-workflows/PROTOCOL.md).
@@ -26,7 +26,7 @@ This skill names no specific agent. Before running, resolve three host values:
 | `<TOOL>` | Your host's rally tool id — the value you pass to `rally enter --tool …`. Use one stable id per terminal/role, e.g. `<host>:<role>:<n>`. The model belongs in the id, not in a separate registration. |
 | Fan-out authorization | Tier-1 in-process fan-out is allowed when the work is parallelizable **and** the descriptor lints clean — **unless your host requires explicit user authorization before spawning subagents/delegating**. If it does, gate Tier-1 on that explicit request; otherwise fan out by default. The rally loop is always active either way; only fan-out is conditional. |
 | Flag conventions | If your host parses structured output, pass `--json` on every `rally` command. Add `--severity` on `rally say blocker` when your host distinguishes severities. |
-| Fan-out width | Your own resource ceiling, passed to `resolveFanout({ hostCap })` (§2). Rally has no model, token, or CPU picture — it never spawns — so it owns only the hard ceiling and the ready-task count. A host with no resource picture omits `hostCap` and takes the default. |
+| Fan-out width | Your own resource ceiling, passed to `resolveFanout({ hostCap })` (§2). Rally Flow supplies the hard ceiling and ready-task count. The host supplies model, token, or CPU constraints. A host with no resource picture omits `hostCap` and takes the default. |
 
 Do not hard-code another agent's identity in a descriptor or command — each host supplies its own
 `<TOOL>` at runtime. Substitute `<TOOL>` wherever it appears below.

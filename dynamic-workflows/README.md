@@ -115,9 +115,9 @@ via [tyroneross/pi-dynamic-workflows-fork](https://github.com/tyroneross/pi-dyna
 - The `agent()`/`parallel()`/`pipeline()` execution primitives.
 - Pi SDK and TUI plumbing.
 
-**Why:** Rally is a coordination facilitator, never an executor. Keeping execution machinery here
-would blur the boundary this module is built around: it emits text, a host decides what to run.
-See `PROTOCOL.md §5`.
+**Why:** Rally Flow emits task packets and reports readiness. The host
+chooses what to run and can use its own launcher or request a managed session
+with `rally run`. See `PROTOCOL.md §5`.
 
 ---
 

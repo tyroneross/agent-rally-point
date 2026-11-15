@@ -5,6 +5,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # Spec — Coordination Mandate ("flexibility within the rules")
 
+This dated specification describes the acknowledgement, liveness, and merge
+checks. Its default editing posture is advisory. Supported hosts can enable
+strict edit checks separately. See the [current hook policy](AUTO-COORDINATION-HOOKS.md#strict-mode).
+
 User directive (2026-05-31): **require coordination** without scripting agents or
 blocking work. Principle: *"Acknowledge once, then trusted; skip it, and your work
 is conflicted-out and unmergeable — but never stopped."*

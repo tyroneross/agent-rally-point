@@ -1,5 +1,8 @@
 # Host plugin surfaces
 
+This page describes the bundles in the source tree. Match the CLI and plugin
+versions when installing from a [published release](https://github.com/tyroneross/agent-rally-point/releases/latest).
+
 `config/host-integrations.json` owns generated host metadata, skill frontmatter,
 events, matchers, and timeouts. Run `python3 scripts/generate_host_surfaces.py`
 after changing it; `--check` reports drift without writing host settings.

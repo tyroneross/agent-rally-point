@@ -1,8 +1,7 @@
 # Rally - the 60-second guide
 
-Rally is the primary Agent Rally Point path. It gives coding agents a shared
-repo-local room: what is owned, blocked, handed off, decided, produced, and what
-to do next.
+Rally gives coding agents a shared Git repository room. Use it to see what is
+owned, blocked, handed off, decided, and ready for your attention.
 
 > **First time in a repo?** Run `rally init` once. It writes
 > `.rally/manifest.json` (machine-readable self-description) and injects a
@@ -13,8 +12,8 @@ to do next.
 >
 > Generic or non-first-class agents should start with
 > [`docs/ANY-AGENT-ONBOARDING.md`](docs/ANY-AGENT-ONBOARDING.md). Rally room
-> participation only requires the CLI; direct injection requires a managed
-> session.
+> participation uses the CLI. Live delivery requires a supported, bound route.
+> See [setup and route testing](docs/SETUP-AND-ROUTING.md).
 
 ## The Load-Bearing Commands
 
@@ -375,7 +374,7 @@ ownership or merge-conflict safety.
 ## Where State Lives
 
 ```text
-.rally/log/<engagement>.jsonl   canonical, append-only per-engagement facts (R5; committed)
+.rally/log/<engagement>.jsonl   canonical, append-only per-engagement facts
 .rally/ledger.jsonl             legacy monolith — migrated into log/ on first open (R1)
 .rally/archive/                 rotated old segments, still replayable (R7)
 .rally/manifest.json            self-describing pointers (R4; committed)
@@ -388,8 +387,9 @@ ownership or merge-conflict safety.
 
 Linked git worktrees resolve this room from the shared git common dir, so the
 main checkout and its worktrees coordinate through one `.rally/` store. The
-**ledger files under `.rally/log/`** are the source of truth — append-only,
-committed, durable across clone/machine. `facts.db` is a pure cache that
+**ledger files under `.rally/log/`** are the canonical append-only record.
+This repository keeps live logs local. Other repositories can choose to track
+them under their [trust policy](docs/security/TRUST-MODEL.md). `facts.db` is a cache that
 `rally` rebuilds from the ledger on first open. Managed session lifecycle
 facts ride the same ledger.
 
@@ -497,11 +497,11 @@ writes over a Unix socket (`.rally/rallyd.sock`) instead of opening the SQLite
 cache directly. This removes the multi-process contention that made many
 concurrent CLIs flaky under load — the cache is opened once, by one writer.
 
-It is **demand-activated and fail-open.** With no daemon running, every command
-behaves exactly as before (each process opens the cache directly). A second
-fresh registered lease starts it idempotently through `rally session ensure`;
-set `RALLY_DAEMON_AUTOSTART=0` when a host deliberately owns daemon lifecycle.
-The explicit commands remain available for operators and diagnostics.
+With the coordinator stopped, commands can use direct store ownership. In a
+room approved through `rally setup --component coordinator`, ordinary CLI
+commands can start the coordinator when it is down. Set
+`RALLY_DAEMON_AUTOSTART=0` when the host owns its lifecycle. See
+[coordinator setup and permissions](docs/SETUP-AND-ROUTING.md).
 
 ```bash
 rally daemon start    # spawn the daemon (detached; returns once it is serving)

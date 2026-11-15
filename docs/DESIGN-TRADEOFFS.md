@@ -83,10 +83,10 @@ Three mechanisms came out of it:
 The moment it decides who does what, it becomes a scheduler, and then it needs to model task
 semantics, agent capability, and progress — which is the job of the thing being coordinated, not
 the coordination substrate. It also becomes a single point of failure with more authority than
-anything else in the system, in a design whose entire premise is that there is no server.
+anything else in a local-first system. The optional local coordinator owns store access.
 
-Stated as an invariant: **if something would make Rally execute, schedule, retry, or assign, it
-belongs in the host or an external runner, not here.**
+The host or lead owns task assignment, scheduling, retries, and verification.
+Rally can launch a named harness on request and manage its terminal session.
 
 Admission is deliberately on the other side of that boundary. When a host
 explicitly asks to launch or resume a named resource, Rally may atomically grant

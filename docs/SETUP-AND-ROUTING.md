@@ -42,7 +42,8 @@ plan, not evidence that a fresh OS installation has been tested.
 `rally setup --component coordinator --apply` asks **Enable Rally's background
 coordinator to improve multi-agent coordination?** The coordinator is included
 in Rally. Approval enables the per-repository service and its later automatic
-activation when multiple fresh leases appear. Approval persists for the exact
+activation, including restart when an ordinary CLI command finds the approved
+room’s coordinator down. Approval persists for the exact
 plan, including after a failed start, so an unchanged retry needs no second
 approval. Use `rally daemon stop` to stop a running coordinator. Stopping it does
 not revoke that stored activation permission.

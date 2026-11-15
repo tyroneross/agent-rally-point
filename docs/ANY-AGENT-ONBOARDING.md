@@ -140,8 +140,8 @@ your host's own spawn mechanism runs the agents.
 Resolve how many to run at once with `resolveFanout()` from
 `dynamic-workflows/core/fanout.mjs` rather than picking a number — it returns the
 width (default 10, hard ceiling 12) alongside the `limiting_factors` that produced
-it. Pass your own resource ceiling as `hostCap`; Rally never spawns, so it has no
-model, token, or CPU picture of its own.
+it. Pass the host’s resource ceiling as `hostCap`. The host chooses fan-out
+width and can request managed launches through `rally run`.
 
 ## Tool Ids
 

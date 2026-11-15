@@ -1,49 +1,25 @@
 <!-- SPDX-FileCopyrightText: 2025-2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com> -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# North Star — Agent Rally Point
+# Agent Rally Point North Star
 
-> Human-facing mirror of the durable product vision. The machine-read source of truth (loaded by
-> build-loop Phase 1) is `build-loop-memory/projects/agent-rally-point/constitution.md`. Edit both
-> together, and only on a deliberate vision shift. Last reviewed: 2026-06-04.
+**Make parallel coding agents accountable to the same record of work, even when they run in different terminals or harnesses.**
 
-## The one line
+An agent joining a busy repository should be able to answer who owns the work, what needs its response, and what evidence supports a result. The person directing the work should be able to inspect those answers without relaying messages between terminals.
 
-**Coordinate thousands of AI coding agents across many terminals on one codebase — trustworthily,
-losslessly, and without a human referee.**
+## What Rally owns
 
-## What it is
+- **A shared repository room.** Agents share context, communicate, and review in parallel. Linked Git worktrees share a room while keeping edits isolated. The local append-only ledger retains coordination history, and derived indexes can be rebuilt from it.
+- **Narrow ownership boundaries.** Each piece of work has one accountable owner. Exclusive claims protect specific resources when an effect needs serialization. Rally refuses conflicting exclusive claims. Edit checks are advisory by default, with strict enforcement where the host or caller supports it.
+- **Handoffs that can be followed to a result.** Queuing, transport delivery, receiver acknowledgement, acceptance of ownership, completion, and verification each require their own evidence. A missed delivery remains visible as pending work the recipient can pick up from the room.
+- **Host-neutral coordination and explicit runtime controls.** The CLI works independently of a model provider. Host hooks can register sessions and check edits. Rally can launch or adopt managed sessions, route prompts, and serve the local store through an optional coordinator.
 
-A per-repo, no-server "rally point." Agents from any host (Claude, Codex, …) announce presence, claim
-work, hand off, and read-back through a shared per-repo `.rally/` channel — so a fleet works the same
-code without clobbering each other and without a human deconflicting.
+The lead or operator sets the goal, decides who does what, and owns convergence, integration, and publication. Agent harnesses perform the work. Rally Flow can validate a plan and report which tasks are ready. Launch, routing, and admission controls act on explicit requests and configured policy.
 
-## Charter — facilitator, never executor
+## Where the product should grow
 
-Rally **records and advises; it never gates, grants, schedules, spawns, retries, or executes.** It
-derives state (presence, claims, handoffs, the DAG, wake-due) from facts and exposes it; the host runs
-the work. A feature that gates or executes work is off-charter.
+A busy room should surface the work and decisions relevant to the current agent while keeping the complete record available for revalidation. Coordination should survive restarts and handoffs, and operators should be able to establish what happened from the record when a route or agent fails.
 
-## Invariants (non-negotiable)
+Broader host support and larger rooms are design targets. Claims about a given host, delivery route, or fleet size depend on evidence from that setup. The current trust model covers trusted local agents under one operator. Easy Terminal is one host for managed sessions and delivery. Other hosts can use the same room protocol.
 
-1. **Zero data loss** — the append-only JSONL ledger (`.rally/log/` + archive) is canonical.
-2. **Derived caches are disposable** — `facts.db` and `.rally/.reconcile-cache.json` rebuild from the
-   ledger; corruption is a non-event, not data loss.
-3. **One owner per path, one store per repo** — collisions WARN + record an audit fact; work is never
-   blocked, mistakes stay fixable.
-4. **Trustworthy results** — room-stamped, fail-loud, read-back-verified, liveness-aware.
-5. **Host-neutral** — one substrate for every coding host; the host's LLM interprets.
-
-## Scale
-
-Durable and correct at **thousands of agents and many terminals**. Public claims
-must follow measured behavior in the current implementation and its tests.
-
-## Non-goals
-
-Not an orchestrator/scheduler/executor (that's the host) · not a server/cloud service (per-repo,
-local-first) · not a human-in-the-loop referee (removing that referee is the point).
-
-## Ecosystem
-
-**Easy Terminal** is the host that launches, hosts, and observes the fleet Rally coordinates underneath.
+[Current product and setup](README.md) · [Architecture](docs/RALLY_ARCHITECTURE.md) · [Protocol design](docs/PROTOCOL-NORTH-STAR.md) · [Trust model](docs/security/TRUST-MODEL.md)

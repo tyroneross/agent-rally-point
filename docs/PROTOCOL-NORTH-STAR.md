@@ -1,6 +1,11 @@
 <!-- SPDX-FileCopyrightText: 2026 Tyrone Ross, Jr <46267523+tyroneross@users.noreply.github.com> | SPDX-License-Identifier: Apache-2.0 -->
 
-# Rally Agent Coordination Protocol - North Star
+# Rally Coordination Protocol Design
+
+This design proposal describes the direction for identity, claims, receipts,
+and scale. The event examples and builder checklist are proposed protocol
+shapes. See the [product North Star](../NORTH_STAR.md) and
+[current architecture](RALLY_ARCHITECTURE.md) for today’s operating contract.
 
 ## Governing Thought
 
@@ -19,19 +24,16 @@ cloud workers, and LLM tools can safely answer:
 - What conflicts with what?
 - What should an idle agent do next without a human acting as clipboard or referee?
 
-This serves the Rally north star: coordinate thousands of AI coding agents across
-many terminals on one codebase, trustworthily, losslessly, and without a human
-referee.
+The scale target is to support large rooms while keeping ownership, handoffs,
+and evidence legible. The current trust boundary is one operator coordinating
+trusted local processes.
 
 ## Design Position
 
-Rally should remain a facilitator, not an executor.
-
-It records, projects, routes, warns, and advises. It does not decide whether code
-is correct, execute work on behalf of agents, grant exclusive locks, or become a
-hidden scheduler. Host agents and their harnesses execute the work. Rally keeps
-their shared coordination state reliable enough that they can work in parallel
-without clobbering each other.
+Rally records, projects, routes, and checks coordination state. It can refuse
+conflicting exclusive claims, check admission for a named resource, and launch
+a managed session on explicit request. The lead and host decide what to run and
+verify the work.
 
 The right model is a protocol with four main planes:
 
@@ -621,7 +623,7 @@ Read receipts are useful for transport debugging but weak as coordination facts.
 Agents need to know whether the actor acknowledged or accepted the request, not
 whether some UI surface displayed it.
 
-### Why Rally Does Not Enforce Locks
+### Claim checks and edit enforcement
 
 Hard locks can strand work when sessions die, hosts crash, or agents make wrong
 claims. Rally should reject or mark conflicting claim acquisition according to
@@ -658,7 +660,7 @@ These are known gaps, not omissions.
 | Challenge-response registration | Agents connect over untrusted transport or remote service. |
 | Hybrid logical clocks | Cross-machine ordering matters beyond per-room sequence. |
 | Federated transport | Multiple machines need real-time coordination without shared files. |
-| Policy enforcement locks | Hosts demand hard prevention instead of warning-only deconfliction. |
+| Filesystem-enforced locks | A future deployment needs enforcement beyond claim acquisition and cooperating host hooks. |
 | Server-backed indexes | Repo-local files cannot handle target fleet size or remote topology. |
 | Strict durable transport audit | Delivery/read receipts become compliance evidence, not debugging state. |
 

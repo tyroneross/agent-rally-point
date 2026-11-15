@@ -1,8 +1,9 @@
 # Rally Architecture
 
-Rally is a repo-local coordination layer for parallel goal-driven agents.
-It is not a conductor, task runner, dashboard, or coding agent. Its job is to
-keep shared room state correct, fresh, and visible before agents act.
+Rally is a repo-local coordination layer for parallel coding agents. It keeps
+shared room state visible, checks ownership boundaries, and provides explicit
+managed-session launch and delivery. The lead and host choose and execute the
+work. See the [North Star](../NORTH_STAR.md) for the product boundary.
 
 Rally is the Agent Rally Point product path. The repository ships one
 coordination CLI: `rally`.
@@ -43,11 +44,11 @@ Rally should not own:
 ## Architecture
 
 ```text
-.rally/log/<engagement>.jsonl  canonical append-only event segments (committed; one file per engagement)
+.rally/log/<engagement>.jsonl  canonical append-only event segments (one file per engagement)
 .rally/ledger.jsonl            R1 legacy single-log — still replayed on read for pre-segmentation repos
 .rally/manifest.json           self-describing pointers to docs + log (committed)
 .rally/RETROSPECTIVE.md        human-readable digest grouped by engagement (committed)
-.rally/archive/**              rotated old segments, still replayable (committed)
+.rally/archive/**              rotated old segments, still replayable
 .rally/facts.db                derived sqlite cache (gitignored; rebuildable)
 .rally/cursors.json            per-tool read cursors (gitignored; a write-through cache — the ledger is authoritative)
 enter/next/room/check          product APIs derived from the segments
@@ -57,22 +58,22 @@ managed sessions               tmux, cmux, and ptyd launch/inject/capture/stop
 The per-repo **`.rally/log/` segments are the source of truth** (R5 segmentation).
 The R1 single `.rally/ledger.jsonl` remains a valid canonical log and is still
 replayed on read for repos that predate segmentation. Each segment is
-append-only, one event per line (`{seq, occurred_at, event_type, payload}`),
-committed, and carries `merge=union` (see `.gitattributes`) so concurrent
-appends from sibling worktrees merge without conflict.
+append-only, with one event per line. Linked worktrees write to the same local
+store. This release repository ignores live logs and tracks its manifest. A
+project that chooses to commit history should review the
+[trust model](security/TRUST-MODEL.md) and set an explicit merge policy.
 
-**Commit cadence.** The committed segments may lag the on-disk segments during
-active work — that is fine: the segments are a live working-tree artifact, and
-`merge=union` makes a lagging commit safe to catch up at any time. Commit them
-on whatever cadence the engagement uses (per chunk, per closeout, or batched);
-there is no daemon and no required cadence.
+**Store ownership.** Commands can own the store directly, or an optional
+per-repository coordinator can own it and serve commands over a local Unix
+socket. In either mode, the ledger remains canonical.
 
 `facts.db` is a *derived* sqlite cache (factstr-sqlite) that `RoomStore` rebuilds
 by replaying the segments whenever the cache is missing or behind. `cursors.json`
 is a write-through read-cursor cache, **never** the source of truth — a tool's
 read position is derived from ledger `Read` checkpoints (R10), with `cursors.json`
-consulted only as a fast-path fallback. A clone or fresh machine reconstructs room
-state from the committed segments alone — no external service, no migration step.
+consulted only as a fast-path fallback. A fresh clone can replay any history
+that was deliberately committed. For this repository it starts with the tracked
+manifest and an empty room.
 
 Room snapshots and managed session lists are derived from the event log on
 demand, not stored in a second projection DB.

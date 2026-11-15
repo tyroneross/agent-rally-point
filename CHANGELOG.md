@@ -7,6 +7,35 @@ All notable changes to Agent Rally Point are documented here.
 
 ## Unreleased
 
+## 0.2.10 — 2026-11-15
+
+### Added
+
+- Cursor and Antigravity join Muse in dedicated generated plugin bundles.
+  Cursor ships skills and hooks, and Antigravity ships skills. The generated
+  payloads share the CLI release identity.
+- `enter`, `next`, and `inbox` page addressed work with exact totals on compatible
+  clients and daemons. Use `rally inbox --before SEQ` to read older items.
+
+### Fixed
+
+- Route previews report the selected delivery path, including routes into nested
+  repositories. A preview uses current routing metadata and leaves delivery to
+  an explicit send or probe.
+- Worktree closeout uses branch matches and backend liveness when attributing
+  session ownership. Completed bounded tasks can clean up worktrees containing
+  only generated hook bookkeeping.
+  Managed `rally run --shared` sessions start in the caller’s checkout.
+- Claim recovery can identify exited local CLI owners. Lead staleness uses durable
+  authored activity, and default room views bound stale presence rows.
+- Host reconciliation checks release identity, detects stale Codex symlink caches,
+  and handles duplicate providers more reliably.
+
+### Documentation
+
+- The README, North Star, and operating guides describe the local room, claim
+  enforcement, managed sessions, and evidence required for a handoff.
+
 ## 0.2.9 — 2026-11-03
 
 ### Changed — lifecycle hooks declare their waiting allowance

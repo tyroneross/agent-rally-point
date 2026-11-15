@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 > **One-line:** turn a goal into a linted MECE workstream, fan it out across any agents on any
 > hosts, and have every step durably **recorded**, rendered as a **DAG**, and **resumed** through
-> trust-gated wake signals — while Rally itself never executes anything.
+> trust-gated wake signals. The host decides when to start or resume a task.
 >
 > **Read this if** you are picking up dynamic workflows cold and need the whole arc — what it is, the
 > pieces, how they compose, and the boundary that keeps it safe.
@@ -237,10 +237,11 @@ remain — durable resume with no in-memory state.
 
 ---
 
-## 4. The non-negotiable charter
+## 4. Runner responsibility
 
-> **Rally RECORDS and DERIVES; it NEVER EXECUTES.**
-> (restated in `docs/ORCHESTRATOR_SEAM.md §0`.)
+Rally Flow records progress and derives readiness. The host can launch workers
+through its native mechanism or request a managed session via `rally run`.
+See the [runner contract](ORCHESTRATOR_SEAM.md).
 
 Every piece above either adds *facts* (`rally say …`) or returns *read-only projections* (`rally dag`,
 `rally wake-due`, `workstream-status.mjs`). None of them start, resume, retry, or schedule work.

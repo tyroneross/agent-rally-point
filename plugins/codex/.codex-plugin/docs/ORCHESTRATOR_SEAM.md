@@ -9,16 +9,14 @@ SPDX-License-Identifier: Apache-2.0
 
 ---
 
-## 0. The Hard Rule (non-negotiable)
+## 0. Runner responsibility
 
-**Rally RECORDS and DERIVES; it NEVER EXECUTES.**
+Rally records work and projects what is ready. The host or external runner
+chooses when to dispatch, resume, or retry it. An explicit managed launch via
+`rally run` starts the named harness for that caller.
 
-Every event below adds *facts* or *derived views*. The actual fan-out, model wake, step execution, and scheduling always happen in an **external runner** (LaunchAgent / cron / Build Loop / `rally watch`).
-
-Litmus for every change: *"Does this make Rally start, resume, retry, or schedule work?"*
-If **yes** → it is out of scope; move it to the runner.
-
-`rally watch` is the reference runner. It polls `rally wake-due --json` and invokes the suggested commands. Rally emits the suggestion; the runner fires the work.
+`rally wake-due` returns suggested commands. A runner such as `rally watch`
+decides whether and when to invoke them.
 
 ---
 

@@ -291,15 +291,13 @@ per-turn prompts surface peer status changes so agents know who is working,
 what file/intent they have, whether they are blocked or done, and when idle
 agents expect to check in again.
 
-**Charter — advisory-only (default).** Coordination is recorded + exposed,
-never enforced. The hook NEVER emits `permissionDecision: "deny"` or
-`decision: "block"` by default. Collisions warn; the agent decides.
+**Default edit policy.** The before-write hook reports collisions as warnings.
+Exclusive claim acquisition is a separate CLI operation and can refuse a
+conflicting claim.
 
-**Strict mode (opt-in escape hatch).** `RALLY_HOOK_STRICT=1` enables hard
-denial on high-severity PreToolUse collisions. Stop remains advisory because a
-normal turn ending is not a run-completion boundary. Strict mode is off by
-default and is an explicit deviation from the never-block charter for
-orchestration paths that want hard mutation gates.
+**Strict mode (opt-in).** `RALLY_HOOK_STRICT=1` can deny on high-severity
+PreToolUse findings in supported host hooks. Stop remains advisory because a
+normal turn ending is separate from run completion.
 
 ## Hook Policy And Opt-Out
 
@@ -417,15 +415,12 @@ silently. The hook MUST NEVER stall a host session. Specifically:
 export RALLY_HOOK_STRICT=1
 ```
 
-When set, the hook may emit `permissionDecision: "deny"` on **high-severity**
-Claude PreToolUse signals only (`severity==stop` or `allow==false`). Codex
-PreToolUse remains fail-open with `systemMessage` because Codex rejects the
-Claude `permissionDecision` field. Stop and low-severity warnings always remain
-advisory.
-
-This contradicts the never-block charter (`rally mission` — *"records and
-exposes only; never enforces"*) and is documented as a deliberate escape hatch
-for orchestration paths where the operator wants hard gates. Use sparingly.
+With this setting, the shell hook translates high-severity PreToolUse findings
+(`severity==stop` or `allow==false`) into the host’s denial envelope where
+supported. Claude-compatible hooks use `permissionDecision: "deny"`; Cursor uses
+`permission: "deny"`. Codex’s shell hook emits an advisory `systemMessage`.
+Verify that the active host loads its hook and honors the response. Stop and
+low-severity findings remain advisory.
 
 ## Disabling per session
 
@@ -443,5 +438,5 @@ shim delegates to that same file so the installed path stays aligned.
 
 ## Cross-refs
 
-- [`../NORTH_STAR.md`](../NORTH_STAR.md) — durable vision + never-block charter.
+- [`../NORTH_STAR.md`](../NORTH_STAR.md) — product direction and operating boundaries.
 - [`../RALLY.md`](../RALLY.md) — 60-second guide.
