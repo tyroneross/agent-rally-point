@@ -17,3 +17,9 @@ tools/agent-rally-watcher/
     for the original attribution and license terms. Migration context lives
     in tools/agent-rally-watcher/MIGRATION.md. Full pre-import history is
     preserved in archive/bundles/agent-rally-watcher.bundle.
+
+vendor/sqlx-sqlite/
+    SQLx SQLite driver (v0.8.6, MIT OR Apache-2.0).
+    Copyright (c) 2020 LaunchBadge, LLC.
+    See vendor/sqlx-sqlite/LICENSE-MIT, vendor/sqlx-sqlite/LICENSE-APACHE, and
+    vendor/sqlx-sqlite/UPSTREAM.md for the license terms and local manifest patch.

@@ -31,6 +31,11 @@ All notable changes to Agent Rally Point are documented here.
 - Host reconciliation checks release identity, detects stale Codex symlink caches,
   and handles duplicate providers more reliably.
 
+### Security
+
+- Upgrade the bundled SQLite to 3.54.1 to address RUSTSEC-2026-0459. The
+  vendored SQLx 0.8.6 SQLite driver accepts the patched native wrapper.
+
 ### Documentation
 
 - The README, North Star, and operating guides describe the local room, claim

@@ -44,7 +44,7 @@ cd agent-rally-point
 rally --version
 ```
 
-The release installer uses GitHub CLI (`gh`) to check build provenance and verifies the asset’s SHA256 before making it executable. Release binaries cover macOS and GNU/Linux on ARM64 and x86-64. To build the checked-out source, use `cargo install --path crates/rally-cli`. The CLI declares Rust 1.89 as its minimum and the checkout pins the contributor toolchain. See [Upgrading Rally](docs/UPGRADING.md) before replacing an existing CLI or upgrading a room with a running coordinator.
+The release installer uses GitHub CLI (`gh`) to check build provenance and verifies the asset’s SHA256 before making it executable. Release binaries cover macOS and GNU/Linux on ARM64 and x86-64. To build the checked-out source, use `cargo install --locked --path crates/rally-cli`. The CLI declares Rust 1.89 as its minimum and the checkout pins the contributor toolchain. See [Upgrading Rally](docs/UPGRADING.md) before replacing an existing CLI or upgrading a room with a running coordinator.
 
 In the Git repository your agents will share, run:
 
