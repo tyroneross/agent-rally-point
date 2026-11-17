@@ -6,13 +6,10 @@
 //! The **entire coupling surface** between rally (writer) and the daemon
 //! (consumer) in Plan F's hybrid ledger-driven coordination architecture.
 //!
-//! Plan F inverts the herdr-era direction: rally no longer calls into the
-//! daemon. Instead, rally appends typed [`Directive`] records to an
-//! append-only per-agent inbox file in the `.rally` ledger; the daemon
-//! (`rally-termd`, a separate daemon that is optional and not publicly
-//! available) subscribes via
-//! kernel file-events, executes terminal-touching directives by logical
-//! agent-id, and posts [`Receipt`]s back to the same ledger.
+//! The legacy Plan F contract represents terminal actions as typed
+//! [`Directive`] records in an append-only per-agent inbox in the `.rally`
+//! ledger. Consumers can execute directives by logical agent-id and post
+//! [`Receipt`]s back to the ledger.
 //!
 //! This crate owns the types + the [`Inbox`] trait + the canonical
 //! file-backed implementation [`ledger::FileInbox`]. Everything else is
