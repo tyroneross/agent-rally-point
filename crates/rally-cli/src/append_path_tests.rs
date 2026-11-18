@@ -899,6 +899,14 @@ fn probe_claims() -> ReadProbe {
     )
 }
 
+fn probe_lead_show() -> ReadProbe {
+    probe_read(
+        "lead show --json",
+        || rally(&["lead", "show", "--json"]),
+        |body| usize::from(body["data"]["lead"].is_object()),
+    )
+}
+
 fn probe_next() -> ReadProbe {
     probe_read(
         "next --audit --json",
@@ -1009,6 +1017,32 @@ fn read_relevance_report() {
 }
 
 // ---- passing relevance guards ----------------------------------------------
+
+/// `lead show` needs the current lead (the snapshot) and the newest
+/// `role:lead` decision for its tier and assignment mode. It used to load
+/// every fact for the second part: on a 101k-fact room that was 17 paged
+/// requests and 363 ms to answer 316 bytes. It now asks for decisions only.
+#[test]
+fn relevance_lead_show_loads_no_history_beyond_the_snapshot() {
+    with_relevance_room("relevance-lead-show", 1_500, |_rr| {
+        rally(&["lead", "assign", "--tool", ME, "--to", ME, "--json"]);
+        let snapshot_only = probe_claims();
+        let lead = probe_lead_show();
+        assert_eq!(lead.body["data"]["lead"]["action"], json!("show"));
+        assert_eq!(lead.body["data"]["lead"]["current_lead"], json!(ME));
+        assert_eq!(lead.body["data"]["lead"]["assigned"], json!("assign"));
+        assert_eq!(
+            lead.counts.facts_db_full_loads, snapshot_only.counts.facts_db_full_loads,
+            "lead show must not load the whole ledger a second time"
+        );
+        assert!(
+            lead.counts.facts_materialized < 2 * snapshot_only.counts.facts_materialized,
+            "lead show read {} facts; the snapshot alone reads {}",
+            lead.counts.facts_materialized,
+            snapshot_only.counts.facts_materialized
+        );
+    });
+}
 
 #[test]
 fn relevance_inbox_returns_only_callers_open_obligations() {
