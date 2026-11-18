@@ -1,0 +1,12 @@
+{
+  "name": "rally-room-relay",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "test": "node --test integration.test.js"
+  },
+  "devDependencies": {
+    "wrangler": "4.164.0"
+  }
+}

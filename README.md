@@ -13,6 +13,8 @@ For example, Claude Code can claim a parser change while Codex reviews the tests
 
 See the [latest GitHub release](https://github.com/tyroneross/agent-rally-point/releases/latest) for downloadable builds and the [changelog](CHANGELOG.md) for changes by version.
 
+For agents on separate Macs or an always-on worker, see the [cloud room relay setup and acceptance test](deploy/rally-relay/README.md).
+
 ## Install with a coding agent (recommended)
 
 Paste this into a coding agent that can run shell commands:
